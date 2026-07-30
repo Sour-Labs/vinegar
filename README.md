@@ -177,12 +177,34 @@ under your own account.
 ```sh
 mkdir -p ~/.vinegar/logs
 cp launchd/io.sourlabs.vinegar.plist ~/Library/LaunchAgents/
-launchctl load ~/Library/LaunchAgents/io.sourlabs.vinegar.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.sourlabs.vinegar.plist
 tail -f ~/.vinegar/logs/vinegar.log
 ```
 
+Create the log directory first. launchd will not create it, and a job whose
+`StandardOutPath` it cannot open fails to spawn at all.
+
+`bootstrap` rather than `load`, which is deprecated and reports nothing when
+it fails. To stop it, `launchctl bootout gui/$(id -u)/io.sourlabs.vinegar`.
+
 The plist sets `PATH` explicitly because launchd starts with a bare one, and
 a daemon that cannot find `claude` fails at the first review.
+
+A LaunchAgent runs only inside a logged-in session, so on a machine with
+FileVault enabled Vinegar does not come back on its own after a reboot: the
+disk waits to be unlocked, and nothing runs until someone logs in. Use
+`sudo fdesetup authrestart` for planned reboots, which unlocks for one boot.
+
+Logs are written per event rather than per poll, so they grow slowly. To
+rotate them anyway, drop a `newsyslog.d` rule in place:
+
+```sh
+sudo tee /etc/newsyslog.d/io.sourlabs.vinegar.conf <<'EOF'
+# logfilename                              [owner:group]  mode count size when flags
+/Users/YOUR_USERNAME/.vinegar/logs/vinegar.log     YOUR_USERNAME:staff 644 7 1000 * J
+/Users/YOUR_USERNAME/.vinegar/logs/vinegar.err.log YOUR_USERNAME:staff 644 7 1000 * J
+EOF
+```
 
 ## What the reviewer is allowed to do
 
