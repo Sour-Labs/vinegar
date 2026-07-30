@@ -6,9 +6,9 @@ Labs](https://sourlabs.io) Capsule.
 
 | File | Use |
 | --- | --- |
-| `vinaigre-avatar-1024.png` | The GitHub App logo. Upload this one. |
-| `vinaigre-avatar.svg` | Source for the above. Chevron is filled with the ground colour, so it is only correct on `#0A0C08`. |
-| `vinaigre-mark.svg` | The mark alone, chevron as real transparency. Use this anywhere the background is not the ground. |
+| `vinegar-avatar-1024.png` | The GitHub App logo. Upload this one. |
+| `vinegar-avatar.svg` | Source for the above. Chevron is filled with the ground colour, so it is only correct on `#0A0C08`. |
+| `vinegar-mark.svg` | The mark alone, chevron as real transparency. Use this anywhere the background is not the ground. |
 
 Acid lime `#7FFF00`, ground `#0A0C08`. Candy pink `#FF6EC7` belongs to the
 Capsule and is deliberately absent here: at avatar size a second colour is one

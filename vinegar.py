@@ -134,7 +134,18 @@ def installation_token(app, repo, cache):
         return token
 
     jwt = app_jwt(app["app_id"], os.path.expanduser(app["private_key"]))
-    install = github_api("/repos/%s/installation" % repo, jwt)
+    try:
+        install = github_api("/repos/%s/installation" % repo, jwt)
+    except RuntimeError as err:
+        # The App existing and the App being installed on a repository are two
+        # different things, and this is the first place that difference shows.
+        if "said 404" not in str(err):
+            raise
+        slug = github_api("/app", jwt).get("slug", "<app>")
+        raise RuntimeError(
+            "the App is not installed on %s. Install it at "
+            "https://github.com/apps/%s/installations/new" % (repo, slug))
+
     minted = github_api("/app/installations/%d/access_tokens" % install["id"],
                         jwt, payload={"repositories": [repo.partition("/")[2]]})
 

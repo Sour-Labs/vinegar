@@ -131,24 +131,29 @@ sandbox limit the allow list could not close.
 Create the App once, in your organisation's settings under **Developer
 settings → GitHub Apps → New GitHub App**:
 
-- **Name** whatever you want the comments signed as. Note that an App's slug
-  shares a namespace with GitHub usernames, so a name is unavailable if the
-  account exists: `vinegar`, `brine`, `acetic`, `verjus`, `aceto` and `acidity`
-  are all taken already. `vinaigre` was free, and is what this project uses.
+- **Name** whatever you want the comments signed as. Expect to need a second
+  and a third choice: the name has to be unique across every GitHub App, and it
+  also cannot collide with an existing user or organisation. `vinegar`,
+  `brine`, `acetic`, `verjus`, `aceto` and `acidity` are all taken as accounts,
+  and `vinaigre` was free as an account but still refused as an App name. This
+  project ended up at `vinegar-bot`.
 - **Homepage URL** anything; it is required and unused.
 - **Webhooks**: untick **Active**. Vinegar polls and needs no callback.
 - **Repository permissions**: `Pull requests` read and write, `Contents` read,
   `Metadata` read. Nothing else.
 - Upload a logo on the App's page. That image is the avatar on every comment.
-  `brand/vinaigre-avatar-1024.png` in this repo is ready to use.
+  `brand/vinegar-avatar-1024.png` in this repo is ready to use.
 
-Then **Generate a private key**, which downloads a `.pem`, and **Install App**
-on the repositories you want reviewed. Point the config at both:
+Then **Generate a private key**, which downloads a `.pem`. Install the App from
+`https://github.com/apps/<your-app-slug>/installations/new`, pick the account
+that owns the repositories, and choose **Only select repositories** rather than
+all of them: the installation is the boundary, and a review can reach every
+repository inside it. Point the config at the App and the key:
 
 ```json
 "github_app": {
   "app_id": 123456,
-  "private_key": "~/.vinegar/vinegar.private-key.pem"
+  "private_key": "~/.vinegar/vinegar-bot.private-key.pem"
 }
 ```
 

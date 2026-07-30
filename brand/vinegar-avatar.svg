@@ -4,7 +4,7 @@
        Full-bleed ground on purpose: GitHub applies its own crop to a bot
        avatar, so baking rounded corners in here would double up.
        The chevron is filled with the ground colour rather than masked, so
-       this file is only correct on #0A0C08. Use vinaigre-mark.svg anywhere
+       this file is only correct on #0A0C08. Use vinegar-mark.svg anywhere
        the background is not the ground. -->
   <rect width="256" height="256" fill="#0A0C08"/>
   <g transform="rotate(-8 128 128)">
