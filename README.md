@@ -95,8 +95,13 @@ Clones live outside that directory, in `~/.vinegar-checkouts/`, one per repo,
 which only Vinegar touches. They are deliberately not under `~/.vinegar`: the
 reviewer is denied every read there so that a diff cannot talk it into reading
 the App's private key, and a checkout inside would be caught by the same rule.
-Set `VINEGAR_CHECKOUTS` to put them somewhere else. Deleting them is safe;
-Vinegar re-clones on the next review.
+The default follows `VINEGAR_HOME`, so pointing that at `~/.vinegar-test`
+gives an instance its own state, its own lock, and its own clones in
+`~/.vinegar-test-checkouts`. `VINEGAR_CHECKOUTS` overrides the location on its
+own. Either way Vinegar refuses to start if the result lands inside
+`VINEGAR_HOME`, because that is the one misconfiguration nothing downstream
+would report. Deleting the clones is safe; Vinegar re-clones on the next
+review.
 
 ### Configuration
 

@@ -32,20 +32,30 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 
-HOME = os.path.expanduser(os.environ.get("VINEGAR_HOME", "~/.vinegar"))
+# abspath, not just expanduser, so a trailing slash or a relative path cannot
+# make the checkout look like it sits somewhere it does not. The check in
+# check_paths() compares these two, and a comparison is only as good as the
+# normalisation under it.
+HOME = os.path.abspath(
+    os.path.expanduser(os.environ.get("VINEGAR_HOME", "~/.vinegar")))
 STATE_PATH = os.path.join(HOME, "state.json")
 LOCK_PATH = os.path.join(HOME, "vinegar.pid")
 REVIEW_DIR = os.path.join(HOME, "reviews")
 
-# Checkouts sit outside HOME, and that is load-bearing rather than tidiness.
-# review-settings.json denies the reviewer every read under `~/.vinegar`, so a
-# diff cannot talk it into reading the App's private key. A checkout inside
-# that directory is covered by the same rule, and then the reviewer cannot
-# read the repository it was pointed at: it falls back to fetching each file
-# over the API, which costs more and reviews worse, while `permission_denials`
-# stays empty and reports nothing wrong.
-CHECKOUT_DIR = os.path.expanduser(
-    os.environ.get("VINEGAR_CHECKOUTS", "~/.vinegar-checkouts"))
+# Checkouts sit beside HOME rather than inside it, and that is load-bearing
+# rather than tidiness. review-settings.json denies the reviewer every read
+# under `~/.vinegar`, so a diff cannot talk it into reading the App's private
+# key. A checkout inside that directory is covered by the same rule, and then
+# the reviewer cannot read the repository it was pointed at: it falls back to
+# fetching each file over the API, which costs more and reviews worse, while
+# `permission_denials` stays empty and reports nothing wrong.
+#
+# The default is derived from HOME rather than fixed, so that VINEGAR_HOME
+# still isolates an entire instance. A fixed path would leave two instances
+# sharing clones while holding separate locks, which is the exact race
+# acquire_lock() exists to prevent.
+CHECKOUT_DIR = os.path.abspath(os.path.expanduser(
+    os.environ.get("VINEGAR_CHECKOUTS", HOME + "-checkouts")))
 SETTINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                              "review-settings.json")
 
@@ -223,6 +233,28 @@ def load_config(path):
         if not os.path.isfile(key):
             sys.exit("%s: no private key at %s" % (path, key))
     return config
+
+
+def check_paths():
+    """Refuse to run with the checkouts inside HOME.
+
+    This is the one misconfiguration that cannot be noticed from the outside.
+    The reviewer is denied every read under HOME, so a checkout in there is a
+    checkout it cannot open; it reviews anyway by fetching each file over the
+    API, `permission_denials` comes back empty, and the log is
+    indistinguishable from a healthy run. Nothing downstream will ever tell
+    you, so it is worth refusing to start rather than warning once.
+
+    Two ordinary routes lead here: pointing VINEGAR_CHECKOUTS at the old
+    location while upgrading, to avoid re-cloning what is already on disk, and
+    pointing VINEGAR_HOME at a directory that happens to contain them.
+    """
+    if os.path.commonpath([CHECKOUT_DIR, HOME]) == HOME:
+        sys.exit(
+            "checkouts must not live inside %s. The reviewer is denied every "
+            "read under it, so it would review from API fetches and report "
+            "nothing wrong. %s is inside it; point VINEGAR_CHECKOUTS "
+            "somewhere else." % (HOME, CHECKOUT_DIR))
 
 
 def load_state():
@@ -521,6 +553,7 @@ def main():
                         help="run the review but post nothing to GitHub")
     args = parser.parse_args()
 
+    check_paths()
     config = load_config(args.config)
     if args.dry_run:
         config["comment"] = False
