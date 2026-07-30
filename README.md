@@ -1,5 +1,7 @@
 # vinegar
 
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
+
 A self-hosted pull-request reviewer. It runs on a machine you already own, uses
 a Claude subscription you already pay for, and posts inline review comments on
 your PRs.
@@ -162,8 +164,21 @@ already bought.
 
 ## License
 
-Not chosen yet. Until a license file is added, default copyright applies and
-this code is not yet reusable by others.
+```
+Copyright 2026 Sour Labs
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+```
 
 ---
 
