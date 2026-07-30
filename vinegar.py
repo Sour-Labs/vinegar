@@ -32,10 +32,15 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 
+# The path component review-settings.json denies the reviewer every read
+# under, as `Read(//**/.vinegar/**)`. It is written there as a literal, so it
+# does not move with VINEGAR_HOME, and both of these paths have to be
+# reconciled against it rather than against each other. check_paths() does
+# that, and refuses to start when they disagree.
+DENIED_COMPONENT = ".vinegar"
+
 # abspath, not just expanduser, so a trailing slash or a relative path cannot
-# make the checkout look like it sits somewhere it does not. The check in
-# check_paths() compares these two, and a comparison is only as good as the
-# normalisation under it.
+# make either of these look like it sits somewhere it does not.
 HOME = os.path.abspath(
     os.path.expanduser(os.environ.get("VINEGAR_HOME", "~/.vinegar")))
 STATE_PATH = os.path.join(HOME, "state.json")
@@ -43,11 +48,9 @@ LOCK_PATH = os.path.join(HOME, "vinegar.pid")
 REVIEW_DIR = os.path.join(HOME, "reviews")
 
 # Checkouts sit beside HOME rather than inside it, and that is load-bearing
-# rather than tidiness. review-settings.json denies the reviewer every read
-# under `~/.vinegar`, so a diff cannot talk it into reading the App's private
-# key. A checkout inside that directory is covered by the same rule, and then
-# the reviewer cannot read the repository it was pointed at: it falls back to
-# fetching each file over the API, which costs more and reviews worse, while
+# rather than tidiness. The reviewer is denied every read under HOME, so a
+# checkout in there is a repository it cannot open: it falls back to fetching
+# each file over the API, which costs more and reviews worse, while
 # `permission_denials` stays empty and reports nothing wrong.
 #
 # The default is derived from HOME rather than fixed, so that VINEGAR_HOME
@@ -236,25 +239,58 @@ def load_config(path):
 
 
 def check_paths():
-    """Refuse to run with the checkouts inside HOME.
+    """Refuse to run when these paths and the sandbox disagree.
 
-    This is the one misconfiguration that cannot be noticed from the outside.
-    The reviewer is denied every read under HOME, so a checkout in there is a
-    checkout it cannot open; it reviews anyway by fetching each file over the
-    API, `permission_denials` comes back empty, and the log is
-    indistinguishable from a healthy run. Nothing downstream will ever tell
-    you, so it is worth refusing to start rather than warning once.
+    Everything the reviewer may read is decided by one fixed glob in
+    review-settings.json, `Read(//**/.vinegar/**)`. That glob matches a
+    literal path component. It cannot follow VINEGAR_HOME, so it is not enough
+    for the checkout to sit outside HOME: what matters is whether each path
+    contains the component the sandbox actually denies.
 
-    Two ordinary routes lead here: pointing VINEGAR_CHECKOUTS at the old
-    location while upgrading, to avoid re-cloning what is already on disk, and
-    pointing VINEGAR_HOME at a directory that happens to contain them.
+    Both directions fail silently, which is why this exits rather than warns.
+
+    A checkout that the glob covers is one the reviewer cannot open. It
+    reviews anyway by fetching each file over the API, `permission_denials`
+    comes back empty, and the log reads like a healthy run.
+
+    A HOME that the glob does *not* cover is worse. Nothing then denies the
+    App's private key, which is the one credential not scoped to a single
+    repository, and `Bash(gh api:*)` is a channel out. Silence here means the
+    protection was never applied, not that it held.
+
+    Checking both makes the older "outside HOME" rule redundant: HOME must
+    contain the component and the checkout must not, so the checkout cannot be
+    inside HOME.
     """
-    if os.path.commonpath([CHECKOUT_DIR, HOME]) == HOME:
+    def components(path):
+        # realpath, so a symlink cannot present a denied directory under an
+        # allowed name. `ln -s ~/.vinegar/checkouts ~/.vinegar-checkouts` is
+        # the shortcut someone reaches for to avoid re-cloning on upgrade.
+        return os.path.realpath(path).split(os.sep)
+
+    # Case-insensitive, because APFS is case-insensitive by default: `.Vinegar`
+    # is the same directory to the filesystem and the glob may not agree.
+    # Rejecting more than the glob denies is the safe direction to be wrong in.
+    if any(part.lower() == DENIED_COMPONENT for part in components(CHECKOUT_DIR)):
         sys.exit(
-            "checkouts must not live inside %s. The reviewer is denied every "
-            "read under it, so it would review from API fetches and report "
-            "nothing wrong. %s is inside it; point VINEGAR_CHECKOUTS "
-            "somewhere else." % (HOME, CHECKOUT_DIR))
+            "checkouts must not sit under a `%s` directory: %s does, and "
+            "review-settings.json denies the reviewer every read there, so "
+            "reviews would run from API fetches and report nothing wrong. "
+            "Point VINEGAR_CHECKOUTS somewhere without that component."
+            % (DENIED_COMPONENT, CHECKOUT_DIR))
+
+    # Exact, because this is the direction where being wrong exposes the key,
+    # and a component the glob does not match is not protected whatever it
+    # looks like.
+    if DENIED_COMPONENT not in components(HOME):
+        sys.exit(
+            "%s must contain a `%s` directory. review-settings.json denies "
+            "the reviewer reads under that name and nowhere else, so as "
+            "configured nothing stops a review from reading the App private "
+            "key kept there. Rename it, or set VINEGAR_HOME to a path ending "
+            "in `%s` (`~/instances/test/%s` isolates an instance and is "
+            "still covered)." % (HOME, DENIED_COMPONENT, DENIED_COMPONENT,
+                                 DENIED_COMPONENT))
 
 
 def load_state():

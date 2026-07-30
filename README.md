@@ -95,13 +95,28 @@ Clones live outside that directory, in `~/.vinegar-checkouts/`, one per repo,
 which only Vinegar touches. They are deliberately not under `~/.vinegar`: the
 reviewer is denied every read there so that a diff cannot talk it into reading
 the App's private key, and a checkout inside would be caught by the same rule.
-The default follows `VINEGAR_HOME`, so pointing that at `~/.vinegar-test`
-gives an instance its own state, its own lock, and its own clones in
-`~/.vinegar-test-checkouts`. `VINEGAR_CHECKOUTS` overrides the location on its
-own. Either way Vinegar refuses to start if the result lands inside
-`VINEGAR_HOME`, because that is the one misconfiguration nothing downstream
-would report. Deleting the clones is safe; Vinegar re-clones on the next
-review.
+The default follows `VINEGAR_HOME`, and `VINEGAR_CHECKOUTS` overrides it on
+its own. Deleting the clones is safe; Vinegar re-clones on the next review.
+
+**`VINEGAR_HOME` must still end in a `.vinegar` directory.** The reviewer's
+deny rule is a fixed glob, `Read(//**/.vinegar/**)`, written in
+`review-settings.json`, and it matches that component and nothing else. Point
+`VINEGAR_HOME` at `~/.vinegar-test` and the rule stops covering it, so nothing
+denies a review the App's private key kept there. To run a second instance,
+keep the component and vary the path above it:
+
+```sh
+VINEGAR_HOME=~/instances/test/.vinegar python3 vinegar.py --once
+```
+
+That gets its own state, its own lock, and its own clones in
+`~/instances/test/.vinegar-checkouts`, all still covered by the same rule.
+
+Vinegar checks this at startup and refuses to run if the two disagree, in
+either direction: a checkout the rule covers, or a `VINEGAR_HOME` it does not.
+Both fail silently otherwise. The first reviews from API fetches while
+`permission_denials` stays empty; the second leaves the key readable, and
+silence there means the protection was never applied rather than that it held.
 
 ### Configuration
 
