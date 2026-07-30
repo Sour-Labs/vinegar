@@ -110,10 +110,55 @@ Every key in `config.example.json`:
 | `skip_forks` | `true` | Skip pull requests whose head branch lives in a fork. Read the next section before you turn this off. |
 | `authors` | `[]` | Only review these GitHub logins. Empty means anyone who passes the checks above. |
 | `review_timeout` | `1800` | Kill a review that runs longer than this many seconds. |
+| `github_app` | `null` | Post as a GitHub App instead of as you. See below. |
 
 The last five are budget and safety controls, not optimizations. Automated
 reviews spend the same subscription limits as your interactive Claude Code
 work.
+
+### Posting as Vinegar instead of as you
+
+Out of the box `gh` uses the account you logged in with, so reviews arrive under
+your own name and avatar, which reads as though you commented on your own pull
+request. A GitHub App gives Vinegar its own name, its own icon, and a `bot`
+badge.
+
+It is worth doing for a second reason. An App's installation token can be
+scoped to a single repository, so a review that gets talked into calling
+`gh api` cannot reach anything else your account can see. That is the one
+sandbox limit the allow list could not close.
+
+Create the App once, in your organisation's settings under **Developer
+settings → GitHub Apps → New GitHub App**:
+
+- **Name** whatever you want the comments signed as, for example `Vinegar`.
+- **Homepage URL** anything; it is required and unused.
+- **Webhooks**: untick **Active**. Vinegar polls and needs no callback.
+- **Repository permissions**: `Pull requests` read and write, `Contents` read,
+  `Metadata` read. Nothing else.
+- Upload a logo on the App's page. That image is the avatar on every comment.
+
+Then **Generate a private key**, which downloads a `.pem`, and **Install App**
+on the repositories you want reviewed. Point the config at both:
+
+```json
+"github_app": {
+  "app_id": 123456,
+  "private_key": "~/.vinegar/vinegar.private-key.pem"
+}
+```
+
+Keep the key private, `chmod 600`. Anyone holding it can act as the App on
+every repository it is installed on.
+
+Vinegar signs a short-lived JWT with that key, exchanges it for an
+installation token scoped to the one repository being reviewed, and passes the
+token to `git`, `gh`, and the review as `GH_TOKEN`. Signing uses `openssl`
+rather than a Python crypto package, so there is still nothing to install. The
+token is never written to disk and never appears on a command line.
+
+Leave `github_app` as `null` and everything works exactly as before, posting
+under your own account.
 
 ### Running it under launchd
 

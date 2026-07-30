@@ -10,5 +10,6 @@
   "skip_bots": true,
   "skip_forks": true,
   "authors": [],
-  "review_timeout": 1800
+  "review_timeout": 1800,
+  "github_app": null
 }

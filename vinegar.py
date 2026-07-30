@@ -22,11 +22,14 @@ reviewer, puts a checkout on the pull request's head commit, and runs
 """
 
 import argparse
+import base64
 import json
 import os
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 
 HOME = os.path.expanduser(os.environ.get("VINEGAR_HOME", "~/.vinegar"))
@@ -57,6 +60,7 @@ DEFAULTS = {
     "skip_forks": True,
     "authors": [],
     "review_timeout": 1800,
+    "github_app": None,
 }
 
 
@@ -65,9 +69,91 @@ def log(message):
     print("%s %s" % (stamp, message), flush=True)
 
 
-def run(cmd, cwd=None, timeout=None):
-    return subprocess.run(cmd, cwd=cwd, timeout=timeout, text=True,
+def run(cmd, cwd=None, timeout=None, env=None):
+    return subprocess.run(cmd, cwd=cwd, timeout=timeout, text=True, env=env,
                           stdin=subprocess.DEVNULL, capture_output=True)
+
+
+def b64url(raw):
+    return base64.urlsafe_b64encode(raw).rstrip(b"=")
+
+
+def app_jwt(app_id, key_path):
+    """Sign the short-lived JWT that authenticates Vinegar as the GitHub App.
+
+    GitHub wants RS256 and Python has no RSA in its standard library. One
+    shell-out to openssl is cheaper than making the daemon depend on a crypto
+    package, and openssl ships with macOS.
+    """
+    now = int(time.time())
+    parts = ({"alg": "RS256", "typ": "JWT"},
+             {"iat": now - 60, "exp": now + 540, "iss": str(app_id)})
+    signing_input = b".".join(
+        b64url(json.dumps(part, separators=(",", ":")).encode())
+        for part in parts)
+
+    signed = subprocess.run(["openssl", "dgst", "-sha256", "-sign", key_path],
+                            input=signing_input, capture_output=True)
+    if signed.returncode != 0:
+        raise RuntimeError("openssl could not sign with %s: %s" % (
+            key_path, signed.stderr.decode(errors="replace").strip()))
+    return (signing_input + b"." + b64url(signed.stdout)).decode()
+
+
+def github_api(path, token, scheme="Bearer", payload=None):
+    """Call the GitHub API directly.
+
+    The App endpoints need `Authorization: Bearer <jwt>`, and `gh` sends
+    `token`, so these two calls cannot go through `gh` the way every other
+    GitHub call in this file does.
+    """
+    body = json.dumps(payload).encode() if payload is not None else None
+    request = urllib.request.Request("https://api.github.com" + path,
+                                     data=body,
+                                     method="POST" if body else "GET")
+    request.add_header("Authorization", "%s %s" % (scheme, token))
+    request.add_header("Accept", "application/vnd.github+json")
+    request.add_header("X-GitHub-Api-Version", "2022-11-28")
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as err:
+        raise RuntimeError("GitHub said %s for %s: %s" % (
+            err.code, path, err.read().decode(errors="replace")[:200]))
+
+
+def installation_token(app, repo, cache):
+    """Return a token that can act on one repository and nothing else.
+
+    This is the point of the GitHub App. The token is scoped to the single
+    repository under review, so a diff that talks the reviewer into calling
+    `gh api` cannot reach anything else the owner can see.
+    """
+    token, expires = cache.get(repo, (None, 0))
+    if token and time.time() < expires:
+        return token
+
+    jwt = app_jwt(app["app_id"], os.path.expanduser(app["private_key"]))
+    install = github_api("/repos/%s/installation" % repo, jwt)
+    minted = github_api("/app/installations/%d/access_tokens" % install["id"],
+                        jwt, payload={"repositories": [repo.partition("/")[2]]})
+
+    # GitHub issues these for an hour. Re-minting five minutes early keeps a
+    # long review from running past the expiry of the token it started with.
+    cache[repo] = (minted["token"], time.time() + 55 * 60)
+    return minted["token"]
+
+
+def github_env(config, repo, cache):
+    """The environment for every git, gh, and claude call touching `repo`.
+
+    Without a configured App this is the ambient environment, so `gh` uses
+    whatever account you logged in with and comments post under your name.
+    """
+    app = config.get("github_app")
+    if not app:
+        return None
+    return dict(os.environ, GH_TOKEN=installation_token(app, repo, cache))
 
 
 def load_config(path):
@@ -86,6 +172,18 @@ def load_config(path):
         sys.exit("%s: no repos listed" % path)
     if config["effort"] not in EFFORTS:
         sys.exit("%s: effort must be one of %s" % (path, ", ".join(EFFORTS)))
+
+    # A misconfigured App is caught here rather than at the first review, which
+    # is minutes later and on a real pull request.
+    app = config["github_app"]
+    if app:
+        missing = {"app_id", "private_key"} - set(app)
+        if missing:
+            sys.exit("%s: github_app needs %s" % (
+                path, " and ".join(sorted(missing))))
+        key = os.path.expanduser(app["private_key"])
+        if not os.path.isfile(key):
+            sys.exit("%s: no private key at %s" % (path, key))
     return config
 
 
@@ -105,9 +203,9 @@ def save_state(state):
     os.replace(temp, STATE_PATH)
 
 
-def open_prs(repo):
+def open_prs(repo, env):
     result = run(["gh", "pr", "list", "-R", repo, "--state", "open",
-                  "--limit", "50", "--json", PR_FIELDS])
+                  "--limit", "50", "--json", PR_FIELDS], env=env)
     if result.returncode != 0:
         log("%s: gh pr list failed: %s" % (repo, result.stderr.strip()))
         return []
@@ -134,7 +232,7 @@ def skip_reason(pr, config):
     return None
 
 
-def checkout(repo, pr):
+def checkout(repo, pr, env):
     """Put a detached checkout on the pull request's head commit.
 
     With a pull request target, /code-review reads local files only when the
@@ -145,9 +243,14 @@ def checkout(repo, pr):
     if not os.path.isdir(os.path.join(path, ".git")):
         os.makedirs(CHECKOUT_DIR, exist_ok=True)
         log("%s: cloning into %s" % (repo, path))
-        result = run(["gh", "repo", "clone", repo, path, "--", "--quiet"])
+        result = run(["gh", "repo", "clone", repo, path, "--", "--quiet"],
+                     env=env)
         if result.returncode != 0:
             raise RuntimeError("clone failed: %s" % result.stderr.strip())
+        # Let git ask gh for credentials, so a fetch uses whatever GH_TOKEN
+        # holds. The token is never written to disk or to a command line.
+        run(["git", "config", "--local", "credential.https://github.com.helper",
+             "!gh auth git-credential"], cwd=path, env=env)
 
     # The tree is cleaned before the checkout, not after. A review killed by
     # its timeout can leave the tree dirty, and then `git checkout` refuses to
@@ -158,7 +261,7 @@ def checkout(repo, pr):
              ["git", "clean", "-qfd"],
              ["git", "checkout", "--quiet", "--detach", pr["headRefOid"]])
     for step in steps:
-        result = run(step, cwd=path)
+        result = run(step, cwd=path, env=env)
         if result.returncode != 0:
             raise RuntimeError("%s failed: %s" % (" ".join(step),
                                                   result.stderr.strip()))
@@ -176,7 +279,7 @@ def save_transcript(repo, pr, text):
     return path
 
 
-def review(path, repo, pr, config):
+def review(path, repo, pr, config, env):
     prompt = "/code-review %s %d" % (config["effort"], pr["number"])
     if config["comment"]:
         prompt += " --comment"
@@ -200,7 +303,7 @@ def review(path, repo, pr, config):
 
     started = time.monotonic()
     try:
-        result = run(cmd, cwd=path, timeout=config["review_timeout"])
+        result = run(cmd, cwd=path, timeout=config["review_timeout"], env=env)
     except subprocess.TimeoutExpired:
         log("%s: killed after %ds" % (label, config["review_timeout"]))
         return
@@ -233,16 +336,17 @@ def review(path, repo, pr, config):
         label, took, priced, transcript))
 
 
-def poll_once(config, state):
+def poll_once(config, state, tokens):
     for repo in config["repos"]:
         try:
-            prs = open_prs(repo)
+            env = github_env(config, repo, tokens)
+            prs = open_prs(repo, env)
         except Exception as err:
             log("%s: cannot list pull requests: %s" % (repo, err))
             continue
         for pr in prs:
             try:
-                handle_pr(repo, pr, config, state)
+                handle_pr(repo, pr, config, state, env)
             except Exception as err:
                 # One bad pull request must not stop the daemon. Under launchd
                 # a crash restarts the process every 30 seconds and polls
@@ -251,7 +355,7 @@ def poll_once(config, state):
                     repo, pr.get("number", "?"), err))
 
 
-def handle_pr(repo, pr, config, state):
+def handle_pr(repo, pr, config, state, env):
     key = "%s#%d" % (repo, pr["number"])
     head = pr["headRefOid"]
     done = state.get(key) or {}
@@ -276,14 +380,14 @@ def handle_pr(repo, pr, config, state):
         return
 
     try:
-        path = checkout(repo, pr)
+        path = checkout(repo, pr, env)
     except Exception as err:
         # A checkout spends no subscription budget, so leave this pull request
         # unrecorded and try it again on the next poll.
         log("%s: checkout failed: %s" % (key, err))
         return
 
-    review(path, repo, pr, config)
+    review(path, repo, pr, config, env)
 
     # A review that failed is recorded all the same. Retrying it on every poll
     # would spend real budget on every retry.
@@ -291,16 +395,16 @@ def handle_pr(repo, pr, config, state):
     save_state(state)
 
 
-def find_pr(target):
-    """Resolve an `owner/repo#number` target to a repo and a pull request."""
+def find_pr(target, env):
+    """Read the one pull request named by an `owner/repo#number` target."""
     if "#" not in target:
         sys.exit("--pr wants owner/repo#number, got %s" % target)
     repo, _, number = target.partition("#")
     result = run(["gh", "pr", "view", number, "-R", repo,
-                  "--json", PR_FIELDS])
+                  "--json", PR_FIELDS], env=env)
     if result.returncode != 0:
         sys.exit("cannot read %s: %s" % (target, result.stderr.strip()))
-    return repo, json.loads(result.stdout)
+    return json.loads(result.stdout)
 
 
 def acquire_lock():
@@ -341,21 +445,25 @@ def main():
     # the tree under a review the daemon already has in flight, and that review
     # would report findings against a commit it was never asked about.
     acquire_lock()
+    tokens = {}
     try:
         if args.pr:
-            repo, pr = find_pr(args.pr)
+            repo = args.pr.partition("#")[0]
+            env = github_env(config, repo, tokens)
+            pr = find_pr(args.pr, env)
             reason = skip_reason(pr, config)
             if reason:
                 log("%s: would be skipped (%s), reviewing anyway" % (
                     args.pr, reason))
-            review(checkout(repo, pr), repo, pr, config)
+            review(checkout(repo, pr, env), repo, pr, config, env)
             return
 
         state = load_state()
-        log("watching %s every %ds" % (", ".join(config["repos"]),
-                                       config["poll_interval"]))
+        log("watching %s every %ds%s" % (
+            ", ".join(config["repos"]), config["poll_interval"],
+            " as the GitHub App" if config.get("github_app") else ""))
         while True:
-            poll_once(config, state)
+            poll_once(config, state, tokens)
             if args.once:
                 return
             time.sleep(config["poll_interval"])
