@@ -40,6 +40,14 @@
       "Bash(jq:*)"
     ],
     "deny": [
+      "Read(//**/.vinegar/**)",
+      "Read(//**/.claude/**)",
+      "Read(//**/.ssh/**)",
+      "Read(//**/.aws/**)",
+      "Read(//**/.gnupg/**)",
+      "Read(//**/.config/gh/**)",
+      "Read(//**/.netrc)",
+      "Read(//**/.env)",
       "Write",
       "Edit",
       "NotebookEdit",

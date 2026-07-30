@@ -221,26 +221,58 @@ is any shell redirection out of an allowed command. That is a useful backstop
 and not something to rely on, so `find`, `awk`, `sed`, `perl`, `xargs`, and
 `tee` are denied outright.
 
-Three limits worth stating plainly.
+Reads are path-denied for `~/.vinegar`, `~/.claude`, `~/.ssh`, `~/.aws`,
+`~/.gnupg`, `~/.config/gh`, `.netrc` and `.env`. Without that, the App's own
+private key is a file the reviewer can read and `gh api` is a channel it can
+post through, and that key is the one credential that is **not** scoped to a
+single repository.
 
-**`gh api` is allowed and cannot be narrowed.** Posting an inline comment is
-`gh api repos/OWNER/REPO/pulls/N/comments`, and the permission matcher compares
-whole space-separated tokens, so `Bash(gh api repos/*/pulls/*/comments:*)` does
-not match anything. It is `gh api` or no posted comments. A review can
-therefore reach any GitHub endpoint your token can.
+### What this does not do
+
+The allow list makes the easy paths closed and the accidental blast radius
+small. **It is not a containment boundary against a determined prompt
+injection**, and it is worth being exact about why rather than discovering it
+later.
+
+A prefix rule matches the start of a command and cannot see the flags that
+follow. So `git diff`, `git log` and `git show` are all allowed, and all three
+accept `--output=<file>`, which writes any file the daemon user can write.
+`git diff --output=$HOME/.zshenv` is persistent code execution, and no prefix
+rule can distinguish it from the `git diff origin/main...HEAD` that every
+review legitimately runs. Removing `git diff` would close it, and would also
+remove the command the reviewer actually gets its diff from, so it stays.
+
+Two more that stay open for the same kind of reason:
+
+**`gh api` cannot be narrowed.** Posting an inline comment is
+`gh api repos/OWNER/REPO/pulls/N/comments`, and the matcher compares whole
+space-separated tokens, so `Bash(gh api repos/*/pulls/*/comments:*)` matches
+nothing. It is `gh api` or no posted comments. The GitHub App is what bounds
+this: the token reaches one repository, not everything you can see.
 
 **A `CLAUDE.md` in the checkout is still read.** `--setting-sources ''` covers
 `settings.json`, not the memory files, so a `CLAUDE.md` or `AGENTS.md` in the
 pull request's head commit reaches the model as project instructions, which is
 a stronger channel than the same text inside a diff hunk.
 
-**Denials are reported, not silenced.** Vinegar logs `permission denial(s)` so
-you can see a review that ran with less than it asked for.
+### So what is the boundary
 
-Those first two are why `skip_forks` stays on by default. On a pull request
-from your own repository the author already has write access and none of this
-is a new capability. On a fork pull request every one of those files is written
-by someone else.
+`skip_forks`, and it is on by default. On a pull request from your own
+repository the author already has write access to the code and to `CLAUDE.md`,
+so none of the above is a capability they did not already have. On a fork pull
+request all of it is written by a stranger, and the allow list is not what you
+want standing between that stranger and the machine holding your credentials.
+
+Second to that, the GitHub App installation. A review can only reach the one
+repository its token was minted for, so the worst case stays inside the
+repository being reviewed instead of spreading across an account.
+
+Turn `skip_forks` off only if you are willing to read fork diffs yourself
+first.
+
+**Denials are reported, not silenced.** Vinegar logs `permission denial(s)`, so
+a review that ran with less than it asked for says so rather than quietly
+returning a worse result.
 
 `Workflow` is denied on purpose. At high effort `/code-review` can otherwise
 launch a multi-agent workflow, which spends far more of your subscription than

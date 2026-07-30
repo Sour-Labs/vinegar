@@ -44,6 +44,17 @@ SETTINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 # separately, so automation must never reach it.
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 
+# What a review attempt settled. DONE means the subscription was spent, whether
+# or not findings came back, so the pull request is closed off. FAILED means it
+# never got that far, which is the case worth retrying: an exhausted rate
+# limit, a logged-out CLI, a model name that does not exist.
+DONE, FAILED = "reviewed", "failed"
+
+# How many times a FAILED pull request is retried before it is left alone. The
+# point is to survive a rate-limit window without turning a permanent failure
+# into a review every minute forever.
+MAX_ATTEMPTS = 3
+
 PR_FIELDS = ("number,title,headRefOid,isDraft,author,additions,deletions,"
              "isCrossRepository,url")
 
@@ -122,15 +133,20 @@ def github_api(path, token, scheme="Bearer", payload=None):
             err.code, path, err.read().decode(errors="replace")[:200]))
 
 
-def installation_token(app, repo, cache):
+def installation_token(app, repo, cache, good_for=0):
     """Return a token that can act on one repository and nothing else.
 
     This is the point of the GitHub App. The token is scoped to the single
     repository under review, so a diff that talks the reviewer into calling
-    `gh api` cannot reach anything else the owner can see.
+    `gh api` cannot reach anything else the owner can see, even other
+    repositories in the same installation.
+
+    `good_for` is how many seconds of life the caller needs. A token with less
+    than that left is replaced now rather than expiring mid-review and losing
+    the comments the review was about to post.
     """
     token, expires = cache.get(repo, (None, 0))
-    if token and time.time() < expires:
+    if token and time.time() + good_for < expires:
         return token
 
     jwt = app_jwt(app["app_id"], os.path.expanduser(app["private_key"]))
@@ -149,13 +165,12 @@ def installation_token(app, repo, cache):
     minted = github_api("/app/installations/%d/access_tokens" % install["id"],
                         jwt, payload={"repositories": [repo.partition("/")[2]]})
 
-    # GitHub issues these for an hour. Re-minting five minutes early keeps a
-    # long review from running past the expiry of the token it started with.
-    cache[repo] = (minted["token"], time.time() + 55 * 60)
+    # GitHub issues these for an hour.
+    cache[repo] = (minted["token"], time.time() + 60 * 60)
     return minted["token"]
 
 
-def github_env(config, repo, cache):
+def github_env(config, repo, cache, good_for=0):
     """The environment for every git, gh, and claude call touching `repo`.
 
     Without a configured App this is the ambient environment, so `gh` uses
@@ -164,7 +179,8 @@ def github_env(config, repo, cache):
     app = config.get("github_app")
     if not app:
         return None
-    return dict(os.environ, GH_TOKEN=installation_token(app, repo, cache))
+    return dict(os.environ,
+                GH_TOKEN=installation_token(app, repo, cache, good_for))
 
 
 def load_config(path):
@@ -179,8 +195,10 @@ def load_config(path):
     unknown = set(config) - set(DEFAULTS)
     if unknown:
         sys.exit("%s: unknown keys %s" % (path, ", ".join(sorted(unknown))))
-    if not config["repos"]:
-        sys.exit("%s: no repos listed" % path)
+    if not isinstance(config["repos"], list) or not config["repos"]:
+        # A bare string passes a truthiness check and then iterates as
+        # characters, which polls `-R S`, `-R o`, `-R u` once a minute forever.
+        sys.exit("%s: repos must be a non-empty list of owner/name" % path)
     if config["effort"] not in EFFORTS:
         sys.exit("%s: effort must be one of %s" % (path, ", ".join(EFFORTS)))
 
@@ -258,15 +276,18 @@ def checkout(repo, pr, env):
                      env=env)
         if result.returncode != 0:
             raise RuntimeError("clone failed: %s" % result.stderr.strip())
-        # Let git ask gh for credentials, so a fetch uses whatever GH_TOKEN
-        # holds. The token is never written to disk or to a command line.
-        run(["git", "config", "--local", "credential.https://github.com.helper",
-             "!gh auth git-credential"], cwd=path, env=env)
 
     # The tree is cleaned before the checkout, not after. A review killed by
     # its timeout can leave the tree dirty, and then `git checkout` refuses to
     # overwrite the leftovers, which would wedge this repo on every later poll.
-    steps = (["git", "fetch", "--quiet", "origin",
+    #
+    # The credential helper is set on every pass rather than once at clone
+    # time. It is what makes `git fetch` use GH_TOKEN, so if it ever fails to
+    # write, a private repo stops fetching until someone finds a config write
+    # that failed days earlier.
+    steps = (["git", "config", "--local",
+              "credential.https://github.com.helper", "!gh auth git-credential"],
+             ["git", "fetch", "--quiet", "origin",
               "pull/%d/head" % pr["number"]],
              ["git", "reset", "--quiet", "--hard"],
              ["git", "clean", "-qfd"],
@@ -316,8 +337,9 @@ def review(path, repo, pr, config, env):
     try:
         result = run(cmd, cwd=path, timeout=config["review_timeout"], env=env)
     except subprocess.TimeoutExpired:
+        # A timeout burned the budget it burned. Retrying would burn it again.
         log("%s: killed after %ds" % (label, config["review_timeout"]))
-        return
+        return DONE
     took = round(time.monotonic() - started)
 
     try:
@@ -326,7 +348,7 @@ def review(path, repo, pr, config, env):
         detail = (result.stderr or result.stdout).strip()
         log("%s: claude printed no result after %ds: %s" % (
             label, took, detail[:400]))
-        return
+        return FAILED
 
     denied = output.get("permission_denials") or []
     if denied:
@@ -338,26 +360,33 @@ def review(path, repo, pr, config, env):
     if output.get("is_error"):
         log("%s: review failed after %ds: %s" % (
             label, took, str(output.get("result"))[:400]))
-        return
+        return FAILED
 
     transcript = save_transcript(repo, pr, str(output.get("result", "")))
     cost = output.get("total_cost_usd")
     priced = ", %.2f USD equivalent" % cost if isinstance(cost, float) else ""
     log("%s: reviewed in %ds%s, transcript at %s" % (
         label, took, priced, transcript))
+    return DONE
 
 
 def poll_once(config, state, tokens):
     for repo in config["repos"]:
         try:
-            env = github_env(config, repo, tokens)
-            prs = open_prs(repo, env)
+            prs = open_prs(repo, github_env(config, repo, tokens))
         except Exception as err:
             log("%s: cannot list pull requests: %s" % (repo, err))
             continue
         for pr in prs:
             try:
-                handle_pr(repo, pr, config, state, env)
+                # The token is fetched per pull request, not once per pass. A
+                # pass can run for hours, and a token minted at the top of it
+                # would expire under a later review, whose comments would then
+                # fail to post. `good_for` also guarantees the token outlives
+                # the review it is handed to.
+                handle_pr(repo, pr, config, state,
+                          github_env(config, repo, tokens,
+                                     good_for=config["review_timeout"]))
             except Exception as err:
                 # One bad pull request must not stop the daemon. Under launchd
                 # a crash restarts the process every 30 seconds and polls
@@ -375,8 +404,16 @@ def handle_pr(repo, pr, config, state, env):
     # again on every poll, because the filter that caused it can stop
     # applying: a draft is marked ready, an oversized pull request is split
     # down, a login is added to `authors`.
-    if done.get("outcome") == "reviewed":
+    if done.get("outcome") == DONE:
         if done.get("sha") == head or not config["review_on_push"]:
+            return
+
+    # A review that never ran is worth retrying, because it spent nothing. The
+    # case this protects is a rate-limit window: without it, every pull request
+    # opened during the window is written off as reviewed and never looked at
+    # again once the limit resets.
+    if done.get("outcome") == FAILED and done.get("sha") == head:
+        if done.get("attempts", 0) >= MAX_ATTEMPTS:
             return
 
     reason = skip_reason(pr, config)
@@ -398,12 +435,15 @@ def handle_pr(repo, pr, config, state, env):
         log("%s: checkout failed: %s" % (key, err))
         return
 
-    review(path, repo, pr, config, env)
-
-    # A review that failed is recorded all the same. Retrying it on every poll
-    # would spend real budget on every retry.
-    state[key] = {"outcome": "reviewed", "sha": head}
+    outcome = review(path, repo, pr, config, env)
+    attempts = done.get("attempts", 0) + 1 if done.get("sha") == head else 1
+    state[key] = {"outcome": outcome, "sha": head, "attempts": attempts}
     save_state(state)
+
+    if outcome == FAILED and attempts >= MAX_ATTEMPTS:
+        log("%s: %d failed attempts, leaving it alone. Fix the cause, then "
+            "delete its entry from %s to try again" % (
+                key, attempts, STATE_PATH))
 
 
 def find_pr(target, env):
@@ -419,20 +459,45 @@ def find_pr(target, env):
 
 
 def acquire_lock():
-    """Refuse to start when another Vinegar already holds the lock."""
+    """Refuse to start when another Vinegar already holds the lock.
+
+    Two Vinegars sharing a repo's checkout is not a small problem: the second
+    one runs `git reset --hard` under the first one's review, which then
+    reports findings against a commit nobody asked about. So the lock is taken
+    with O_EXCL, and a stale one is only cleared after checking that the
+    process it names is really gone.
+    """
     os.makedirs(HOME, exist_ok=True)
-    if os.path.exists(LOCK_PATH):
-        with open(LOCK_PATH) as handle:
-            other = handle.read().strip()
+    try:
+        handle = os.open(LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    except FileExistsError:
         try:
-            os.kill(int(other), 0)
-            sys.exit("vinegar is already running as pid %s" % other)
-        except (ValueError, ProcessLookupError):
-            pass  # stale lock from a process that is gone
+            with open(LOCK_PATH) as existing:
+                other = int(existing.read().strip())
+            os.kill(other, 0)
+        except (ValueError, ProcessLookupError, FileNotFoundError):
+            log("clearing a stale lock at %s" % LOCK_PATH)
+            try:
+                os.remove(LOCK_PATH)
+            except FileNotFoundError:
+                pass
+            return acquire_lock()
         except PermissionError:
-            sys.exit("pid %s is running and is not ours" % other)
-    with open(LOCK_PATH, "w") as handle:
-        handle.write(str(os.getpid()))
+            sys.exit("pid %d holds the lock and is not ours" % other)
+        sys.exit("vinegar is already running as pid %d" % other)
+    with os.fdopen(handle, "w") as lock:
+        lock.write(str(os.getpid()))
+
+
+def release_lock():
+    """Drop the lock, but only when it is still ours."""
+    try:
+        with open(LOCK_PATH) as handle:
+            if int(handle.read().strip()) != os.getpid():
+                return
+        os.remove(LOCK_PATH)
+    except (ValueError, FileNotFoundError):
+        pass
 
 
 def main():
@@ -460,7 +525,8 @@ def main():
     try:
         if args.pr:
             repo = args.pr.partition("#")[0]
-            env = github_env(config, repo, tokens)
+            env = github_env(config, repo, tokens,
+                             good_for=config["review_timeout"])
             pr = find_pr(args.pr, env)
             reason = skip_reason(pr, config)
             if reason:
@@ -481,8 +547,7 @@ def main():
     except KeyboardInterrupt:
         log("stopped")
     finally:
-        if os.path.exists(LOCK_PATH):
-            os.remove(LOCK_PATH)
+        release_lock()
 
 
 if __name__ == "__main__":
