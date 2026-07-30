@@ -6,9 +6,10 @@ A self-hosted pull-request reviewer. It runs on a machine you already own, uses
 a Claude subscription you already pay for, and posts inline review comments on
 your PRs.
 
-> **Status: design stage. There is no working code in this repo yet.**
-> The architecture and the constraints are settled and written down below.
-> Nothing here has been run against a real PR.
+> **Status: the poller works. Triage does not exist yet.**
+> `vinegar.py` polls GitHub, picks which pull requests deserve a reviewer, and
+> runs the review. The cheap triage model described below is still a design,
+> so today every pull request that passes the filters gets a full review.
 
 ## Why it exists
 
@@ -47,12 +48,116 @@ A daemon on an always-on machine polls GitHub for pull requests whose head
 commit it has not seen. Polling rather than webhooks means no inbound port, no
 tunnel, and nothing exposed to the internet.
 
+Before each review the daemon puts a checkout on the pull request's head
+commit. This is not cosmetic. Given a pull request number, `/code-review` reads
+local files only when the checkout matches that branch, and otherwise fetches
+each file over the API, which costs more and reviews worse.
+
 **A self-hosted GitHub Actions runner is deliberately not used.** It would give
 nicer triggering, but GitHub's own guidance is that self-hosted runners should
 almost never serve public repositories: anyone can open a pull request from a
 fork and execute code on the runner. The machine running Vinegar holds your
 Claude credentials, which makes it the worst possible host for untrusted PR
 code.
+
+## Running it
+
+You need macOS or Linux, Python 3.9 or newer, `git`, the GitHub CLI logged in
+(`gh auth login`), and Claude Code logged in (`claude`). There are no other
+dependencies and nothing to install.
+
+```sh
+git clone https://github.com/Sour-Labs/vinegar.git
+cd vinegar
+mkdir -p ~/.vinegar
+cp config.example.json ~/.vinegar/config.json
+$EDITOR ~/.vinegar/config.json          # list your repos
+```
+
+Review one pull request by hand, posting nothing, to see what you would get:
+
+```sh
+python3 vinegar.py --pr owner/repo#123 --dry-run
+```
+
+The review lands in `~/.vinegar/reviews/`. When it reads well, poll once, then
+run the loop:
+
+```sh
+python3 vinegar.py --once                # one pass, then exit
+python3 vinegar.py                       # poll forever
+```
+
+Vinegar keeps everything under `~/.vinegar`: `config.json`, `state.json` (the
+head commit it last handled per pull request), `checkouts/` (one clone per
+repo, which only Vinegar touches), and `reviews/`.
+
+### Configuration
+
+Every key in `config.example.json`:
+
+| Key | Default | What it does |
+| --- | --- | --- |
+| `repos` | none | Repositories to poll, as `owner/name`. Required. |
+| `poll_interval` | `60` | Seconds between polls. |
+| `effort` | `"high"` | Effort passed to `/code-review`: `low`, `medium`, `high`, `xhigh`, `max`. `ultra` is rejected. |
+| `comment` | `true` | Post findings on the pull request. False runs the review and writes only to `~/.vinegar/reviews/`. |
+| `model` | `null` | Model for the review. Null uses your Claude Code default. |
+| `review_on_push` | `false` | Review again when the head commit changes. |
+| `max_changed_lines` | `3000` | Skip pull requests larger than this. |
+| `skip_drafts` | `true` | Skip drafts. |
+| `skip_bots` | `true` | Skip pull requests opened by bots. |
+| `skip_forks` | `true` | Skip pull requests whose head branch lives in a fork. Read the next section before you turn this off. |
+| `authors` | `[]` | Only review these GitHub logins. Empty means anyone who passes the checks above. |
+| `review_timeout` | `1800` | Kill a review that runs longer than this many seconds. |
+
+The last five are budget and safety controls, not optimizations. Automated
+reviews spend the same subscription limits as your interactive Claude Code
+work.
+
+### Running it under launchd
+
+`launchd/io.sourlabs.vinegar.plist` is a template. Replace every
+`YOUR_USERNAME` and every `VINEGAR_PATH`, then:
+
+```sh
+mkdir -p ~/.vinegar/logs
+cp launchd/io.sourlabs.vinegar.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/io.sourlabs.vinegar.plist
+tail -f ~/.vinegar/logs/vinegar.log
+```
+
+The plist sets `PATH` explicitly because launchd starts with a bare one, and
+a daemon that cannot find `claude` fails at the first review.
+
+## What the reviewer is allowed to do
+
+A pull request diff is input written by someone else, and the reviewer reads it
+on the machine that holds your Claude credentials. That is the same threat that
+rules out a self-hosted Actions runner, so Vinegar does not hand the reviewer
+your normal permissions.
+
+Every review runs with `--settings review-settings.json --setting-sources ''
+--strict-mcp-config`. That combination ignores your user, project, and local
+settings, and loads no MCP servers. It matters: a permissive
+`permissions.allow` in `~/.claude/settings.json` is common, and the project
+settings would come from the repository under review, which on a fork pull
+request is attacker-controlled.
+
+`review-settings.json` allows reading, searching, and `git` and `gh`. It denies
+writing and editing files, fetching the web, `curl` and `wget`, every shell and
+interpreter, and the `git` and `gh` subcommands that change something. Denials
+beat allows, and anything not listed is refused rather than granted.
+
+Two limits worth stating plainly. A denied tool call is reported rather than
+silenced: Vinegar logs `permission denial(s)` so you can see a review that ran
+with less than it asked for. And the reviewer still reads an untrusted diff
+with a model, so `skip_forks` stays on by default. Turning it off means
+accepting that a crafted diff gets read by a reviewer that can run `gh`.
+
+`Workflow` is denied on purpose. At high effort `/code-review` can otherwise
+launch a multi-agent workflow, which spends far more of your subscription than
+a single review should.
 
 ## The triage pass
 
@@ -104,6 +209,13 @@ it misleads a human skimming and can anchor the reviewer that runs next.
 lot of repository context. At roughly 250k input and 25k output tokens, Opus 5
 costs about $1.90 per review and Sonnet 5 about $1.15. That is Bugbot's price
 again.
+
+One measured run supports that estimate rather than undercutting it. A 45-line
+pull request, reviewed on Opus 5 at high effort, took 243 seconds and reported
+$0.86 of equivalent token cost. Forty-five lines is about as small as a real
+pull request gets, and it still landed inside Bugbot's price band, because the
+cost is dominated by reading the repository rather than by reading the diff.
+Vinegar pays that in subscription limits instead of dollars.
 
 The entire saving comes from running reviews through a Claude subscription you
 already have, plus letting cheap triage drop the PRs that never needed a
