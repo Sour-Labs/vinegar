@@ -120,10 +120,13 @@ def skip_reason(pr, config):
         return "draft"
     if config["skip_forks"] and pr["isCrossRepository"]:
         return "head branch lives in a fork"
-    if config["skip_bots"] and pr["author"].get("is_bot"):
-        return "opened by the bot %s" % pr["author"]["login"]
-    if config["authors"] and pr["author"]["login"] not in config["authors"]:
-        return "author %s is not in the authors list" % pr["author"]["login"]
+    # A pull request from a deleted account has no author at all.
+    author = pr.get("author") or {}
+    login = author.get("login", "")
+    if config["skip_bots"] and author.get("is_bot"):
+        return "opened by the bot %s" % login
+    if config["authors"] and login not in config["authors"]:
+        return "author %s is not in the authors list" % (login or "unknown")
     changed = pr["additions"] + pr["deletions"]
     if changed > config["max_changed_lines"]:
         return "%d changed lines, over the %d cap" % (
@@ -146,10 +149,14 @@ def checkout(repo, pr):
         if result.returncode != 0:
             raise RuntimeError("clone failed: %s" % result.stderr.strip())
 
+    # The tree is cleaned before the checkout, not after. A review killed by
+    # its timeout can leave the tree dirty, and then `git checkout` refuses to
+    # overwrite the leftovers, which would wedge this repo on every later poll.
     steps = (["git", "fetch", "--quiet", "origin",
               "pull/%d/head" % pr["number"]],
-             ["git", "checkout", "--quiet", "--detach", pr["headRefOid"]],
-             ["git", "clean", "-qfd"])
+             ["git", "reset", "--quiet", "--hard"],
+             ["git", "clean", "-qfd"],
+             ["git", "checkout", "--quiet", "--detach", pr["headRefOid"]])
     for step in steps:
         result = run(step, cwd=path)
         if result.returncode != 0:
@@ -175,8 +182,10 @@ def review(path, repo, pr, config):
         prompt += " --comment"
 
     # The review reads a diff that Vinegar did not write, so it runs under
-    # vinegar's own settings file and never loads the user, project, or local
-    # settings that an interactive session would.
+    # vinegar's own settings file and loads none of the user, project, or
+    # local settings.json an interactive session would, and no MCP server.
+    # This does not cover a CLAUDE.md in the checkout, which is still read as
+    # project instructions. See "What the reviewer is allowed to do".
     cmd = ["claude", "-p", prompt,
            "--output-format", "json",
            "--settings", SETTINGS_PATH,
@@ -226,29 +235,60 @@ def review(path, repo, pr, config):
 
 def poll_once(config, state):
     for repo in config["repos"]:
-        for pr in open_prs(repo):
-            key = "%s#%d" % (repo, pr["number"])
-            seen = state.get(key)
-            if seen == pr["headRefOid"] or (seen and not config["review_on_push"]):
-                continue
+        try:
+            prs = open_prs(repo)
+        except Exception as err:
+            log("%s: cannot list pull requests: %s" % (repo, err))
+            continue
+        for pr in prs:
+            try:
+                handle_pr(repo, pr, config, state)
+            except Exception as err:
+                # One bad pull request must not stop the daemon. Under launchd
+                # a crash restarts the process every 30 seconds and polls
+                # nothing in between.
+                log("%s#%s: unhandled error: %s" % (
+                    repo, pr.get("number", "?"), err))
 
-            reason = skip_reason(pr, config)
-            if reason:
-                log("%s: skipped, %s" % (key, reason))
-            else:
-                try:
-                    path = checkout(repo, pr)
-                except RuntimeError as err:
-                    # A checkout costs no subscription budget, so leave this
-                    # pull request unrecorded and try it again next poll.
-                    log("%s: %s" % (key, err))
-                    continue
-                review(path, repo, pr, config)
 
-            # A review that failed is recorded all the same. Retrying it on
-            # every poll would spend real budget on every retry.
-            state[key] = pr["headRefOid"]
+def handle_pr(repo, pr, config, state):
+    key = "%s#%d" % (repo, pr["number"])
+    head = pr["headRefOid"]
+    done = state.get(key) or {}
+
+    # Only a finished review closes a pull request off. A skip is decided
+    # again on every poll, because the filter that caused it can stop
+    # applying: a draft is marked ready, an oversized pull request is split
+    # down, a login is added to `authors`.
+    if done.get("outcome") == "reviewed":
+        if done.get("sha") == head or not config["review_on_push"]:
+            return
+
+    reason = skip_reason(pr, config)
+    if reason:
+        # Deciding again is free. Saying so every minute is noise, so this
+        # logs only when the decision is new or its reason changed.
+        if (done.get("outcome") != "skipped" or done.get("sha") != head
+                or done.get("reason") != reason):
+            log("%s: skipped, %s" % (key, reason))
+            state[key] = {"outcome": "skipped", "sha": head, "reason": reason}
             save_state(state)
+        return
+
+    try:
+        path = checkout(repo, pr)
+    except Exception as err:
+        # A checkout spends no subscription budget, so leave this pull request
+        # unrecorded and try it again on the next poll.
+        log("%s: checkout failed: %s" % (key, err))
+        return
+
+    review(path, repo, pr, config)
+
+    # A review that failed is recorded all the same. Retrying it on every poll
+    # would spend real budget on every retry.
+    state[key] = {"outcome": "reviewed", "sha": head}
+    save_state(state)
 
 
 def find_pr(target):
@@ -296,16 +336,21 @@ def main():
     if args.dry_run:
         config["comment"] = False
 
-    if args.pr:
-        repo, pr = find_pr(args.pr)
-        reason = skip_reason(pr, config)
-        if reason:
-            log("%s: would be skipped (%s), reviewing anyway" % (args.pr, reason))
-        review(checkout(repo, pr), repo, pr, config)
-        return
-
+    # Both paths take the lock. A manual --pr run shares the daemon's checkout
+    # for that repo, so without it the manual run would reset and re-check-out
+    # the tree under a review the daemon already has in flight, and that review
+    # would report findings against a commit it was never asked about.
     acquire_lock()
     try:
+        if args.pr:
+            repo, pr = find_pr(args.pr)
+            reason = skip_reason(pr, config)
+            if reason:
+                log("%s: would be skipped (%s), reviewing anyway" % (
+                    args.pr, reason))
+            review(checkout(repo, pr), repo, pr, config)
+            return
+
         state = load_state()
         log("watching %s every %ds" % (", ".join(config["repos"]),
                                        config["poll_interval"]))

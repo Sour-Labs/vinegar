@@ -144,16 +144,49 @@ settings, and loads no MCP servers. It matters: a permissive
 settings would come from the repository under review, which on a fork pull
 request is attacker-controlled.
 
-`review-settings.json` allows reading, searching, and `git` and `gh`. It denies
-writing and editing files, fetching the web, `curl` and `wget`, every shell and
-interpreter, and the `git` and `gh` subcommands that change something. Denials
-beat allows, and anything not listed is refused rather than granted.
+`review-settings.json` allows reading and searching, a fixed list of read-only
+`git` and `gh` subcommands, and the text utilities a review pipes through. It
+denies writing and editing files, fetching the web, every shell and
+interpreter, and anything that changes state. Denials beat allows, and anything
+not listed is refused rather than granted.
 
-Two limits worth stating plainly. A denied tool call is reported rather than
-silenced: Vinegar logs `permission denial(s)` so you can see a review that ran
-with less than it asked for. And the reviewer still reads an untrusted diff
-with a model, so `skip_forks` stays on by default. Turning it off means
-accepting that a crafted diff gets read by a reviewer that can run `gh`.
+The allow list names subcommands (`git diff`, `gh pr view`) rather than
+programs. Vinegar's first review of itself found out why, and the holes were
+confirmed by hand:
+
+- `Bash(git:*)` is arbitrary command execution. `git -c alias.x='!some command'
+  x` runs a shell, and `git -c` is not `git config`, so denying `git config`
+  does not help.
+- `Bash(gh:*)` lets a review approve and merge the pull request it is
+  reviewing, and read any private repo the token can see.
+- `sed -i` writes files even though `Write` and `Edit` are denied.
+
+Claude Code's own analyzer independently blocks some of this. `find -exec` and
+`awk 'BEGIN { system(...) }'` are refused whatever the allow list says, and so
+is any shell redirection out of an allowed command. That is a useful backstop
+and not something to rely on, so `find`, `awk`, `sed`, `perl`, `xargs`, and
+`tee` are denied outright.
+
+Three limits worth stating plainly.
+
+**`gh api` is allowed and cannot be narrowed.** Posting an inline comment is
+`gh api repos/OWNER/REPO/pulls/N/comments`, and the permission matcher compares
+whole space-separated tokens, so `Bash(gh api repos/*/pulls/*/comments:*)` does
+not match anything. It is `gh api` or no posted comments. A review can
+therefore reach any GitHub endpoint your token can.
+
+**A `CLAUDE.md` in the checkout is still read.** `--setting-sources ''` covers
+`settings.json`, not the memory files, so a `CLAUDE.md` or `AGENTS.md` in the
+pull request's head commit reaches the model as project instructions, which is
+a stronger channel than the same text inside a diff hunk.
+
+**Denials are reported, not silenced.** Vinegar logs `permission denial(s)` so
+you can see a review that ran with less than it asked for.
+
+Those first two are why `skip_forks` stays on by default. On a pull request
+from your own repository the author already has write access and none of this
+is a new capability. On a fork pull request every one of those files is written
+by someone else.
 
 `Workflow` is denied on purpose. At high effort `/code-review` can otherwise
 launch a multi-agent workflow, which spends far more of your subscription than
