@@ -35,8 +35,17 @@ from datetime import datetime, timezone
 HOME = os.path.expanduser(os.environ.get("VINEGAR_HOME", "~/.vinegar"))
 STATE_PATH = os.path.join(HOME, "state.json")
 LOCK_PATH = os.path.join(HOME, "vinegar.pid")
-CHECKOUT_DIR = os.path.join(HOME, "checkouts")
 REVIEW_DIR = os.path.join(HOME, "reviews")
+
+# Checkouts sit outside HOME, and that is load-bearing rather than tidiness.
+# review-settings.json denies the reviewer every read under `~/.vinegar`, so a
+# diff cannot talk it into reading the App's private key. A checkout inside
+# that directory is covered by the same rule, and then the reviewer cannot
+# read the repository it was pointed at: it falls back to fetching each file
+# over the API, which costs more and reviews worse, while `permission_denials`
+# stays empty and reports nothing wrong.
+CHECKOUT_DIR = os.path.expanduser(
+    os.environ.get("VINEGAR_CHECKOUTS", "~/.vinegar-checkouts"))
 SETTINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                              "review-settings.json")
 

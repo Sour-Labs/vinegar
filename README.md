@@ -88,9 +88,15 @@ python3 vinegar.py --once                # one pass, then exit
 python3 vinegar.py                       # poll forever
 ```
 
-Vinegar keeps everything under `~/.vinegar`: `config.json`, `state.json` (the
-head commit it last handled per pull request), `checkouts/` (one clone per
-repo, which only Vinegar touches), and `reviews/`.
+Vinegar keeps its own state under `~/.vinegar`: `config.json`, `state.json`
+(the head commit it last handled per pull request), and `reviews/`.
+
+Clones live outside that directory, in `~/.vinegar-checkouts/`, one per repo,
+which only Vinegar touches. They are deliberately not under `~/.vinegar`: the
+reviewer is denied every read there so that a diff cannot talk it into reading
+the App's private key, and a checkout inside would be caught by the same rule.
+Set `VINEGAR_CHECKOUTS` to put them somewhere else. Deleting them is safe;
+Vinegar re-clones on the next review.
 
 ### Configuration
 
@@ -226,6 +232,12 @@ Reads are path-denied for `~/.vinegar`, `~/.claude`, `~/.ssh`, `~/.aws`,
 private key is a file the reviewer can read and `gh api` is a channel it can
 post through, and that key is the one credential that is **not** scoped to a
 single repository.
+
+That is why clones live in `~/.vinegar-checkouts/` rather than under
+`~/.vinegar`. A blanket deny on a directory catches everything you later put
+inside it, including the repository the reviewer is supposed to read. Keep the
+deny broad and keep the checkout out of it, rather than narrowing the rule to
+name each secret: the next secret added to `~/.vinegar` would not be named.
 
 ### What this does not do
 
