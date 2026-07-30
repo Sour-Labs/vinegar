@@ -328,9 +328,26 @@ repository being reviewed instead of spreading across an account.
 Turn `skip_forks` off only if you are willing to read fork diffs yourself
 first.
 
-**Denials are reported, not silenced.** Vinegar logs `permission denial(s)`, so
-a review that ran with less than it asked for says so rather than quietly
-returning a worse result.
+**Some denials are reported. Do not read silence as a clean run.** Vinegar
+logs `permission denial(s)` from the `permission_denials` array that
+`--output-format json` returns, so a review denied a *command* says so instead
+of quietly returning a worse result.
+
+Reads refused by a path deny are not in that array. It comes back empty from a
+review that could not open a single file in its own checkout, which is how
+that failure went unnoticed until it was found by hand and fixed by
+`check_paths()`. Treat a non-empty array as worth acting on and an empty one as
+no evidence either way. To check the reads themselves, ask the sandbox
+directly, which is worth doing after any edit to `review-settings.json`:
+
+```sh
+cd ~/.vinegar-checkouts/<any-repo>
+claude -p 'Read README.md and reply with only its first line, or BLOCKED if denied.' \
+  --model claude-haiku-4-5 --settings <path-to>/review-settings.json \
+  --setting-sources '' --strict-mcp-config
+```
+
+Measured on Claude Code 2.1.220.
 
 `Workflow` is denied on purpose. At high effort `/code-review` can otherwise
 launch a multi-agent workflow, which spends far more of your subscription than
