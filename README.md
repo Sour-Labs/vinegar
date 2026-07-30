@@ -131,12 +131,16 @@ sandbox limit the allow list could not close.
 Create the App once, in your organisation's settings under **Developer
 settings → GitHub Apps → New GitHub App**:
 
-- **Name** whatever you want the comments signed as, for example `Vinegar`.
+- **Name** whatever you want the comments signed as. Note that an App's slug
+  shares a namespace with GitHub usernames, so a name is unavailable if the
+  account exists: `vinegar`, `brine`, `acetic`, `verjus`, `aceto` and `acidity`
+  are all taken already. `vinaigre` was free, and is what this project uses.
 - **Homepage URL** anything; it is required and unused.
 - **Webhooks**: untick **Active**. Vinegar polls and needs no callback.
 - **Repository permissions**: `Pull requests` read and write, `Contents` read,
   `Metadata` read. Nothing else.
 - Upload a logo on the App's page. That image is the avatar on every comment.
+  `brand/vinaigre-avatar-1024.png` in this repo is ready to use.
 
 Then **Generate a private key**, which downloads a `.pem`, and **Install App**
 on the repositories you want reviewed. Point the config at both:
