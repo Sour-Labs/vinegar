@@ -177,12 +177,38 @@ under your own account.
 ```sh
 mkdir -p ~/.vinegar/logs
 cp launchd/io.sourlabs.vinegar.plist ~/Library/LaunchAgents/
-launchctl load ~/Library/LaunchAgents/io.sourlabs.vinegar.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.sourlabs.vinegar.plist
 tail -f ~/.vinegar/logs/vinegar.log
 ```
 
+Create the log directory first. launchd will not create it, and a job whose
+`StandardOutPath` it cannot open fails to spawn at all.
+
+`bootstrap` rather than `load`, which is deprecated and reports nothing when
+it fails. To stop it, `launchctl bootout gui/$(id -u)/io.sourlabs.vinegar`.
+
+Run that at the machine, in a logged-in session. `gui/$(id -u)` names a domain
+that only exists while someone is logged in, so the same command over ssh to a
+machine sitting at the login window fails with `Bootstrap failed: 5:
+Input/output error`, which says nothing about the actual cause.
+
 The plist sets `PATH` explicitly because launchd starts with a bare one, and
 a daemon that cannot find `claude` fails at the first review.
+
+That login requirement is not only about installing it. A LaunchAgent runs
+only inside a logged-in session, so on a machine with FileVault enabled
+Vinegar does not come back on its own after a reboot: the disk waits to be
+unlocked, and nothing runs until someone logs in. Use `sudo fdesetup
+authrestart` for planned reboots, which unlocks for one boot and proceeds to
+log in. An unplanned reboot needs someone at the machine.
+
+Nothing here rotates the logs, deliberately. Vinegar logs per event rather
+than per poll, so the file grows slowly, and rotating it would break it:
+launchd opens `StandardOutPath` once and hands the job that one descriptor, so
+a rotation that renames the file leaves Vinegar writing to the renamed inode
+while the new `vinegar.log` stays empty. `newsyslog` has no way to ask a
+process to reopen, and the only signal that would work here kills a review
+mid-flight. Truncate it by hand if it ever gets big enough to care about.
 
 ## What the reviewer is allowed to do
 
