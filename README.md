@@ -6,9 +6,10 @@ A self-hosted pull-request reviewer. It runs on a machine you already own, uses
 a Claude subscription you already pay for, and posts inline review comments on
 your PRs.
 
-> **Status: design stage. There is no working code in this repo yet.**
-> The architecture and the constraints are settled and written down below.
-> Nothing here has been run against a real PR.
+> **Status: the poller works. Triage does not exist yet.**
+> `vinegar.py` polls GitHub, picks which pull requests deserve a reviewer, and
+> runs the review. The cheap triage model described below is still a design,
+> so today every pull request that passes the filters gets a full review.
 
 ## Why it exists
 
@@ -47,12 +48,235 @@ A daemon on an always-on machine polls GitHub for pull requests whose head
 commit it has not seen. Polling rather than webhooks means no inbound port, no
 tunnel, and nothing exposed to the internet.
 
+Before each review the daemon puts a checkout on the pull request's head
+commit. This is not cosmetic. Given a pull request number, `/code-review` reads
+local files only when the checkout matches that branch, and otherwise fetches
+each file over the API, which costs more and reviews worse.
+
 **A self-hosted GitHub Actions runner is deliberately not used.** It would give
 nicer triggering, but GitHub's own guidance is that self-hosted runners should
 almost never serve public repositories: anyone can open a pull request from a
 fork and execute code on the runner. The machine running Vinegar holds your
 Claude credentials, which makes it the worst possible host for untrusted PR
 code.
+
+## Running it
+
+You need macOS or Linux, Python 3.9 or newer, `git`, the GitHub CLI logged in
+(`gh auth login`), and Claude Code logged in (`claude`). There are no other
+dependencies and nothing to install.
+
+```sh
+git clone https://github.com/Sour-Labs/vinegar.git
+cd vinegar
+mkdir -p ~/.vinegar
+cp config.example.json ~/.vinegar/config.json
+$EDITOR ~/.vinegar/config.json          # list your repos
+```
+
+Review one pull request by hand, posting nothing, to see what you would get:
+
+```sh
+python3 vinegar.py --pr owner/repo#123 --dry-run
+```
+
+The review lands in `~/.vinegar/reviews/`. When it reads well, poll once, then
+run the loop:
+
+```sh
+python3 vinegar.py --once                # one pass, then exit
+python3 vinegar.py                       # poll forever
+```
+
+Vinegar keeps everything under `~/.vinegar`: `config.json`, `state.json` (the
+head commit it last handled per pull request), `checkouts/` (one clone per
+repo, which only Vinegar touches), and `reviews/`.
+
+### Configuration
+
+Every key in `config.example.json`:
+
+| Key | Default | What it does |
+| --- | --- | --- |
+| `repos` | none | Repositories to poll, as `owner/name`. Required. |
+| `poll_interval` | `60` | Seconds between polls. |
+| `effort` | `"high"` | Effort passed to `/code-review`: `low`, `medium`, `high`, `xhigh`, `max`. `ultra` is rejected. |
+| `comment` | `true` | Post findings on the pull request. False runs the review and writes only to `~/.vinegar/reviews/`. |
+| `model` | `null` | Model for the review. Null uses your Claude Code default. |
+| `review_on_push` | `false` | Review again when the head commit changes. |
+| `max_changed_lines` | `3000` | Skip pull requests larger than this. |
+| `skip_drafts` | `true` | Skip drafts. |
+| `skip_bots` | `true` | Skip pull requests opened by bots. |
+| `skip_forks` | `true` | Skip pull requests whose head branch lives in a fork. Read the next section before you turn this off. |
+| `authors` | `[]` | Only review these GitHub logins. Empty means anyone who passes the checks above. |
+| `review_timeout` | `1800` | Kill a review that runs longer than this many seconds. |
+| `github_app` | `null` | Post as a GitHub App instead of as you. See below. |
+
+The last five are budget and safety controls, not optimizations. Automated
+reviews spend the same subscription limits as your interactive Claude Code
+work.
+
+### Posting as Vinegar instead of as you
+
+Out of the box `gh` uses the account you logged in with, so reviews arrive under
+your own name and avatar, which reads as though you commented on your own pull
+request. A GitHub App gives Vinegar its own name, its own icon, and a `bot`
+badge.
+
+It is worth doing for a second reason. An App's installation token can be
+scoped to a single repository, so a review that gets talked into calling
+`gh api` cannot reach anything else your account can see. That is the one
+sandbox limit the allow list could not close.
+
+Create the App once, in your organisation's settings under **Developer
+settings → GitHub Apps → New GitHub App**:
+
+- **Name** whatever you want the comments signed as. Expect to need a second
+  and a third choice: the name has to be unique across every GitHub App, and it
+  also cannot collide with an existing user or organisation. `vinegar`,
+  `brine`, `acetic`, `verjus`, `aceto` and `acidity` are all taken as accounts,
+  and `vinaigre` was free as an account but still refused as an App name. This
+  project ended up at `vinegar-bot`.
+- **Homepage URL** anything; it is required and unused.
+- **Webhooks**: untick **Active**. Vinegar polls and needs no callback.
+- **Repository permissions**: `Pull requests` read and write, `Contents` read,
+  `Metadata` read. Nothing else.
+- Upload a logo on the App's page. That image is the avatar on every comment.
+  `brand/vinegar-avatar-1024.png` in this repo is ready to use.
+
+Then **Generate a private key**, which downloads a `.pem`. Install the App from
+`https://github.com/apps/<your-app-slug>/installations/new`, pick the account
+that owns the repositories, and choose **Only select repositories** rather than
+all of them: the installation is the boundary, and a review can reach every
+repository inside it. Point the config at the App and the key:
+
+```json
+"github_app": {
+  "app_id": 123456,
+  "private_key": "~/.vinegar/vinegar-bot.private-key.pem"
+}
+```
+
+Keep the key private, `chmod 600`. Anyone holding it can act as the App on
+every repository it is installed on.
+
+Vinegar signs a short-lived JWT with that key, exchanges it for an
+installation token scoped to the one repository being reviewed, and passes the
+token to `git`, `gh`, and the review as `GH_TOKEN`. Signing uses `openssl`
+rather than a Python crypto package, so there is still nothing to install. The
+token is never written to disk and never appears on a command line.
+
+Leave `github_app` as `null` and everything works exactly as before, posting
+under your own account.
+
+### Running it under launchd
+
+`launchd/io.sourlabs.vinegar.plist` is a template. Replace every
+`YOUR_USERNAME` and every `VINEGAR_PATH`, then:
+
+```sh
+mkdir -p ~/.vinegar/logs
+cp launchd/io.sourlabs.vinegar.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/io.sourlabs.vinegar.plist
+tail -f ~/.vinegar/logs/vinegar.log
+```
+
+The plist sets `PATH` explicitly because launchd starts with a bare one, and
+a daemon that cannot find `claude` fails at the first review.
+
+## What the reviewer is allowed to do
+
+A pull request diff is input written by someone else, and the reviewer reads it
+on the machine that holds your Claude credentials. That is the same threat that
+rules out a self-hosted Actions runner, so Vinegar does not hand the reviewer
+your normal permissions.
+
+Every review runs with `--settings review-settings.json --setting-sources ''
+--strict-mcp-config`. That combination ignores your user, project, and local
+settings, and loads no MCP servers. It matters: a permissive
+`permissions.allow` in `~/.claude/settings.json` is common, and the project
+settings would come from the repository under review, which on a fork pull
+request is attacker-controlled.
+
+`review-settings.json` allows reading and searching, a fixed list of read-only
+`git` and `gh` subcommands, and the text utilities a review pipes through. It
+denies writing and editing files, fetching the web, every shell and
+interpreter, and anything that changes state. Denials beat allows, and anything
+not listed is refused rather than granted.
+
+The allow list names subcommands (`git diff`, `gh pr view`) rather than
+programs. Vinegar's first review of itself found out why, and the holes were
+confirmed by hand:
+
+- `Bash(git:*)` is arbitrary command execution. `git -c alias.x='!some command'
+  x` runs a shell, and `git -c` is not `git config`, so denying `git config`
+  does not help.
+- `Bash(gh:*)` lets a review approve and merge the pull request it is
+  reviewing, and read any private repo the token can see.
+- `sed -i` writes files even though `Write` and `Edit` are denied.
+
+Claude Code's own analyzer independently blocks some of this. `find -exec` and
+`awk 'BEGIN { system(...) }'` are refused whatever the allow list says, and so
+is any shell redirection out of an allowed command. That is a useful backstop
+and not something to rely on, so `find`, `awk`, `sed`, `perl`, `xargs`, and
+`tee` are denied outright.
+
+Reads are path-denied for `~/.vinegar`, `~/.claude`, `~/.ssh`, `~/.aws`,
+`~/.gnupg`, `~/.config/gh`, `.netrc` and `.env`. Without that, the App's own
+private key is a file the reviewer can read and `gh api` is a channel it can
+post through, and that key is the one credential that is **not** scoped to a
+single repository.
+
+### What this does not do
+
+The allow list makes the easy paths closed and the accidental blast radius
+small. **It is not a containment boundary against a determined prompt
+injection**, and it is worth being exact about why rather than discovering it
+later.
+
+A prefix rule matches the start of a command and cannot see the flags that
+follow. So `git diff`, `git log` and `git show` are all allowed, and all three
+accept `--output=<file>`, which writes any file the daemon user can write.
+`git diff --output=$HOME/.zshenv` is persistent code execution, and no prefix
+rule can distinguish it from the `git diff origin/main...HEAD` that every
+review legitimately runs. Removing `git diff` would close it, and would also
+remove the command the reviewer actually gets its diff from, so it stays.
+
+Two more that stay open for the same kind of reason:
+
+**`gh api` cannot be narrowed.** Posting an inline comment is
+`gh api repos/OWNER/REPO/pulls/N/comments`, and the matcher compares whole
+space-separated tokens, so `Bash(gh api repos/*/pulls/*/comments:*)` matches
+nothing. It is `gh api` or no posted comments. The GitHub App is what bounds
+this: the token reaches one repository, not everything you can see.
+
+**A `CLAUDE.md` in the checkout is still read.** `--setting-sources ''` covers
+`settings.json`, not the memory files, so a `CLAUDE.md` or `AGENTS.md` in the
+pull request's head commit reaches the model as project instructions, which is
+a stronger channel than the same text inside a diff hunk.
+
+### So what is the boundary
+
+`skip_forks`, and it is on by default. On a pull request from your own
+repository the author already has write access to the code and to `CLAUDE.md`,
+so none of the above is a capability they did not already have. On a fork pull
+request all of it is written by a stranger, and the allow list is not what you
+want standing between that stranger and the machine holding your credentials.
+
+Second to that, the GitHub App installation. A review can only reach the one
+repository its token was minted for, so the worst case stays inside the
+repository being reviewed instead of spreading across an account.
+
+Turn `skip_forks` off only if you are willing to read fork diffs yourself
+first.
+
+**Denials are reported, not silenced.** Vinegar logs `permission denial(s)`, so
+a review that ran with less than it asked for says so rather than quietly
+returning a worse result.
+
+`Workflow` is denied on purpose. At high effort `/code-review` can otherwise
+launch a multi-agent workflow, which spends far more of your subscription than
+a single review should.
 
 ## The triage pass
 
@@ -104,6 +328,13 @@ it misleads a human skimming and can anchor the reviewer that runs next.
 lot of repository context. At roughly 250k input and 25k output tokens, Opus 5
 costs about $1.90 per review and Sonnet 5 about $1.15. That is Bugbot's price
 again.
+
+One measured run supports that estimate rather than undercutting it. A 45-line
+pull request, reviewed on Opus 5 at high effort, took 243 seconds and reported
+$0.86 of equivalent token cost. Forty-five lines is about as small as a real
+pull request gets, and it still landed inside Bugbot's price band, because the
+cost is dominated by reading the repository rather than by reading the diff.
+Vinegar pays that in subscription limits instead of dollars.
 
 The entire saving comes from running reviews through a Claude subscription you
 already have, plus letting cheap triage drop the PRs that never needed a

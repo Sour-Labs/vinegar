@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="Vinegar mark">
+  <!-- Prompt Drop. A drop of acid with a shell chevron cut out of it.
+       Tilted -8° to match the Sour Labs Capsule.
+       Full-bleed ground on purpose: GitHub applies its own crop to a bot
+       avatar, so baking rounded corners in here would double up.
+       The chevron is filled with the ground colour rather than masked, so
+       this file is only correct on #0A0C08. Use vinegar-mark.svg anywhere
+       the background is not the ground. -->
+  <rect width="256" height="256" fill="#0A0C08"/>
+  <g transform="rotate(-8 128 128)">
+    <path d="M128 46 C152 92 198 126 198 158 A70 70 0 1 1 58 158 C58 126 104 92 128 46 Z" fill="#7FFF00"/>
+    <path d="M112 130 L150 158 L112 186" fill="none" stroke="#0A0C08" stroke-width="20" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+</svg>

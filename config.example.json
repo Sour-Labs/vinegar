@@ -1,0 +1,15 @@
+{
+  "repos": ["Sour-Labs/wonky-flow"],
+  "poll_interval": 60,
+  "effort": "high",
+  "comment": true,
+  "model": null,
+  "review_on_push": false,
+  "max_changed_lines": 3000,
+  "skip_drafts": true,
+  "skip_bots": true,
+  "skip_forks": true,
+  "authors": [],
+  "review_timeout": 1800,
+  "github_app": null
+}

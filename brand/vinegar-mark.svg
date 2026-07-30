@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="Vinegar mark">
+  <!-- The same mark with the chevron as real transparency rather than as a
+       filled shape, so it can sit on any background. -->
+  <mask id="vinegar-chevron">
+    <rect width="256" height="256" fill="#000000"/>
+    <g transform="rotate(-8 128 128)">
+      <path d="M128 46 C152 92 198 126 198 158 A70 70 0 1 1 58 158 C58 126 104 92 128 46 Z" fill="#FFFFFF"/>
+      <path d="M112 130 L150 158 L112 186" fill="none" stroke="#000000" stroke-width="20" stroke-linecap="round" stroke-linejoin="round"/>
+    </g>
+  </mask>
+  <rect width="256" height="256" fill="#7FFF00" mask="url(#vinegar-chevron)"/>
+</svg>

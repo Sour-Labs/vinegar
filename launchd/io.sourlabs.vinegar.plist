@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Copyright 2026 Sour Labs
+  Licensed under the Apache License, Version 2.0. See the LICENSE file.
+
+  Replace every YOUR_USERNAME and every VINEGAR_PATH before you load this.
+  See "Running it under launchd" in the README.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>io.sourlabs.vinegar</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>VINEGAR_PATH/vinegar.py</string>
+  </array>
+
+  <!-- launchd starts with a bare PATH, so `claude`, `gh`, and `git` have to
+       be findable here or every review fails at the first subprocess. -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/Users/YOUR_USERNAME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>HOME</key>
+    <string>/Users/YOUR_USERNAME</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <!-- Without this, a daemon that dies on startup restarts in a tight loop. -->
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+
+  <key>StandardOutPath</key>
+  <string>/Users/YOUR_USERNAME/.vinegar/logs/vinegar.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/Users/YOUR_USERNAME/.vinegar/logs/vinegar.err.log</string>
+</dict>
+</plist>
