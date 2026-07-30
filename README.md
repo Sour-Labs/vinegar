@@ -187,24 +187,28 @@ Create the log directory first. launchd will not create it, and a job whose
 `bootstrap` rather than `load`, which is deprecated and reports nothing when
 it fails. To stop it, `launchctl bootout gui/$(id -u)/io.sourlabs.vinegar`.
 
+Run that at the machine, in a logged-in session. `gui/$(id -u)` names a domain
+that only exists while someone is logged in, so the same command over ssh to a
+machine sitting at the login window fails with `Bootstrap failed: 5:
+Input/output error`, which says nothing about the actual cause.
+
 The plist sets `PATH` explicitly because launchd starts with a bare one, and
 a daemon that cannot find `claude` fails at the first review.
 
-A LaunchAgent runs only inside a logged-in session, so on a machine with
-FileVault enabled Vinegar does not come back on its own after a reboot: the
-disk waits to be unlocked, and nothing runs until someone logs in. Use
-`sudo fdesetup authrestart` for planned reboots, which unlocks for one boot.
+That login requirement is not only about installing it. A LaunchAgent runs
+only inside a logged-in session, so on a machine with FileVault enabled
+Vinegar does not come back on its own after a reboot: the disk waits to be
+unlocked, and nothing runs until someone logs in. Use `sudo fdesetup
+authrestart` for planned reboots, which unlocks for one boot and proceeds to
+log in. An unplanned reboot needs someone at the machine.
 
-Logs are written per event rather than per poll, so they grow slowly. To
-rotate them anyway, drop a `newsyslog.d` rule in place:
-
-```sh
-sudo tee /etc/newsyslog.d/io.sourlabs.vinegar.conf <<'EOF'
-# logfilename                              [owner:group]  mode count size when flags
-/Users/YOUR_USERNAME/.vinegar/logs/vinegar.log     YOUR_USERNAME:staff 644 7 1000 * J
-/Users/YOUR_USERNAME/.vinegar/logs/vinegar.err.log YOUR_USERNAME:staff 644 7 1000 * J
-EOF
-```
+Nothing here rotates the logs, deliberately. Vinegar logs per event rather
+than per poll, so the file grows slowly, and rotating it would break it:
+launchd opens `StandardOutPath` once and hands the job that one descriptor, so
+a rotation that renames the file leaves Vinegar writing to the renamed inode
+while the new `vinegar.log` stays empty. `newsyslog` has no way to ask a
+process to reopen, and the only signal that would work here kills a review
+mid-flight. Truncate it by hand if it ever gets big enough to care about.
 
 ## What the reviewer is allowed to do
 
