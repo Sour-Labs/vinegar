@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Copyright 2026 Sour Labs
+  Licensed under the Apache License, Version 2.0. See the LICENSE file.
+
+  Replace every YOUR_USERNAME and every VINEGAR_PATH before you load this.
+  See "Watching the watcher" in the README.
+
+  Pairs with watchdog.sh in the repo and ~/.vinegar/watchdog.env for the two
+  secrets. This one points at the checkout rather than at ~/.vinegar, so a
+  `git pull` updates the watchdog the same way it updates the daemon.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>io.sourlabs.vinegar-watchdog</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>VINEGAR_PATH/watchdog.sh</string>
+  </array>
+
+  <!-- Only curl, ps and date are needed, so the stock PATH is enough. This is
+       deliberately not the daemon's PATH: the watchdog must keep working when
+       whatever the daemon needs is broken. -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>HOME</key>
+    <string>/Users/YOUR_USERNAME</string>
+  </dict>
+
+  <!-- Every five minutes, matching the healthchecks.io check period. The
+       grace window there should be longer (15 minutes) so a single dropped
+       ping over flaky wifi does not page you. -->
+  <key>StartInterval</key>
+  <integer>300</integer>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- No KeepAlive. This is a periodic job that exits, not a daemon, and
+       KeepAlive would restart it the instant it finished. -->
+
+  <key>StandardOutPath</key>
+  <string>/Users/YOUR_USERNAME/.vinegar/logs/watchdog.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/Users/YOUR_USERNAME/.vinegar/logs/watchdog.err.log</string>
+</dict>
+</plist>

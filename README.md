@@ -236,6 +236,52 @@ while the new `vinegar.log` stays empty. `newsyslog` has no way to ask a
 process to reopen, and the only signal that would work here kills a review
 mid-flight. Truncate it by hand if it ever gets big enough to care about.
 
+### Watching the watcher
+
+Vinegar fails quietly. It reviews on a poll rather than on a webhook, so a
+daemon that is not running looks exactly like a week with no pull requests, and
+the first thing you notice is a merge nobody reviewed. `watchdog.sh` is the
+answer to that, run every five minutes by a second agent:
+
+```sh
+cp watchdog.env.example ~/.vinegar/watchdog.env
+chmod 600 ~/.vinegar/watchdog.env
+$EDITOR ~/.vinegar/watchdog.env          # a healthchecks.io URL, an ntfy topic
+cp launchd/io.sourlabs.vinegar-watchdog.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.sourlabs.vinegar-watchdog.plist
+```
+
+Two channels, because they have different blind spots, and the less obvious one
+is the one that matters. **The heartbeat to healthchecks.io reports by
+silence.** Nothing running on this machine can tell you this machine is off, so
+the signal has to be the pings stopping: that is what covers a power cut, a
+dead network, and a reboot parked at the FileVault screen. The ntfy push is the
+fast path for the case the watchdog is still alive to observe, a crashed daemon
+on a healthy Mac, and it arrives in seconds instead of after the grace window.
+Point the healthchecks.io alert at the same ntfy topic and both land together.
+
+It confirms over a 45-second window before it says anything, because two cases
+produce a down reading that fixes itself: at login launchd starts both agents
+at once and the watchdog can win the race, and after a crash `KeepAlive` waits
+out the daemon plist's 30-second `ThrottleInterval`. Without the window it
+pages on every reboot and every self-healing restart, which is how a watchdog
+teaches you to ignore it.
+
+Nothing is logged on a healthy pass, so an empty `watchdog.log` is the good
+outcome. Only a confirmed outage and a failed send get written, the second
+because it means the alerting itself is broken.
+
+**Liveness is the pid file, and the pid has to be checked against what is
+actually running under it.** Log freshness will not do: Vinegar logs per event
+rather than per poll, so a healthy daemon watching quiet repos writes nothing
+for hours. But `~/.vinegar/vinegar.pid` is never removed, so it outlives every
+exit and names a dead process until the next start, and pids get reused. `kill
+-0` answers "is this number taken", which after a reuse is a yes, and a
+watchdog that trusts it reports a dead Vinegar as healthy and sends nothing.
+Matching the process command line answers "is this number our daemon", which is
+the question worth asking. If you write your own check, this is the part to get
+right.
+
 ## What the reviewer is allowed to do
 
 A pull request diff is input written by someone else, and the reviewer reads it
