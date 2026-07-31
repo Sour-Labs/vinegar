@@ -23,6 +23,7 @@ reviewer, puts a checkout on the pull request's head commit, and runs
 
 import argparse
 import base64
+import errno
 import fcntl
 import json
 import os
@@ -572,6 +573,13 @@ def acquire_lock():
 
     The pid is still written, because the watchdog and anyone reading the log
     need to know which process to look at, but nothing decides anything by it.
+
+    The file outliving the process is now normal rather than a sign of a crash.
+    It is never unlinked, so it survives `--once` finishing, a Ctrl-C, and a
+    clean shutdown alike, and from then until the next start it names a process
+    that is gone. Nothing outside this module may read it as evidence Vinegar
+    is alive: the file existing means nothing, and the pid in it means nothing
+    until you have checked that the process it names is really this daemon.
     """
     global _lock_handle
     os.makedirs(HOME, exist_ok=True)
@@ -579,11 +587,29 @@ def acquire_lock():
     # open the race the lock exists to close: a second Vinegar can hold the
     # old inode locked while a third creates a new one at the same path and
     # locks that, leaving two holders who cannot see each other.
-    handle = os.open(LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o644)
+    #
+    # Opening RDWR rather than the old WRONLY|EXCL means an existing lock file
+    # now has to be writable, which one `sudo python3 vinegar.py` is enough to
+    # break: it leaves the file owned by root and every later unprivileged
+    # start fails here. That is worth a sentence naming the file, because the
+    # bare traceback it would otherwise raise sends the reader looking at the
+    # lock logic instead of at `ls -l`.
+    try:
+        handle = os.open(LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o644)
+    except OSError as err:
+        sys.exit("cannot open the lock file %s: %s" % (LOCK_PATH, err))
     try:
         fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
+    except OSError as err:
         os.close(handle)
+        # Only contention means another Vinegar. A filesystem with no working
+        # flock, or a kernel out of lock structures, fails here too, and
+        # reporting those as "already running" would send the operator hunting
+        # for a second process that does not exist while KeepAlive restarts
+        # into the same message every 30 seconds. POSIX allows either errno
+        # for a lock someone else holds.
+        if err.errno not in (errno.EAGAIN, errno.EACCES):
+            sys.exit("cannot lock %s: %s" % (LOCK_PATH, err))
         sys.exit("vinegar is already running as pid %s" % locked_by())
     os.ftruncate(handle, 0)
     os.write(handle, str(os.getpid()).encode())
