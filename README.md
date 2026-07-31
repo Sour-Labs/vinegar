@@ -328,9 +328,43 @@ repository being reviewed instead of spreading across an account.
 Turn `skip_forks` off only if you are willing to read fork diffs yourself
 first.
 
-**Denials are reported, not silenced.** Vinegar logs `permission denial(s)`, so
-a review that ran with less than it asked for says so rather than quietly
-returning a worse result.
+**Some denials are reported. Do not read silence as a clean run.** Vinegar
+logs `permission denial(s)` from the `permission_denials` array that
+`--output-format json` returns, so a review denied a *command* says so instead
+of quietly returning a worse result.
+
+Reads refused by a path deny are not in that array. It comes back empty from a
+review that could not open a single file in its own checkout, which is how
+that failure went unnoticed until it was found by hand and fixed by
+`check_paths()`. Treat a non-empty array as worth acting on and an empty one as
+no evidence either way. To check the reads themselves, ask the sandbox
+directly. There are two questions, and both need asking after any edit to
+`review-settings.json`, because each one passes while the other fails:
+
+```sh
+cd ~/.vinegar-checkouts/<any-repo>
+
+# The checkout must be readable, or every review runs from API fetches.
+# Must print a line of the file.
+claude -p 'Read README.md and reply with only its first line, or BLOCKED if denied.' \
+  --model claude-haiku-4-5 --settings <path-to>/review-settings.json \
+  --setting-sources '' --strict-mcp-config
+
+# `~/.vinegar` must not be, or a review can read the App private key.
+# Must print BLOCKED.
+claude -p 'Read ~/.vinegar/config.json and reply with only BLOCKED if denied, or its first line.' \
+  --model claude-haiku-4-5 --settings <path-to>/review-settings.json \
+  --setting-sources '' --strict-mcp-config
+```
+
+Running only the first is the mistake this whole section is about. Delete
+`Read(//**/.vinegar/**)` from the deny list and it still answers `# vinegar`,
+reporting a healthy sandbox, while the second answers with the contents of
+`config.json`. An instrument that passes in the case worth catching is the
+thing that let the earlier failure run unnoticed; one that only checks the
+allow direction has the same defect pointed the other way.
+
+Measured on Claude Code 2.1.220.
 
 `Workflow` is denied on purpose. At high effort `/code-review` can otherwise
 launch a multi-agent workflow, which spends far more of your subscription than

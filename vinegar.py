@@ -427,6 +427,15 @@ def review(path, repo, pr, config, env):
             label, took, detail[:400]))
         return FAILED
 
+    # A non-empty list is worth acting on. An empty one proves nothing.
+    #
+    # `permission_denials` does not record every refusal. A denied Bash command
+    # lands here; a Read refused by a path deny does not, and the array comes
+    # back empty from a review that could not open a single file in its own
+    # checkout. That is how exactly that failure ran unnoticed for long enough
+    # to need check_paths(), and it is why the guard is a startup check on the
+    # paths rather than something that reads this after the fact. Measured on
+    # Claude Code 2.1.220.
     denied = output.get("permission_denials") or []
     if denied:
         tools = sorted({entry.get("tool_name", "?") for entry in denied})
