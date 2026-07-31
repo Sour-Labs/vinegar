@@ -23,6 +23,7 @@ reviewer, puts a checkout on the pull request's head commit, and runs
 
 import argparse
 import base64
+import fcntl
 import json
 import os
 import subprocess
@@ -544,46 +545,66 @@ def find_pr(target, env):
     return json.loads(result.stdout)
 
 
+# The locked descriptor, held open for the life of the process. Closing it,
+# including by letting it fall out of scope and be collected, drops the lock.
+_lock_handle = None
+
+
 def acquire_lock():
     """Refuse to start when another Vinegar already holds the lock.
 
     Two Vinegars sharing a repo's checkout is not a small problem: the second
     one runs `git reset --hard` under the first one's review, which then
-    reports findings against a commit nobody asked about. So the lock is taken
-    with O_EXCL, and a stale one is only cleared after checking that the
-    process it names is really gone.
+    reports findings against a commit nobody asked about.
+
+    The lock is the kernel's flock on the file, not the pid written in it. A
+    pid means nothing once its process is gone: pids are reused, and after a
+    reboot they are all reused. Deciding staleness by asking whether the
+    recorded pid is alive gets that wrong in both directions. If the number
+    now belongs to some unrelated process, a dead Vinegar looks alive and
+    nothing starts until someone deletes the file by hand; that is not
+    theoretical, it stopped this daemon for 78 minutes when a reboot handed
+    pid 780 to a system extension. If the number belongs to a Vinegar in
+    another VINEGAR_HOME, a live one looks like ours. flock has no such
+    question to answer. The kernel releases it when the process dies, however
+    it dies, so a crash, a SIGTERM with no handler, and a power cut all leave
+    a lock that is already free.
+
+    The pid is still written, because the watchdog and anyone reading the log
+    need to know which process to look at, but nothing decides anything by it.
     """
+    global _lock_handle
     os.makedirs(HOME, exist_ok=True)
+    # The file is never unlinked, here or in release_lock. Removing it would
+    # open the race the lock exists to close: a second Vinegar can hold the
+    # old inode locked while a third creates a new one at the same path and
+    # locks that, leaving two holders who cannot see each other.
+    handle = os.open(LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o644)
     try:
-        handle = os.open(LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-    except FileExistsError:
-        try:
-            with open(LOCK_PATH) as existing:
-                other = int(existing.read().strip())
-            os.kill(other, 0)
-        except (ValueError, ProcessLookupError, FileNotFoundError):
-            log("clearing a stale lock at %s" % LOCK_PATH)
-            try:
-                os.remove(LOCK_PATH)
-            except FileNotFoundError:
-                pass
-            return acquire_lock()
-        except PermissionError:
-            sys.exit("pid %d holds the lock and is not ours" % other)
-        sys.exit("vinegar is already running as pid %d" % other)
-    with os.fdopen(handle, "w") as lock:
-        lock.write(str(os.getpid()))
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(handle)
+        sys.exit("vinegar is already running as pid %s" % locked_by())
+    os.ftruncate(handle, 0)
+    os.write(handle, str(os.getpid()).encode())
+    _lock_handle = handle
+
+
+def locked_by():
+    """The pid recorded in the lock file, for error messages only."""
+    try:
+        with open(LOCK_PATH) as handle:
+            return int(handle.read().strip())
+    except (ValueError, OSError):
+        return "unknown"
 
 
 def release_lock():
-    """Drop the lock, but only when it is still ours."""
-    try:
-        with open(LOCK_PATH) as handle:
-            if int(handle.read().strip()) != os.getpid():
-                return
-        os.remove(LOCK_PATH)
-    except (ValueError, FileNotFoundError):
-        pass
+    """Drop the lock. Exiting would do it too; this just makes it explicit."""
+    global _lock_handle
+    if _lock_handle is not None:
+        os.close(_lock_handle)
+        _lock_handle = None
 
 
 def main():
