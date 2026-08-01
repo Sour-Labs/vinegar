@@ -241,15 +241,28 @@ mid-flight. Truncate it by hand if it ever gets big enough to care about.
 Vinegar fails quietly. It reviews on a poll rather than on a webhook, so a
 daemon that is not running looks exactly like a week with no pull requests, and
 the first thing you notice is a merge nobody reviewed. `watchdog.sh` is the
-answer to that, run every five minutes by a second agent:
+answer to that, run every five minutes by a second agent.
+
+`launchd/io.sourlabs.vinegar-watchdog.plist` is a template, the same as the
+daemon's. Replace every `YOUR_USERNAME` and every `VINEGAR_PATH` before you
+copy it, or launchd gets a job whose program does not exist and whose log path
+it cannot open, which fails to spawn exactly as described above.
 
 ```sh
+mkdir -p ~/.vinegar/logs
 cp watchdog.env.example ~/.vinegar/watchdog.env
 chmod 600 ~/.vinegar/watchdog.env
 $EDITOR ~/.vinegar/watchdog.env          # a healthchecks.io URL, an ntfy topic
+$EDITOR launchd/io.sourlabs.vinegar-watchdog.plist   # YOUR_USERNAME, VINEGAR_PATH
+./watchdog.sh                            # run it once by hand; silence is a pass
 cp launchd/io.sourlabs.vinegar-watchdog.plist ~/Library/LaunchAgents/
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.sourlabs.vinegar-watchdog.plist
 ```
+
+Run it by hand once before loading it. With Vinegar up it should print nothing
+and exit 0, and a heartbeat should show up at healthchecks.io within seconds.
+That one command distinguishes a working watchdog from a watchdog that cannot
+find its config, which is a distinction the automated runs cannot make for you.
 
 Two channels, because they have different blind spots, and the less obvious one
 is the one that matters. **The heartbeat to healthchecks.io reports by
@@ -269,18 +282,22 @@ teaches you to ignore it.
 
 Nothing is logged on a healthy pass, so an empty `watchdog.log` is the good
 outcome. Only a confirmed outage and a failed send get written, the second
-because it means the alerting itself is broken.
+because it means the alerting itself is broken. With neither channel configured
+the script refuses to run at all, rather than watching in silence and reporting
+success it never sent.
 
 **Liveness is the pid file, and the pid has to be checked against what is
 actually running under it.** Log freshness will not do: Vinegar logs per event
 rather than per poll, so a healthy daemon watching quiet repos writes nothing
-for hours. But `~/.vinegar/vinegar.pid` is never removed, so it outlives every
-exit and names a dead process until the next start, and pids get reused. `kill
--0` answers "is this number taken", which after a reuse is a yes, and a
-watchdog that trusts it reports a dead Vinegar as healthy and sends nothing.
-Matching the process command line answers "is this number our daemon", which is
-the question worth asking. If you write your own check, this is the part to get
-right.
+for hours. But `~/.vinegar/vinegar.pid` outlives a crash or a kill, where the
+cleanup never runs, and then names a dead process until the next start, and
+pids get reused. `kill -0` answers "is this number taken", which after a reuse
+is a yes, and a watchdog that trusts it reports a dead Vinegar as healthy and
+sends nothing. Matching the process command line answers "is this number our
+daemon", which is the question worth asking. Use `ps -ww`, or `ps` truncates to
+the width of any terminal it can find and a long checkout path loses the
+`vinegar.py` you are matching on. If you write your own check, these are the
+parts to get right.
 
 ## What the reviewer is allowed to do
 

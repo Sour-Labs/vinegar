@@ -41,26 +41,50 @@ log() {
     printf '%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$1"
 }
 
+# Refuse to run with no channel at all, rather than watching in silence. With
+# both blank every send below is skipped, so a watchdog that was never
+# configured behaves identically to one that is working: it exits 0 on a
+# healthy pass having sent nothing, and on a real outage it writes to a local
+# log nobody reads and pages no one. That is the same "instrument reporting
+# fine" failure this script exists to catch, so it has to be loud. Missing the
+# `cp watchdog.env.example ~/.vinegar/watchdog.env` step is all it takes.
+#
+# Blanking one channel deliberately still works; only both being empty is an
+# error. stderr and a non-zero exit, because those are the two places launchd
+# keeps a record: watchdog.err.log, and `last exit code` in `launchctl print`.
+if [ -z "$HEALTHCHECK_URL" ] && [ -z "$NTFY_TOPIC" ]; then
+    log "no alerting channel: $CONF sets neither HEALTHCHECK_URL nor NTFY_TOPIC" >&2
+    exit 1
+fi
+
 # Liveness is the pid file, not the log file. Vinegar logs per event rather
 # than per poll, so a healthy daemon watching quiet repos writes nothing for
 # hours and log freshness would report it dead.
 #
 # The pid has to be checked against what is actually running under it, not just
-# for existence. Vinegar never removes the file, so it outlives every exit and
-# from then until the next start it names a process that is gone. Pids get
-# reused, so that number can come back as somebody else's process. `kill -0`
-# answers "is this number taken", which is then a yes, and the watchdog reports
-# a dead Vinegar as healthy and sends nothing. That is the one failure a
-# watchdog cannot have, and it is not hypothetical: a reboot handed pid 780 to
-# a system extension while the daemon was down. Matching the command line
-# answers "is this number our daemon" instead, which is the actual question.
+# for existence. The file survives a crash and a kill, where Vinegar's cleanup
+# never runs, and from then until the next start it names a process that is
+# gone. Pids get reused, so that number can come back as somebody else's
+# process. `kill -0` answers "is this number taken", which is then a yes, and
+# the watchdog reports a dead Vinegar as healthy and sends nothing. That is the
+# one failure a watchdog cannot have, and it is not hypothetical: a reboot
+# handed pid 780 to a system extension while the daemon was down. Matching the
+# command line answers "is this number our daemon" instead, which is the actual
+# question.
+#
+# `-ww` is load-bearing. Without it `ps` truncates to the width of whatever
+# terminal it can find on stdin, stdout or stderr, so redirecting stdout alone
+# does not widen it. launchd gives the job no terminal and it comes out full
+# width, but run this by hand from an 80-column window and a long checkout path
+# is cut at 79 characters, `.py` never appears, and the script pages you about
+# a daemon that is running perfectly.
 is_alive() {
     [ -r "$PIDFILE" ] || return 1
     pid="$(cat "$PIDFILE" 2>/dev/null)"
     case "$pid" in
         '' | *[!0-9]*) return 1 ;;
     esac
-    ps -p "$pid" -o command= 2>/dev/null | grep -q 'vinegar\.py'
+    ps -ww -p "$pid" -o command= 2>/dev/null | grep -q 'vinegar\.py'
 }
 
 # A single failed check is not news, and alerting on one is how a watchdog
