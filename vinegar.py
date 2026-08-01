@@ -79,8 +79,8 @@ DONE, FAILED = "reviewed", "failed"
 # into a review every minute forever.
 MAX_ATTEMPTS = 3
 
-PR_FIELDS = ("number,title,headRefOid,isDraft,author,additions,deletions,"
-             "isCrossRepository,url")
+PR_FIELDS = ("number,title,headRefOid,baseRefName,isDraft,author,additions,"
+             "deletions,isCrossRepository,url")
 
 DEFAULTS = {
     "repos": [],
@@ -364,13 +364,30 @@ def checkout(repo, pr, env):
     # time. It is what makes `git fetch` use GH_TOKEN, so if it ever fails to
     # write, a private repo stops fetching until someone finds a config write
     # that failed days earlier.
+    #
+    # The base branch is refreshed too, and that is not housekeeping. Fetching
+    # only the pull request head leaves the clone's base branch frozen at clone
+    # time, so it falls further behind every merge, and `git diff <base>...HEAD`
+    # then reports already-merged work as part of the pull request. Measured on
+    # this repo: reviewing #7 against a base three merges stale showed five
+    # changed files where the pull request had four, the extra one being
+    # `vinegar.py` from #5 and #6. Every review of this repo so far hit it,
+    # noticed, and re-scoped by hand, which is effort spent per review and a
+    # correctness risk for any pass that does not think to check.
+    #
+    # It goes last because it cannot go earlier. Fetching into a branch that is
+    # checked out is refused, and a fresh clone sits on that branch, so this
+    # only works once HEAD is detached.
+    base = pr["baseRefName"]
     steps = (["git", "config", "--local",
               "credential.https://github.com.helper", "!gh auth git-credential"],
              ["git", "fetch", "--quiet", "origin",
               "pull/%d/head" % pr["number"]],
              ["git", "reset", "--quiet", "--hard"],
              ["git", "clean", "-qfd"],
-             ["git", "checkout", "--quiet", "--detach", pr["headRefOid"]])
+             ["git", "checkout", "--quiet", "--detach", pr["headRefOid"]],
+             ["git", "fetch", "--quiet", "--force", "origin",
+              "%s:%s" % (base, base)])
     for step in steps:
         result = run(step, cwd=path, env=env)
         if result.returncode != 0:
