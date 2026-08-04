@@ -81,15 +81,17 @@ DONE, FAILED = "reviewed", "failed"
 # into a review every minute forever.
 MAX_ATTEMPTS = 3
 
-# Seconds of token life reserved for the checkout and the posting, on top of
-# the review's own budget. One token covers all three, and they run in that
-# order: a clone of a large repository over a slow link is minutes, and asking
-# only for `review_timeout` can hand back a token that dies before the review
-# is posted. That post is the entire output, and the outcome is recorded
-# either way, so the pull request is marked reviewed with its findings lost.
-# The margin matters more now than it did: the review is posted after the
-# reviewer exits rather than by the reviewer while it works, so the posting
-# happens at the very end of the token's life rather than throughout it.
+# Seconds of token life reserved for the checkout, on top of the review's own
+# budget. One token covers both and the checkout runs first: a clone of a
+# large repository over a slow link is minutes, so asking only for
+# `review_timeout` can hand back a token that dies part-way through the
+# review, taking with it the `gh` calls the review makes to read the pull
+# request.
+#
+# It deliberately does not have to cover the posting as well. That happens
+# after a review which may have consumed the entire `review_timeout`, and at
+# the timeouts people actually configure no obtainable token is guaranteed to
+# survive that far. POST_GRACE asks for a fresh one at that point instead.
 CHECKOUT_GRACE = 600
 
 # Enough life for `gh pr list`, which is one call. This is not zero because the
@@ -100,6 +102,13 @@ LISTING_GRACE = 60
 
 PR_FIELDS = ("number,title,headRefOid,baseRefName,isDraft,author,additions,"
              "deletions,isCrossRepository,url")
+
+# Seconds of token life asked for immediately before the review is posted.
+# The token minted at the top cannot be relied on here: it has to survive the
+# checkout and the whole review first, and `review_timeout` alone can consume
+# more life than a token has. Whatever is left at that point, this asks for a
+# usable token now, when the only work remaining is one or two API calls.
+POST_GRACE = 300
 
 # Characters a review comment may carry. GitHub's own ceiling is 65536 and it
 # refuses the whole review for going over, which on the path that posts the
@@ -543,15 +552,23 @@ def parse_findings(text):
             continue
         candidates.append(json.dumps(value))
 
+    # Findings first, an empty array only if nothing else parsed. `all()` is
+    # true of an empty list, so a bare `[]` anywhere in the message satisfies
+    # the shape test vacuously: a markdown `- [ ]` item, or prose naming the
+    # empty array, would otherwise shadow the real findings and turn a review
+    # that found six things into a confident "No findings.".
+    empty = False
     for candidate in candidates:
         try:
             findings = json.loads(candidate)
         except json.JSONDecodeError:
             continue
-        if isinstance(findings, list) and all(
-                isinstance(finding, dict) for finding in findings):
+        if not isinstance(findings, list):
+            continue
+        if findings and all(isinstance(f, dict) for f in findings):
             return findings
-    return None
+        empty = empty or not findings
+    return [] if empty else None
 
 
 def diff_lines(path, base, env):
@@ -577,7 +594,12 @@ def diff_lines(path, base, env):
     `--unified=0` an added line whose own text begins with `++ ` produces one
     that looks exactly like a file header.
     """
-    result = run(["git", "diff", "--unified=0",
+    # core.quotepath is on by default and prints a non-ASCII path as
+    # `"b/caf\303\251.py"`, quotes and all, which matches no finding's `file`
+    # and would route every finding in that file to the general comment. A
+    # path holding a quote or a backslash is still escaped even so, and still
+    # degrades that way; that is the safe direction and the rarer case.
+    result = run(["git", "-c", "core.quotepath=false", "diff", "--unified=0",
                   "--src-prefix=a/", "--dst-prefix=b/",
                   "%s...HEAD" % base], cwd=path, env=env)
     if result.returncode != 0:
@@ -614,13 +636,37 @@ def repo_path(name, root):
     into the checkout despite being asked not to, and a finding is worth more
     routed to the general comment than dropped, so anything that does not
     resolve inside the checkout returns None rather than raising.
+
+    normpath because `./vinegar.py` and `src//app.py` both name a file that is
+    in the diff and neither matches the key git prints for it. The absolute
+    branch is normalised by relpath already.
     """
     if not isinstance(name, str) or not name.strip():
         return None
     name = name.strip()
-    if os.path.isabs(name):
-        name = os.path.relpath(name, root)
+    name = (os.path.relpath(name, root) if os.path.isabs(name)
+            else os.path.normpath(name))
     return None if name.startswith("..") else name
+
+
+def finding_line(finding):
+    """The line a finding anchors to, as an int, or None.
+
+    A model asked for `line` answers with `812`, `"812"` or `812.0`
+    interchangeably. Only the first anchors an inline comment, and the other
+    two would otherwise cost the finding both its anchor and, in the general
+    listing, the line number that says where to look.
+
+    bool is an int to Python and True would anchor at line 1, so it is not
+    one of the answers accepted here.
+    """
+    line = finding.get("line")
+    if isinstance(line, bool):
+        return None
+    try:
+        return int(line)
+    except (TypeError, ValueError):
+        return None
 
 
 def describe(finding):
@@ -635,11 +681,8 @@ def split_findings(findings, covered, root):
     inline, general = [], []
     for finding in findings:
         name = repo_path(finding.get("file"), root)
-        line = finding.get("line")
-        # bool is an int, and True would index line 1 of the file.
-        anchored = (name and isinstance(line, int) and not isinstance(line, bool)
-                    and line in covered.get(name, ()))
-        if anchored:
+        line = finding_line(finding)
+        if name and line is not None and line in covered.get(name, ()):
             inline.append({"path": name, "line": line, "side": "RIGHT",
                            "body": describe(finding)})
         else:
@@ -647,7 +690,8 @@ def split_findings(findings, covered, root):
     return inline, general
 
 
-def review_body(pr, config, inline, general, raw=None):
+def review_body(pr, config, inline, general, raw=None,
+                heading="These could not be anchored in the diff:"):
     """The review's top-level comment.
 
     Always present, and not only because the endpoint requires one for a
@@ -655,6 +699,12 @@ def review_body(pr, config, inline, general, raw=None):
     over: a pull request Vinegar reviewed says so, including when the answer
     was that there is nothing to report. Silence has to keep meaning that
     something went wrong.
+
+    `heading` is a parameter because the retry path lists findings that could
+    be anchored perfectly well and were refused for some other reason. Saying
+    they could not be anchored there would send whoever is debugging to
+    diff_lines and the base branch instead of to the error submit_review
+    logged.
     """
     lines = ["**Vinegar** · reviewed `%s` at %s effort" % (
         pr["headRefOid"][:7], config["effort"])]
@@ -671,11 +721,11 @@ def review_body(pr, config, inline, general, raw=None):
             total, "" if total == 1 else "s", len(inline))]
 
     if general:
-        lines += ["", "These could not be anchored in the diff:", ""]
+        lines += ["", heading, ""]
         for finding in general:
             where = str(finding.get("file", "")).strip() or "(no file)"
-            line = finding.get("line")
-            if isinstance(line, int) and not isinstance(line, bool):
+            line = finding_line(finding)
+            if line is not None:
                 where += ":%d" % line
             lines.append("- `%s`: %s" % (
                 where, describe(finding).replace("\n\n", "\n  ")))
@@ -759,11 +809,13 @@ def post_review(repo, pr, path, text, config, env):
     # that needs no anchor at all.
     log("%s: retrying with every finding in the review comment" % label)
     payload.pop("comments")
-    payload["body"] = review_body(pr, config, [], findings)
+    payload["body"] = review_body(
+        pr, config, [], findings,
+        heading="GitHub refused the inline comments, so all of it is here:")
     submit_review(repo, pr, payload, env)
 
 
-def review(path, repo, pr, config, env):
+def review(path, repo, pr, config, env, tokens):
     prompt = "/code-review %s %d" % (config["effort"], pr["number"])
 
     # The review reads a diff that Vinegar did not write, so it runs under
@@ -807,7 +859,9 @@ def review(path, repo, pr, config, env):
     except subprocess.TimeoutExpired:
         # A timeout burned the budget it burned. Retrying would burn it again.
         log("%s: killed after %ds" % (label, config["review_timeout"]))
-        post_timeout(repo, pr, config, config["review_timeout"], env)
+        post_timeout(repo, pr, config, config["review_timeout"],
+                     github_env(config, repo, tokens,
+                                good_for=POST_GRACE))
         return DONE
     took = round(time.monotonic() - started)
 
@@ -851,7 +905,13 @@ def review(path, repo, pr, config, env):
     # posted is still a review someone can read. The outcome stays DONE
     # either way: the subscription is spent by this point, and re-running a
     # review to recover from a failed post would spend it again.
-    post_review(repo, pr, path, text, config, env)
+    # A fresh token, rather than the one minted before the checkout. That one
+    # had to outlast the clone and the whole review, and at a `review_timeout`
+    # near the hour a token lives it cannot be guaranteed to. Posting is the
+    # entire output of the run, and this is the last moment it can be made
+    # safe cheaply.
+    post_review(repo, pr, path, text, config,
+                github_env(config, repo, tokens, good_for=POST_GRACE))
     return DONE
 
 
@@ -941,7 +1001,7 @@ def handle_pr(repo, pr, config, state, tokens):
         log("%s: checkout failed: %s" % (key, err))
         return
 
-    outcome = review(path, repo, pr, config, env)
+    outcome = review(path, repo, pr, config, env, tokens)
     attempts = done.get("attempts", 0) + 1 if done.get("sha") == head else 1
     state[key] = {"outcome": outcome, "sha": head, "attempts": attempts}
     save_state(state)
@@ -1078,8 +1138,8 @@ def main():
         if args.pr:
             repo = args.pr.partition("#")[0]
             # The same sum handle_pr() asks for, and for the same reason: one
-            # token covers the checkout, the review, and now the posting that
-            # follows the review rather than happening during it.
+            # token covers the checkout and the review that follows it. The
+            # posting asks for its own, in review().
             env = github_env(config, repo, tokens,
                              good_for=CHECKOUT_GRACE + config["review_timeout"])
             pr = find_pr(args.pr, env)
@@ -1087,7 +1147,8 @@ def main():
             if reason:
                 log("%s: would be skipped (%s), reviewing anyway" % (
                     args.pr, reason))
-            review(checkout(repo, pr, env), repo, pr, config, env)
+            review(checkout(repo, pr, env), repo, pr, config, env,
+                   tokens)
             return
 
         state = load_state()
