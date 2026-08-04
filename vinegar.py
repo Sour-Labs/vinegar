@@ -81,12 +81,15 @@ DONE, FAILED = "reviewed", "failed"
 # into a review every minute forever.
 MAX_ATTEMPTS = 3
 
-# Seconds of token life reserved for the checkout, on top of the review's own
-# budget. One token covers both, and the checkout runs first: a clone of a
-# large repository over a slow link is minutes, and asking only for
-# `review_timeout` can hand back a token that dies while the review is posting
-# its comments. Those posts are the entire output, and the outcome is recorded
+# Seconds of token life reserved for the checkout and the posting, on top of
+# the review's own budget. One token covers all three, and they run in that
+# order: a clone of a large repository over a slow link is minutes, and asking
+# only for `review_timeout` can hand back a token that dies before the review
+# is posted. That post is the entire output, and the outcome is recorded
 # either way, so the pull request is marked reviewed with its findings lost.
+# The margin matters more now than it did: the review is posted after the
+# reviewer exits rather than by the reviewer while it works, so the posting
+# happens at the very end of the token's life rather than throughout it.
 CHECKOUT_GRACE = 600
 
 # Enough life for `gh pr list`, which is one call. This is not zero because the
@@ -454,11 +457,19 @@ def reviewer_brief(pr):
     `main`. On a pull request that targets anything else, that is not the
     pull request's diff at all, and the reviewer has no way to tell.
 
-    And who posts. Vinegar now submits the review itself, in one piece, so a
-    finding the reviewer keeps to itself is a finding nobody ever sees. The
-    field names match the output contract /code-review already asks for at
-    this point, so this repeats that contract rather than competing with it,
-    and a review still lands if a future release changes the wording.
+    And how to hand the findings back. Vinegar submits the review itself, in
+    one piece, so a finding the reviewer keeps to itself is a finding nobody
+    ever sees.
+
+    That half spells the contract out rather than deferring to the one
+    /code-review sets, which an earlier version did, to its cost. Which
+    contract that is depends on whether a findings-reporting tool is in the
+    session: with one, the review is asked to report through the tool and
+    told not to print the findings as text. Only the process's final message
+    reaches Vinegar, so under that contract the findings never arrive. The
+    first live run came back with no array at all, and the review was posted
+    as prose. Asking for the JSON block outright works under either contract,
+    because a review can call the tool and still end with the block.
 
     Both go in the system prompt rather than after the command, because
     everything after the effort level is collapsed into /code-review's review
@@ -471,12 +482,16 @@ def reviewer_brief(pr):
         "pull request's base branch is `%s`, already fetched into this clone. "
         "`git diff %s...HEAD` is the review scope. Do not guess a base branch "
         "and do not assume `main`.\n\n"
-        "Post nothing to GitHub yourself. Return every finding in the JSON "
-        "array your output contract describes, each with `file`, `line`, "
-        "`summary` and `failure_scenario`, and `[]` when you found nothing. "
-        "Give `file` relative to the repository root. Vinegar reads that "
-        "array and posts the whole review in one piece, so a finding you "
-        "leave out of it is a finding nobody sees."
+        "Post nothing to GitHub yourself, and do not rely on a "
+        "findings-reporting tool to hand your findings over: a tool call does "
+        "not reach Vinegar. Whatever else you are told to do with them, and "
+        "even if you also report them some other way, end your final message "
+        "with a fenced ```json block holding an array of every finding, each "
+        "an object with `file`, `line`, `summary` and `failure_scenario`. Use "
+        "an empty array when you found nothing, and give `file` relative to "
+        "the repository root. That block is the only part of your answer "
+        "Vinegar can read, and it posts the whole review from it, so a "
+        "finding missing from it is a finding nobody sees."
         % (pr["number"], base, base))
 
 
@@ -486,8 +501,23 @@ def parse_findings(text):
     None and `[]` are different answers and the caller treats them that way:
     an empty array is the reviewer saying it found nothing, while None is the
     reviewer having said something Vinegar cannot read.
+
+    A fenced block is what reviewer_brief() asks for, so it is tried first and
+    last-first, the last being the answer rather than an example. An array
+    with no fence around it is tried after that: the fence is a formatting
+    instruction like any other, and losing a whole review to a missing pair
+    of backticks is a bad trade for four lines.
     """
-    for block in reversed(re.findall(r"```(?:json)?\s*\n(.*?)```", text, re.S)):
+    candidates = re.findall(r"```(?:json)?\s*\n(.*?)```", text, re.S)[::-1]
+
+    # Widest first, so an array nested inside the real one cannot win. Prose
+    # routinely contains a `[` that opens nothing, hence trying each in turn
+    # rather than only the first.
+    end = text.rfind("]")
+    candidates += [text[start.start():end + 1]
+                   for start in re.finditer(r"\[", text) if start.start() < end]
+
+    for block in candidates:
         try:
             findings = json.loads(block)
         except json.JSONDecodeError:
@@ -509,20 +539,38 @@ def diff_lines(path, base, env):
     the context around them. A deletion-only hunk reports `+n,0`, which is an
     empty range and correctly contributes no line: nothing was added there for
     a comment to sit on.
+
+    The prefixes are pinned rather than assumed. `diff.noprefix` and
+    `diff.mnemonicPrefix` are both real settings that change what precedes
+    the path, and reading a fixed two characters off the front under either
+    of them would truncate every path and send every finding to the general
+    comment.
+
+    `+++ ` only counts between `diff --git` and the first hunk, because at
+    `--unified=0` an added line whose own text begins with `++ ` produces one
+    that looks exactly like a file header.
     """
-    result = run(["git", "diff", "--unified=0", "%s...HEAD" % base],
-                 cwd=path, env=env)
+    result = run(["git", "diff", "--unified=0",
+                  "--src-prefix=a/", "--dst-prefix=b/",
+                  "%s...HEAD" % base], cwd=path, env=env)
     if result.returncode != 0:
+        # Every finding is about to be routed to the general comment. Say why
+        # here, because the comment itself can only report the effect.
+        log("cannot diff %s...HEAD, no finding can be anchored: %s"
+            % (base, result.stderr.strip()[:200]))
         return {}
 
-    covered, name = {}, None
+    covered, name, heading = {}, None, False
     for line in result.stdout.splitlines():
-        if line.startswith("+++ "):
+        if line.startswith("diff --git "):
+            name, heading = None, True
+        elif heading and line.startswith("+++ "):
             target = line[4:]
             # /dev/null is a delete, and there is no head-side file to
             # comment on. The b/ prefix is git's, not part of the path.
             name = None if target == "/dev/null" else target[2:]
         elif name and line.startswith("@@"):
+            heading = False
             hunk = re.match(r"@@ -\S+ \+(\d+)(?:,(\d+))? @@", line)
             if hunk:
                 start, count = int(hunk.group(1)), int(hunk.group(2) or 1)
@@ -559,8 +607,6 @@ def split_findings(findings, covered, root):
     """Route each finding to an inline comment or to the general comment."""
     inline, general = [], []
     for finding in findings:
-        if not isinstance(finding, dict):
-            continue
         name = repo_path(finding.get("file"), root)
         line = finding.get("line")
         # bool is an int, and True would index line 1 of the file.
@@ -629,6 +675,18 @@ def post_review(repo, pr, path, text, config, env):
     """Turn what the reviewer returned into one review on the pull request."""
     label = "%s#%d" % (repo, pr["number"])
     findings = parse_findings(text)
+
+    # An array whose entries are not findings is not an empty review, and the
+    # difference matters: dropping the entries it cannot read would leave
+    # Vinegar posting a confident "No findings." on a pull request that had
+    # some. Anything unreadable in there disqualifies the whole array and the
+    # reviewer's own words are posted instead.
+    if findings is not None and not all(
+            isinstance(finding, dict) for finding in findings):
+        log("%s: the findings array holds entries that are not findings, "
+            "posting the reviewer's text instead" % label)
+        findings = None
+
     if findings is None:
         log("%s: the reviewer returned no findings array, posting its text "
             "as the review" % label)
@@ -664,8 +722,7 @@ def post_review(repo, pr, path, text, config, env):
     # that needs no anchor at all.
     log("%s: retrying with every finding in the review comment" % label)
     payload.pop("comments")
-    payload["body"] = review_body(pr, config, [], [
-        finding for finding in findings if isinstance(finding, dict)])
+    payload["body"] = review_body(pr, config, [], findings)
     submit_review(repo, pr, payload, env)
 
 
@@ -973,8 +1030,11 @@ def main():
     try:
         if args.pr:
             repo = args.pr.partition("#")[0]
+            # The same sum handle_pr() asks for, and for the same reason: one
+            # token covers the checkout, the review, and now the posting that
+            # follows the review rather than happening during it.
             env = github_env(config, repo, tokens,
-                             good_for=config["review_timeout"])
+                             good_for=CHECKOUT_GRACE + config["review_timeout"])
             pr = find_pr(args.pr, env)
             reason = skip_reason(pr, config)
             if reason:
