@@ -79,8 +79,8 @@ DONE, FAILED = "reviewed", "failed"
 # into a review every minute forever.
 MAX_ATTEMPTS = 3
 
-PR_FIELDS = ("number,title,headRefOid,isDraft,author,additions,deletions,"
-             "isCrossRepository,url")
+PR_FIELDS = ("number,title,headRefOid,baseRefName,isDraft,author,additions,"
+             "deletions,isCrossRepository,url")
 
 DEFAULTS = {
     "repos": [],
@@ -376,6 +376,37 @@ def checkout(repo, pr, env):
         if result.returncode != 0:
             raise RuntimeError("%s failed: %s" % (" ".join(step),
                                                   result.stderr.strip()))
+
+    # Refreshing the base branch is not housekeeping. Fetching only the pull
+    # request head leaves the clone's base frozen at clone time, so it falls
+    # further behind every merge, and `git diff <base>...HEAD` then reports
+    # already-merged work as part of the pull request. Measured on this repo:
+    # reviewing #7 against a base three merges stale showed five changed files
+    # where the pull request had four, the extra one being `vinegar.py` from #5
+    # and #6. Every review of this repo so far hit it, noticed, and re-scoped by
+    # hand, which is effort spent per review and a correctness risk for any pass
+    # that does not think to check.
+    #
+    # It happens here, after the loop, for two separate reasons.
+    #
+    # It cannot happen earlier: git refuses to fetch into a branch that is
+    # checked out, and a fresh clone sits on exactly that branch, so this only
+    # works once HEAD is detached.
+    #
+    # And it must not be able to fail the checkout, which is why it is not just
+    # a sixth step. By this point the tree is already on the right commit and is
+    # perfectly reviewable; a stale base only widens the diff, which is the
+    # state every review was in before this existed. A failed checkout is worse
+    # than that, and worse than it looks: handle_pr() records no state when
+    # checkout() raises, so MAX_ATTEMPTS never applies, and anything persistent
+    # would log one line per poll forever with the pull request never reviewed
+    # and never given up on.
+    base = pr["baseRefName"]
+    result = run(["git", "fetch", "--quiet", "--force", "origin",
+                  "%s:%s" % (base, base)], cwd=path, env=env)
+    if result.returncode != 0:
+        log("%s#%d: base %s not refreshed, the diff may include merged work: %s"
+            % (repo, pr["number"], base, result.stderr.strip()))
     return path
 
 
