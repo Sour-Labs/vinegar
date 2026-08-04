@@ -529,6 +529,14 @@ def parse_findings(text):
     An array with no fence around it is tried after that. `raw_decode` reads
     one value and ignores what follows, so a closing sentence, or a stray
     bracket in the prose, cannot swallow or truncate it.
+
+    An array has to hold something shaped like a finding, because "objects"
+    alone is a shape plenty of other things have. A review that quotes a JSON
+    payload while explaining itself, this file's own `comments` array being
+    the obvious one, hands over a nested array of dicts that would otherwise
+    be accepted the moment the real block failed to parse. The result would be
+    a confident review of one finding with no file and no summary, posted in
+    place of the reviewer's actual words.
     """
     candidates, block, open_fence = [], None, False
     for line in text.splitlines():
@@ -567,13 +575,15 @@ def parse_findings(text):
             continue
         if not isinstance(findings, list):
             continue
-        if findings and all(isinstance(f, dict) for f in findings):
+        if findings and all(isinstance(f, dict) for f in findings) and any(
+                key in finding for finding in findings
+                for key in ("file", "summary", "failure_scenario")):
             return findings
         empty = empty or (was_fenced and not findings)
     return [] if empty else None
 
 
-def diff_lines(path, base, env):
+def diff_lines(path, base, env, label):
     """The head-side line numbers the pull request's diff covers, per file.
 
     This decides which findings can be inline comments. The reviews endpoint
@@ -596,19 +606,33 @@ def diff_lines(path, base, env):
     `--unified=0` an added line whose own text begins with `++ ` produces one
     that looks exactly like a file header.
     """
+    # Every one of these pins something the repository under review could
+    # otherwise decide for it, and the diff has to describe the file as
+    # GitHub will see it.
+    #
     # core.quotepath is on by default and prints a non-ASCII path as
     # `"b/caf\303\251.py"`, quotes and all, which matches no finding's `file`
     # and would route every finding in that file to the general comment. A
     # path holding a quote or a backslash is still escaped even so, and still
     # degrades that way; that is the safe direction and the rarer case.
+    #
+    # --no-textconv and --no-ext-diff because a `.gitattributes` in the pull
+    # request can name a converter, and nbdime on `*.ipynb` is a normal thing
+    # to find. The hunk headers then count lines in the converted text, which
+    # can still land inside GitHub's range for that file, so the review is
+    # accepted and the comments attach to whatever happens to be at those
+    # numbers. Wrong lines, confidently placed, are worse than no lines. An
+    # external driver does not print a unified diff at all, which is the
+    # harmless half of the same setting.
     result = run(["git", "-c", "core.quotepath=false", "diff", "--unified=0",
+                  "--no-textconv", "--no-ext-diff",
                   "--src-prefix=a/", "--dst-prefix=b/",
                   "%s...HEAD" % base], cwd=path, env=env)
     if result.returncode != 0:
         # Every finding is about to be routed to the general comment. Say why
         # here, because the comment itself can only report the effect.
-        log("cannot diff %s...HEAD, no finding can be anchored: %s"
-            % (base, result.stderr.strip()[:200]))
+        log("%s: cannot diff %s...HEAD, no finding can be anchored: %s"
+            % (label, base, result.stderr.strip()[:200]))
         return {}
 
     covered, name, heading = {}, None, False
@@ -712,7 +736,13 @@ def review_body(pr, config, inline, general, raw=None,
         pr["headRefOid"][:7], config["effort"])]
 
     total = len(inline) + len(general)
-    if raw is not None:
+    if raw is not None and not raw.strip():
+        # Distinct from unreadable output, because the two send you to
+        # different places: this one to whether the reviewer ran at all.
+        lines += ["", "The review finished without saying anything. There are "
+                      "no findings to show and no words to quote, which means "
+                      "the run produced nothing, not that the change is clean."]
+    elif raw is not None:
         lines += ["", "The reviewer did not return its findings in a form "
                       "Vinegar could read, so its own words follow unedited.",
                   "", "---", "", raw.strip()]
@@ -746,8 +776,14 @@ def submit_review(repo, pr, payload, env):
                  env=env, stdin_text=json.dumps(payload))
     if result.returncode == 0:
         return True
+    # Both streams. `gh api` puts a one-line summary on stderr and GitHub's
+    # own body on stdout, and the body is the half that names which comment
+    # was refused and why. Logging stderr alone left the retry's comment
+    # telling the reader to consult an error that does not say.
     log("%s#%d: posting the review failed: %s" % (
-        repo, pr["number"], result.stderr.strip()[:400]))
+        repo, pr["number"],
+        " ".join(part.strip() for part in (result.stderr, result.stdout)
+                 if part and part.strip())[:600]))
     return False
 
 
@@ -806,7 +842,7 @@ def post_review(repo, pr, path, text, config, env):
         inline, general, raw = [], [], text
     else:
         inline, general = split_findings(
-            findings, diff_lines(path, pr["baseRefName"], env), path)
+            findings, diff_lines(path, pr["baseRefName"], env, label), path)
         raw = None
 
     if not config["comment"]:
@@ -824,7 +860,16 @@ def post_review(repo, pr, path, text, config, env):
         log("%s: posted %d inline comment(s) and the review comment" % (
             label, len(inline)))
         return
+
     if not inline:
+        # Nothing to strip out, so the same request again. A review with no
+        # inline comments cannot have been refused over an anchor, which
+        # leaves the transient failures a second attempt is exactly right
+        # for. Without this a clean review, or the reviewer's own words, met
+        # one 502 and the pull request received nothing at all, for good:
+        # the outcome is recorded reviewed and `review_on_push` is false.
+        log("%s: retrying the review comment" % label)
+        submit_review(repo, pr, payload, env)
         return
 
     # The endpoint took none of it, and the likeliest reason is an anchor it
