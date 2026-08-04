@@ -7,7 +7,6 @@
       "Glob",
       "Task",
       "TodoWrite",
-      "ReportFindings",
       "Bash(git diff:*)",
       "Bash(git log:*)",
       "Bash(git show:*)",

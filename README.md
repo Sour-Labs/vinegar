@@ -493,6 +493,15 @@ the whole review in one request when the run finishes. Findings still arrive as
 separate inline comments anchored to their line; what changed is that they all
 appear at the same moment.
 
+Getting the findings back takes one non-obvious flag: `/code-review` is run with
+`--disallowedTools ReportFindings`. That command picks its output contract from
+whether that tool is in the session. With it, the review reports through the
+tool and is told not to print its findings as text, and a tool call does not
+reach the process's final message, which is all Vinegar reads. Withholding it
+makes `/code-review` ask for a JSON array in the message instead. Two live
+reviews were lost before this was understood: both came back as prose, and both
+were posted as raw text with no inline comments.
+
 That timing is the point. The comments appearing is how you know the round is
 finished and the feedback is complete enough to hand to an agent. While the
 reviewer posted as it worked, three comments could mean three findings or could

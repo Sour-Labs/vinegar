@@ -101,6 +101,12 @@ LISTING_GRACE = 60
 PR_FIELDS = ("number,title,headRefOid,baseRefName,isDraft,author,additions,"
              "deletions,isCrossRepository,url")
 
+# Characters a review comment may carry. GitHub's own ceiling is 65536 and it
+# refuses the whole review for going over, which on the path that posts the
+# reviewer's message verbatim would mean posting nothing at all. The reviewer
+# decides that message's length, not Vinegar, so it is cut to fit.
+MAX_BODY = 60000
+
 DEFAULTS = {
     "repos": [],
     "poll_interval": 60,
@@ -462,37 +468,37 @@ def reviewer_brief(pr):
     ever sees.
 
     That half spells the contract out rather than deferring to the one
-    /code-review sets, which an earlier version did, to its cost. Which
-    contract that is depends on whether a findings-reporting tool is in the
-    session: with one, the review is asked to report through the tool and
-    told not to print the findings as text. Only the process's final message
-    reaches Vinegar, so under that contract the findings never arrive. The
-    first live run came back with no array at all, and the review was posted
-    as prose. Asking for the JSON block outright works under either contract,
-    because a review can call the tool and still end with the block.
+    /code-review sets, which an earlier version did, to its cost. See the
+    --disallowedTools note in review() for why the two used to disagree.
 
     Both go in the system prompt rather than after the command, because
     everything after the effort level is collapsed into /code-review's review
     target and a sentence there would be read as the thing to review.
+
+    The base branch is described as what it is rather than promised, and the
+    reviewer is given somewhere to go when it does not resolve. checkout()
+    treats a failed base fetch as non-fatal on purpose, so the ref named here
+    is the right one to use and not always one that exists locally. Telling a
+    reviewer to diff against a missing ref and forbidding any alternative
+    leaves it with the guess this exists to prevent.
     """
     base = pr["baseRefName"]
     return (
         "This checkout is detached at the head commit of pull request #%d, so "
         "it has no upstream branch and `@{upstream}` does not resolve. The "
-        "pull request's base branch is `%s`, already fetched into this clone. "
-        "`git diff %s...HEAD` is the review scope. Do not guess a base branch "
-        "and do not assume `main`.\n\n"
-        "Post nothing to GitHub yourself, and do not rely on a "
-        "findings-reporting tool to hand your findings over: a tool call does "
-        "not reach Vinegar. Whatever else you are told to do with them, and "
-        "even if you also report them some other way, end your final message "
-        "with a fenced ```json block holding an array of every finding, each "
-        "an object with `file`, `line`, `summary` and `failure_scenario`. Use "
-        "an empty array when you found nothing, and give `file` relative to "
-        "the repository root. That block is the only part of your answer "
-        "Vinegar can read, and it posts the whole review from it, so a "
-        "finding missing from it is a finding nobody sees."
-        % (pr["number"], base, base))
+        "pull request targets `%s`, which should be fetched into this clone: "
+        "`git diff %s...HEAD` is the review scope. If that ref does not "
+        "resolve, fall back to `gh pr diff %d` and say in your summary that "
+        "you did. Do not substitute a branch of your own choosing, and do not "
+        "assume `main`.\n\n"
+        "Post nothing to GitHub yourself. End your final message with a "
+        "fenced ```json block holding an array of every finding, each an "
+        "object with `file`, `line`, `summary` and `failure_scenario`. Use an "
+        "empty array when you found nothing, and give `file` relative to the "
+        "repository root. That block is the only part of your answer Vinegar "
+        "can read, and it posts the whole review from it, so a finding "
+        "missing from it is a finding nobody sees."
+        % (pr["number"], base, base, pr["number"]))
 
 
 def parse_findings(text):
@@ -502,27 +508,48 @@ def parse_findings(text):
     an empty array is the reviewer saying it found nothing, while None is the
     reviewer having said something Vinegar cannot read.
 
-    A fenced block is what reviewer_brief() asks for, so it is tried first and
-    last-first, the last being the answer rather than an example. An array
-    with no fence around it is tried after that: the fence is a formatting
-    instruction like any other, and losing a whole review to a missing pair
-    of backticks is a bad trade for four lines.
+    An array whose entries are not all objects is not findings, and reading it
+    as an empty review would put a confident "No findings." on a pull request
+    that had some. It counts as unreadable instead.
+
+    Fenced blocks are found by tracking the fences down the message rather
+    than by pairing them with a regex. A regex pairs them left to right, so
+    one earlier code block in the summary shifts every pair after it and the
+    real block at the end is never seen.
+
+    An array with no fence around it is tried after that. `raw_decode` reads
+    one value and ignores what follows, so a closing sentence, or a stray
+    bracket in the prose, cannot swallow or truncate it.
     """
-    candidates = re.findall(r"```(?:json)?\s*\n(.*?)```", text, re.S)[::-1]
+    candidates, block, fenced = [], None, False
+    for line in text.splitlines():
+        marker = line.strip().startswith("```")
+        if marker and not fenced:
+            block, fenced = [], True
+        elif marker and fenced:
+            candidates.append("\n".join(block))
+            block, fenced = None, False
+        elif fenced:
+            block.append(line)
 
-    # Widest first, so an array nested inside the real one cannot win. Prose
-    # routinely contains a `[` that opens nothing, hence trying each in turn
-    # rather than only the first.
-    end = text.rfind("]")
-    candidates += [text[start.start():end + 1]
-                   for start in re.finditer(r"\[", text) if start.start() < end]
+    # Last first: the answer is at the end, and anything earlier is an example.
+    candidates.reverse()
 
-    for block in candidates:
+    decoder = json.JSONDecoder()
+    for start in reversed([hit.start() for hit in re.finditer(r"\[", text)]):
         try:
-            findings = json.loads(block)
+            value, _ = decoder.raw_decode(text[start:])
+        except ValueError:
+            continue
+        candidates.append(json.dumps(value))
+
+    for candidate in candidates:
+        try:
+            findings = json.loads(candidate)
         except json.JSONDecodeError:
             continue
-        if isinstance(findings, list):
+        if isinstance(findings, list) and all(
+                isinstance(finding, dict) for finding in findings):
             return findings
     return None
 
@@ -632,19 +659,16 @@ def review_body(pr, config, inline, general, raw=None):
     lines = ["**Vinegar** · reviewed `%s` at %s effort" % (
         pr["headRefOid"][:7], config["effort"])]
 
+    total = len(inline) + len(general)
     if raw is not None:
         lines += ["", "The reviewer did not return its findings in a form "
                       "Vinegar could read, so its own words follow unedited.",
                   "", "---", "", raw.strip()]
-        return "\n".join(lines)
-
-    total = len(inline) + len(general)
-    if not total:
+    elif not total:
         lines += ["", "No findings."]
-        return "\n".join(lines)
-
-    lines += ["", "%d finding%s, %d posted inline." % (
-        total, "" if total == 1 else "s", len(inline))]
+    else:
+        lines += ["", "%d finding%s, %d posted inline." % (
+            total, "" if total == 1 else "s", len(inline))]
 
     if general:
         lines += ["", "These could not be anchored in the diff:", ""]
@@ -655,7 +679,11 @@ def review_body(pr, config, inline, general, raw=None):
                 where += ":%d" % line
             lines.append("- `%s`: %s" % (
                 where, describe(finding).replace("\n\n", "\n  ")))
-    return "\n".join(lines)
+
+    body = "\n".join(lines)
+    if len(body) > MAX_BODY:
+        body = body[:MAX_BODY] + "\n\n(cut to fit GitHub's comment limit)"
+    return body
 
 
 def submit_review(repo, pr, payload, env):
@@ -671,22 +699,31 @@ def submit_review(repo, pr, payload, env):
     return False
 
 
+def post_timeout(repo, pr, config, seconds, env):
+    """Say on the pull request that the review was killed.
+
+    A timeout returns no text at all, so there is nothing for post_review() to
+    read and the pull request would otherwise get nothing. It is recorded as
+    reviewed and never tried again, so nothing later fills the gap either.
+    That was survivable only while the reviewer posted its findings as it
+    went, which left whatever it had found before the kill.
+    """
+    if not config["comment"]:
+        return
+    submit_review(repo, pr, {
+        "event": "COMMENT",
+        "commit_id": pr["headRefOid"],
+        "body": "**Vinegar** · review of `%s` killed after %ds\n\n"
+                "It ran past `review_timeout` and returned nothing, so there "
+                "are no findings to show. Read that as the review not "
+                "finishing, not as the change being clean."
+                % (pr["headRefOid"][:7], seconds)}, env)
+
+
 def post_review(repo, pr, path, text, config, env):
     """Turn what the reviewer returned into one review on the pull request."""
     label = "%s#%d" % (repo, pr["number"])
     findings = parse_findings(text)
-
-    # An array whose entries are not findings is not an empty review, and the
-    # difference matters: dropping the entries it cannot read would leave
-    # Vinegar posting a confident "No findings." on a pull request that had
-    # some. Anything unreadable in there disqualifies the whole array and the
-    # reviewer's own words are posted instead.
-    if findings is not None and not all(
-            isinstance(finding, dict) for finding in findings):
-        log("%s: the findings array holds entries that are not findings, "
-            "posting the reviewer's text instead" % label)
-        findings = None
-
     if findings is None:
         log("%s: the reviewer returned no findings array, posting its text "
             "as the review" % label)
@@ -735,15 +772,24 @@ def review(path, repo, pr, config, env):
     # This does not cover a CLAUDE.md in the checkout, which is still read as
     # project instructions. See "What the reviewer is allowed to do".
     #
-    # `--output-format json` is load-bearing twice over. It is how Vinegar
-    # reads the result at all, and it is also what settles the reviewer's
-    # output contract: /code-review asks for findings as a JSON array in its
-    # final message under `json` and `text`, and asks for a ReportFindings
-    # tool call otherwise. Only the first of those reaches this process.
-    # Changing this to `stream-json` would swap the contract silently, and
-    # Vinegar would post an empty review off a review that found plenty.
+    # ReportFindings is withheld, and that is what makes any of this work.
+    # /code-review picks its output contract from whether that tool is in the
+    # session: with it, the review is told to report through the tool and
+    # *not* to print the findings as text; without it, to end with a JSON
+    # array in its final message. Only the final message reaches this process.
+    # So while the tool was available the findings went somewhere Vinegar
+    # cannot see, and asking for the array in the system prompt just argued
+    # with the command. Two live reviews were lost that way, both coming back
+    # as prose with no array. Removing the tool makes /code-review ask for the
+    # array itself, which agrees with reviewer_brief() instead of fighting it.
+    #
+    # It is a flag rather than a deny in review-settings.json because that
+    # file is the security boundary, and this is not about danger. Withholding
+    # it costs nothing: the tool renders findings for an interactive UI that
+    # a daemon does not have.
     cmd = ["claude", "-p", prompt,
            "--append-system-prompt", reviewer_brief(pr),
+           "--disallowedTools", "ReportFindings",
            "--output-format", "json",
            "--settings", SETTINGS_PATH,
            "--setting-sources", "",
@@ -761,6 +807,7 @@ def review(path, repo, pr, config, env):
     except subprocess.TimeoutExpired:
         # A timeout burned the budget it burned. Retrying would burn it again.
         log("%s: killed after %ds" % (label, config["review_timeout"]))
+        post_timeout(repo, pr, config, config["review_timeout"], env)
         return DONE
     took = round(time.monotonic() - started)
 
