@@ -435,6 +435,30 @@ def save_transcript(repo, pr, text):
     return path
 
 
+def reviewer_brief(pr):
+    """Which branch this pull request targets, since nothing else says.
+
+    /code-review's own instructions reach for `git diff @{upstream}...HEAD`
+    and name `git diff main...HEAD` as the fallback when there is no
+    upstream. checkout() leaves HEAD detached, so there never is one, and the
+    fallback is what runs: every transcript so far diffed against `main`. On a
+    pull request that targets anything else that is not the pull request's
+    diff at all, and the reviewer has no way to tell that it is reviewing the
+    wrong range.
+
+    It goes in the system prompt rather than after the command, because
+    everything after the effort level is collapsed into /code-review's review
+    target and a sentence there would be read as the thing to review.
+    """
+    base = pr["baseRefName"]
+    return (
+        "This checkout is detached at the head commit of pull request #%d, so "
+        "it has no upstream branch and `@{upstream}` does not resolve. The "
+        "pull request's base branch is `%s`, already fetched into this clone. "
+        "`git diff %s...HEAD` is the review scope. Do not guess a base branch "
+        "and do not assume `main`." % (pr["number"], base, base))
+
+
 def review(path, repo, pr, config, env):
     prompt = "/code-review %s %d" % (config["effort"], pr["number"])
     if config["comment"]:
@@ -446,6 +470,7 @@ def review(path, repo, pr, config, env):
     # This does not cover a CLAUDE.md in the checkout, which is still read as
     # project instructions. See "What the reviewer is allowed to do".
     cmd = ["claude", "-p", prompt,
+           "--append-system-prompt", reviewer_brief(pr),
            "--output-format", "json",
            "--settings", SETTINGS_PATH,
            "--setting-sources", "",
