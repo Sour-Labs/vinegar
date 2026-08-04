@@ -24,14 +24,17 @@ Vinegar keeps the reviews and removes the per-review bill.
 ## How it works
 
 The reviewer is not something Vinegar implements. Claude Code already ships a
-`/code-review` command that takes a PR number, posts its findings as inline
-comments with `--comment`, and runs non-interactively:
+`/code-review` command that takes a PR number, returns its findings as JSON,
+and runs non-interactively:
 
 ```sh
-claude -p '/code-review 123 --comment'
+claude -p '/code-review 123' --output-format json
 ```
 
-Vinegar is the trigger, the router, and the calibration around that.
+Vinegar is the trigger, the router, and the calibration around that. It also
+does the posting: the reviewer returns findings and Vinegar submits them as one
+review, rather than letting comments trickle out while the reviewer works. See
+"The review".
 
 ```
 new PR (or a new head commit)
@@ -40,8 +43,11 @@ new PR (or a new head commit)
    triage: a cheap model reads the diff  ──▶  posts a sticky comment on the PR
         │
         ├─ skip    nothing here needs a reviewer
-        ├─ light   claude -p '/code-review <n> --comment'   (low/medium effort)
-        └─ full    claude -p '/code-review <n> --comment'   (high effort)
+        ├─ light   claude -p '/code-review <n>'   (low/medium effort)
+        └─ full    claude -p '/code-review <n>'   (high effort)
+                          │
+                          ▼
+                   findings returned  ──▶  one review posted on the PR
 ```
 
 A daemon on an always-on machine polls GitHub for pull requests whose head
@@ -365,11 +371,14 @@ remove the command the reviewer actually gets its diff from, so it stays.
 
 Two more that stay open for the same kind of reason:
 
-**`gh api` cannot be narrowed.** Posting an inline comment is
-`gh api repos/OWNER/REPO/pulls/N/comments`, and the matcher compares whole
-space-separated tokens, so `Bash(gh api repos/*/pulls/*/comments:*)` matches
-nothing. It is `gh api` or no posted comments. The GitHub App is what bounds
-this: the token reaches one repository, not everything you can see.
+**`gh api` is broader than the reviewer now needs.** It was allowed because
+posting an inline comment is `gh api repos/OWNER/REPO/pulls/N/comments`, and
+the matcher compares whole space-separated tokens, so
+`Bash(gh api repos/*/pulls/*/comments:*)` matches nothing: it was `gh api` or
+no posted comments. Vinegar does the posting now, so that reason is gone and
+the entry is a candidate for removal. It is still allowed today, and the
+GitHub App is what bounds it: the token reaches one repository, not everything
+you can see.
 
 **A `CLAUDE.md` in the checkout is still read.** `--setting-sources ''` covers
 `settings.json`, not the memory files, so a `CLAUDE.md` or `AGENTS.md` in the
@@ -476,6 +485,44 @@ The summary describes what the diff touches. It never claims the change is
 correct, safe, or complete: a small model will occasionally be confidently
 wrong, and a wrong summary pinned to the top of a PR is worse than none, because
 it misleads a human skimming and can anchor the reviewer that runs next.
+
+## The review
+
+The reviewer returns its findings instead of posting them, and Vinegar submits
+the whole review in one request when the run finishes. Findings still arrive as
+separate inline comments anchored to their line; what changed is that they all
+appear at the same moment.
+
+That timing is the point. The comments appearing is how you know the round is
+finished and the feedback is complete enough to hand to an agent. While the
+reviewer posted as it worked, three comments could mean three findings or could
+mean a review that died after three.
+
+Every review carries a top-level comment as well, and it says how many findings
+there were, including when there were none:
+
+> **Vinegar** · reviewed `a1b2c3d` at high effort
+>
+> 4 findings, 3 posted inline.
+>
+> These could not be anchored in the diff:
+>
+> - `vinegar.py:812`: The caller this relies on drops the error.
+>   Failure: a failed fetch returns None and the loop treats it as empty.
+
+A finding lands inline only when its line is part of the diff. Reviews at high
+effort read whole files, so some findings land on code the PR did not touch, and
+GitHub rejects a review comment anchored outside the diff. Those go in the
+top-level comment rather than being dropped.
+
+**Vinegar is never silent about a pull request it looked at.** A clean review
+says so. A review whose findings cannot be read back posts the reviewer's own
+words unedited. A review GitHub refuses is posted again with every finding in
+the top-level comment, which needs no anchor. Silence means something broke, and
+that is the only thing it is allowed to mean.
+
+Reviews are submitted with `event: COMMENT`. Vinegar never approves and never
+requests changes, so it cannot hold up a merge. See "What this is not".
 
 ## What it costs, honestly
 

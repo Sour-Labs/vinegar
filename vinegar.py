@@ -18,7 +18,8 @@
 
 Vinegar reviews nothing itself. It decides which pull requests deserve a
 reviewer, puts a checkout on the pull request's head commit, and runs
-`claude -p '/code-review <n> --comment'` in it.
+`claude -p '/code-review <n>'` in it. The reviewer returns its findings and
+Vinegar posts them as one review when the run finishes.
 """
 
 import argparse
@@ -27,6 +28,7 @@ import errno
 import fcntl
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -118,9 +120,14 @@ def log(message):
     print("%s %s" % (stamp, message), flush=True)
 
 
-def run(cmd, cwd=None, timeout=None, env=None):
+def run(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
+    # `input` and `stdin` cannot both be passed, so the default stays DEVNULL
+    # and only a caller with something to send opts out of it.
     return subprocess.run(cmd, cwd=cwd, timeout=timeout, text=True, env=env,
-                          stdin=subprocess.DEVNULL, capture_output=True)
+                          input=stdin_text,
+                          stdin=None if stdin_text is not None
+                          else subprocess.DEVNULL,
+                          capture_output=True)
 
 
 def b64url(raw):
@@ -436,17 +443,24 @@ def save_transcript(repo, pr, text):
 
 
 def reviewer_brief(pr):
-    """Which branch this pull request targets, since nothing else says.
+    """What the reviewer cannot work out from the checkout it wakes up in.
 
-    /code-review's own instructions reach for `git diff @{upstream}...HEAD`
-    and name `git diff main...HEAD` as the fallback when there is no
-    upstream. checkout() leaves HEAD detached, so there never is one, and the
-    fallback is what runs: every transcript so far diffed against `main`. On a
-    pull request that targets anything else that is not the pull request's
-    diff at all, and the reviewer has no way to tell that it is reviewing the
-    wrong range.
+    Two things, and both of them are things it otherwise guesses at.
 
-    It goes in the system prompt rather than after the command, because
+    The base branch. /code-review's own instructions reach for
+    `git diff @{upstream}...HEAD` and name `git diff main...HEAD` as the
+    fallback. This checkout is detached, so there is no upstream and the
+    fallback is what runs: every transcript before this showed a diff against
+    `main`. On a pull request that targets anything else, that is not the
+    pull request's diff at all, and the reviewer has no way to tell.
+
+    And who posts. Vinegar now submits the review itself, in one piece, so a
+    finding the reviewer keeps to itself is a finding nobody ever sees. The
+    field names match the output contract /code-review already asks for at
+    this point, so this repeats that contract rather than competing with it,
+    and a review still lands if a future release changes the wording.
+
+    Both go in the system prompt rather than after the command, because
     everything after the effort level is collapsed into /code-review's review
     target and a sentence there would be read as the thing to review.
     """
@@ -456,19 +470,221 @@ def reviewer_brief(pr):
         "it has no upstream branch and `@{upstream}` does not resolve. The "
         "pull request's base branch is `%s`, already fetched into this clone. "
         "`git diff %s...HEAD` is the review scope. Do not guess a base branch "
-        "and do not assume `main`." % (pr["number"], base, base))
+        "and do not assume `main`.\n\n"
+        "Post nothing to GitHub yourself. Return every finding in the JSON "
+        "array your output contract describes, each with `file`, `line`, "
+        "`summary` and `failure_scenario`, and `[]` when you found nothing. "
+        "Give `file` relative to the repository root. Vinegar reads that "
+        "array and posts the whole review in one piece, so a finding you "
+        "leave out of it is a finding nobody sees."
+        % (pr["number"], base, base))
+
+
+def parse_findings(text):
+    """The reviewer's findings array, or None if it did not return one.
+
+    None and `[]` are different answers and the caller treats them that way:
+    an empty array is the reviewer saying it found nothing, while None is the
+    reviewer having said something Vinegar cannot read.
+    """
+    for block in reversed(re.findall(r"```(?:json)?\s*\n(.*?)```", text, re.S)):
+        try:
+            findings = json.loads(block)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(findings, list):
+            return findings
+    return None
+
+
+def diff_lines(path, base, env):
+    """The head-side line numbers the pull request's diff covers, per file.
+
+    This decides which findings can be inline comments. The reviews endpoint
+    refuses a comment on a line outside the diff, and it applies the whole
+    review or none of it, so a single badly anchored comment would throw away
+    every finding alongside it.
+
+    `--unified=0` so the ranges are the changed lines themselves rather than
+    the context around them. A deletion-only hunk reports `+n,0`, which is an
+    empty range and correctly contributes no line: nothing was added there for
+    a comment to sit on.
+    """
+    result = run(["git", "diff", "--unified=0", "%s...HEAD" % base],
+                 cwd=path, env=env)
+    if result.returncode != 0:
+        return {}
+
+    covered, name = {}, None
+    for line in result.stdout.splitlines():
+        if line.startswith("+++ "):
+            target = line[4:]
+            # /dev/null is a delete, and there is no head-side file to
+            # comment on. The b/ prefix is git's, not part of the path.
+            name = None if target == "/dev/null" else target[2:]
+        elif name and line.startswith("@@"):
+            hunk = re.match(r"@@ -\S+ \+(\d+)(?:,(\d+))? @@", line)
+            if hunk:
+                start, count = int(hunk.group(1)), int(hunk.group(2) or 1)
+                if count:
+                    covered.setdefault(name, set()).update(
+                        range(start, start + count))
+    return covered
+
+
+def repo_path(name, root):
+    """The finding's file as the reviews endpoint wants it, or None.
+
+    Relative to the repository root. Reviewers have reported absolute paths
+    into the checkout despite being asked not to, and a finding is worth more
+    routed to the general comment than dropped, so anything that does not
+    resolve inside the checkout returns None rather than raising.
+    """
+    if not isinstance(name, str) or not name.strip():
+        return None
+    name = name.strip()
+    if os.path.isabs(name):
+        name = os.path.relpath(name, root)
+    return None if name.startswith("..") else name
+
+
+def describe(finding):
+    """A finding as prose, without the file and line that anchor it."""
+    summary = str(finding.get("summary", "")).strip() or "(no summary)"
+    scenario = str(finding.get("failure_scenario", "")).strip()
+    return "%s\n\nFailure: %s" % (summary, scenario) if scenario else summary
+
+
+def split_findings(findings, covered, root):
+    """Route each finding to an inline comment or to the general comment."""
+    inline, general = [], []
+    for finding in findings:
+        if not isinstance(finding, dict):
+            continue
+        name = repo_path(finding.get("file"), root)
+        line = finding.get("line")
+        # bool is an int, and True would index line 1 of the file.
+        anchored = (name and isinstance(line, int) and not isinstance(line, bool)
+                    and line in covered.get(name, ()))
+        if anchored:
+            inline.append({"path": name, "line": line, "side": "RIGHT",
+                           "body": describe(finding)})
+        else:
+            general.append(finding)
+    return inline, general
+
+
+def review_body(pr, config, inline, general, raw=None):
+    """The review's top-level comment.
+
+    Always present, and not only because the endpoint requires one for a
+    COMMENT review. It is what makes the comments arriving mean the round is
+    over: a pull request Vinegar reviewed says so, including when the answer
+    was that there is nothing to report. Silence has to keep meaning that
+    something went wrong.
+    """
+    lines = ["**Vinegar** · reviewed `%s` at %s effort" % (
+        pr["headRefOid"][:7], config["effort"])]
+
+    if raw is not None:
+        lines += ["", "The reviewer did not return its findings in a form "
+                      "Vinegar could read, so its own words follow unedited.",
+                  "", "---", "", raw.strip()]
+        return "\n".join(lines)
+
+    total = len(inline) + len(general)
+    if not total:
+        lines += ["", "No findings."]
+        return "\n".join(lines)
+
+    lines += ["", "%d finding%s, %d posted inline." % (
+        total, "" if total == 1 else "s", len(inline))]
+
+    if general:
+        lines += ["", "These could not be anchored in the diff:", ""]
+        for finding in general:
+            where = str(finding.get("file", "")).strip() or "(no file)"
+            line = finding.get("line")
+            if isinstance(line, int) and not isinstance(line, bool):
+                where += ":%d" % line
+            lines.append("- `%s`: %s" % (
+                where, describe(finding).replace("\n\n", "\n  ")))
+    return "\n".join(lines)
+
+
+def submit_review(repo, pr, payload, env):
+    """Post one review, as one request, and say whether it landed."""
+    result = run(["gh", "api",
+                  "repos/%s/pulls/%d/reviews" % (repo, pr["number"]),
+                  "--method", "POST", "--input", "-"],
+                 env=env, stdin_text=json.dumps(payload))
+    if result.returncode == 0:
+        return True
+    log("%s#%d: posting the review failed: %s" % (
+        repo, pr["number"], result.stderr.strip()[:400]))
+    return False
+
+
+def post_review(repo, pr, path, text, config, env):
+    """Turn what the reviewer returned into one review on the pull request."""
+    label = "%s#%d" % (repo, pr["number"])
+    findings = parse_findings(text)
+    if findings is None:
+        log("%s: the reviewer returned no findings array, posting its text "
+            "as the review" % label)
+        inline, general, raw = [], [], text
+    else:
+        inline, general = split_findings(
+            findings, diff_lines(path, pr["baseRefName"], env), path)
+        raw = None
+
+    if not config["comment"]:
+        log("%s: dry run, %d inline and %d general finding(s) not posted" % (
+            label, len(inline), len(general)))
+        return
+
+    payload = {"event": "COMMENT",
+               "commit_id": pr["headRefOid"],
+               "body": review_body(pr, config, inline, general, raw)}
+    if inline:
+        payload["comments"] = inline
+
+    if submit_review(repo, pr, payload, env):
+        log("%s: posted %d inline comment(s) and the review comment" % (
+            label, len(inline)))
+        return
+    if not inline:
+        return
+
+    # The endpoint took none of it, and the likeliest reason is an anchor it
+    # disagrees with: a comment lands only on a line inside the diff *it*
+    # computed, and checkout() deliberately carries on when the base branch
+    # cannot be refreshed, which widens the local diff past GitHub's. Rather
+    # than lose ten findings to one line number, say all of it in the comment
+    # that needs no anchor at all.
+    log("%s: retrying with every finding in the review comment" % label)
+    payload.pop("comments")
+    payload["body"] = review_body(pr, config, [], [
+        finding for finding in findings if isinstance(finding, dict)])
+    submit_review(repo, pr, payload, env)
 
 
 def review(path, repo, pr, config, env):
     prompt = "/code-review %s %d" % (config["effort"], pr["number"])
-    if config["comment"]:
-        prompt += " --comment"
 
     # The review reads a diff that Vinegar did not write, so it runs under
     # vinegar's own settings file and loads none of the user, project, or
     # local settings.json an interactive session would, and no MCP server.
     # This does not cover a CLAUDE.md in the checkout, which is still read as
     # project instructions. See "What the reviewer is allowed to do".
+    #
+    # `--output-format json` is load-bearing twice over. It is how Vinegar
+    # reads the result at all, and it is also what settles the reviewer's
+    # output contract: /code-review asks for findings as a JSON array in its
+    # final message under `json` and `text`, and asks for a ReportFindings
+    # tool call otherwise. Only the first of those reaches this process.
+    # Changing this to `stream-json` would swap the contract silently, and
+    # Vinegar would post an empty review off a review that found plenty.
     cmd = ["claude", "-p", prompt,
            "--append-system-prompt", reviewer_brief(pr),
            "--output-format", "json",
@@ -520,11 +736,18 @@ def review(path, repo, pr, config, env):
             label, took, str(output.get("result"))[:400]))
         return FAILED
 
-    transcript = save_transcript(repo, pr, str(output.get("result", "")))
+    text = str(output.get("result", ""))
+    transcript = save_transcript(repo, pr, text)
     cost = output.get("total_cost_usd")
     priced = ", %.2f USD equivalent" % cost if isinstance(cost, float) else ""
     log("%s: reviewed in %ds%s, transcript at %s" % (
         label, took, priced, transcript))
+
+    # After the transcript is on disk, so a review whose findings cannot be
+    # posted is still a review someone can read. The outcome stays DONE
+    # either way: the subscription is spent by this point, and re-running a
+    # review to recover from a failed post would spend it again.
+    post_review(repo, pr, path, text, config, env)
     return DONE
 
 
