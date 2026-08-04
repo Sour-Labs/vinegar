@@ -172,9 +172,10 @@ request. A GitHub App gives Vinegar its own name, its own icon, and a `bot`
 badge.
 
 It is worth doing for a second reason. An App's installation token can be
-scoped to a single repository, so a review that gets talked into calling
-`gh api` cannot reach anything else your account can see. That is the one
-sandbox limit the allow list could not close.
+scoped to a single repository, so a review that gets talked into calling `gh`
+cannot reach anything else your account can see. The allow list names only
+read-only `gh` subcommands, but a prefix rule cannot see the flags that follow
+one, and the token is what bounds the damage when a rule is not enough.
 
 Create the App once, in your organisation's settings under **Developer
 settings → GitHub Apps → New GitHub App**:
@@ -358,11 +359,22 @@ is any shell redirection out of an allowed command. That is a useful backstop
 and not something to rely on, so `find`, `awk`, `sed`, `perl`, `xargs`, and
 `tee` are denied outright.
 
+`gh api` is denied outright, alongside `curl` and `wget`, because it is the
+same thing they are: a way to reach the network with whatever the reviewer
+decides to send. It was allowed once, and only because posting an inline
+comment was `gh api repos/OWNER/REPO/pulls/N/comments`. The matcher compares
+whole space-separated tokens, so `Bash(gh api repos/*/pulls/*/comments:*)`
+matches nothing and it was `gh api` or no posted comments at all. Vinegar
+submits the review itself now, and the reviewer is told to post nothing, so
+the reason is gone and so is the entry. The named read-only subcommands above
+are what remain, and a review that wants more than those says so: a refused
+`Bash` command is recorded in `permission_denials`, which the log reports
+after every run.
+
 Reads are path-denied for `~/.vinegar`, `~/.claude`, `~/.ssh`, `~/.aws`,
 `~/.gnupg`, `~/.config/gh`, `.netrc` and `.env`. Without that, the App's own
-private key is a file the reviewer can read and `gh api` is a channel it can
-post through, and that key is the one credential that is **not** scoped to a
-single repository.
+private key is a file the reviewer can read, and that key is the one
+credential that is **not** scoped to a single repository.
 
 That is why clones live in `~/.vinegar-checkouts/` rather than under
 `~/.vinegar`. A blanket deny on a directory catches everything you later put
@@ -385,16 +397,7 @@ rule can distinguish it from the `git diff origin/main...HEAD` that every
 review legitimately runs. Removing `git diff` would close it, and would also
 remove the command the reviewer actually gets its diff from, so it stays.
 
-Two more that stay open for the same kind of reason:
-
-**`gh api` is broader than the reviewer now needs.** It was allowed because
-posting an inline comment is `gh api repos/OWNER/REPO/pulls/N/comments`, and
-the matcher compares whole space-separated tokens, so
-`Bash(gh api repos/*/pulls/*/comments:*)` matches nothing: it was `gh api` or
-no posted comments. Vinegar does the posting now, so that reason is gone and
-the entry is a candidate for removal. It is still allowed today, and the
-GitHub App is what bounds it: the token reaches one repository, not everything
-you can see.
+One more stays open for the same kind of reason:
 
 **A `CLAUDE.md` in the checkout is still read.** `--setting-sources ''` covers
 `settings.json`, not the memory files, so a `CLAUDE.md` or `AGENTS.md` in the
