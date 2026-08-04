@@ -132,9 +132,9 @@ Every key in `config.example.json`:
 | --- | --- | --- |
 | `repos` | none | Repositories to poll, as `owner/name`. Required. |
 | `poll_interval` | `60` | Seconds between polls. |
-| `effort` | `"high"` | Effort passed to `/code-review`: `low`, `medium`, `high`, `xhigh`, `max`. `ultra` is rejected. |
+| `effort` | `"high"` | Effort passed to `/code-review`: `low`, `medium`, `high`, `xhigh`, `max`. `ultra` is rejected. Read the note below before pairing it with `model`. |
 | `comment` | `true` | Post findings on the pull request. False runs the review and writes only to `~/.vinegar/reviews/`. |
-| `model` | `null` | Model for the review. Null uses your Claude Code default. |
+| `model` | `null` | Model for the review. Null uses your Claude Code default. Read the note below before setting it. |
 | `review_on_push` | `false` | Review again when the head commit changes. |
 | `max_changed_lines` | `3000` | Skip pull requests larger than this. |
 | `skip_drafts` | `true` | Skip drafts. |
@@ -147,6 +147,22 @@ Every key in `config.example.json`:
 The last five are budget and safety controls, not optimizations. Automated
 reviews spend the same subscription limits as your interactive Claude Code
 work.
+
+**`model` and `effort` together decide whether findings come back at all.**
+`/code-review` picks its prompt from a table keyed by both, and not every
+prompt in it can be asked for structured output. Pinning `model` to Opus 5 and
+leaving `effort` at `high` or `medium` selects one that cannot: it asks the
+reviewer for a tool call plus a prose restatement, so Vinegar reads no findings
+and posts the reviewer's text as one comment with no inline anchors. It happens
+quietly, because a review is still posted and still says useful things.
+
+With Opus 5 pinned, use `xhigh` or `max`. With `model` left null, `high` is
+fine. If your reviews stop arriving as inline comments, this pairing is the
+first thing to check, and `~/.vinegar/logs/` says
+`the reviewer returned no findings array` on every affected run.
+
+This is a detail of a command Vinegar does not own, so treat it as true of the
+Claude Code version you have rather than forever.
 
 ### Posting as Vinegar instead of as you
 
