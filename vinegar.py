@@ -530,15 +530,15 @@ def parse_findings(text):
     one value and ignores what follows, so a closing sentence, or a stray
     bracket in the prose, cannot swallow or truncate it.
     """
-    candidates, block, fenced = [], None, False
+    candidates, block, open_fence = [], None, False
     for line in text.splitlines():
         marker = line.strip().startswith("```")
-        if marker and not fenced:
-            block, fenced = [], True
-        elif marker and fenced:
-            candidates.append("\n".join(block))
-            block, fenced = None, False
-        elif fenced:
+        if marker and not open_fence:
+            block, open_fence = [], True
+        elif marker and open_fence:
+            candidates.append(("\n".join(block), True))
+            block, open_fence = None, False
+        elif open_fence:
             block.append(line)
 
     # Last first: the answer is at the end, and anything earlier is an example.
@@ -550,15 +550,17 @@ def parse_findings(text):
             value, _ = decoder.raw_decode(text[start:])
         except ValueError:
             continue
-        candidates.append(json.dumps(value))
+        candidates.append((json.dumps(value), False))
 
-    # Findings first, an empty array only if nothing else parsed. `all()` is
-    # true of an empty list, so a bare `[]` anywhere in the message satisfies
-    # the shape test vacuously: a markdown `- [ ]` item, or prose naming the
-    # empty array, would otherwise shadow the real findings and turn a review
-    # that found six things into a confident "No findings.".
+    # Findings win outright. An empty array is a much weaker claim and only a
+    # fenced one is allowed to make it, because `all()` is true of an empty
+    # list and `raw_decode` reads `[]` out of a markdown `- [ ]` item or out
+    # of prose naming the empty array. Truncation is what usually makes the
+    # real array unreadable, and truncation leaves that prose behind, so
+    # letting an unfenced `[]` through would answer a review that was cut off
+    # mid-findings with a confident "No findings.".
     empty = False
-    for candidate in candidates:
+    for candidate, was_fenced in candidates:
         try:
             findings = json.loads(candidate)
         except json.JSONDecodeError:
@@ -567,7 +569,7 @@ def parse_findings(text):
             continue
         if findings and all(isinstance(f, dict) for f in findings):
             return findings
-        empty = empty or not findings
+        empty = empty or (was_fenced and not findings)
     return [] if empty else None
 
 
@@ -749,6 +751,30 @@ def submit_review(repo, pr, payload, env):
     return False
 
 
+def announce(label, post):
+    """Run the posting step so that nothing it does can escape review().
+
+    Not defensiveness about the posting: defensiveness about what raising
+    here would cost. By this point the subscription is spent and the
+    transcript is on disk, and review() has to reach its `return DONE` for
+    handle_pr() to record that. It does not wrap the call, so an exception
+    leaves no state at all: no outcome, no attempts, MAX_ATTEMPTS never
+    reached, and the next poll a minute later checks the pull request out and
+    reviews it again, at full cost, on every poll from then on.
+
+    Minting the token is what made that reachable. It happens after the
+    review now, so it is a live API call every time `review_timeout` is set
+    near the hour a token lives, and `github_api` turns only HTTPError into
+    RuntimeError: a DNS failure or a dropped connection raises URLError
+    straight through. A transient 5xx on that endpoint is documented in
+    handle_pr() as something that already happens.
+    """
+    try:
+        post()
+    except Exception as err:
+        log("%s: the review is not posted: %s" % (label, err))
+
+
 def post_timeout(repo, pr, config, seconds, env):
     """Say on the pull request that the review was killed.
 
@@ -859,9 +885,10 @@ def review(path, repo, pr, config, env, tokens):
     except subprocess.TimeoutExpired:
         # A timeout burned the budget it burned. Retrying would burn it again.
         log("%s: killed after %ds" % (label, config["review_timeout"]))
-        post_timeout(repo, pr, config, config["review_timeout"],
-                     github_env(config, repo, tokens,
-                                good_for=POST_GRACE))
+        if config["comment"]:
+            announce(label, lambda: post_timeout(
+                repo, pr, config, config["review_timeout"],
+                github_env(config, repo, tokens, good_for=POST_GRACE)))
         return DONE
     took = round(time.monotonic() - started)
 
@@ -909,9 +936,11 @@ def review(path, repo, pr, config, env, tokens):
     # had to outlast the clone and the whole review, and at a `review_timeout`
     # near the hour a token lives it cannot be guaranteed to. Posting is the
     # entire output of the run, and this is the last moment it can be made
-    # safe cheaply.
-    post_review(repo, pr, path, text, config,
-                github_env(config, repo, tokens, good_for=POST_GRACE))
+    # safe cheaply. A dry run mints nothing, having nothing to post.
+    announce(label, lambda: post_review(
+        repo, pr, path, text, config,
+        github_env(config, repo, tokens, good_for=POST_GRACE)
+        if config["comment"] else env))
     return DONE
 
 
