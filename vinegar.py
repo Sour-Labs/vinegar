@@ -498,14 +498,7 @@ def poll_once(config, state, tokens):
             continue
         for pr in prs:
             try:
-                # The token is fetched per pull request, not once per pass. A
-                # pass can run for hours, and a token minted at the top of it
-                # would expire under a later review, whose comments would then
-                # fail to post. `good_for` also guarantees the token outlives
-                # the review it is handed to.
-                handle_pr(repo, pr, config, state,
-                          github_env(config, repo, tokens,
-                                     good_for=config["review_timeout"]))
+                handle_pr(repo, pr, config, state, tokens)
             except Exception as err:
                 # One bad pull request must not stop the daemon. Under launchd
                 # a crash restarts the process every 30 seconds and polls
@@ -514,7 +507,7 @@ def poll_once(config, state, tokens):
                     repo, pr.get("number", "?"), err))
 
 
-def handle_pr(repo, pr, config, state, env):
+def handle_pr(repo, pr, config, state, tokens):
     key = "%s#%d" % (repo, pr["number"])
     head = pr["headRefOid"]
     done = state.get(key) or {}
@@ -545,6 +538,26 @@ def handle_pr(repo, pr, config, state, env):
             state[key] = {"outcome": "skipped", "sha": head, "reason": reason}
             save_state(state)
         return
+
+    # Credentials are minted here, once a review is actually going to happen,
+    # rather than for every pull request the pass looks at.
+    #
+    # Still per review rather than once per pass: a pass can run for hours, and
+    # a token minted at the top of it would expire under a later review, whose
+    # comments would then fail to post. `good_for` asks for one that outlives
+    # the review it is handed to.
+    #
+    # But asking for that before the checks above meant minting one for every
+    # open pull request on every poll, including the ones that return one line
+    # later as already reviewed. Nothing deduplicated it, because a token lives
+    # an hour and `good_for` is `review_timeout`, which is also an hour, so the
+    # cache test `now + good_for < expires` is false even against a token minted
+    # this instant. That is roughly 1440 installation tokens a day per open pull
+    # request, and a transient 5xx on that endpoint took the pull request out of
+    # the pass. Raising `review_timeout` from 1800 to 3600 is what silently
+    # turned the cache off, so keep the two apart: `good_for` at or above the
+    # token's own lifetime means every call is a fresh mint.
+    env = github_env(config, repo, tokens, good_for=config["review_timeout"])
 
     try:
         path = checkout(repo, pr, env)
