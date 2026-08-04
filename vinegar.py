@@ -79,6 +79,20 @@ DONE, FAILED = "reviewed", "failed"
 # into a review every minute forever.
 MAX_ATTEMPTS = 3
 
+# Seconds of token life reserved for the checkout, on top of the review's own
+# budget. One token covers both, and the checkout runs first: a clone of a
+# large repository over a slow link is minutes, and asking only for
+# `review_timeout` can hand back a token that dies while the review is posting
+# its comments. Those posts are the entire output, and the outcome is recorded
+# either way, so the pull request is marked reviewed with its findings lost.
+CHECKOUT_GRACE = 600
+
+# Enough life for `gh pr list`, which is one call. This is not zero because the
+# cache serves a token right up to its recorded expiry, and that expiry is
+# optimistic: it is computed from the local clock after the mint response
+# arrives, while GitHub set the real one before sending it.
+LISTING_GRACE = 60
+
 PR_FIELDS = ("number,title,headRefOid,baseRefName,isDraft,author,additions,"
              "deletions,isCrossRepository,url")
 
@@ -492,20 +506,14 @@ def review(path, repo, pr, config, env):
 def poll_once(config, state, tokens):
     for repo in config["repos"]:
         try:
-            prs = open_prs(repo, github_env(config, repo, tokens))
+            prs = open_prs(repo, github_env(config, repo, tokens,
+                                            good_for=LISTING_GRACE))
         except Exception as err:
             log("%s: cannot list pull requests: %s" % (repo, err))
             continue
         for pr in prs:
             try:
-                # The token is fetched per pull request, not once per pass. A
-                # pass can run for hours, and a token minted at the top of it
-                # would expire under a later review, whose comments would then
-                # fail to post. `good_for` also guarantees the token outlives
-                # the review it is handed to.
-                handle_pr(repo, pr, config, state,
-                          github_env(config, repo, tokens,
-                                     good_for=config["review_timeout"]))
+                handle_pr(repo, pr, config, state, tokens)
             except Exception as err:
                 # One bad pull request must not stop the daemon. Under launchd
                 # a crash restarts the process every 30 seconds and polls
@@ -514,7 +522,7 @@ def poll_once(config, state, tokens):
                     repo, pr.get("number", "?"), err))
 
 
-def handle_pr(repo, pr, config, state, env):
+def handle_pr(repo, pr, config, state, tokens):
     key = "%s#%d" % (repo, pr["number"])
     head = pr["headRefOid"]
     done = state.get(key) or {}
@@ -545,6 +553,33 @@ def handle_pr(repo, pr, config, state, env):
             state[key] = {"outcome": "skipped", "sha": head, "reason": reason}
             save_state(state)
         return
+
+    # Credentials are minted here, once a review is actually going to happen,
+    # rather than for every pull request the pass looks at.
+    #
+    # Still per review rather than once per pass: a pass can run for hours, and
+    # a token minted at the top of it would expire under a later review, whose
+    # comments would then fail to post. What is asked for covers the checkout
+    # as well, because that runs first and on this one token.
+    #
+    # Asking before the checks above meant minting for every open pull request
+    # on every poll, including the ones that return one line later as already
+    # reviewed, and a transient 5xx on that endpoint took the pull request out
+    # of the pass. Whether anything deduplicated it depended on a setting that
+    # looks unrelated: the cache serves a token only while
+    # `now + good_for < expires`, so once `good_for` reaches the hour a token
+    # lives, no token can ever satisfy it and every call is a fresh mint. At the
+    # shipped `review_timeout` of 1800 the cache did dedupe, for the first half
+    # of each token's life. Raising it to 3600 turned that off silently, which
+    # is how this ran at roughly 1440 tokens a day per open pull request without
+    # anyone noticing.
+    #
+    # That ceiling still applies to the sum below. Set `review_timeout` high
+    # enough and no obtainable token can outlast the review, which is worth
+    # knowing when revisiting it: past that point the guarantee is gone rather
+    # than merely expensive.
+    env = github_env(config, repo, tokens,
+                     good_for=CHECKOUT_GRACE + config["review_timeout"])
 
     try:
         path = checkout(repo, pr, env)
