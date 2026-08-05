@@ -2015,9 +2015,21 @@ def review(path, repo, pr, config, env, tokens, resent=False):
     # Nothing reported means nothing to post, and that is the case retrying
     # is for. Deciding this on the text instead posted "Claude AI usage limit
     # reached" as though the reviewer had written it, so the text has no vote.
+    # Priced before the failure is handled, not after. A run that ends in
+    # an error has spent whatever it spent, and the failing path returned
+    # before ever reaching this, so the only line that says what the
+    # daemon costs skipped exactly the runs that bought nothing. Measured
+    # on a live 529 after eight and a half minutes of xhigh: the log said
+    # what broke and never said what it cost.
+    cost = output.get("total_cost_usd")
+    # bool first: it is an int, and True would print as 1.00 USD.
+    priced = ", %.2f USD equivalent" % cost if isinstance(
+        cost, (int, float)) and not isinstance(cost, bool) else ""
+
     note = None
     if output.get("is_error"):
-        log("%s: review failed after %ds: %s" % (label, took, text[:400]))
+        log("%s: review failed after %ds%s: %s" % (
+            label, took, priced, text[:400]))
         if findings is None:
             keep(label, repo, pr, spoken, "the review failed")
             return FAILED
@@ -2025,10 +2037,6 @@ def review(path, repo, pr, config, env, tokens, resent=False):
             "posted" % (label, len(findings)))
         note = partial_note("failed before it finished")
 
-    cost = output.get("total_cost_usd")
-    # bool first: it is an int, and True would print as 1.00 USD.
-    priced = ", %.2f USD equivalent" % cost if isinstance(
-        cost, (int, float)) and not isinstance(cost, bool) else ""
     log("%s: reviewed in %ds%s" % (label, took, priced))
 
     # After the transcript is on disk, so a review whose findings cannot be

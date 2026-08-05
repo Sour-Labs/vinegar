@@ -1547,6 +1547,18 @@ for value, shown in ((1.5, "1.50 USD"), (2, "2.00 USD"), (0, "0.00 USD")):
     check("a cost of %r is reported, whatever its JSON type" % (value,),
           any(shown in m for m in logged),
           [m for m in logged if "reviewed in" in m])
+
+# A run that fails has still spent the money. The failing path returned
+# before the only line that says what the daemon costs, so the runs that
+# bought nothing were the ones that never reported a price. Seen live: a
+# 529 after eight and a half minutes of xhigh, with no cost in the log.
+claude_run.stream = stream(result_event(is_error=True, result="529 boom",
+                                        total_cost_usd=2.5))
+del logged[:]
+check("a failed review is retried and its cost still reported",
+      vinegar.review(ROOT, "o/r", PR, CONFIG, None, {}) == vinegar.FAILED
+      and any("2.50 USD" in m for m in logged),
+      [m for m in logged if "failed" in m])
 vinegar.log = lambda message: None
 vinegar.run = fake_run
 
