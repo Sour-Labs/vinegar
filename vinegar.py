@@ -587,7 +587,7 @@ def load_state():
                    or any(not isinstance(done[field], int)
                           or isinstance(done[field], bool)
                           for field in ("attempts", "announce_tries",
-                                        "post_tries")
+                                        "post_tries", "post_waivers")
                           if field in done)
                    # The flags too, and for the same reason: this file is
                    # hand-edited on the log's own advice, and a bare
@@ -1796,7 +1796,11 @@ def finish(label, repo, pr, path, text, findings, config, env, tokens,
     # silence the README forbids, reached by the one path that had no
     # retry of its own. The give-up has its own bounded retry and is
     # never marked.
-    if posted:
+    # `not preserve` here as well as above. The give-up writes no marker,
+    # so forgetting one on its way out could only ever delete somebody
+    # else's — a saved review that is still waiting to be sent, gone with
+    # nothing left pointing at it.
+    if posted and not preserve:
         forget(marker)
     return posted
 
@@ -1898,6 +1902,7 @@ def repost(key, repo, pr, config, state, tokens, done, marker, sha):
     # per pull request, for ever. review() has announce() for the same
     # reason.
     tries = done.get("post_tries", 0) + 1
+    waived = done.get("post_waivers", 0)
     state[key] = dict(done, post_tries=tries)
     save_state(state)
 
@@ -1941,25 +1946,36 @@ def repost(key, repo, pr, config, state, tokens, done, marker, sha):
                         key, len(body), room))
                 body = ("(the beginning was cut to fit GitHub's comment "
                         "limit)\n\n" + body[-room:])
-            # Not on the first try. The marker is written before the post
-            # is attempted, so the first read here can only answer no, at
-            # the price of a paginated walk of every review on the pull
-            # request. The give-up path makes the same distinction.
-            settled = (POSTED if tries > 1
-                       and already_posted(key, repo, at, env) else
+            # Always, including the first try. Skipping it there assumed
+            # post_review had already established that nothing landed —
+            # true only when *its* landed-review read succeeded, and that
+            # read answers "no" when it times out or errors, which is
+            # exactly what happens during the GitHub incident that made
+            # the post ambiguous in the first place. The saved review then
+            # went on top of one that was already up.
+            settled = (POSTED if already_posted(key, repo, at, env) else
                        submit_review(
                            key, repo, at,
                            {"event": "COMMENT",
                             "commit_id": at["headRefOid"],
                             "body": opening + body}, env))
             landed = settled == POSTED
-            if settled == THROTTLED:
+            if settled == THROTTLED and waived < MAX_ATTEMPTS:
                 # Refused by a limit, not by the request. Spending an
                 # attempt on it meant a rate-limit window that outlasts
                 # three polls — three minutes against a limit that resets
                 # hourly — abandoned a finished review for good.
+                #
+                # Bounded all the same. Refunding every time pinned the
+                # pull request in this branch: handle_pr returns straight
+                # after a repost, so while a throttle persisted the
+                # review was never re-run at a new head, never
+                # re-evaluated by skip_reason and never abandoned, at one
+                # token mint and one call per poll for ever.
                 log("%s: the posting is rate limited, so this attempt is "
-                    "not counted against the %d" % (key, MAX_ATTEMPTS))
+                    "not counted against the %d (%d of %d such waivers)"
+                    % (key, MAX_ATTEMPTS, waived + 1, MAX_ATTEMPTS))
+                waived += 1
                 tries -= 1
                 give_up_on_it = False
         except Exception as err:
@@ -1979,9 +1995,12 @@ def repost(key, repo, pr, config, state, tokens, done, marker, sha):
         entry = dict(done,
                      post_tries=MAX_ATTEMPTS if give_up_on_it else tries)
         entry.pop("unposted", None)
+        entry.pop("post_waivers", None)
         state[key] = entry
     else:
         state[key] = dict(done, post_tries=tries)
+        if waived:
+            state[key]["post_waivers"] = waived
     save_state(state)
 
 
@@ -2482,11 +2501,15 @@ def handle_pr(repo, pr, config, state, tokens):
                 # `announce_tries` at 0, so trusting the count skipped the
                 # check on exactly the run that needed it and posted the
                 # give-up twice.
+                # On its own line: this posts to the pull request, and as
+                # an argument expression it ran before the function meant
+                # to govern it had a say, which a reader has to know
+                # Python's evaluation order to see.
+                said = give_up(key, repo, pr, config, done["attempts"],
+                               tokens, env=post_env, tries=tries,
+                               resent=True)
                 spend_announce(key, config, state, head, done["attempts"],
-                               tries, give_up(key, repo, pr, config,
-                                              done["attempts"], tokens,
-                                              env=post_env, tries=tries,
-                                              resent=True))
+                               tries, said)
             return
 
     reason = skip_reason(pr, config)
@@ -2556,9 +2579,15 @@ def handle_pr(repo, pr, config, state, tokens):
     # what an interrupted attempt is, and because MAX_ATTEMPTS then bounds the
     # damage at three rather than leaving it open-ended. The real outcome
     # overwrites it a few lines below.
+    # Carried only while the head is the same one, exactly as `attempts`
+    # is computed above. A budget spent on one head's saved review must
+    # not follow the pull request to the next: with `review_on_push` on,
+    # a head that had exhausted its three sends made every later head's
+    # review unpostable the moment it was written.
+    kept = done if done.get("sha") == head else {}
     state[key] = state_entry(head, FAILED, attempts,
-                             post_tries=done.get("post_tries", 0),
-                             unposted=done.get("unposted", False))
+                             post_tries=kept.get("post_tries", 0),
+                             unposted=kept.get("unposted", False))
     save_state(state)
 
     try:
@@ -2585,7 +2614,7 @@ def handle_pr(repo, pr, config, state, tokens):
     # Recorded with whether a saved review is waiting behind it, so the
     # next poll can find that out without listing a directory.
     state[key] = state_entry(head, outcome, attempts,
-                             post_tries=done.get("post_tries", 0),
+                             post_tries=kept.get("post_tries", 0),
                              unposted=os.path.exists(
                                  unposted_path(repo, pr)))
     save_state(state)
@@ -2595,9 +2624,9 @@ def handle_pr(repo, pr, config, state, tokens):
         # the mark a daemon restart would say it all again; with it applied
         # regardless, a failed announcement was never retried at all.
         tries = done.get("announce_tries", 0)
-        spend_announce(key, config, state, head, attempts, tries,
-                       give_up(key, repo, pr, config, attempts, tokens, path,
-                               env, tries))
+        said = give_up(key, repo, pr, config, attempts, tokens, path, env,
+                       tries)
+        spend_announce(key, config, state, head, attempts, tries, said)
 
 
 def find_pr(repo, number, env):
@@ -2732,8 +2761,11 @@ def main():
     # a daemon (`comment: false` is a configuration, not only a flag), and
     # remembering nothing would review every open pull request again on
     # every poll at full cost.
-    if not config["comment"]:
-        global STATE_PATH, REVIEW_DIR
+    global STATE_PATH, REVIEW_DIR
+    # Idempotent, because this rewrites module state rather than deriving
+    # it: reaching here twice in one process would otherwise produce
+    # `state.json.dry.dry` and lose everything the first pass recorded.
+    if not config["comment"] and not STATE_PATH.endswith(".dry"):
         STATE_PATH = STATE_PATH + ".dry"
         # The transcripts too. They are named from repo, number and sha, so
         # a rehearsal of a pull request the daemon has already reviewed

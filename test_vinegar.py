@@ -1095,6 +1095,18 @@ del posted[:]
 vinegar.handle_pr("o/r", PR_LIVE, CONFIG, _gc_state, {})
 check("a give-up already up is not repeated after a crash",
       not posted, (len(posted), _gc_state))
+
+# The give-up writes no marker, so anything it forgets on its way out can
+# only be somebody else's — a saved review still waiting to be sent.
+_gu_marker = vinegar.unposted_path("o/r", PR)
+os.makedirs(vinegar.REVIEW_DIR, exist_ok=True)
+with open(_gu_marker, "w") as h:
+    h.write("%s\n" % PR["headRefOid"])
+fake_run.look_out = ""
+vinegar.give_up(L, "o/r", PR, CONFIG, vinegar.MAX_ATTEMPTS, {})
+check("a give-up does not delete another review's mark",
+      os.path.exists(_gu_marker), _gu_marker)
+vinegar.forget(_gu_marker)
 fake_run.look_out = ""
 
 # A give-up whose announcement never landed must not be marked as said,
@@ -2004,12 +2016,13 @@ vinegar.handle_pr("o/r", PR_LOST, CONFIG, _lost_state, {})
 check("the saved review is posted on a later poll, without re-reviewing",
       len(posted) == 1
       and "posted from the transcript" in posted[0][1]["body"], len(posted))
-# The marker is only written once post_review has established GitHub
-# created nothing, so the first send here cannot find a review already
-# up: asking costs a paginated walk of every review on the pull request
-# and can only answer no.
-check("the first repost does not pay for the landed-review read",
-      not looked, looked)
+# Asked every time, including the first. Skipping it there assumed
+# post_review had established that nothing landed, which holds only when
+# its own landed-review read succeeded — and that read answers "no" when
+# it times out, which is what happens during the incident that made the
+# post ambiguous. The saved review then went on top of one already up.
+check("every repost asks whether the review is already up",
+      len(looked) == 1, looked)
 check("a posted review clears the mark",
       not os.path.exists(_lost_marker), _lost_marker)
 
@@ -2129,6 +2142,23 @@ vinegar.handle_pr("o/r", PR_RERUN, CONFIG, _rerun, {})
 (vinegar.review, vinegar.checkout, vinegar.save_state) = _rerun_real
 check("the repost budget is not handed back by a fresh review",
       _rerun[_rerun_key].get("post_tries") == 2, _rerun)
+
+# But it does not follow the pull request to the next head. A budget
+# spent on one head's saved review made every later head's review
+# unpostable the moment it was written.
+_moved_budget = {_rerun_key: {"outcome": vinegar.DONE, "sha": "0ldhead0",
+                              "attempts": 1,
+                              "post_tries": vinegar.MAX_ATTEMPTS}}
+vinegar.review = lambda *a, **k: vinegar.DONE
+vinegar.checkout = lambda repo, pr, env: ROOT
+vinegar.save_state = lambda st: None
+vinegar.handle_pr("o/r", PR_RERUN, dict(CONFIG, review_on_push=True),
+                  _moved_budget, {})
+(vinegar.review, vinegar.checkout, vinegar.save_state) = _rerun_real
+check("a spent repost budget does not follow the head",
+      _moved_budget[_rerun_key].get("sha") == PR_RERUN["headRefOid"]
+      and _moved_budget[_rerun_key].get("post_tries", 0) == 0,
+      _moved_budget)
 # The marker written before the review runs carries it too. Only that
 # entry survives a process killed mid-review, and it is the entry the
 # next poll reads.
@@ -2274,11 +2304,20 @@ _rl_state = {_lost_key: {"outcome": vinegar.DONE,
                          "unposted": True}}
 fake_run.rc = 1
 fake_run.post_err = "gh: API rate limit exceeded (HTTP 403)"
-for _ in range(4):
+for _ in range(vinegar.MAX_ATTEMPTS):
     vinegar.handle_pr("o/r", PR_LOST, CONFIG, _rl_state, {})
 check("a rate-limited repost does not spend the budget",
       _rl_state[_lost_key].get("post_tries", 0) == 0
       and os.path.exists(_lost_marker), _rl_state)
+# Waived, but not for ever: handle_pr returns straight after a repost, so
+# an endless refund pins the pull request there and it is never reviewed
+# at a new head, never re-skipped and never abandoned.
+for _ in range(vinegar.MAX_ATTEMPTS * 2):
+    vinegar.handle_pr("o/r", PR_LOST, CONFIG, _rl_state, {})
+check("a throttle that never lifts still ends",
+      not os.path.exists(_lost_marker)
+      and _rl_state[_lost_key].get("post_tries") == vinegar.MAX_ATTEMPTS,
+      _rl_state)
 fake_run.post_err = "HTTP 403 Resource not accessible"
 vinegar.forget(_lost_marker)
 
