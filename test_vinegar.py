@@ -992,6 +992,25 @@ vinegar.github_env = lambda *a, **k: None
 vinegar.handle_pr("o/r", PR_LIVE, CONFIG, _hp_state, {})
 check("a review that raises is still recorded, so it cannot loop for ever",
       _hp_state.get(L, {}).get("outcome") == vinegar.FAILED, _hp_state)
+
+# The marker handle_pr writes before the review runs, and the outcome it
+# writes after, leave a window: a process killed in between records
+# FAILED for a review that did post. The retry must ask before posting a
+# complete second review over the first.
+_cw_real = vinegar.review
+vinegar.review = _real_review
+_cw_state = {L: {"outcome": vinegar.FAILED, "sha": PR["headRefOid"],
+                 "attempts": 1}}
+vinegar.run = claude_run
+claude_run.stream = stream(call(FINDINGS[:1]), result_event())
+fake_run.look_out = "%s reviewed `a1b2c3d` at high effort\n" % (
+    vinegar.BODY_MARK)
+del posted[:]
+vinegar.handle_pr("o/r", PR_LIVE, CONFIG, _cw_state, {})
+check("a retry after a crash does not post the review twice",
+      not posted, (len(posted), _cw_state))
+fake_run.look_out = ""
+vinegar.run, vinegar.review = fake_run, _cw_real
 check("a review that raises counts as an attempt against MAX_ATTEMPTS",
       _hp_state.get(L, {}).get("attempts") == 1, _hp_state)
 
@@ -1646,6 +1665,7 @@ vinegar.save_state = _real_save_state
 vinegar.run = fake_run
 
 # --- save_transcript, unstubbed ------------------------------------------
+reset_stubs()
 # The stub above hides this everywhere else, and on a dry run the transcript
 # is the only artifact there is.
 _tx_home = tempfile.mkdtemp(prefix="vinegar-test-tx-")
@@ -1690,9 +1710,15 @@ vinegar.keep(L, "o/r", PR_GAVE, "Twenty minutes of analysis.",
 vinegar.finish(L, "o/r", PR_GAVE, ROOT, "", None,
                dict(CONFIG, comment=False), None, {},
                note="Vinegar tried to review this 3 times.", preserve=True)
-body = open(vinegar.transcript_path("o/r", PR_GAVE)).read()
+_gave_body = open(vinegar.transcript_path("o/r", PR_GAVE)).read()
 check("the give-up leaves the words the attempts saved",
-      "Twenty minutes of analysis." in body, body[:200])
+      "Twenty minutes of analysis." in _gave_body, _gave_body[:200])
+# Its own name, and asserted here rather than ninety lines further down
+# past three blocks that read other files into other names.
+check("the give-up itself is recorded beneath them",
+      "tried to review this 3 times" in _gave_body
+      and _gave_body.find("Twenty minutes") < _gave_body.find(
+          "tried to review"), _gave_body[:300])
 
 # Through give_up() itself, which is what has to ask for that: the check
 # above calls finish() directly and would pass even if nothing did.
@@ -1786,10 +1812,40 @@ finally:
      vinegar.github_env, sys.argv) = _pr_real
 check("a --pr run asks before posting over an earlier review",
       _pr_kw.get("resent") is True, _pr_kw)
-check("the give-up itself is recorded beneath them",
-      "tried to review this 3 times" in body
-      and body.find("Twenty minutes") < body.find("tried to review"),
-      body[:300])
+
+# A manual run writes no state, which is right. But a refused post leaves
+# a marker the daemon only honours when an entry stands behind it, so
+# without one the next poll reads it as left over and deletes it — and on
+# a pull request the daemon skips, nothing would ever replace the review.
+_mr_home = os.environ["VINEGAR_HOME"]
+_mr_marker = vinegar.unposted_path("o/r", PR_LIVE)
+
+
+def _review_that_could_not_post(*a, **k):
+    os.makedirs(vinegar.REVIEW_DIR, exist_ok=True)
+    with open(_mr_marker, "w") as handle:
+        handle.write("%s\n" % PR_LIVE["headRefOid"])
+    return vinegar.DONE
+
+
+vinegar.review = _review_that_could_not_post
+vinegar.find_pr = lambda repo, number, env: PR_LIVE
+vinegar.checkout = lambda repo, pr, env: ROOT
+vinegar.github_env = lambda *a, **k: None
+sys.argv = ["vinegar.py", "--pr", "o/r#12"]
+try:
+    vinegar.main()
+except SystemExit:
+    pass
+finally:
+    (vinegar.review, vinegar.find_pr, vinegar.checkout,
+     vinegar.github_env, sys.argv) = _pr_real
+_mr_state = vinegar.load_state()
+check("a manual run's unpostable review is left for the daemon to send",
+      _mr_state.get(L, {}).get("outcome") == vinegar.DONE
+      and _mr_state.get(L, {}).get("sha") == PR_LIVE["headRefOid"],
+      _mr_state)
+vinegar.forget(_mr_marker)
 
 # Announcing is retried while it fails to land, and each retry used to
 # append the same ending again to the file a dry run is judged by.
@@ -1828,6 +1884,7 @@ check("the transcript write leaves nothing temporary behind",
       os.listdir(_tx_home))
 
 # A review GitHub refused is finished work waiting on one API call. It is
+reset_stubs()
 # marked, and a later poll sends it from the transcript rather than
 # re-running a review the subscription already paid for.
 PR_LOST = dict(PR_LIVE, headRefOid="1051051051aa")
@@ -1851,6 +1908,12 @@ vinegar.handle_pr("o/r", PR_LOST, CONFIG, _lost_state, {})
 check("the saved review is posted on a later poll, without re-reviewing",
       len(posted) == 1
       and "posted from the transcript" in posted[0][1]["body"], len(posted))
+# The marker is only written once post_review has established GitHub
+# created nothing, so the first send here cannot find a review already
+# up: asking costs a paginated walk of every review on the pull request
+# and can only answer no.
+check("the first repost does not pay for the landed-review read",
+      not looked, looked)
 check("a posted review clears the mark",
       not os.path.exists(_lost_marker), _lost_marker)
 

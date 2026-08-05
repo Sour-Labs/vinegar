@@ -1767,22 +1767,36 @@ def unposted_for(repo, pr):
     the marker carries because the transcript's name holds only seven
     characters of it and the reviews endpoint wants all forty.
     """
+    # The current head first, which is the answer almost every time and
+    # costs one stat. The scan behind it is for the case the head has
+    # moved, and it runs for every open pull request on every poll against
+    # a directory that only ever grows, so it does no sorting: it returns
+    # the first match, and ordering a list of thousands of names to pick
+    # one arbitrary member of it was pure work.
+    here = unposted_path(repo, pr)
+    if os.path.exists(here):
+        return here, read_mark(here)
+
     prefix = "%s__%d__" % (repo.replace("/", "__"), pr["number"])
     try:
-        names = sorted(os.listdir(REVIEW_DIR))
+        names = os.listdir(REVIEW_DIR)
     except OSError:
         return None, None
     for name in names:
         if not (name.startswith(prefix) and name.endswith(".md.unposted")):
             continue
         path = os.path.join(REVIEW_DIR, name)
-        try:
-            with open(path, encoding="utf-8", errors="replace") as handle:
-                sha = handle.read().strip()
-        except OSError:
-            sha = ""
-        return path, sha
+        return path, read_mark(path)
     return None, None
+
+
+def read_mark(path):
+    """The commit a marker was written for, or "" if it cannot be read."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            return handle.read().strip()
+    except OSError:
+        return ""
 
 
 def repost(key, repo, pr, config, state, tokens, done, marker, sha):
@@ -1842,10 +1856,16 @@ def repost(key, repo, pr, config, state, tokens, done, marker, sha):
                               "so its findings are not anchored in the "
                               "diff.\n\n---\n\n%s" % (
                                   review_heading(at, config), body))
-            landed = already_posted(key, repo, at, env) or submit_review(
-                key, repo, at,
-                {"event": "COMMENT", "commit_id": at["headRefOid"],
-                 "body": body}, env) == POSTED
+            # Not on the first try. The marker is written only after
+            # post_review has established that GitHub created nothing, so
+            # the first read here can only answer no, at the price of a
+            # paginated walk of every review on the pull request. The
+            # give-up path makes the same distinction.
+            landed = (tries > 1 and already_posted(key, repo, at, env)) or (
+                submit_review(
+                    key, repo, at,
+                    {"event": "COMMENT", "commit_id": at["headRefOid"],
+                     "body": body}, env) == POSTED)
         except Exception as err:
             log("%s: the saved review could not be sent: %s" % (key, err))
 
@@ -2399,7 +2419,16 @@ def handle_pr(repo, pr, config, state, tokens):
     save_state(state)
 
     try:
-        outcome = review(path, repo, pr, config, env, tokens)
+        # A second attempt at a head asks before posting. The marker above
+        # is written before review() runs and the real outcome only after,
+        # so a process killed in between — launchd booting the job out, a
+        # save_state that raises on a full disk — leaves FAILED on disk
+        # for a review that did post. Without this the retry re-reviews at
+        # full cost and posts a complete second review with duplicate
+        # inline comments. The give-up rediscovery already says `resent`
+        # for the same crash window.
+        outcome = review(path, repo, pr, config, env, tokens,
+                         resent=attempts > 1)
     except Exception as err:
         # The subscription is spent by the time most of these can happen, and
         # an unrecorded pull request is reviewed again on the very next poll,
@@ -2606,6 +2635,21 @@ def main():
             # comments.
             review(checkout(repo, pr, env), repo, pr, config, env, tokens,
                    resent=True)
+            # A manual run writes no state, which is right: it is not the
+            # daemon's record of what has been reviewed. But a refused
+            # post leaves a marker the daemon only honours when an entry
+            # stands behind it, so without this the next poll reads that
+            # marker as left over from a run nobody remembers and deletes
+            # it. On a pull request the daemon skips — a draft, a fork,
+            # one over max_changed_lines — nothing would ever replace the
+            # review it threw away.
+            if unposted_for(repo, pr)[0]:
+                state = load_state()
+                state["%s#%d" % (repo, pr["number"])] = state_entry(
+                    pr["headRefOid"], DONE, 1)
+                save_state(state)
+                log("%s: the review is saved to be posted on a later poll"
+                    % args.pr)
             return
 
         state = load_state()

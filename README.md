@@ -91,8 +91,11 @@ Review one pull request by hand, posting nothing, to see what you would get:
 python3 vinegar.py --pr owner/repo#123 --dry-run
 ```
 
-The review lands in `~/.vinegar/reviews/`. When it reads well, poll once, then
-run the loop:
+The review lands in `~/.vinegar/reviews.dry/`. A run that posts nothing keeps
+its transcripts and its bookkeeping beside the real ones rather than in them,
+so a rehearsal cannot overwrite a review that failed to post or tell the daemon
+a pull request is already done. When it reads well, poll once, then run the
+loop:
 
 ```sh
 python3 vinegar.py --once                # one pass, then exit
@@ -100,7 +103,10 @@ python3 vinegar.py                       # poll forever
 ```
 
 Vinegar keeps its own state under `~/.vinegar`: `config.json`, `state.json`
-(the head commit it last handled per pull request), and `reviews/`.
+(the head commit it last handled per pull request), and `reviews/`. A run that
+posts nothing uses `state.json.dry` and `reviews.dry/` instead. A review that
+GitHub refused leaves a `.unposted` marker beside its transcript, and a later
+poll sends that transcript rather than reviewing again.
 
 There are tests, and they need nothing installed:
 
@@ -151,7 +157,7 @@ Every key in `config.example.json`:
 | `repos` | none | Repositories to poll, as `owner/name`. Required. |
 | `poll_interval` | `60` | Seconds between polls. |
 | `effort` | `"high"` | Effort passed to `/code-review`: `low`, `medium`, `high`, `xhigh`, `max`. `ultra` is rejected. Read the note below before pairing it with `model`. |
-| `comment` | `true` | Post findings on the pull request. False runs the review and writes only to `~/.vinegar/reviews/`. |
+| `comment` | `true` | Post findings on the pull request. False runs the review and writes only to `~/.vinegar/reviews.dry/`, remembering what it did in `state.json.dry`. |
 | `model` | `null` | Model for the review. Null uses your Claude Code default. Read the note below before setting it. |
 | `review_on_push` | `false` | Review again when the head commit changes. |
 | `max_changed_lines` | `3000` | Skip pull requests larger than this. |
