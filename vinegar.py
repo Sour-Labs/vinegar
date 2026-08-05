@@ -478,12 +478,7 @@ def save_transcript(repo, pr, text, findings=None):
     body = text
     if findings:
         body += "\n\n## Findings\n\n" + "\n\n".join(
-            "- `%s%s`: %s" % (
-                str(finding.get("file") or "(no file)").strip(),
-                ":%d" % finding_line(finding)
-                if finding_line(finding) is not None else "",
-                describe(finding).replace("\n\n", "\n  "))
-            for finding in findings)
+            finding_bullet(finding) for finding in findings)
     elif findings is not None:
         body += "\n\n## Findings\n\nNone.\n"
     with open(path, "w") as handle:
@@ -667,11 +662,10 @@ def diff_lines(path, base, env, label):
             % (label, base, result.stderr.strip()[:200]))
         return {}
 
-    # split("\n") for the reason parse_findings() uses it, and here a forged
-    # line is worse than a lost one: splitlines() breaks on a lone CR, so an
-    # added line whose content holds one would be cut into a fragment that can
-    # look like a hunk header and put line numbers into `covered` that the
-    # diff never touched.
+    # split("\n"), not splitlines(), which also breaks on a lone CR. An
+    # added line whose content holds one would then be cut into a fragment
+    # that can look like a hunk header, putting line numbers into `covered`
+    # that the diff never touched. Wrong lines, confidently placed.
     covered, name, heading = {}, None, False
     for line in result.stdout.split("\n"):
         if line.startswith("diff --git "):
@@ -744,6 +738,20 @@ def finding_line(finding):
         return None
 
 
+def finding_bullet(finding):
+    """A finding as one markdown bullet, for the comment and the transcript.
+
+    Both need it and they used to build it separately, which was enough for
+    them to disagree: a `file` of only spaces rendered as empty backticks in
+    one and `(no file)` in the other, for the same finding.
+    """
+    where = str(finding.get("file") or "").strip() or "(no file)"
+    line = finding_line(finding)
+    if line is not None:
+        where += ":%d" % line
+    return "- `%s`: %s" % (where, describe(finding).replace("\n\n", "\n  "))
+
+
 def describe(finding):
     """A finding as prose, without the file and line that anchor it."""
     # `or ""` rather than a get default, because these keys arrive present
@@ -772,7 +780,7 @@ def split_findings(findings, covered, root, label):
 
 
 def review_body(label, pr, config, inline, general, raw=None,
-                heading="These could not be anchored in the diff:"):
+                heading="These could not be anchored in the diff:", note=None):
     """The review's top-level comment.
 
     Always present, and not only because the endpoint requires one for a
@@ -790,6 +798,14 @@ def review_body(label, pr, config, inline, general, raw=None,
     lines = ["**Vinegar** · reviewed `%s` at %s effort" % (
         pr["headRefOid"][:7], config["effort"])]
 
+    # A run that was killed or that errored still reports whatever it had
+    # got to, and without this that is indistinguishable from a finished
+    # review. The comments arriving is the signal that the round is over and
+    # the feedback is complete enough to act on, so a partial round has to
+    # say it is one.
+    if note:
+        lines += ["", note]
+
     total = len(inline) + len(general)
     if raw is not None and not raw.strip():
         # Distinct from unreadable output, because the two send you to
@@ -802,20 +818,17 @@ def review_body(label, pr, config, inline, general, raw=None,
                       "Vinegar could read, so its own words follow unedited.",
                   "", "---", "", raw.strip()]
     elif not total:
-        lines += ["", "No findings."]
+        # Never "No findings." on a run that did not finish: it did not look
+        # at everything, so it is not entitled to say the change is clean.
+        lines += ["", "It reported nothing before it stopped." if note
+                  else "No findings."]
     else:
         lines += ["", "%d finding%s, %d posted inline." % (
             total, "" if total == 1 else "s", len(inline))]
 
     if general:
         lines += ["", heading, ""]
-        for finding in general:
-            where = str(finding.get("file") or "").strip() or "(no file)"
-            line = finding_line(finding)
-            if line is not None:
-                where += ":%d" % line
-            lines.append("- `%s`: %s" % (
-                where, describe(finding).replace("\n\n", "\n  ")))
+        lines += [finding_bullet(finding) for finding in general]
 
     return clamp(label, "\n".join(lines))
 
@@ -926,7 +939,8 @@ def post_timeout(label, pr, repo, seconds, env):
         submit_review(label, repo, pr, payload, env)
 
 
-def post_review(repo, pr, path, text, findings, config, env):
+def post_review(repo, pr, path, text, findings, config, env,
+                note=None):
     """Turn what the reviewer reported into one review on the pull request."""
     label = "%s#%d" % (repo, pr["number"])
     if findings is None:
@@ -950,7 +964,8 @@ def post_review(repo, pr, path, text, findings, config, env):
 
     payload = {"event": "COMMENT",
                "commit_id": pr["headRefOid"],
-               "body": review_body(label, pr, config, inline, general, raw)}
+               "body": review_body(label, pr, config, inline, general, raw,
+                                   note=note)}
     if inline:
         payload["comments"] = inline
 
@@ -984,9 +999,29 @@ def post_review(repo, pr, path, text, findings, config, env):
     log("%s: retrying with every finding in the review comment" % label)
     payload.pop("comments")
     payload["body"] = review_body(
-        label, pr, config, [], findings,
+        label, pr, config, [], findings, note=note,
         heading="GitHub refused the inline comments, so all of it is here:")
     submit_review(label, repo, pr, payload, env)
+
+
+def finish(label, repo, pr, path, text, findings, config, env, tokens,
+           note=None):
+    """Record the review on disk and post it, whatever ended the run.
+
+    Both callers do exactly this and used to do it separately, which is how
+    the killed-run path came to post a partial review under a heading that
+    read like a finished one: the marker was added to one and not the other.
+
+    It runs inside announce(), so writing the transcript is covered too. That
+    write can fail on its own, a `~/.vinegar/reviews` left root-owned by one
+    `sudo` run being the way it happens, and an exception here would leave
+    handle_pr() with no state to record and the pull request re-reviewed at
+    full cost on every poll from then on.
+    """
+    log("%s: transcript at %s" % (
+        label, save_transcript(repo, pr, text, findings)))
+    post_review(repo, pr, path, text, findings, config,
+                posting_env(label, config, repo, tokens, env), note)
 
 
 def review(path, repo, pr, config, env, tokens):
@@ -1052,11 +1087,12 @@ def review(path, repo, pr, config, env, tokens):
         if findings:
             log("%s: it had already reported %d finding(s), posting those"
                 % (label, len(findings)))
-            transcript = save_transcript(repo, pr, salvaged[-4000:], findings)
-            log("%s: transcript at %s" % (label, transcript))
-            announce(label, lambda: post_review(
-                repo, pr, path, "", findings, config,
-                posting_env(label, config, repo, tokens, env)))
+            announce(label, lambda: finish(
+                label, repo, pr, path, salvaged[-4000:], findings, config,
+                env, tokens,
+                note="This review was killed after %ds, so these are the "
+                     "findings it had reported by then and not a finished "
+                     "round." % config["review_timeout"]))
         elif config["comment"]:
             announce(label, lambda: post_timeout(
                 label, pr, repo, config["review_timeout"],
@@ -1114,18 +1150,19 @@ def review(path, repo, pr, config, env, tokens):
     # Nothing reported means nothing to post, and that is the case retrying
     # is for. Deciding this on the text instead posted "Claude AI usage limit
     # reached" as though the reviewer had written it, so the text has no vote.
+    note = None
     if output.get("is_error"):
         log("%s: review failed after %ds: %s" % (label, took, text[:400]))
         if findings is None:
             return FAILED
         log("%s: it failed with %d finding(s) already reported, so those are "
             "posted" % (label, len(findings)))
+        note = ("This review failed before it finished, so these are the "
+                "findings it had reported by then and not a finished round.")
 
-    transcript = save_transcript(repo, pr, text, findings)
     cost = output.get("total_cost_usd")
     priced = ", %.2f USD equivalent" % cost if isinstance(cost, float) else ""
-    log("%s: reviewed in %ds%s, transcript at %s" % (
-        label, took, priced, transcript))
+    log("%s: reviewed in %ds%s" % (label, took, priced))
 
     # After the transcript is on disk, so a review whose findings cannot be
     # posted is still a review someone can read. The outcome stays DONE
@@ -1136,9 +1173,8 @@ def review(path, repo, pr, config, env, tokens):
     # near the hour a token lives it cannot be guaranteed to. Posting is the
     # entire output of the run, and this is the last moment it can be made
     # safe cheaply. A dry run mints nothing, having nothing to post.
-    announce(label, lambda: post_review(
-        repo, pr, path, text, findings, config,
-        posting_env(label, config, repo, tokens, env)))
+    announce(label, lambda: finish(
+        label, repo, pr, path, text, findings, config, env, tokens, note))
     return DONE
 
 

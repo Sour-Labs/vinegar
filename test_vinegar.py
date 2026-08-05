@@ -129,7 +129,7 @@ DONE_EVENT = {"type": "result", "subtype": "success", "is_error": False,
               "result": "Reviewed it.", "total_cost_usd": 1.5}
 REAL = [{"file": "a.py", "line": 2, "summary": "s", "failure_scenario": "f"}]
 
-result, found = read = vinegar.read_stream(stream(call(REAL), DONE_EVENT))
+result, found = vinegar.read_stream(stream(call(REAL), DONE_EVENT))
 check("findings come back from the tool call", found == REAL, found)
 check("the result event comes back with them",
       result and result["total_cost_usd"] == 1.5, result)
@@ -260,6 +260,9 @@ mixed = vinegar.review_body(L, PR, CONFIG, inline, general)
 check("mixed body lists the out-of-diff findings",
       "6 findings, 2 posted inline." in mixed
       and "- `vinegar.py:900`: outside the diff" in mixed, mixed)
+check("a blank file name reads the same everywhere it is rendered",
+      vinegar.finding_bullet({"file": "   ", "summary": "s"})
+      == "- `(no file)`: s")
 check("a finding with no line is still named",
       "- `vinegar.py`: no line at all" in mixed, mixed)
 
@@ -383,6 +386,10 @@ def exploding_env(*a, **k):
     raise RuntimeError("GitHub is unreachable")
 
 
+def exploding_post(*a, **k):
+    raise RuntimeError("the endpoint is unreachable")
+
+
 def claude_run(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
     if cmd[0] == "claude":
         claude_run.saw, claude_run.env = cmd, env
@@ -401,8 +408,33 @@ claude_run.stream = stream(call(FINDINGS[:4]), result_event())
 
 vinegar.run, vinegar.github_env = claude_run, exploding_env
 del posted[:]
-check("a review whose posting dies is still recorded as done",
+check("a mint failure falls back rather than losing the review",
+      vinegar.review(ROOT, "o/r", PR, CONFIG, None, {}) == vinegar.DONE
+      and len(posted) == 1, (len(posted),))
+
+# Posting itself raising, which is what announce() exists for: an exception
+# escaping review() leaves handle_pr with no state and re-reviews the pull
+# request at full cost on every poll.
+_real_post = vinegar.post_review
+vinegar.post_review = exploding_post
+vinegar.github_env = lambda *a, **k: None
+del posted[:]
+check("a review whose posting raises is still recorded as done",
+      vinegar.review(ROOT, "o/r", PR, CONFIG, None, {}) == vinegar.DONE
+      and not posted, (posted,))
+vinegar.post_review = _real_post
+
+_real_save = vinegar.save_transcript
+
+
+def exploding_save(*a, **k):
+    raise PermissionError("~/.vinegar/reviews is not writable")
+
+
+vinegar.save_transcript = exploding_save
+check("a transcript that cannot be written is still recorded as done",
       vinegar.review(ROOT, "o/r", PR, CONFIG, None, {}) == vinegar.DONE)
+vinegar.save_transcript = _real_save
 
 vinegar.github_env = lambda *a, **k: None
 del posted[:]
@@ -469,9 +501,12 @@ check("a kill after the findings were reported still posts them",
       vinegar.review(ROOT, "o/r", PR, CONFIG, None, {}) == vinegar.DONE
       and len(posted) == 1
       and "comments" in posted[0][1], (len(posted),))
+check("a salvaged review says it was not a finished round",
+      posted and "not a finished round" in posted[0][1]["body"],
+      posted[0][1]["body"][:160] if posted else "nothing posted")
 check("a salvaged review is not announced as having produced nothing",
-      posted and "killed after" not in posted[0][1]["body"],
-      posted[0][1]["body"][:120] if posted else "nothing posted")
+      posted and "It reported nothing" not in posted[0][1]["body"],
+      posted[0][1]["body"][:160] if posted else "nothing posted")
 
 
 def timing_out_early(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
@@ -495,6 +530,19 @@ del posted[:]
 check("an error after the findings arrived posts them, not a retry",
       vinegar.review(ROOT, "o/r", PR, CONFIG, None, {}) == vinegar.DONE
       and len(posted) == 1, (len(posted),))
+check("a failed run says so rather than reading as finished",
+      posted and "failed before it finished" in posted[0][1]["body"],
+      posted[0][1]["body"][:160] if posted else "nothing posted")
+
+claude_run.stream = stream(call([]),
+                           result_event(is_error=True,
+                                        subtype="error_during_execution"))
+del posted[:]
+vinegar.review(ROOT, "o/r", PR, CONFIG, None, {})
+check("a failed run reporting nothing is never called clean",
+      posted and "No findings." not in posted[0][1]["body"]
+      and "reported nothing before it stopped" in posted[0][1]["body"],
+      posted[0][1]["body"][:200] if posted else "nothing posted")
 
 claude_run.stream = stream(call(FINDINGS[:4]), result_event())
 del posted[:]
