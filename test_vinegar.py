@@ -763,6 +763,32 @@ check("the reporting tool is allowed, which is what makes it reachable",
       vinegar.REPORT_TOOL in json.load(
           open(os.path.join(here_dir, "review-settings.json"))
       )["permissions"]["allow"])
+
+# The reviewer runs under settings passed as JSON, not as a path, because
+# the checkout deny is derived. A regression to `--settings SETTINGS_PATH`
+# leaves the sandbox enabled and the workspace — where .git/config is —
+# writable, which is the whole of the hole.
+_settings_arg = (claude_run.saw[claude_run.saw.index("--settings") + 1]
+                 if "--settings" in claude_run.saw else "")
+try:
+    _sent = json.loads(_settings_arg)
+except ValueError:
+    _sent = {}
+check("the reviewer is given settings as JSON, not the file path",
+      isinstance(_sent, dict) and _sent != {},
+      _settings_arg[:120])
+check("the reviewer's sandbox is enabled in what is actually sent",
+      _sent.get("sandbox", {}).get("enabled") is True,
+      json.dumps(_sent.get("sandbox")))
+# The one rule no file can carry: CHECKOUT_DIR moves with VINEGAR_HOME.
+check("the reviewer cannot write the checkout it is reviewing",
+      vinegar.CHECKOUT_DIR in
+      _sent.get("sandbox", {}).get("filesystem", {}).get("denyWrite", []),
+      json.dumps(_sent.get("sandbox", {}).get("filesystem")))
+# Denying the checkout must not cost the reviewer its own permissions.
+check("the settings sent still carry the permission rules",
+      vinegar.REPORT_TOOL in _sent.get("permissions", {}).get("allow", []),
+      json.dumps(_sent.get("permissions", {}).get("allow"))[:120])
 # check_paths() is the startup guard for that agreement, so first prove it
 # passes as configured, or the refusal below would prove nothing.
 try:
@@ -797,6 +823,94 @@ except SystemExit as err:
 vinegar.DENY_HOME = _dh
 check("a missing private-key deny rule refuses to start",
       "must deny" in _denied, _denied)
+
+# The sandbox stanza, which is what stops `git show --output=` writing any
+# file the daemon user can write. The allow list cannot: it matches the
+# start of a command and never sees the flag. Each key is checked
+# separately because each fails differently and silently.
+_sp_real = vinegar.SETTINGS_PATH
+
+
+def _with_sandbox(sandbox):
+    """What check_paths says when the settings carry this sandbox stanza."""
+    path = os.path.join(_home, "sandbox-settings.json")
+    real = json.load(open(_sp_real))
+    real["sandbox"] = sandbox
+    with open(path, "w") as handle:
+        json.dump(real, handle)
+    vinegar.SETTINGS_PATH = path
+    try:
+        vinegar.check_paths()
+        return "started"
+    except SystemExit as err:
+        return str(err)
+    finally:
+        vinegar.SETTINGS_PATH = _sp_real
+
+
+_good = {"enabled": True, "failIfUnavailable": True,
+         "allowUnsandboxedCommands": False}
+check("the sandbox stanza as shipped starts cleanly",
+      _with_sandbox(_good) == "started", _with_sandbox(_good))
+check("no sandbox at all refuses to start",
+      "sandbox.enabled" in _with_sandbox({}), _with_sandbox({}))
+check("a disabled sandbox refuses to start",
+      "sandbox.enabled" in _with_sandbox(dict(_good, enabled=False)),
+      _with_sandbox(dict(_good, enabled=False)))
+# `"true"` is a non-empty string, so reading these flags for truth rather
+# than for value would take a hand-edited quote as an enabled sandbox. It
+# is the same slip load_config refuses in config.json, in the file
+# operators edit far more often.
+check("a quoted true is not an enabled sandbox",
+      "sandbox.enabled" in _with_sandbox(dict(_good, enabled="true")),
+      _with_sandbox(dict(_good, enabled="true")))
+# And `1 == True` in Python, so comparing with `==` accepts a number where
+# a flag belongs. `is` is what makes these three keys mean what they say.
+check("a sandbox enabled with 1 rather than true refuses to start",
+      "sandbox.enabled" in _with_sandbox(dict(_good, enabled=1)),
+      _with_sandbox(dict(_good, enabled=1)))
+check("unsandboxed commands allowed as 0 rather than false refuses",
+      "allowUnsandboxedCommands" in _with_sandbox(
+          dict(_good, allowUnsandboxedCommands=0)),
+      _with_sandbox(dict(_good, allowUnsandboxedCommands=0)))
+# Without this, a sandbox that cannot start is skipped and the review runs
+# unconfined, which is the failure that looks exactly like success.
+check("a sandbox allowed to be unavailable refuses to start",
+      "failIfUnavailable" in _with_sandbox(
+          dict(_good, failIfUnavailable=False)),
+      _with_sandbox(dict(_good, failIfUnavailable=False)))
+check("letting commands run unsandboxed refuses to start",
+      "allowUnsandboxedCommands" in _with_sandbox(
+          dict(_good, allowUnsandboxedCommands=True)),
+      _with_sandbox(dict(_good, allowUnsandboxedCommands=True)))
+
+# reviewer_settings() is where the checkout deny comes from, and it has to
+# survive a settings file that carries no sandbox stanza at all: the
+# guarantee is in code, not in the file.
+_bare = os.path.join(_home, "bare-settings.json")
+with open(_bare, "w") as h:
+    json.dump({"permissions": {"allow": ["Read"], "deny": []}}, h)
+vinegar.SETTINGS_PATH = _bare
+_built = json.loads(vinegar.reviewer_settings())
+vinegar.SETTINGS_PATH = _sp_real
+check("the checkout deny is added even to settings that carry no sandbox",
+      vinegar.CHECKOUT_DIR in
+      _built["sandbox"]["filesystem"]["denyWrite"],
+      json.dumps(_built.get("sandbox")))
+# A settings file that already names the checkout must not have it added a
+# second time. Re-reading the file makes every call start clean, so only a
+# file that carries the path can drive the branch that decides this.
+_named = os.path.join(_home, "named-checkout-settings.json")
+with open(_named, "w") as h:
+    json.dump({"permissions": {"allow": ["Read"], "deny": []},
+               "sandbox": {"filesystem": {
+                   "denyWrite": [vinegar.CHECKOUT_DIR]}}}, h)
+vinegar.SETTINGS_PATH = _named
+_twice = json.loads(vinegar.reviewer_settings())["sandbox"]["filesystem"][
+    "denyWrite"]
+vinegar.SETTINGS_PATH = _sp_real
+check("a checkout the file already denies is not denied twice",
+      _twice.count(vinegar.CHECKOUT_DIR) == 1, _twice)
 
 # And the key has to be somewhere that rule reaches. check_paths argues
 # the key is safe because HOME carries the denied component; the key's

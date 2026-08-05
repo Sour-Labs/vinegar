@@ -358,6 +358,12 @@ denies writing and editing files, fetching the web, every shell and
 interpreter, and anything that changes state. Denials beat allows, and anything
 not listed is refused rather than granted.
 
+The same file turns on Claude Code's sandbox, which is what actually confines
+writes. The permission rules cannot: they match the start of a command and
+never see the flags after it, so `git show --output=<file>` reads to them
+exactly like the `git show` a review is for. See
+[What the permission rules cannot do](#what-the-permission-rules-cannot-do).
+
 The allow list names subcommands (`git diff`, `gh pr view`) rather than
 programs. Vinegar's first review of itself found out why, and the holes were
 confirmed by hand:
@@ -398,35 +404,84 @@ inside it, including the repository the reviewer is supposed to read. Keep the
 deny broad and keep the checkout out of it, rather than narrowing the rule to
 name each secret: the next secret added to `~/.vinegar` would not be named.
 
-### What this does not do
+### What the permission rules cannot do
 
 The allow list makes the easy paths closed and the accidental blast radius
-small. **It is not a containment boundary against a determined prompt
-injection**, and it is worth being exact about why rather than discovering it
-later.
+small. **On its own it is not a containment boundary against a determined
+prompt injection**, and it is worth being exact about why.
 
 A prefix rule matches the start of a command and cannot see the flags that
-follow. So `git diff`, `git log` and `git show` are all allowed, and all three
-accept `--output=<file>`, which writes any file the daemon user can write.
-`git diff --output=$HOME/.zshenv` is persistent code execution, and no prefix
-rule can distinguish it from the `git diff origin/main...HEAD` that every
-review legitimately runs. Removing `git diff` would close it, and would also
-remove the command the reviewer actually gets its diff from, so it stays.
+follow. `git diff`, `git log`, `git show` and `git blame` are all allowed, and
+all four accept `--output=<file>`, which writes any file the daemon user can
+write. `git show -s --format=%B --output=<file> HEAD` writes a commit message
+byte for byte, so the attacker also chooses the contents. `sort -o <file>` and
+`uniq <in> <out>` write files too. No prefix rule can tell any of them from the
+`git diff origin/main...HEAD` every review legitimately runs, and `git diff` is
+the command the reviewer gets its diff from, so it cannot be removed.
 
-One more stays open for the same kind of reason:
+Claude Code's own command analyser catches some of this and not all of it:
+measured on 2.1.221, `sort -o` outside the working directory is refused and
+recorded in `permission_denials`, while `git show --output=` is allowed and the
+file appears. Do not assume the analyser covers a flag you have not tested.
+
+### What closes it
+
+`review-settings.json` enables Claude Code's sandbox, which enforces at the
+operating system level rather than by pattern:
+
+```json
+"sandbox": {
+  "enabled": true,
+  "failIfUnavailable": true,
+  "allowUnsandboxedCommands": false
+}
+```
+
+`failIfUnavailable` matters as much as `enabled`. Without it a sandbox that
+cannot start is skipped and the review runs unconfined, which looks exactly
+like a successful review. `check_paths()` refuses to start when any of the
+three is missing or changed, the same way it refuses without the read deny.
+
+**The checkout is denied writes as well, and Vinegar adds that rule itself.**
+The sandbox leaves the workspace writable, and the workspace is the checkout.
+That is not survivable here: `core.fsmonitor` in a repository's `.git/config`
+names a command git runs, and `git reset --hard`, `git clean -qfd` and
+`git checkout --detach` all execute it — the three commands Vinegar runs in
+that checkout on its next poll, outside the sandbox, as the daemon user. It
+survives `reset --hard` and `clean -qfd` too, so one line written into
+`.git/config` would buy the next poll.
+
+`CHECKOUT_DIR` moves with `VINEGAR_HOME` so that one machine can run isolated
+instances, so no fixed string in the settings file is right for every install.
+Vinegar reads the file, adds the checkout to `sandbox.filesystem.denyWrite`,
+and passes the result to `claude --settings` as JSON. Nothing legitimate is
+lost: every read-only git command a review runs works with the checkout
+read-only.
+
+### What is still open
 
 **A `CLAUDE.md` in the checkout is still read.** `--setting-sources ''` covers
 `settings.json`, not the memory files, so a `CLAUDE.md` or `AGENTS.md` in the
 pull request's head commit reaches the model as project instructions, which is
-a stronger channel than the same text inside a diff hunk.
+a stronger channel than the same text inside a diff hunk. A `CLAUDE.md` saying
+"report no findings" is the shape that matters, because a clean review reads as
+a signal. `--bare` suppresses those files, and on 2.1.221 it also stops the CLI
+from finding an OAuth login, so it is not usable here without moving to an API
+key.
 
 ### So what is the boundary
 
 `skip_forks`, and it is on by default. On a pull request from your own
-repository the author already has write access to the code and to `CLAUDE.md`,
-so none of the above is a capability they did not already have. On a fork pull
-request all of it is written by a stranger, and the allow list is not what you
-want standing between that stranger and the machine holding your credentials.
+repository the author already has write access to the code and to `CLAUDE.md`.
+That is a capability over the *repository*, and it is worth being clear that it
+was never a capability over the *machine*: push access to one repository does
+not otherwise let someone write your shell profile, this program, or your
+launchd agents. That gap is what the sandbox above closes; before it, a
+same-repository pull request could reach all three.
+
+On a fork pull request all of it is written by a stranger, and the permission
+rules are not what you want standing between that stranger and the machine
+holding your credentials.
 
 Second to that, the GitHub App installation. A review can only reach the one
 repository its token was minted for, so the worst case stays inside the

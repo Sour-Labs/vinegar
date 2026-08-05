@@ -49,6 +49,31 @@ DENIED_COMPONENT = ".vinegar"
 # about what this glob covers, and neither of them notices if it is gone.
 DENY_HOME = "Read(//**/.vinegar/**)"
 
+# What the sandbox stanza in review-settings.json must say, and why each
+# part of it carries weight. The allow list names subcommands and cannot
+# see the flags that follow them, so `git show -s --format=%B
+# --output=<path> HEAD` writes a commit message byte for byte to any file
+# the daemon user can write, while matching `Bash(git show:*)` exactly
+# like the reads a review is for. That is not theoretical: run against
+# this settings file it created the file, and Claude Code's own command
+# analyser did not stop it, though it does stop `sort -o` — which is how
+# the flag went unnoticed while a narrower one did not.
+#
+# Denying `git show` would not close it either. `git diff` takes the same
+# flag and is the command every review gets its diff from, and `git
+# blame`, `sort -o` and `uniq in out` all write files too. A rule that
+# cannot see flags cannot be the boundary; the sandbox can.
+SANDBOX_RULES = (
+    ("enabled", True,
+     "nothing else confines what the reviewer writes"),
+    ("failIfUnavailable", True,
+     "a sandbox that cannot start would otherwise be skipped and the "
+     "review would run unconfined, saying nothing about it"),
+    ("allowUnsandboxedCommands", False,
+     "a command that may ask to run outside the sandbox is a command "
+     "the sandbox does not cover"),
+)
+
 # abspath, not just expanduser, so a trailing slash or a relative path cannot
 # make either of these look like it sits somewhere it does not.
 HOME = os.path.abspath(
@@ -476,9 +501,11 @@ def check_paths():
             # raise TypeError out of the check below, giving a traceback
             # every 30 seconds under launchd in place of the one sentence
             # that says what to add.
-            permissions = json.load(handle).get("permissions", {})
+            settings = json.load(handle)
+            permissions = settings.get("permissions") or {}
             allowed = permissions.get("allow") or []
             denied = permissions.get("deny") or []
+            sandbox = settings.get("sandbox") or {}
     except Exception as err:
         sys.exit("%s cannot be read (%s), and the reviewer runs under it."
                  % (SETTINGS_PATH, err))
@@ -501,6 +528,66 @@ def check_paths():
             "review reading the App private key under %s, and both path "
             "checks above assume it is there. Add it to permissions.deny."
             % (DENY_HOME, HOME))
+
+    # Everything above governs reads. Nothing above governs writes, and the
+    # allow list cannot: a prefix rule matches `git show` and cannot see the
+    # `--output=<path>` that follows it. SANDBOX_RULES says what closes that
+    # and why each key matters; this refuses to start when the file no
+    # longer says it, the same as the deny rule above.
+    #
+    # Compared by identity, for two different reasons. Not truthiness,
+    # because `"false"` is a non-empty string and would read as enabled.
+    # And not `!=` either, because `1 == True` and `0 == False` in Python,
+    # so `!=` accepts `"enabled": 1` and `"allowUnsandboxedCommands": 0` —
+    # a number where a flag belongs, in a file edited by hand.
+    for name, wanted, why in SANDBOX_RULES:
+        if sandbox.get(name) is not wanted:
+            sys.exit(
+                "review-settings.json must set sandbox.%s to %s, because %s. "
+                "Without the sandbox the reviewer can write any file the "
+                "daemon user can, including this program, through "
+                "`git show --output=`, which the allow list matches as an "
+                "ordinary read." % (name, str(wanted).lower(), why))
+
+    # The checkout is denied writes too, but reviewer_settings() adds that
+    # rather than this checking for it. CHECKOUT_DIR moves with
+    # VINEGAR_HOME by design, so a fixed file cannot name it for every
+    # instance, and a rule the operator has to keep in step is a rule that
+    # falls out of step. The file's own entry covers the default install;
+    # the guarantee is in code.
+
+
+def reviewer_settings():
+    """The settings the reviewer runs under: the file, plus this checkout.
+
+    Passed to `claude --settings` as JSON rather than as a path, because
+    the one rule that cannot live in the file is the one that matters
+    most here. The sandbox leaves the workspace writable, the workspace
+    is the checkout, and `.git/config` sits inside it: `core.fsmonitor`
+    there names a command git runs, and the commands Vinegar runs in that
+    checkout on its next poll — reset, clean, checkout — would run it
+    outside the sandbox as the daemon user. Measured: all three execute
+    it, and it survives both `reset --hard` and `clean -qfd`, so one line
+    written into `.git/config` buys the next poll.
+
+    CHECKOUT_DIR is derived from VINEGAR_HOME so that one machine can run
+    isolated instances, which means no fixed string in review-settings.json
+    is right for all of them. Deriving it here cannot drift; the file's
+    own entry is the same path for a default install, kept so the file
+    still reads as what it does.
+
+    Nothing legitimate is lost. Every read-only git command a review runs
+    — diff, log, show, blame, status, ls-files, rev-parse — works with the
+    checkout read-only.
+    """
+    with open(SETTINGS_PATH, encoding="utf-8") as handle:
+        settings = json.load(handle)
+    filesystem = settings.setdefault("sandbox", {}).setdefault(
+        "filesystem", {})
+    denied = filesystem.setdefault("denyWrite", [])
+    if CHECKOUT_DIR not in denied:
+        denied.append(CHECKOUT_DIR)
+    return json.dumps(settings)
 
 
 def waive(key, what, waived):
@@ -2284,7 +2371,7 @@ def review(path, repo, pr, config, env, tokens, resent=False):
     cmd = ["claude", "-p", prompt,
            "--append-system-prompt", reviewer_brief(pr),
            "--output-format", "stream-json", "--verbose",
-           "--settings", SETTINGS_PATH,
+           "--settings", reviewer_settings(),
            "--setting-sources", "",
            "--strict-mcp-config"]
     if config["model"]:
