@@ -97,6 +97,9 @@
       "denyWrite": [
         "~/.vinegar-checkouts"
       ]
+    },
+    "network": {
+      "allowedDomains": []
     }
   }
 }

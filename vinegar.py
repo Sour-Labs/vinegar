@@ -49,6 +49,34 @@ DENIED_COMPONENT = ".vinegar"
 # about what this glob covers, and neither of them notices if it is gone.
 DENY_HOME = "Read(//**/.vinegar/**)"
 
+# The read denials the security argument actually rests on, pinned so that
+# editing the file cannot quietly drop one. Only DENY_HOME used to be
+# checked, out of 47 rules, so deleting `Read(//**/.ssh/**)` while widening
+# the list left every check passing: the reviewer of an attacker-authored
+# branch could then read `~/.ssh/id_ed25519` and quote it into a finding
+# Vinegar publishes on a public pull request.
+#
+# These and not the rest of the file. The allow list is meant to be tuned,
+# and the write denials are backed by the sandbox now; what cannot be
+# recovered from is a credential read, because the finding carrying it is
+# already public by the time anyone notices.
+DENY_ALWAYS = (
+    DENY_HOME,
+    "Read(//**/.claude/**)",
+    "Read(//**/.ssh/**)",
+    "Read(//**/.aws/**)",
+    "Read(//**/.gnupg/**)",
+    "Read(//**/.config/gh/**)",
+    "Read(//**/.netrc)",
+    "Read(//**/.env)",
+)
+
+# And the one key that would make all of them moot. `bypassPermissions`
+# ignores the allow and deny lists entirely, so a single word here undoes
+# every rule above without touching one of them. Absent is the same as
+# "default"; anything else is refused.
+PERMISSION_MODE = "default"
+
 # What the sandbox stanza in review-settings.json must say, and why each
 # part of it carries weight. The allow list names subcommands and cannot
 # see the flags that follow them, so `git show -s --format=%B
@@ -74,13 +102,24 @@ SANDBOX_RULES = (
      "the sandbox does not cover"),
 )
 
-# Every key the file's own sandbox stanza may carry. reviewer_settings()
-# sends these and nothing else, so a key outside this set changes what a
-# hand-run does while leaving the daemon untouched — which makes the file
-# describe something Vinegar does not do. load_settings() refuses rather
-# than let the two readings of this file differ.
+# The network rule, pinned rather than assumed. Measured: with the sandbox
+# on and no network key at all, `gh pr view` fails with "Forbidden", which
+# is why the reviewer is told it has no network — but that came from a
+# default nothing here stated. A release that changed the default would
+# reopen the network silently, while the brief went on promising it was
+# closed and an injected review could send a diff or a credential
+# anywhere. Saying it costs nothing and cannot drift.
+SANDBOX_NETWORK = {"allowedDomains": []}
+
+# Every key the file's own sandbox stanza may carry, at both levels.
+# reviewer_settings() sends these and nothing else, so a key outside this
+# set changes what a hand-run does while leaving the daemon untouched —
+# which makes the file describe something Vinegar does not do.
+# `filesystem` needs its own set: checking only the top level accepted a
+# `filesystem.allowWrite` that hands a hand-run the whole disk.
 SANDBOX_KEYS = frozenset(
-    [name for name, _, _ in SANDBOX_RULES] + ["filesystem"])
+    [name for name, _, _ in SANDBOX_RULES] + ["filesystem", "network"])
+SANDBOX_FS_KEYS = frozenset(["denyWrite"])
 
 # abspath, not just expanduser, so a trailing slash or a relative path cannot
 # make either of these look like it sits somewhere it does not.
@@ -563,12 +602,22 @@ def load_settings():
     # widening the deny list, every path check still passes, the daemon
     # starts, and a review can read the App private key — the one
     # credential not scoped to a single repository.
-    if DENY_HOME not in denied:
+    for rule in DENY_ALWAYS:
+        if rule not in denied:
+            sys.exit(
+                "review-settings.json must deny %s. The credential reads in "
+                "DENY_ALWAYS are what keep a review from quoting a private "
+                "key into a finding this program then publishes, and %s is "
+                "missing. Add it to permissions.deny."
+                % (rule, rule))
+    # And the word that would make every rule above decorative.
+    mode = permissions.get("defaultMode", PERMISSION_MODE)
+    if mode != PERMISSION_MODE:
         sys.exit(
-            "review-settings.json must deny %s. That rule is what stops a "
-            "review reading the App private key under %s, and the path "
-            "checks assume it is there. Add it to permissions.deny."
-            % (DENY_HOME, HOME))
+            "review-settings.json sets permissions.defaultMode to %r. Only "
+            "%r is allowed here: the alternatives ignore the allow and deny "
+            "lists, so one word would undo every rule in this file without "
+            "touching one of them." % (mode, PERMISSION_MODE))
 
     # Reads are governed above. Writes are governed by nothing there, and
     # the allow list cannot govern them: a prefix rule matches `git show`
@@ -598,19 +647,39 @@ def load_settings():
     # `network` rule added to tighten it is silently dropped, so the file
     # would describe something the program does not do. Refusing keeps the
     # two readings of this file the same one.
-    extra = sorted(set(sandbox) - SANDBOX_KEYS)
+    filesystem = sandbox.get("filesystem")
+    filesystem = filesystem if isinstance(filesystem, dict) else {}
+    extra = (sorted(set(sandbox) - SANDBOX_KEYS)
+             + ["filesystem." + name
+                for name in sorted(set(filesystem) - SANDBOX_FS_KEYS)])
     if extra:
         sys.exit(
             "review-settings.json sets sandbox.%s, which Vinegar does not "
             "send: it builds that stanza itself for every review, so the "
             "key would change what a hand-run does and nothing else. "
-            "Remove it, or change SANDBOX_RULES and reviewer_settings() if "
-            "the daemon should carry it too." % ", sandbox.".join(extra))
+            "Remove it, or change reviewer_settings() if the daemon should "
+            "carry it too." % ", sandbox.".join(extra))
+    # The network rule is pinned like the flags, not merely permitted. The
+    # brief tells the reviewer it has no network and the README counts that
+    # as the larger half of the win, and until now both rested on a default
+    # nothing stated.
+    if sandbox.get("network", SANDBOX_NETWORK) != SANDBOX_NETWORK:
+        sys.exit(
+            "review-settings.json must set sandbox.network to %s or leave "
+            "it out. The reviewer is told it has no network and an allowed "
+            "domain would make that false — while also failing, since the "
+            "sandbox terminates TLS and `gh` will not trust it."
+            % json.dumps(SANDBOX_NETWORK))
     return settings
 
 
-def reviewer_settings():
+def reviewer_settings(workspace):
     """The settings the reviewer runs under: the file, plus this checkout.
+
+    `workspace` is the directory the review runs in, which review() has
+    and this cannot derive: it is CHECKOUT_DIR/<owner>__<repo>, and any
+    part of that may be a symlink pointing somewhere neither this
+    function nor CHECKOUT_DIR would name.
 
     Passed to `claude --settings` as JSON rather than as a path, because
     the one rule that cannot live in the file is the one that matters
@@ -655,19 +724,23 @@ def reviewer_settings():
     # would widen what three validated keys still describe as closed, and
     # means a hand-edited `"sandbox": null` cannot raise out of here into
     # a give-up comment about a local typo.
-    denied = [CHECKOUT_DIR]
-    # The resolved path too, because the kernel judges the write by it.
-    # Measured: denying only the symlink path let the write through, and
-    # `ln -s <elsewhere> ~/.vinegar-checkouts` is the shortcut people take
-    # to avoid re-cloning on upgrade — the one components() names too.
-    # Both forms are sent, since an entry that matches nothing costs
-    # nothing and guessing which one the sandbox canonicalises does not.
-    real = os.path.realpath(CHECKOUT_DIR)
-    if real != CHECKOUT_DIR:
-        denied.append(real)
+    # The workspace as well as the directory holding it, and the resolved
+    # form of each. The kernel judges a write by the path it resolves to,
+    # and denying only the parent missed the case that matters: the
+    # reviewer's workspace is CHECKOUT_DIR/<owner>__<repo>, so moving one
+    # large clone with `ln -s /Volumes/big/o__r ~/.vinegar-checkouts/o__r`
+    # put the workspace outside every denied entry while the parent still
+    # looked covered. An entry that matches nothing costs nothing, and
+    # guessing which form the sandbox canonicalises does not.
+    denied = []
+    for path in (CHECKOUT_DIR, workspace):
+        for form in (path, os.path.realpath(path)):
+            if form not in denied:
+                denied.append(form)
     settings["sandbox"] = dict(
         ((name, wanted) for name, wanted, _ in SANDBOX_RULES),
-        filesystem={"denyWrite": denied})
+        filesystem={"denyWrite": denied},
+        network=dict(SANDBOX_NETWORK))
     return json.dumps(settings)
 
 
@@ -1171,17 +1244,19 @@ def reviewer_brief(pr):
         "pull request targets `%s`, which should be fetched into this clone: "
         "`git diff refs/heads/%s...HEAD` is the review scope, spelled that "
         "way because a tag of the same name would otherwise win. If that ref "
-        "does not resolve, review `HEAD~1...HEAD` if that is the whole pull "
-        "request, and otherwise say in your summary that you could not "
-        "establish the scope. You have no network: `gh` cannot reach GitHub "
-        "from here, so do not reach for it. Do not substitute a branch of "
-        "your own choosing, and do not assume `main`.\n\n"
+        "does not resolve, use `refs/remotes/origin/%s...HEAD`, which this "
+        "clone carries even when the branch itself was not fetched, and say "
+        "in your summary that you used it. If neither resolves, say you "
+        "could not establish the scope rather than guessing at one. You have "
+        "no network: `gh` cannot reach GitHub from here, so do not reach for "
+        "it. Do not substitute a branch of your own choosing, and do not "
+        "assume `main`.\n\n"
         "Post nothing to GitHub yourself. Report every finding through the "
         "%s tool, including when you found none, and give `file` relative to "
         "the repository root. Vinegar reads that call and posts the whole "
         "review from it, so a finding you leave out of it is a finding "
         "nobody sees."
-        % (pr["number"], base, base, REPORT_TOOL))
+        % (pr["number"], base, base, base, REPORT_TOOL))
 
 
 def clamp(label, body):
@@ -2453,7 +2528,7 @@ def review(path, repo, pr, config, env, tokens, resent=False):
     cmd = ["claude", "-p", prompt,
            "--append-system-prompt", reviewer_brief(pr),
            "--output-format", "stream-json", "--verbose",
-           "--settings", reviewer_settings(),
+           "--settings", reviewer_settings(path),
            "--setting-sources", "",
            "--strict-mcp-config"]
     if config["model"]:

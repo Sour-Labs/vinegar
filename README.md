@@ -398,6 +398,14 @@ Reads are path-denied for `~/.vinegar`, `~/.claude`, `~/.ssh`, `~/.aws`,
 private key is a file the reviewer can read, and that key is the one
 credential that is **not** scoped to a single repository.
 
+Those eight are pinned in `DENY_ALWAYS` and re-checked before every review,
+not just at startup, because losing one is unrecoverable in a way the rest of
+the file is not: the finding carrying a private key is already published by
+the time anyone reads it. `permissions.defaultMode` is pinned for the same
+reason — `bypassPermissions` ignores the allow and deny lists entirely, so one
+word there would undo every rule in the file without touching one of them. The
+allow list itself is meant to be tuned and is not pinned.
+
 That is why clones live in `~/.vinegar-checkouts/` rather than under
 `~/.vinegar`. A blanket deny on a directory catches everything you later put
 inside it, including the repository the reviewer is supposed to read. Keep the
@@ -479,15 +487,21 @@ it came from in every review anyway.
 
 Closing the network is a gain in its own right, and a bigger one than the
 `gh` commands were worth: an injected review cannot send anything anywhere,
-whatever command it finds to run.
+whatever command it finds to run. It is stated rather than assumed —
+`sandbox.network` is sent as `{"allowedDomains": []}` on every review, because
+a property the reviewer is told about should not rest on a default that a
+future release is free to change.
 
 `CHECKOUT_DIR` moves with `VINEGAR_HOME` so that one machine can run isolated
 instances, so no fixed string in the settings file is right for every install.
-Vinegar puts the checkout in `sandbox.filesystem.denyWrite` and passes the
-result to `claude --settings` as JSON. The resolved path goes in as well as
-the written one, because the kernel judges a write by the path it resolves to:
-denying only `~/.vinegar-checkouts` when that is a symlink lets the write
-through, measured. Nothing legitimate is lost — every read-only git command a
+Vinegar puts both the checkout directory and the review's own workspace
+(`<checkouts>/<owner>__<repo>`) in `sandbox.filesystem.denyWrite`, and passes
+the result to `claude --settings` as JSON. The resolved path of each goes in
+as well as the written one, because the kernel judges a write by the path it
+resolves to: denying only `~/.vinegar-checkouts` when that is a symlink lets
+the write through, measured. Denying the parent alone is not enough either —
+moving one large clone with `ln -s /Volumes/big/o__r ~/.vinegar-checkouts/o__r`
+puts the workspace outside a rule that still looks like it covers it. Nothing legitimate is lost — every read-only git command a
 review runs works with the checkout read-only.
 
 ### What is still open
