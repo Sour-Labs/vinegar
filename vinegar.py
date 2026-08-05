@@ -206,8 +206,10 @@ def installation_token(app, repo, cache, good_for=0):
 
     This is the point of the GitHub App. The token is scoped to the single
     repository under review, so a diff that talks the reviewer into calling
-    `gh api` cannot reach anything else the owner can see, even other
-    repositories in the same installation.
+    `gh` cannot reach anything else the owner can see, even other
+    repositories in the same installation. The allow list names only
+    read-only `gh` subcommands, but a prefix rule cannot see the flags that
+    follow one, and this is what bounds the damage when a rule is not enough.
 
     `good_for` is how many seconds of life the caller needs. A token with less
     than that left is replaced now rather than expiring mid-review and losing
@@ -301,8 +303,9 @@ def check_paths():
 
     A HOME that the glob does *not* cover is worse. Nothing then denies the
     App's private key, which is the one credential not scoped to a single
-    repository, and `Bash(gh api:*)` is a channel out. Silence here means the
-    protection was never applied, not that it held.
+    repository, and a key that can be read is a key that can be copied out in
+    a finding. Silence here means the protection was never applied, not that
+    it held.
 
     Checking both makes the older "outside HOME" rule redundant: HOME must
     contain the component and the checkout must not, so the checkout cannot be
@@ -515,10 +518,17 @@ def reviewer_brief(pr):
         % (pr["number"], base, base, pr["number"]))
 
 
-def clamp(body):
-    """A comment body GitHub will accept, cut with a note if it has to be."""
+def clamp(label, body):
+    """A comment body GitHub will accept, cut with a note if it has to be.
+
+    Logged as well as marked. On the retry that packs every finding into one
+    comment, what gets cut is whole findings off the end, and a parenthesis
+    at the bottom of a long comment is not where anyone looks for that.
+    """
     if len(body) <= MAX_BODY:
         return body
+    log("%s: the comment is %d characters, cut to %d to fit GitHub's limit"
+        % (label, len(body), MAX_BODY))
     return body[:MAX_BODY] + "\n\n(cut to fit GitHub's comment limit)"
 
 
@@ -563,8 +573,13 @@ def parse_findings(text):
     a confident review of one finding with no file and no summary, posted in
     place of the reviewer's actual words.
     """
+    # split("\n"), not splitlines(). splitlines() also breaks on \x0b, \x0c,
+    # \x1c to \x1e, \x85 and U+2028/U+2029, every one of which is legal inside
+    # a JSON string. Rejoining those pieces with \n rewrites the block into
+    # something that no longer parses, and a review is lost to a form feed
+    # someone quoted.
     fenced, block, open_fence = [], None, False
-    for line in text.splitlines():
+    for line in text.split("\n"):
         marker = line.strip().startswith("```")
         if marker and not open_fence:
             block, open_fence = [], True
@@ -574,28 +589,26 @@ def parse_findings(text):
         elif open_fence:
             block.append(line)
 
-    # Last first: the answer is at the end, and anything earlier is an example.
-    empty = False
-    for candidate in reversed(fenced):
+    # The last fenced block is the answer, and only that one. Reading past it
+    # to an earlier block was how an empty array quoted while explaining the
+    # format came to answer for a review whose real block was truncated, and
+    # "No findings." is the one thing this must never say by accident.
+    #
+    # A last block that is not an array leaves the question open rather than
+    # settling it, so a review that ends with some other snippet falls to the
+    # scan below. That scan never returns an empty array, so nothing down
+    # there can invent a clean review either.
+    if fenced:
         try:
-            findings = json.loads(candidate)
+            answer = json.loads(fenced[-1])
         except json.JSONDecodeError:
-            continue
-        if is_findings(findings):
-            return findings
-        if isinstance(findings, list) and not findings:
-            empty = True
+            answer = None
+        if isinstance(answer, list):
+            return answer if is_findings(answer) or not answer else None
 
-    # A fenced answer settles it, either way. Going on to the unfenced scan
-    # after the reviewer fenced `[]` would let a findings-shaped array it
-    # merely quoted outrank the answer it actually gave, and post invented
-    # findings over a review that said it found nothing.
-    if empty:
-        return []
-
-    # Only now, and only because nothing fenced parsed. It walks the message
-    # once per `[`, so running it when a fenced block already answered would
-    # cost the length of the message squared for nothing.
+    # Only now, and only because nothing fenced parsed as an array at all. It
+    # walks the message once per `[`, so running it when a fenced block
+    # already answered would cost the message's length squared for nothing.
     decoder = json.JSONDecoder()
     for start in reversed([hit.start() for hit in re.finditer(r"\[", text)]):
         try:
@@ -660,8 +673,13 @@ def diff_lines(path, base, env, label):
             % (label, base, result.stderr.strip()[:200]))
         return {}
 
+    # split("\n") for the reason parse_findings() uses it, and here a forged
+    # line is worse than a lost one: splitlines() breaks on a lone CR, so an
+    # added line whose content holds one would be cut into a fragment that can
+    # look like a hunk header and put line numbers into `covered` that the
+    # diff never touched.
     covered, name, heading = {}, None, False
-    for line in result.stdout.splitlines():
+    for line in result.stdout.split("\n"):
         if line.startswith("diff --git "):
             name, heading = None, True
         elif heading and line.startswith("+++ "):
@@ -697,7 +715,12 @@ def repo_path(name, root):
     name = name.strip()
     name = (os.path.relpath(name, root) if os.path.isabs(name)
             else os.path.normpath(name))
-    return None if name.startswith("..") else name
+    # The component, not the two characters. `..config.py` is an ordinary
+    # file name and rejecting it would send a perfectly anchorable finding to
+    # the general comment.
+    if name == ".." or name.startswith(".." + os.sep):
+        return None
+    return name
 
 
 def finding_line(finding):
@@ -730,7 +753,7 @@ def describe(finding):
     return "%s\n\nFailure: %s" % (summary, scenario) if scenario else summary
 
 
-def split_findings(findings, covered, root):
+def split_findings(findings, covered, root, label):
     """Route each finding to an inline comment or to the general comment."""
     inline, general = [], []
     for finding in findings:
@@ -741,13 +764,13 @@ def split_findings(findings, covered, root):
             # to a comment, and one overlong finding refused there takes the
             # whole review with it.
             inline.append({"path": name, "line": line, "side": "RIGHT",
-                           "body": clamp(describe(finding))})
+                           "body": clamp(label, describe(finding))})
         else:
             general.append(finding)
     return inline, general
 
 
-def review_body(pr, config, inline, general, raw=None,
+def review_body(label, pr, config, inline, general, raw=None,
                 heading="These could not be anchored in the diff:"):
     """The review's top-level comment.
 
@@ -793,7 +816,7 @@ def review_body(pr, config, inline, general, raw=None,
             lines.append("- `%s`: %s" % (
                 where, describe(finding).replace("\n\n", "\n  ")))
 
-    return clamp("\n".join(lines))
+    return clamp(label, "\n".join(lines))
 
 
 def submit_review(repo, pr, payload, env):
@@ -813,10 +836,14 @@ def submit_review(repo, pr, payload, env):
                      env=env, timeout=POST_TIMEOUT,
                      stdin_text=json.dumps(payload))
     except subprocess.TimeoutExpired:
-        # Returning rather than raising, so the caller's retry still runs.
-        log("%s#%d: posting the review timed out after %ds" % (
-            repo, pr["number"], POST_TIMEOUT))
-        return False
+        # None, not False, and the difference is the whole point. The request
+        # may well have arrived: the timeout is on this side, and GitHub can
+        # have accepted the review and been slow to say so. Retrying that
+        # posts the review twice. Callers retry a definite refusal and leave
+        # this alone.
+        log("%s#%d: posting the review timed out after %ds, so it may or may "
+            "not have landed" % (repo, pr["number"], POST_TIMEOUT))
+        return None
     if result.returncode == 0:
         return True
     # Both streams. `gh api` puts a one-line summary on stderr and GitHub's
@@ -876,7 +903,7 @@ def post_timeout(repo, pr, config, seconds, env):
     # Twice, for the reason post_review() retries: this comment carries no
     # inline anchors, so a refusal is a transient one, and losing it leaves a
     # pull request silent about a review that really did run.
-    if not submit_review(repo, pr, payload, env):
+    if submit_review(repo, pr, payload, env) is False:
         submit_review(repo, pr, payload, env)
 
 
@@ -888,9 +915,14 @@ def post_review(repo, pr, path, text, config, env):
         log("%s: the reviewer returned no findings array, posting its text "
             "as the review" % label)
         inline, general, raw = [], [], text
+    elif not findings:
+        # Nothing to anchor, so nothing to work the diff out for. That is a
+        # `git diff` over the whole pull request saved on every clean review.
+        inline, general, raw = [], [], None
     else:
         inline, general = split_findings(
-            findings, diff_lines(path, pr["baseRefName"], env, label), path)
+            findings, diff_lines(path, pr["baseRefName"], env, label),
+            path, label)
         raw = None
 
     if not config["comment"]:
@@ -900,13 +932,18 @@ def post_review(repo, pr, path, text, config, env):
 
     payload = {"event": "COMMENT",
                "commit_id": pr["headRefOid"],
-               "body": review_body(pr, config, inline, general, raw)}
+               "body": review_body(label, pr, config, inline, general, raw)}
     if inline:
         payload["comments"] = inline
 
-    if submit_review(repo, pr, payload, env):
+    landed = submit_review(repo, pr, payload, env)
+    if landed:
         log("%s: posted %d inline comment(s) and the review comment" % (
             label, len(inline)))
+        return
+    if landed is None:
+        # It timed out on this side, so it may already be on the pull
+        # request. Sending it again would post the review twice.
         return
 
     if not inline:
@@ -929,7 +966,7 @@ def post_review(repo, pr, path, text, config, env):
     log("%s: retrying with every finding in the review comment" % label)
     payload.pop("comments")
     payload["body"] = review_body(
-        pr, config, [], findings,
+        label, pr, config, [], findings,
         heading="GitHub refused the inline comments, so all of it is here:")
     submit_review(repo, pr, payload, env)
 
@@ -1015,22 +1052,26 @@ def review(path, repo, pr, config, env, tokens):
     # posted as though the reviewer had written them.
     text = str(output.get("result") or "")
 
-    # An error that still produced text is not a review that never ran. The
-    # clearest case is the turn limit, which returns `is_error` with the whole
-    # review sitting in `result`: the subscription is spent and the findings
-    # exist. Discarding that lost them and then charged for them twice more,
-    # because FAILED means "worth retrying" and MAX_ATTEMPTS allows three.
+    # The turn limit is the one error that spends the whole subscription and
+    # still hands back the review: `result` holds the findings rather than a
+    # message about why there are none. Treating it as FAILED lost them and
+    # then charged for them twice more, since FAILED means "worth retrying"
+    # and MAX_ATTEMPTS allows three.
     #
-    # Deciding on whether there is text, rather than on which subtype came
-    # back, so a new error subtype is handled the same way without this
-    # having to learn about it. An error with nothing to show still returns
-    # FAILED, which is the case retrying is for.
+    # Named explicitly, because every other error also arrives with text in
+    # `result` and that text is an error message. Deciding on whether there
+    # was any text posted "Claude AI usage limit reached" to the pull request
+    # as though the reviewer had written it, and recorded the pull request
+    # reviewed for good, which is worse than the loss it was meant to fix.
+    # An unrecognised subtype is FAILED for the same reason: retrying costs
+    # at most three attempts, and MAX_ATTEMPTS bounds it, while the other
+    # mistake is silent and permanent.
     if output.get("is_error"):
         log("%s: review failed after %ds: %s" % (label, took, text[:400]))
-        if not text.strip():
+        if output.get("subtype") != "error_max_turns" or not text.strip():
             return FAILED
-        log("%s: it failed with a review in hand, so that is what is posted"
-            % label)
+        log("%s: it ran out of turns with a review in hand, so that is what "
+            "is posted" % label)
 
     transcript = save_transcript(repo, pr, text)
     cost = output.get("total_cost_usd")
@@ -1151,11 +1192,9 @@ def handle_pr(repo, pr, config, state, tokens):
                 key, attempts, STATE_PATH))
 
 
-def find_pr(target, env):
+def find_pr(repo, number, env):
     """Read the one pull request named by an `owner/repo#number` target."""
-    if "#" not in target:
-        sys.exit("--pr wants owner/repo#number, got %s" % target)
-    repo, _, number = target.partition("#")
+    target = "%s#%s" % (repo, number)
     result = run(["gh", "pr", "view", number, "-R", repo,
                   "--json", PR_FIELDS], env=env)
     if result.returncode != 0:
@@ -1275,18 +1314,21 @@ def main():
     tokens = {}
     try:
         if args.pr:
-            # Checked before anything is minted, so a mistyped target says it
-            # is mistyped rather than failing on whichever repository the
-            # string happened to name.
-            if "#" not in args.pr:
+            # Checked before anything is minted, so a mistyped target says
+            # it is mistyped rather than minting a token for whatever the
+            # string happened to name and failing on that instead. The whole
+            # shape, not just the `#`, since a half-check leaves the same
+            # error to be discovered later by the call it was meant to guard.
+            repo, _, number = args.pr.partition("#")
+            if not number.isdigit() or repo.count("/") != 1 or not all(
+                    part for part in repo.split("/")):
                 sys.exit("--pr wants owner/repo#number, got %s" % args.pr)
-            repo = args.pr.partition("#")[0]
             # The same sum handle_pr() asks for, and for the same reason: one
             # token covers the checkout and the review that follows it. The
             # posting asks for its own, in review().
             env = github_env(config, repo, tokens,
                              good_for=CHECKOUT_GRACE + config["review_timeout"])
-            pr = find_pr(args.pr, env)
+            pr = find_pr(repo, number, env)
             reason = skip_reason(pr, config)
             if reason:
                 log("%s: would be skipped (%s), reviewing anyway" % (
