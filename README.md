@@ -28,8 +28,13 @@ The reviewer is not something Vinegar implements. Claude Code already ships a
 and runs non-interactively:
 
 ```sh
-claude -p '/code-review 123' --output-format stream-json --verbose
+CLAUDE_CODE_REPORT_FINDINGS=1 \
+  claude -p '/code-review 123' --output-format stream-json --verbose
 ```
+
+That environment variable is not decoration. It, the two stream flags, and the
+`ReportFindings` allow-list entry are the three settings "The review" describes,
+and dropping any one sends the findings somewhere Vinegar cannot read them.
 
 Vinegar is the trigger, the router, and the calibration around that. It also
 does the posting: the reviewer returns findings and Vinegar submits them as one

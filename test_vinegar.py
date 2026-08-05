@@ -50,6 +50,8 @@ atexit.register(shutil.rmtree, _home, True)
 os.environ["VINEGAR_HOME"] = os.path.join(_home, ".vinegar")
 import vinegar
 
+GENUINE_SAVE_TRANSCRIPT = vinegar.save_transcript
+
 PR = {"number": 12, "headRefOid": "a1b2c3d4e5f6", "baseRefName": "release-2",
       "url": "https://github.com/o/r/pull/12"}
 CONFIG = dict(vinegar.DEFAULTS, effort="high", comment=True)
@@ -72,6 +74,11 @@ diff --git a/doc.md b/doc.md
 @@ -1,0 +2,2 @@
 +++ b/spoofed.py
 +@@ -1 +9999 @@
+diff --git a/my file.py b/my file.py
+--- a/my file.py	
++++ b/my file.py	
+@@ -1,0 +2,1 @@
++spaced
 diff --git a/crlf.py b/crlf.py
 --- a/crlf.py
 +++ b/crlf.py
@@ -165,6 +172,13 @@ check("a tool call whose input is not an object does not crash the review",
               {"type": "tool_use", "name": "ReportFindings",
                "input": [{"file": "a.py"}]}]}},
           DONE_EVENT))[1] is None)
+check("an empty last block does not erase what the reviewer said",
+      vinegar.read_stream(stream(
+          {"type": "assistant", "message": {"content": [
+              {"type": "text", "text": "The risk is here."}]}},
+          {"type": "assistant", "message": {"content": [
+              {"type": "text", "text": "  \n "}]}},
+          DONE_EVENT))[2] == "The risk is here.")
 check("only the reviewer's last words are kept, not the whole run",
       vinegar.read_stream(stream(
           {"type": "assistant", "message": {"content": [
@@ -216,6 +230,8 @@ check("added lines are covered", covered.get("vinegar.py") == {11, 12, 13, 43},
 check("deleted file contributes nothing", "gone.py" not in covered, covered)
 check("deletion-only hunk contributes nothing", "README.md" not in covered,
       covered)
+check("a path with a space is keyed without git's trailing tab",
+      covered.get("my file.py") == {2}, list(covered))
 check("a carriage return cannot forge a hunk header",
       covered.get("crlf.py") == {2}, covered.get("crlf.py"))
 check("an added line that looks like a file header is content",
@@ -762,6 +778,7 @@ check("brief does not promise the base ref is definitely there",
 _hp_state = {}
 _hp_saved = []
 _real_review, _real_save_state = vinegar.review, vinegar.save_state
+_real_checkout, _real_github_env = vinegar.checkout, vinegar.github_env
 vinegar.save_state = lambda st: _hp_saved.append(dict(st))
 PR_LIVE = dict(PR, isDraft=False, isCrossRepository=False,
                author={"login": "kevin"}, additions=1, deletions=0)
@@ -793,6 +810,7 @@ check("the real outcome replaces the marker when the review finishes",
       _hp_state[L]["outcome"] == vinegar.DONE, _hp_state)
 
 vinegar.review, vinegar.save_state = _real_review, _real_save_state
+vinegar.checkout, vinegar.github_env = _real_checkout, _real_github_env
 
 # --- a resend must not duplicate a review that already landed --------------
 claude_run.stream = stream(call([]), result_event())
@@ -814,6 +832,8 @@ check("someone else's review at the same commit does not suppress ours",
 
 check("the landed-review question asks every page",
       "--paginate" in looked[0], looked[0])
+check("the landed-review question survives a review with no body",
+      any('// ""' in a for a in looked[0]), looked[0])
 
 # The anchored retry is the common path and was the unguarded one.
 claude_run.stream = stream(call(FINDINGS[:1]), result_event())
@@ -843,8 +863,58 @@ check("an empty result field falls back to the reviewer's own words",
       posted and "the risk is here" in posted[0][1]["body"]
       and "produced nothing" not in posted[0][1]["body"],
       posted[0][1]["body"][:180] if posted else "nothing posted")
-fake_run.rc = 1
 fake_run.rc = 0
+vinegar.run = fake_run
+
+logged = []
+vinegar.log = lambda m: logged.append(m)
+vinegar.run, vinegar.github_env = claude_run, lambda *a, **k: None
+for value, shown in ((1.5, "1.50 USD"), (2, "2.00 USD"), (0, "0.00 USD")):
+    claude_run.stream = stream(call([]), result_event(total_cost_usd=value))
+    del logged[:]
+    vinegar.review(ROOT, "o/r", PR, CONFIG, None, {})
+    check("a cost of %r is reported, whatever its JSON type" % (value,),
+          any(shown in m for m in logged),
+          [m for m in logged if "reviewed in" in m])
+vinegar.log = lambda message: None
+vinegar.run = fake_run
+
+# A failed attempt posts nothing, correctly, but must not lose what it said.
+vinegar.save_transcript = stub_transcript
+vinegar.run, vinegar.github_env = claude_run, lambda *a, **k: None
+claude_run.stream = stream(
+    {"type": "assistant", "message": {"content": [
+        {"type": "text", "text": "Twenty minutes of analysis."}]}},
+    result_event(is_error=True, result=None,
+                 subtype="error_during_execution"))
+del posted[:]
+del _tx_calls[:]
+check("a failed attempt is retried, not posted",
+      vinegar.review(ROOT, "o/r", PR, CONFIG, None, {}) == vinegar.FAILED
+      and not posted, (posted,))
+check("a failed attempt still keeps the reviewer's words on disk",
+      _tx_calls and "Twenty minutes of analysis." in _tx_calls[-1][2],
+      _tx_calls[-1][2][:80] if _tx_calls else "never called")
+check("a failed attempt's transcript does not claim to be a review",
+      _tx_calls and "not a review" in (_tx_calls[-1][4] or ""),
+      _tx_calls[-1][4] if _tx_calls else "never called")
+
+# Giving up after MAX_ATTEMPTS must be said on the pull request.
+_gu_state = {L: {"outcome": vinegar.FAILED, "sha": PR["headRefOid"],
+                 "attempts": vinegar.MAX_ATTEMPTS - 1}}
+_real_review2 = vinegar.review
+vinegar.review = lambda *a, **k: vinegar.FAILED
+vinegar.checkout = lambda repo, pr, env: ROOT
+vinegar.save_state = lambda st: None
+del posted[:]
+vinegar.handle_pr("o/r", PR_LIVE, CONFIG, _gu_state, {})
+check("giving up is announced on the pull request, not only in the log",
+      len(posted) == 1 and "not as the change being clean"
+      in posted[0][1]["body"],
+      posted[0][1]["body"][:160] if posted else "nothing posted")
+vinegar.review = _real_review2
+vinegar.checkout, vinegar.github_env = _real_checkout, _real_github_env
+vinegar.save_state = _real_save_state
 vinegar.run = fake_run
 
 # --- save_transcript, unstubbed ------------------------------------------
@@ -854,6 +924,7 @@ _tx_home = tempfile.mkdtemp(prefix="vinegar-test-tx-")
 atexit.register(shutil.rmtree, _tx_home, True)
 _tx_real = vinegar.REVIEW_DIR
 vinegar.REVIEW_DIR = _tx_home
+vinegar.save_transcript = GENUINE_SAVE_TRANSCRIPT
 
 written = vinegar.save_transcript("o/r", PR, "Reviewed it.", FINDINGS[:2])
 body = open(written).read()
@@ -878,6 +949,17 @@ check("a transcript with nothing reported has no findings section",
       "## Findings" not in body, body[:160])
 
 vinegar.REVIEW_DIR = _tx_real
+
+# What finish() actually hands the transcript, which only the recorder sees.
+del _tx_calls[:]
+vinegar.save_transcript = stub_transcript
+vinegar.run = timing_out
+del posted[:]
+vinegar.review(ROOT, "o/r", PR, CONFIG, None, {})
+check("the killed-run marker reaches the transcript, not just the comment",
+      _tx_calls and _tx_calls[-1][4] and "killed after" in _tx_calls[-1][4],
+      _tx_calls[-1][4] if _tx_calls else "never called")
+vinegar.run = fake_run
 
 # --- the --pr guard, through the real entry point -------------------------
 # A mistyped target must be refused before anything is minted or asked of

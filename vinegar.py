@@ -701,7 +701,12 @@ def read_stream(stdout, label="review"):
                 # thirty has been narrating throughout, and posting all of it
                 # put a wall of "let me read the enclosing function" on the
                 # pull request in place of a review.
-                spoken = str(block.get("text") or "")
+                # The last *non-empty* block. A trailing empty or
+                # whitespace-only one would otherwise wipe the closing
+                # summary and leave the pull request told the reviewer said
+                # nothing, while its analysis sat one block earlier.
+                said = str(block.get("text") or "")
+                spoken = said if said.strip() else spoken
     spoken = spoken.strip()
     if len(spoken) > MAX_SPOKEN:
         # Said, not silently done. review_body introduces this text with
@@ -796,7 +801,11 @@ def diff_lines(path, base, env, label):
             target = line[4:]
             # /dev/null is a delete, and there is no head-side file to
             # comment on. The b/ prefix is git's, not part of the path.
-            name = None if target == "/dev/null" else target[2:]
+            # rstrip("\t"), because git appends a tab to this header for any
+            # path containing a space. Without it the key carries the tab,
+            # no finding's `file` can match, and every finding in that file
+            # is silently demoted to the general comment.
+            name = None if target == "/dev/null" else target[2:].rstrip("\t")
         elif name and line.startswith("@@"):
             heading = False
             hunk = re.match(r"@@ -\S+ \+(\d+)(?:,(\d+))? @@", line)
@@ -1082,7 +1091,7 @@ def already_posted(label, repo, pr, env):
         result = run(["gh", "api", "--paginate", "-X", "GET",
                       "repos/%s/pulls/%d/reviews" % (repo, pr["number"]),
                       "--jq", '.[] | select(.commit_id == "%s") '
-                              '| .body | split("\n")[0]'
+                              '| (.body // "") | split("\n")[0]'
                               % pr["headRefOid"]],
                      env=env, timeout=POST_TIMEOUT)
     except subprocess.TimeoutExpired:
@@ -1096,6 +1105,14 @@ def already_posted(label, repo, pr, env):
 def post_review(label, repo, pr, path, text, findings, config, env,
                 note=None):
     """Turn what the reviewer reported into one review on the pull request."""
+    if not config["comment"]:
+        # Before the routing, not after. Working out which findings could be
+        # anchored means a full `git diff` over the pull request, and a dry
+        # run discards the answer to print two counts.
+        log("%s: dry run, %d finding(s) not posted" % (
+            label, len(findings) if findings else 0))
+        return
+
     if findings is None:
         log("%s: %s, posting its text as the review" % (
             label, "the review stopped before reporting" if note else
@@ -1110,11 +1127,6 @@ def post_review(label, repo, pr, path, text, findings, config, env,
             findings, diff_lines(path, pr["baseRefName"], env, label),
             path, label)
         raw = None
-
-    if not config["comment"]:
-        log("%s: dry run, %d inline and %d general finding(s) not posted" % (
-            label, len(inline), len(general)))
-        return
 
     payload = {"event": "COMMENT",
                "commit_id": pr["headRefOid"],
@@ -1166,6 +1178,26 @@ def post_review(label, repo, pr, path, text, findings, config, env,
         label, pr, config, [], findings, note=note,
         heading="GitHub refused the inline comments, so all of it is here:")
     submit_review(label, repo, pr, payload, env)
+
+
+def keep(label, repo, pr, text, why):
+    """Save what a failed attempt said, since nothing else will.
+
+    The two FAILED endings post nothing, correctly: they are retried, and
+    posting on each attempt would leave three comments. But the reviewer's
+    own words are in hand by then and were being dropped, so a run that
+    narrated for twenty minutes before dying left no trace anywhere. On a
+    dry run the transcript is the only output there is.
+    """
+    if not text.strip():
+        return
+    try:
+        log("%s: %s, its words are in %s" % (label, why, save_transcript(
+            repo, pr, text, None,
+            "This attempt did not finish, so this is what it said before it "
+            "stopped. It is not a review.")))
+    except Exception as err:
+        log("%s: the transcript is not saved: %s" % (label, err))
 
 
 def finish(label, repo, pr, path, text, findings, config, env, tokens,
@@ -1301,8 +1333,9 @@ def review(path, repo, pr, config, env, tokens):
         # it and then charge for it twice more, since FAILED is retried.
         detail = (result.stderr or result.stdout)[:400].strip()
         log("%s: claude printed no result after %ds: %s" % (
-            label, took, detail[:400]))
+            label, took, detail))
         if findings is None:
+            keep(label, repo, pr, spoken, "the stream stopped early")
             return FAILED
         log("%s: it had reported %d finding(s) first, posting those"
             % (label, len(findings)))
@@ -1376,6 +1409,7 @@ def review(path, repo, pr, config, env, tokens):
     if output.get("is_error"):
         log("%s: review failed after %ds: %s" % (label, took, text[:400]))
         if findings is None:
+            keep(label, repo, pr, spoken, "the review failed")
             return FAILED
         log("%s: it failed with %d finding(s) already reported, so those are "
             "posted" % (label, len(findings)))
@@ -1383,7 +1417,9 @@ def review(path, repo, pr, config, env, tokens):
                 "findings it had reported by then and not a finished round.")
 
     cost = output.get("total_cost_usd")
-    priced = ", %.2f USD equivalent" % cost if isinstance(cost, float) else ""
+    # bool first: it is an int, and True would print as 1.00 USD.
+    priced = ", %.2f USD equivalent" % cost if isinstance(
+        cost, (int, float)) and not isinstance(cost, bool) else ""
     log("%s: reviewed in %ds%s" % (label, took, priced))
 
     # After the transcript is on disk, so a review whose findings cannot be
@@ -1517,6 +1553,17 @@ def handle_pr(repo, pr, config, state, tokens):
         log("%s: %d failed attempts, leaving it alone. Fix the cause, then "
             "delete its entry from %s to try again" % (
                 key, attempts, STATE_PATH))
+        # Said on the pull request, not only in a log nobody is watching.
+        # This is the moment Vinegar stops trying, and until now it was the
+        # one ending that left a pull request it had looked at three times
+        # with nothing on it at all. Silence has to keep meaning that
+        # something broke, which is only true if the giving-up is announced.
+        announce(key, lambda: finish(
+            key, repo, pr, path, "", None, config, env, tokens,
+            note="Vinegar tried to review this %d times and each attempt "
+                 "failed before it could report anything. Read that as the "
+                 "review not running, not as the change being clean." % (
+                     attempts,)))
 
 
 def find_pr(repo, number, env):
