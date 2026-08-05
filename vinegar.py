@@ -29,6 +29,7 @@ import fcntl
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -359,6 +360,22 @@ def load_config(path):
         sys.exit("%s: repos must be a non-empty list of owner/name" % path)
     if config["effort"] not in EFFORTS:
         sys.exit("%s: effort must be one of %s" % (path, ", ".join(EFFORTS)))
+
+    # The numbers, because they are read as numbers. A hand-edited
+    # `"review_timeout": "1800"` is accepted by JSON and by every check
+    # above it, and then raises TypeError inside checkout_grace on every
+    # pull request on every poll: nothing reviewed, MAX_ATTEMPTS never
+    # reached, no give-up posted, and the pull requests silent. This is
+    # the file operators actually edit, and load_state guards the same
+    # class for the one they are only told to edit.
+    for name in ("poll_interval", "review_timeout", "max_changed_lines"):
+        value = config[name]
+        if not isinstance(value, int) or isinstance(value, bool):
+            sys.exit("%s: %s must be a whole number of %s, not %r" % (
+                path, name,
+                "lines" if name == "max_changed_lines" else "seconds", value))
+        if value <= 0:
+            sys.exit("%s: %s must be greater than zero" % (path, name))
 
     # A misconfigured App is caught here rather than at the first review, which
     # is minutes later and on a real pull request.
@@ -727,9 +744,21 @@ def open_prs(repo, env):
         log("%s: gh pr list timed out after %ds" % (repo, LIST_TIMEOUT))
         return []
     if result.returncode != 0:
-        log("%s: gh pr list failed: %s" % (repo, result.stderr.strip()))
+        log("%s: gh pr list failed: %s" % (
+            repo, both_streams(result, 400)))
         return []
     prs = json.loads(result.stdout)
+    # A list of objects, or nothing. `gh` answering 0 with something else
+    # — a wrapper's error object, a future release reporting in band —
+    # sails past the length check below and then raises inside
+    # handle_pr; poll_once's own handler builds its message with
+    # `pr.get`, which raises AttributeError from inside the except and
+    # takes the daemon out entirely. load_state was hardened against
+    # exactly this shape; the listing was not.
+    if not isinstance(prs, list) or not all(
+            isinstance(pr, dict) for pr in prs):
+        log("%s: gh pr list did not answer with pull requests" % repo)
+        return []
     # Said out loud when the cap is reached. Anything past it is never
     # handed to handle_pr: not skipped, not reviewed, not recorded and
     # not mentioned — indistinguishable from Vinegar having judged it,
@@ -768,6 +797,35 @@ def checkout(repo, pr, env):
     which costs more and reviews worse.
     """
     path = os.path.join(CHECKOUT_DIR, repo.replace("/", "__"))
+
+    # What a killed run leaves behind, cleared before it can wedge every
+    # future poll. A SIGKILL during a fetch leaves `.git/index.lock`, and
+    # every later `git reset` then fails with "Unable to create
+    # index.lock: File exists" — a checkout failure, which is
+    # deliberately exempt from MAX_ATTEMPTS, so no pull request in that
+    # repository is ever reviewed again and nothing says why beyond one
+    # line. The lock is only meaningful while a git process holds it, and
+    # acquire_lock() means no other Vinegar is running.
+    #
+    # A clone killed part-way is the same shape one level up: `.git`
+    # exists, so the clone is skipped and a repository git itself refuses
+    # to open is used for ever. If it does not answer to rev-parse it is
+    # not a repository, and starting again costs one clone.
+    stale = os.path.join(path, ".git", "index.lock")
+    if os.path.exists(stale):
+        log("%s: clearing a lock left by a killed run" % repo)
+        forget(stale)
+    if os.path.isdir(os.path.join(path, ".git")):
+        try:
+            usable = run(["git", "rev-parse", "--git-dir"], cwd=path,
+                         env=env, timeout=DIFF_TIMEOUT).returncode == 0
+        except subprocess.TimeoutExpired:
+            usable = False
+        if not usable:
+            log("%s: the checkout is not a usable repository, cloning it "
+                "again" % repo)
+            shutil.rmtree(path, ignore_errors=True)
+
     if not os.path.isdir(os.path.join(path, ".git")):
         os.makedirs(CHECKOUT_DIR, exist_ok=True)
         log("%s: cloning into %s" % (repo, path))
@@ -799,16 +857,11 @@ def checkout(repo, pr, env):
         # checkout(), which is deliberately never counted against
         # MAX_ATTEMPTS: a 120-second cap turned a slow repository into a
         # pull request that was never reviewed and never given up on.
+        # The local steps do need a ceiling: on a filesystem that stops
+        # answering they block in the kernel for ever, parking the one
+        # poll thread while the watchdog sees a live pid and calls it
+        # healthy.
         bound = FETCH_TIMEOUT if step[:2] == ["git", "fetch"] else DIFF_TIMEOUT
-        # Bounded, unlike the clone above it. The exemption beside
-        # LIST_TIMEOUT is for a first clone over a slow link; reset, clean
-        # and detach are local work, and on a filesystem that stops
-        # answering they block in the kernel with no ceiling at all. The
-        # poll loop is one thread, so that parks the daemon on every
-        # repository while the watchdog sees a live pid and calls it
-        # healthy — which is the failure DIFF_TIMEOUT exists to prevent,
-        # reached through the call site beside it. The fetch shares the
-        # budget because it is one ref from one remote, not a clone.
         try:
             result = run(step, cwd=path, env=env, timeout=bound)
         except subprocess.TimeoutExpired:
@@ -1297,7 +1350,7 @@ def finding_bullet(finding):
     # a field with a blank line, and GitHub reads two spaces on their own
     # as the end of the list item: the failure scenario and the category
     # rendered at column zero, detached from the finding they belong to.
-    body = re.sub(r"\n{2,}", "\n  ", describe(finding))
+    body = re.sub(r"(\n[ \t\r]*){2,}", "\n  ", describe(finding))
     return "- `%s`: %s" % (where, body)
 
 
@@ -2106,8 +2159,6 @@ def repost(key, repo, pr, config, state, tokens, done, marker, sha):
     if body is not None:
         try:
             env = github_env(config, repo, tokens, good_for=POST_GRACE)
-            log("%s: posting the review that was refused earlier (attempt "
-                "%d of %d)" % (key, tries, MAX_ATTEMPTS))
             opening = ("%s\n\nThis review was refused when it was written "
                        "and is posted from the transcript, so its findings "
                        "are not anchored in the diff.\n\n---\n\n" % (
@@ -2135,12 +2186,20 @@ def repost(key, repo, pr, config, state, tokens, done, marker, sha):
             # exactly what happens during the GitHub incident that made
             # the post ambiguous in the first place. The saved review then
             # went on top of one that was already up.
-            settled = (POSTED if already_posted(key, repo, at, env) else
-                       submit_review(
-                           key, repo, at,
-                           {"event": "COMMENT",
-                            "commit_id": at["headRefOid"],
-                            "body": opening + body}, env))
+            # Said where it is actually done. Logged before the check, a
+            # poll that sent nothing because the review was already up
+            # still claimed to have sent one, and the line after it
+            # ("the saved review is on the pull request") then read as
+            # confirmation that this attempt was what put it there.
+            if already_posted(key, repo, at, env):
+                settled = POSTED
+            else:
+                log("%s: posting the review that was refused earlier "
+                    "(attempt %d of %d)" % (key, tries, MAX_ATTEMPTS))
+                settled = submit_review(
+                    key, repo, at,
+                    {"event": "COMMENT", "commit_id": at["headRefOid"],
+                     "body": opening + body}, env)
             landed = settled == POSTED
             if settled == THROTTLED and waive(key, "the posting", waived):
                 waived += 1
@@ -2430,15 +2489,11 @@ def review(path, repo, pr, config, env, tokens, resent=False):
         # anyone grepping for one.
         log("%s: reviewed in %ds%s" % (label, took, priced))
 
-    # After the transcript is on disk, so a review whose findings cannot be
-    # posted is still a review someone can read. The outcome stays DONE
-    # either way: the subscription is spent by this point, and re-running a
-    # review to recover from a failed post would spend it again.
-    # A fresh token, rather than the one minted before the checkout. That one
-    # had to outlast the clone and the whole review, and at a `review_timeout`
-    # near the hour a token lives it cannot be guaranteed to. Posting is the
-    # entire output of the run, and this is the last moment it can be made
-    # safe cheaply. A dry run mints nothing, having nothing to post.
+    # The outcome stays DONE whatever the posting answers: the
+    # subscription is spent by this point, and re-running a review to
+    # recover from a failed post would spend it again. What happens to
+    # the transcript and to the token is finish()'s and posting_env()'s,
+    # and each says so where it happens.
     deliver(text, findings, note)
     return DONE
 
@@ -2654,6 +2709,14 @@ def handle_pr(repo, pr, config, state, tokens):
             log("%s: an unposted review is left over from a run that is no "
                 "longer recorded, so it is forgotten" % key)
             forget(marker)
+            # And the flag comes off with it, as it does in repost().
+            # Left set, the scan gate stays armed and every later poll
+            # lists a directory that only grows to learn that a file it
+            # deleted is still gone.
+            if done.get("unposted"):
+                state[key] = dict(done)
+                state[key].pop("unposted", None)
+                save_state(state)
         elif marker and done.get("post_tries", 0) < MAX_ATTEMPTS:
             repost(key, repo, pr, config, state, tokens, done, marker,
                    saved_sha)
@@ -2809,7 +2872,7 @@ def handle_pr(repo, pr, config, state, tokens):
     # review unpostable the moment it was written.
     kept = done if done.get("sha") == head else {}
     state[key] = state_entry(head, FAILED, attempts,
-                             **dict(carry_forward(kept), post_tries=0))
+                             **dict(carry_forward(kept), post_tries=0, waivers=0))
     save_state(state)
 
     try:
@@ -2840,7 +2903,7 @@ def handle_pr(repo, pr, config, state, tokens):
     # it met the new marker already spent and nothing would repost or
     # forget it.
     state[key] = state_entry(head, outcome, attempts,
-                             **dict(carry_forward(kept), post_tries=0,
+                             **dict(carry_forward(kept), post_tries=0, waivers=0,
                                     unposted=os.path.exists(
                                         unposted_path(repo, pr))))
     save_state(state)
@@ -2867,7 +2930,8 @@ def find_pr(repo, number, env):
     except subprocess.TimeoutExpired:
         sys.exit("cannot read %s: timed out after %ds" % (target, LIST_TIMEOUT))
     if result.returncode != 0:
-        sys.exit("cannot read %s: %s" % (target, result.stderr.strip()))
+        sys.exit("cannot read %s: %s" % (
+            target, both_streams(result, 400)))
     # Said in one sentence like the two failures above it. `gh` exiting
     # zero with something that is not the object asked for is unlikely
     # and not impossible, and a traceback out of here reads as a bug in
@@ -3053,7 +3117,17 @@ def main():
                 # One sentence, like the daemon gives for the same
                 # failure, rather than a traceback through the lock.
                 sys.exit("%s: checkout failed: %s" % (args.pr, err))
-            outcome = review(where, repo, pr, config, env, tokens)
+            # Wrapped, so the recording below always happens. The
+            # subscription is spent by the time most of these can fire,
+            # and dying here left no entry at all: the daemon reviewed
+            # the same head a minute later at full cost and posted a
+            # second complete review, because its first attempt does not
+            # ask. handle_pr wraps its own call for the same reason.
+            try:
+                outcome = review(where, repo, pr, config, env, tokens)
+            except Exception as err:
+                log("%s: the review did not complete: %s" % (args.pr, err))
+                outcome = FAILED
 
             # Recorded, always. A manual run is still a review of that
             # commit, and leaving no trace meant the daemon reviewed the
@@ -3083,7 +3157,7 @@ def main():
             # and the review sat on disk for ever.
             state[pr_key(repo, pr)] = state_entry(
                 pr["headRefOid"], outcome, kept.get("attempts", 0) + 1,
-                **dict(carry_forward(kept), post_tries=0,
+                **dict(carry_forward(kept), post_tries=0, waivers=0,
                        unposted=bool(unposted_for(repo, pr, scan=False)[0])))
             save_state(state)
             if state[pr_key(repo, pr)].get("unposted"):

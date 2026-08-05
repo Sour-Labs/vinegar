@@ -829,6 +829,33 @@ check("a private key under the denied component is accepted",
       _config_with_key(_covered_key) == "started",
       _config_with_key(_covered_key))
 
+# The numbers are read as numbers. A hand-edited string sails past every
+# other check and then raises inside checkout_grace on every pull request
+# on every poll, with nothing reviewed and no give-up ever announced.
+def _config_with(**over):
+    path = os.path.join(_home, "num-config.json")
+    with open(path, "w") as handle:
+        json.dump(dict({"repos": ["o/r"]}, **over), handle)
+    try:
+        vinegar.load_config(path)
+        return "started"
+    except SystemExit as err:
+        return str(err)
+
+
+check("a timeout given as a string refuses to start",
+      "whole number of seconds" in _config_with(review_timeout="1800"),
+      _config_with(review_timeout="1800"))
+check("a zero poll interval refuses to start",
+      "greater than zero" in _config_with(poll_interval=0),
+      _config_with(poll_interval=0))
+check("a boolean is not a number here either",
+      "whole number" in _config_with(max_changed_lines=True),
+      _config_with(max_changed_lines=True))
+check("the numbers as numbers still start",
+      _config_with(poll_interval=30, review_timeout=900,
+                   max_changed_lines=100) == "started")
+
 
 def _refuses(**over):
     """Whether check_paths exits with these module paths in place."""
@@ -1858,6 +1885,36 @@ vinegar.run = fake_run
 check("a repository at the listing cap says so",
       len(_capped) == vinegar.PR_LIMIT
       and any("not seen at all" in m for m in _cap_log), _cap_log)
+
+# A listing that is not pull requests must not reach handle_pr: the
+# catch-all that keeps one bad pull request from stopping the daemon
+# builds its message with `pr.get`, which raises from inside the except
+# and takes the process out.
+def listing_not_prs(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
+    if cmd[:3] == ["gh", "pr", "list"]:
+        return subprocess.CompletedProcess(cmd, 0, '["o/r#12", "o/r#13"]', "")
+    return fake_run(cmd, cwd, timeout, env, stdin_text)
+
+
+vinegar.run = listing_not_prs
+del _cap_log[:]
+vinegar.log = lambda m: _cap_log.append(m)
+_not_prs = vinegar.open_prs("o/r", None)
+vinegar.log = lambda message: None
+vinegar.run = fake_run
+check("a listing that is not pull requests is refused, not iterated",
+      _not_prs == []
+      and any("did not answer with pull requests" in m for m in _cap_log),
+      (_not_prs, _cap_log))
+
+# A blank line that carries indentation is how a model writes one inside
+# an indented block, and it ends the markdown list item just as surely.
+_spaced = vinegar.finding_bullet(
+    {"file": "a.py", "line": 1, "summary": "one\n   \ntwo",
+     "failure_scenario": "boom", "category": "correctness"})
+check("an indented blank line does not break out of its bullet either",
+      "\n  \n" not in _spaced and "\n   \n" not in _spaced
+      and "Failure: boom" in _spaced, repr(_spaced))
 
 check("the transcript renders findings the same way the comment does",
       vinegar.finding_bullet(FINDINGS[0]) in body, body[:200])
