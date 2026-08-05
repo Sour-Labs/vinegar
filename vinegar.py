@@ -402,16 +402,40 @@ def check_paths():
             "still covered)." % (HOME, DENIED_COMPONENT, DENIED_COMPONENT,
                                  DENIED_COMPONENT))
 
+    # The reporting contract has a third copy: REPORT_TOOL names the tool
+    # review() asks for and read_stream() listens for, and the allow list in
+    # review-settings.json is what makes calling it possible. That list is a
+    # literal in a file this code cannot derive from the constant. If they
+    # disagree, every review comes back as unanchored prose with findings
+    # nobody sees, quietly, which is the same shape of silent failure the
+    # path checks above exist to refuse at startup.
+    try:
+        allowed = json.load(open(SETTINGS_PATH)).get(
+            "permissions", {}).get("allow", [])
+    except Exception as err:
+        sys.exit("%s cannot be read (%s), and the reviewer runs under it."
+                 % (SETTINGS_PATH, err))
+    if REPORT_TOOL not in allowed:
+        sys.exit(
+            "review-settings.json does not allow %s. The reviewer would be "
+            "told to report through a tool it cannot call, and every review "
+            "would come back as prose with no findings. Add %s to "
+            "permissions.allow." % (REPORT_TOOL, REPORT_TOOL))
+
 
 def load_state():
     """Everything Vinegar remembers about which pull requests it has done.
 
     A missing file is a first run and starts empty. A file that exists but
-    cannot be parsed is refused instead, because the two are worlds apart in
-    cost: treating a truncated state file as empty re-reviews every open pull
-    request in every configured repository, at roughly two dollars each, and
-    the operator's only clue would be the bill. Exiting stops the daemon,
-    which the watchdog reports within minutes.
+    cannot be parsed is moved aside and the daemon carries on empty, saying
+    so. Exiting instead read as the safe choice until two facts met it:
+    launchd restarts an exited daemon every 30 seconds, so a malformed file
+    stopped every configured repository indefinitely rather than stopping
+    anything cleanly, and the give-up log's own advice is to edit this file
+    by hand, which makes malformed exactly the state an operator can leave
+    it in. One round of re-reviews is a bounded bill; an outage that lasts
+    until a human reads the right log is not. The bad file is kept, so what
+    was known is recoverable rather than guessed at.
     """
     try:
         with open(STATE_PATH) as handle:
@@ -419,10 +443,11 @@ def load_state():
     except FileNotFoundError:
         return {}
     except json.JSONDecodeError as err:
-        sys.exit("%s is unreadable (%s). It records which pull requests have "
-                 "been reviewed, and starting without it would review every "
-                 "open one again. Repair or delete it deliberately." % (
-                     STATE_PATH, err))
+        aside = STATE_PATH + ".unreadable"
+        os.replace(STATE_PATH, aside)
+        log("%s is unreadable (%s). It is kept at %s, and every open pull "
+            "request will be reviewed once more" % (STATE_PATH, err, aside))
+        return {}
 
 
 def save_state(state):
@@ -430,6 +455,12 @@ def save_state(state):
     temp = STATE_PATH + ".tmp"
     with open(temp, "w") as handle:
         json.dump(state, handle, indent=2, sort_keys=True)
+        handle.flush()
+        # fsync before the rename. os.replace promises the name flips
+        # atomically, not that the bytes behind it reached the disk first,
+        # and a power cut in that gap leaves a zero-length state file under
+        # the final name.
+        os.fsync(handle.fileno())
     os.replace(temp, STATE_PATH)
 
 
@@ -582,8 +613,13 @@ def save_transcript(repo, pr, text, findings=None, note=None):
     # this file's existence as "the attempts left words worth keeping", and
     # a crash mid-write must not leave a truncated file wearing that
     # meaning.
+    #
+    # utf-8 pinned for the same reason run() pins it: findings quote source,
+    # the C locale a launchd job can run under encodes almost none of it,
+    # and on a dry run a transcript that cannot be written is the entire
+    # output of the run, silently gone.
     tmp = path + ".tmp"
-    with open(tmp, "w") as handle:
+    with open(tmp, "w", encoding="utf-8", errors="replace") as handle:
         handle.write("# %s#%d %s\n\n%s\n\n---\n\n%s\n" % (
             repo, pr["number"], pr["headRefOid"][:7], pr["url"], body))
     os.replace(tmp, path)
@@ -849,12 +885,13 @@ def diff_lines(path, base, env, label):
                               else result.stderr.strip()[:200]))
         return {}
 
-    # split("\n"), not splitlines(), which also breaks on a lone CR. An
-    # added line whose content holds one would then be cut into a fragment
-    # that can look like a hunk header, putting line numbers into `covered`
-    # that the diff never touched. Wrong lines, confidently placed.
+    # stream_lines, not splitlines(): a lone CR must stay inside its line,
+    # or an added line holding one is cut into a fragment that can look
+    # like a hunk header, putting line numbers into `covered` that the diff
+    # never touched. stream_lines carries that contract for the reviewer's
+    # stream too; one rule, one place.
     covered, name, heading = {}, None, False
-    for line in result.stdout.split("\n"):
+    for line in stream_lines(result.stdout):
         if line.startswith("diff --git "):
             name, heading = None, True
         elif heading and line.startswith("+++ "):
@@ -1061,8 +1098,24 @@ def review_body(label, pr, config, inline, general, raw=None,
             total, "" if total == 1 else "s", len(inline))]
 
     if general:
-        lines += ["", heading, ""]
-        lines += [finding_bullet(finding) for finding in general]
+        bullets = [finding_bullet(finding) for finding in general]
+        # Whole findings come off the end when the body cannot fit, said
+        # out loud, with clamp() left as the last resort only. Its
+        # character cut shears mid-bullet and logs a byte count, which
+        # loses the tail findings with nothing on the pull request saying
+        # more existed. The transcript holds every finding regardless of
+        # what fits here.
+        dropped, extra = 0, []
+        while bullets and len("\n".join(
+                lines + ["", heading, ""] + bullets + extra)) > MAX_BODY:
+            bullets.pop()
+            dropped += 1
+            extra = ["", "%d finding(s) did not fit GitHub's comment limit "
+                         "and are only in the transcript." % dropped]
+        if dropped:
+            log("%s: %d finding(s) did not fit the comment and are only in "
+                "the transcript" % (label, dropped))
+        lines += ["", heading, ""] + bullets + extra
 
     return clamp(label, "\n".join(lines))
 
@@ -1096,9 +1149,14 @@ def submit_review(label, repo, pr, payload, env):
         return None
     if result.returncode == 0:
         return True
-    log("%s: posting the review failed: %s" % (
-        label, both_streams(result, 600)))
-    return False
+    said = both_streams(result, 600)
+    log("%s: posting the review failed: %s" % (label, said))
+    # A 4xx is GitHub judging the request and creating nothing, so the
+    # caller may retry without first asking whether it landed. Anything
+    # else, a 5xx or a summary with no status in it at all, may have landed
+    # after the error was already on the wire: the timeout's ambiguity,
+    # spelled differently. gh names the status in its one-line summary.
+    return False if re.search(r"HTTP 4\d\d", said) else None
 
 
 def posting_env(label, config, repo, tokens, fallback):
@@ -1240,28 +1298,29 @@ def post_review(label, repo, pr, path, text, findings, config, env,
             label, len(inline)))
         return
 
-    # Before any retry, the timed-out post as much as the refused one. A 5xx
-    # can arrive after GitHub has already created the review, and a timeout
-    # is the same ambiguity with less information: either way a resend can
-    # leave two reviews where the operator asked for one, and one cheap read
-    # settles it.
-    if already_posted(label, repo, pr, env):
-        log("%s: the review is already on the pull request" % label)
-        return
-
     if landed is None:
-        # Timed out, and the read above says nothing landed. Returning here
-        # instead recorded DONE around a pull request carrying no review at
-        # all, and with `review_on_push` false nothing ever came back for
-        # it: the one silence the README does not allow. The resend can
-        # duplicate only inside the window the read cannot see, and the
-        # ordering already_posted() documents stands: a duplicate is worse
-        # than one review, silence is worse than both.
-        log("%s: the post timed out and nothing landed, so it is sent again"
-            % label)
+        # Ambiguous: a timeout, a 5xx, an error with no status in it. Any
+        # of those can arrive after GitHub has already created the review,
+        # so one cheap read comes before the resend, and the resend comes
+        # rather than returning: returning recorded DONE around a pull
+        # request carrying no review at all, and with `review_on_push`
+        # false nothing ever came back for it, the one silence the README
+        # does not allow. The resend can duplicate only inside the window
+        # the read cannot see, and the ordering already_posted() documents
+        # stands: a duplicate is worse than one review, silence is worse
+        # than both.
+        if already_posted(label, repo, pr, env):
+            log("%s: the review is already on the pull request" % label)
+            return
+        log("%s: the post may not have landed and nothing is up, so it is "
+            "sent again" % label)
         submit_review(label, repo, pr, payload, env)
         return
 
+    # A definite refusal created nothing, so there is nothing to go and
+    # look for: the status code already answered the question the
+    # landed-review read exists to ask, and that read is seven paginated
+    # calls on the poll thread on a busy pull request.
     if inline:
         # The endpoint took none of it, and the likeliest reason is an
         # anchor it disagrees with: a comment lands only on a line inside
@@ -1335,12 +1394,23 @@ def finish(label, repo, pr, path, text, findings, config, env, tokens,
     # a dry run this file is the only place the giving-up can be recorded
     # at all. Skipping the write entirely kept the words but left the
     # ending nowhere but a log nobody is watching.
-    if (not text.strip() and findings is None
-            and os.path.exists(transcript_path(repo, pr))):
+    path_kept = transcript_path(repo, pr)
+    if not text.strip() and findings is None and os.path.exists(path_kept):
         if note:
             try:
-                with open(transcript_path(repo, pr), "a") as handle:
-                    handle.write("\n\n---\n\n%s\n" % note)
+                # Rewritten whole through a rename, like save_transcript,
+                # not appended in place. This branch trusts the existence
+                # of the file to mean the attempts left words worth
+                # keeping, and an append that dies half-way would hand the
+                # next reader a file that passes that test and ends
+                # mid-note.
+                whole = open(path_kept, encoding="utf-8",
+                             errors="replace").read()
+                tmp = path_kept + ".tmp"
+                with open(tmp, "w", encoding="utf-8",
+                          errors="replace") as handle:
+                    handle.write(whole + "\n\n---\n\n%s\n" % note)
+                os.replace(tmp, path_kept)
                 log("%s: the ending is appended to the transcript the "
                     "attempts left" % label)
             except Exception as err:
@@ -1591,6 +1661,31 @@ def poll_once(config, state, tokens):
                     repo, pr.get("number", "?"), err))
 
 
+def give_up(key, repo, pr, config, attempts, tokens, path=None, env=None):
+    """Say, once, that Vinegar has stopped trying to review this.
+
+    Called from two moments that must say the same thing: the last attempt
+    returning FAILED in-process, and a later poll discovering a spent
+    budget whose attempt never returned at all, because the pre-review
+    marker charges the attempt before review() runs and a kill between the
+    two leaves no one behind to announce anything. `path` and `env` exist
+    only at the first moment; the posting needs neither, since a give-up
+    has no findings to anchor and posting_env() mints its own token.
+    """
+    log("%s: %d failed attempts, leaving it alone. Fix the cause, then "
+        "delete its entry from %s to try again" % (key, attempts, STATE_PATH))
+    # Said on the pull request, not only in a log nobody is watching.
+    # Silence has to keep meaning that something broke, which is only true
+    # if the giving-up is announced.
+    announce(key, lambda: finish(
+        key, repo, pr, path, "", None, config, env, tokens,
+        note="Vinegar tried to review this %d times and each attempt "
+             "failed before it could report anything. Read that as the "
+             "review not running, not as the change being clean." % (
+                 attempts,),
+        verb="gave up on"))
+
+
 def handle_pr(repo, pr, config, state, tokens):
     key = "%s#%d" % (repo, pr["number"])
     head = pr["headRefOid"]
@@ -1617,6 +1712,15 @@ def handle_pr(repo, pr, config, state, tokens):
     # is what closed it.
     if done.get("outcome") == FAILED and done.get("sha") == head:
         if done.get("attempts", 0) >= MAX_ATTEMPTS:
+            # The last attempt can die without returning: the marker below
+            # is written before review() runs, so a kill mid-attempt leaves
+            # a spent budget that no one ever announced, and every later
+            # poll returned here with the pull request permanently silent.
+            # The discovery announces it instead, once.
+            if not done.get("announced"):
+                give_up(key, repo, pr, config, done["attempts"], tokens)
+                state[key] = dict(done, announced=True)
+                save_state(state)
             return
 
     reason = skip_reason(pr, config)
@@ -1699,21 +1803,12 @@ def handle_pr(repo, pr, config, state, tokens):
     save_state(state)
 
     if outcome == FAILED and attempts >= MAX_ATTEMPTS:
-        log("%s: %d failed attempts, leaving it alone. Fix the cause, then "
-            "delete its entry from %s to try again" % (
-                key, attempts, STATE_PATH))
-        # Said on the pull request, not only in a log nobody is watching.
-        # This is the moment Vinegar stops trying, and until now it was the
-        # one ending that left a pull request it had looked at three times
-        # with nothing on it at all. Silence has to keep meaning that
-        # something broke, which is only true if the giving-up is announced.
-        announce(key, lambda: finish(
-            key, repo, pr, path, "", None, config, env, tokens,
-            note="Vinegar tried to review this %d times and each attempt "
-                 "failed before it could report anything. Read that as the "
-                 "review not running, not as the change being clean." % (
-                     attempts,),
-            verb="gave up on"))
+        give_up(key, repo, pr, config, attempts, tokens, path, env)
+        # Marked, so the restart path knows this was said. Without the mark
+        # a daemon restart would discover the spent budget and say it all
+        # again.
+        state[key] = dict(state[key], announced=True)
+        save_state(state)
 
 
 def find_pr(repo, number, env):

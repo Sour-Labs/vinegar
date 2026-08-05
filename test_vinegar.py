@@ -111,7 +111,8 @@ def fake_run(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
             cmd, fake_run.look_rc, fake_run.look_out, "")
     if cmd[:2] == ["gh", "api"]:
         posted.append((cmd, json.loads(stdin_text)))
-        return subprocess.CompletedProcess(cmd, fake_run.rc, "", "HTTP 422")
+        return subprocess.CompletedProcess(cmd, fake_run.rc, "",
+                                           fake_run.post_err)
     raise AssertionError("unexpected command %r" % cmd)
 
 
@@ -119,6 +120,7 @@ fake_run.rc = 0
 fake_run.diff_rc = 0
 fake_run.look_rc = 0
 fake_run.look_out = ""
+fake_run.post_err = "HTTP 422"
 GENUINE_RUN = vinegar.run
 vinegar.run = fake_run
 vinegar.log = lambda message: None
@@ -457,6 +459,14 @@ check("a verdict rides with the category when one arrives",
 check("no category and no verdict adds no empty parenthesis",
       "(" not in vinegar.describe({"summary": "s"}))
 
+_big = [{"file": "a.py", "summary": "s%d" % i,
+         "failure_scenario": "x" * 9000, "category": "correctness"}
+        for i in range(10)]
+_body = vinegar.review_body(L, PR, CONFIG, [], _big)
+check("overflow drops whole findings and says how many",
+      len(_body) <= vinegar.MAX_BODY and "did not fit" in _body
+      and "cut to fit GitHub's comment limit" not in _body, len(_body))
+
 del posted[:]
 vinegar.post_review(L, "o/r", PR, ROOT, text, FINDINGS[:4],
                     dict(CONFIG, comment=False), None)
@@ -622,9 +632,28 @@ check("the review asks for the stream the tool call arrives in",
       "stream-json" in claude_run.saw and "--verbose" in claude_run.saw,
       claude_run.saw)
 check("the reporting tool is allowed, which is what makes it reachable",
-      "ReportFindings" in json.load(
+      vinegar.REPORT_TOOL in json.load(
           open(os.path.join(here_dir, "review-settings.json"))
       )["permissions"]["allow"])
+# check_paths() is the startup guard for that agreement, so first prove it
+# passes as configured, or the refusal below would prove nothing.
+try:
+    vinegar.check_paths()
+    _agreed = "started"
+except SystemExit as err:
+    _agreed = "refused: %s" % err
+check("the paths and settings under test start cleanly",
+      _agreed == "started", _agreed)
+_rt = vinegar.REPORT_TOOL
+vinegar.REPORT_TOOL = "SomethingElse"
+try:
+    vinegar.check_paths()
+    _agreed = "started"
+except SystemExit:
+    _agreed = "refused"
+vinegar.REPORT_TOOL = _rt
+check("a reporting tool the settings do not allow refuses to start",
+      _agreed == "refused", _agreed)
 check("the environment asks for the tool contract",
       (claude_run.env or {}).get("CLAUDE_CODE_REPORT_FINDINGS") == "1",
       sorted(claude_run.env or {})[:5])
@@ -851,18 +880,53 @@ vinegar.handle_pr("o/r", PR_LIVE, CONFIG, _sk_state, {})
 check("a lifted skip cannot re-run a review whose budget is spent",
       not _sk_ran, (_sk_state, _sk_ran))
 
+# The pre-review marker can be the last thing an attempt writes: a kill
+# mid-review leaves a spent budget that nothing announced. The next poll's
+# discovery must say so on the pull request, once.
+_ga_state = {L: {"outcome": vinegar.FAILED, "sha": PR["headRefOid"],
+                 "attempts": vinegar.MAX_ATTEMPTS}}
+del posted[:]
+vinegar.handle_pr("o/r", PR_LIVE, CONFIG, _ga_state, {})
+check("a give-up interrupted by a crash is announced on restart",
+      len(posted) == 1 and "gave up on" in posted[0][1]["body"],
+      (len(posted), _ga_state))
+vinegar.handle_pr("o/r", PR_LIVE, CONFIG, _ga_state, {})
+check("the crash-discovered give-up is announced once, not every poll",
+      len(posted) == 1 and _ga_state[L].get("announced") is True,
+      (len(posted), _ga_state))
+
 vinegar.review, vinegar.save_state = _real_review, _real_save_state
 vinegar.checkout, vinegar.github_env = _real_checkout, _real_github_env
 
+# state.json is a file the give-up log tells the operator to hand-edit,
+# and under launchd KeepAlive an exit here is a 30-second crash loop that
+# stops every repository. A bad file is quarantined instead.
+os.makedirs(os.path.dirname(vinegar.STATE_PATH), exist_ok=True)
+with open(vinegar.STATE_PATH, "w") as h:
+    h.write('{"o/r#12": {,}')
+try:
+    _st = vinegar.load_state()
+except SystemExit:
+    _st = "exited"
+check("an unreadable state file is quarantined, not fatal", _st == {}, _st)
+check("the quarantined state is kept for the operator",
+      os.path.exists(vinegar.STATE_PATH + ".unreadable")
+      and "{,}" in open(vinegar.STATE_PATH + ".unreadable").read(),
+      vinegar.STATE_PATH)
+os.remove(vinegar.STATE_PATH + ".unreadable")
+
 # --- a resend must not duplicate a review that already landed --------------
+# A 5xx is ambiguous the way a timeout is; a 4xx created nothing and is
+# retried without the read. The stub answers 502 for the ambiguous half.
 claude_run.stream = stream(call([]), result_event())
 vinegar.run, vinegar.github_env = claude_run, lambda *a, **k: None
 fake_run.rc = 1
+fake_run.post_err = "HTTP 502"
 fake_run.look_out = vinegar.BODY_MARK + " reviewed `a1b2c3d` ...\n"
 del posted[:]
 del looked[:]
 vinegar.review(ROOT, "o/r", PR, CONFIG, None, {})
-check("a refused post asks before resending",
+check("an ambiguous refusal asks before resending",
       len(looked) == 1, (len(looked), len(posted)))
 check("a review that already landed is not posted twice",
       len(posted) == 1, len(posted))
@@ -908,6 +972,13 @@ del posted[:]
 vinegar.review(ROOT, "o/r", PR, CONFIG, None, {})
 check("a review that did not land is resent",
       len(posted) == 2, len(posted))
+
+fake_run.post_err = "HTTP 422"
+del posted[:]
+del looked[:]
+vinegar.review(ROOT, "o/r", PR, CONFIG, None, {})
+check("a definite refusal retries without the landed-review read",
+      len(posted) == 2 and len(looked) == 0, (len(posted), len(looked)))
 
 # A result field that is empty must not discard what the reviewer said.
 fake_run.rc = 0
@@ -1122,6 +1193,26 @@ except UnicodeDecodeError:
     _bytes_out = "raised"
 check("bytes that are not UTF-8 are read, not raised",
       _bytes_out == "caf�\n", repr(_bytes_out))
+
+# And written back out the same way: an ASCII default encoding must not
+# cost a dry run its only artifact when a finding quotes é. Plain LC_ALL=C
+# is not enough to reproduce that, because CPython turns UTF-8 mode on for
+# the C locale (PEP 540); the two PYTHON* variables switch that rescue off,
+# which is also only one operator-set environment variable away in life.
+_tx_script = (
+    "import os, tempfile\n"
+    "os.environ['VINEGAR_HOME'] = tempfile.mkdtemp()\n"
+    "import vinegar\n"
+    "p = vinegar.save_transcript('o/r', {'number': 1, 'headRefOid':"
+    " 'abc1234def', 'url': 'u'}, 'caf\\u00e9', None)\n"
+    "print(ascii(open(p, encoding='utf-8').read()))\n")
+_tx_proc = subprocess.run(
+    [sys.executable, "-c", _tx_script], capture_output=True, text=True,
+    cwd=here_dir, env=dict(os.environ, LC_ALL="C", LANG="C",
+                           PYTHONUTF8="0", PYTHONCOERCECLOCALE="0"))
+check("a transcript survives the C locale with its quotes intact",
+      _tx_proc.returncode == 0 and "caf\\xe9" in _tx_proc.stdout,
+      (_tx_proc.returncode, (_tx_proc.stderr or _tx_proc.stdout)[:200]))
 
 # --- the --pr guard, through the real entry point -------------------------
 # A mistyped target must be refused before anything is minted or asked of
