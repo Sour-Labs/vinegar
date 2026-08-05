@@ -206,11 +206,26 @@ MUTATIONS = [
      "            result = run(clone, env=env, timeout=CLONE_TIMEOUT)",
      "            result = run(clone, env=env)"),
     ("clone-timeout-message",
-     "        except subprocess.TimeoutExpired:\n"
-     '            raise RuntimeError("the clone did not finish within %ds"\n'
-     "                               % CLONE_TIMEOUT)",
-     "        except subprocess.TimeoutExpired:\n"
+     '            raise RuntimeError("%s did not finish within %ds"\n'
+     '                               % (" ".join(clone), CLONE_TIMEOUT))',
      "            raise"),
+    ("clone-partial-cleanup",
+     "            shutil.rmtree(path, ignore_errors=True)\n"
+     '            raise RuntimeError("%s did not finish within %ds"',
+     '            raise RuntimeError("%s did not finish within %ds"'),
+    # --- token life the checkout has to survive on ----------------------
+    ("openssl-timeout",
+     "            input=signing_input, capture_output=True, timeout=DIFF_TIMEOUT)",
+     "            input=signing_input, capture_output=True)"),
+    ("openssl-timeout-message",
+     "    except subprocess.TimeoutExpired:\n"
+     '        raise RuntimeError("openssl did not finish signing with %s within "\n'
+     '                           "%ds" % (key_path, DIFF_TIMEOUT))',
+     "    except subprocess.TimeoutExpired:\n"
+     "        raise"),
+    ("grace-cap-guard",
+     "    if checkout_grace(config) >= TOKEN_LIFE:",
+     "    if False:"),
     ("checkout-cwd",
      "            result = run(step, cwd=path, env=env, timeout=bound)",
      "            result = run(step, env=env, timeout=bound)"),
@@ -245,6 +260,11 @@ MUTATIONS = [
 
     # --- constants -----------------------------------------------------
     ("max-attempts", "MAX_ATTEMPTS = 3", "MAX_ATTEMPTS = 99"),
+    # The value, not just the argument. Removing `timeout=` leaves the
+    # constant intact, so the check that the clone gets longer than the
+    # fetch was covered by neither of the two entries above it.
+    ("clone-timeout-value", "CLONE_TIMEOUT = 1800", "CLONE_TIMEOUT = 60"),
+    ("checkout-grace-value", "CHECKOUT_GRACE = 1500", "CHECKOUT_GRACE = 60"),
     ("efforts-ultra",
      'EFFORTS = ("low", "medium", "high", "xhigh", "max")',
      'EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")'),

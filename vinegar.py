@@ -175,11 +175,37 @@ MAX_ATTEMPTS = 3
 # review, taking with it the `gh` calls the review makes to read the pull
 # request.
 #
+# 1500 covers the checkout that runs every time: the usability probe and the
+# four local steps at DIFF_TIMEOUT each, plus the head fetch at its whole
+# FETCH_TIMEOUT. It does **not** cover a first clone that runs its full
+# CLONE_TIMEOUT, and cannot: that would need 1800 more, and the sum below is
+# capped far tighter than that.
+#
+# The cap is the hour a GitHub token lives. The cache serves one only while
+# `now + good_for < expires`, so once `CHECKOUT_GRACE + review_timeout`
+# reaches 3600 no token can ever satisfy it and every call mints a fresh one.
+# At 1500 plus the shipped `review_timeout` of 1800 that leaves 300 seconds
+# of each token's life in which the cache still dedupes, where 600 left
+# 1200. That is the accepted cost of the raise: more minting, in exchange for
+# a token that survives the checkout it was minted for. load_config refuses a
+# `review_timeout` that pushes the sum over the cap, because crossing it is
+# otherwise silent and once ran at roughly 1440 tokens a day per open pull
+# request without anyone noticing.
+#
+# What is left uncovered is one review, on one repository, on the poll that
+# first clones it, and it is retried. That is the trade: the alternative was
+# a clone bounded tightly enough to fit the budget, which costs that
+# repository every review rather than its first.
+#
 # It deliberately does not have to cover the posting as well. That happens
 # after a review which may have consumed the entire `review_timeout`, and at
 # the timeouts people actually configure no obtainable token is guaranteed to
 # survive that far. POST_GRACE asks for a fresh one at that point instead.
-CHECKOUT_GRACE = 600
+CHECKOUT_GRACE = 1500
+
+# The hour a GitHub installation token lives. Not a tunable: it is GitHub's
+# number, named here because two things are measured against it.
+TOKEN_LIFE = 3600
 
 # Enough life for `gh pr list`, which is one call. This is not zero because the
 # cache serves a token right up to its recorded expiry, and that expiry is
@@ -235,8 +261,16 @@ DIFF_TIMEOUT = 120
 # Seconds `gh pr list` may take. One HTTP call, made once a minute per
 # repository on the poll thread, which makes it the daemon's most frequent
 # exposure to a socket that answers nothing. The clone and fetch in
-# checkout() get far longer bounds rather than none, for the reasons
-# written beside each. Nothing on this thread is unbounded.
+# checkout() get far longer bounds rather than none, for the reasons written
+# beside each.
+#
+# Nothing on this thread is unbounded, and the one that is easy to miss when
+# checking that is the openssl signing in app_jwt(): it is the only
+# subprocess in this file that does not go through run(), so a reader
+# auditing run()'s callers will not see it. github_api() bounds its own
+# urlopen. Two earlier versions of this comment claimed the fetch was
+# unbounded when it was not, so treat a claim here as something to re-derive
+# rather than inherit.
 LIST_TIMEOUT = 120
 
 # Seconds a single posting request may take. Generous for one API call, and
@@ -348,8 +382,20 @@ def app_jwt(app_id, key_path):
         b64url(json.dumps(part, separators=(",", ":")).encode())
         for part in parts)
 
-    signed = subprocess.run(["openssl", "dgst", "-sha256", "-sign", key_path],
-                            input=signing_input, capture_output=True)
+    # Bounded like every other call on this thread, and this one does not go
+    # through run(): it needs bytes rather than text, because a signature is
+    # not UTF-8. Signing is milliseconds of local CPU, so the bound is only
+    # against the key sitting on a mount that stops answering, which parks
+    # openssl in the kernel and with it the one poll thread, while the
+    # watchdog reads a live pid as healthy. Same argument as DIFF_TIMEOUT,
+    # and the same number.
+    try:
+        signed = subprocess.run(
+            ["openssl", "dgst", "-sha256", "-sign", key_path],
+            input=signing_input, capture_output=True, timeout=DIFF_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("openssl did not finish signing with %s within "
+                           "%ds" % (key_path, DIFF_TIMEOUT))
     if signed.returncode != 0:
         raise RuntimeError("openssl could not sign with %s: %s" % (
             key_path, signed.stderr.decode(errors="replace").strip()))
@@ -464,6 +510,21 @@ def load_config(path):
                 "lines" if name == "max_changed_lines" else "seconds", value))
         if value <= 0:
             sys.exit("%s: %s must be greater than zero" % (path, name))
+
+    # Refused rather than warned about, because the failure is silence. The
+    # token cache serves a token only while `now + good_for < expires`, so
+    # once the checkout and review together ask for a token's whole life no
+    # cached token can satisfy it and every call mints a new one. Nothing
+    # breaks and nothing is logged; it once ran at roughly 1440 tokens a day
+    # per open pull request before anyone noticed. Raising CHECKOUT_GRACE to
+    # 1500 moved this within reach of an ordinary edit: `review_timeout`
+    # above 2100 now crosses it, where the old 600 left room to 3000.
+    if checkout_grace(config) >= TOKEN_LIFE:
+        sys.exit("%s: review_timeout must be under %d, because the checkout "
+                 "reserves %d seconds on top of it and a GitHub token only "
+                 "lives %d. Above that every call mints a new token."
+                 % (path, TOKEN_LIFE - CHECKOUT_GRACE, CHECKOUT_GRACE,
+                    TOKEN_LIFE))
 
     # A misconfigured App is caught here rather than at the first review, which
     # is minutes later and on a real pull request.
@@ -1086,15 +1147,27 @@ def checkout(repo, pr, env):
     if not os.path.isdir(os.path.join(path, ".git")):
         os.makedirs(CHECKOUT_DIR, exist_ok=True)
         log("%s: cloning into %s" % (repo, path))
-        # Bounded like the steps below, and reported the same way: the
-        # caller tells them apart only by the message, and "timed out" and
-        # "failed" send whoever reads the log to different places.
+        # Bounded like the steps below, and reported in the same shape: the
+        # caller tells them apart only by the message, so both name the
+        # command that hung. Grepping the log for one has to find the other.
         clone = ["gh", "repo", "clone", repo, path, "--", "--quiet"]
         try:
             result = run(clone, env=env, timeout=CLONE_TIMEOUT)
         except subprocess.TimeoutExpired:
-            raise RuntimeError("the clone did not finish within %ds"
-                               % CLONE_TIMEOUT)
+            # Removed before raising, or the timeout is worse than the hang
+            # it replaced. `git clone` writes .git during its init phase,
+            # long before it has any refs, so a killed clone leaves a
+            # directory that `git rev-parse --git-dir` answers 0 for. The
+            # probe above then calls it usable, the clone is skipped for
+            # ever, and the steps loop runs against a repository with an
+            # unborn HEAD: `git reset --quiet --hard` fails, checkout()
+            # raises, and handle_pr exempts that from MAX_ATTEMPTS. One log
+            # line, then that repository is never reviewed again. The
+            # unusable-repository branch above already does this, for a
+            # state that is milder and easier to reach.
+            shutil.rmtree(path, ignore_errors=True)
+            raise RuntimeError("%s did not finish within %ds"
+                               % (" ".join(clone), CLONE_TIMEOUT))
         if result.returncode != 0:
             raise RuntimeError("clone failed: %s" % result.stderr.strip())
 
