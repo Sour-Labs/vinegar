@@ -499,7 +499,66 @@ vinegar.checkout("o/r", PR, None)
 check("a checkout git cannot open is cloned again rather than reused",
       any(c[:3] == ["gh", "repo", "clone"] for c, _w, _t in _co_ran),
       [c[:3] for c, _w, _t in _co_ran])
+# The clone reaches the network on the one poll thread, and it ran unbounded
+# until issue #13: a socket that is open and never answers is not an error
+# anyone raises, so nothing polled and the watchdog called a live pid with
+# no log lines healthy. Generous rather than tight, because a cap that bites
+# costs the repository every review.
+_co_clone = [t for c, _w, t in _co_ran if c[:3] == ["gh", "repo", "clone"]]
+check("the clone is bounded so it cannot park the poll thread",
+      _co_clone and _co_clone[0] == vinegar.CLONE_TIMEOUT, _co_clone)
+check("the clone is given longer than the fetch, not less",
+      vinegar.CLONE_TIMEOUT >= vinegar.FETCH_TIMEOUT,
+      (vinegar.CLONE_TIMEOUT, vinegar.FETCH_TIMEOUT))
+
+
+def clone_hangs(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
+    if cmd[:3] == ["gh", "repo", "clone"]:
+        # The half-built checkout has to exist before the raise, or the
+        # cleanup below has nothing to remove and the check that it did
+        # passes either way. `git clone` writes .git during its init phase,
+        # so this is the state a killed one leaves: a directory rev-parse
+        # answers 0 for, with no refs in it.
+        os.makedirs(os.path.join(cmd[4], ".git"), exist_ok=True)
+        raise subprocess.TimeoutExpired(cmd, timeout or 0)
+    return co_run(cmd, cwd, timeout, env, stdin_text)
+
+
+# The bound is only half of it. Left to raise TimeoutExpired, the failure
+# reaches handle_pr's generic handler and logs "checkout failed: Command
+# '[...]' timed out", which names a subprocess rather than the clone and
+# reads like the tree is broken rather than like the network is. The steps
+# loop already converts its own timeout for that reason.
+vinegar.run = clone_hangs
+shutil.rmtree(_co_path, ignore_errors=True)
+try:
+    vinegar.checkout("o/r", PR, None)
+    _co_hung = "returned normally"
+except subprocess.TimeoutExpired:
+    _co_hung = "TimeoutExpired escaped"
+except RuntimeError as err:
+    _co_hung = str(err)
+check("a clone that hangs is reported as a clone that hung",
+      "did not finish within" in _co_hung, _co_hung)
+check("the message names the command, like the steps below it do",
+      "gh repo clone" in _co_hung, _co_hung)
+# What the timeout leaves behind matters more than what it says. `git clone`
+# writes .git during init, long before it has refs, so a killed clone leaves
+# a directory rev-parse answers 0 for. Left there, the probe calls it usable,
+# the clone is skipped for ever, and the steps loop runs against an unborn
+# HEAD: one log line, then that repository is never reviewed again, because
+# checkout() failures are exempt from MAX_ATTEMPTS.
+check("a clone that hangs leaves nothing behind to be mistaken for a repo",
+      not os.path.exists(_co_path), _co_path)
+# The property that actually matters, checked the way the unusable-repo case
+# above is: with rev-parse answering 0, so a leftover would be accepted.
 co_run.usable = 0
+vinegar.run = co_run
+del _co_ran[:]
+vinegar.checkout("o/r", PR, None)
+check("the poll after a hung clone clones again rather than limping on",
+      any(c[:3] == ["gh", "repo", "clone"] for c, _w, _t in _co_ran),
+      [c[:3] for c, _w, _t in _co_ran])
 vinegar.CHECKOUT_DIR = _co_dir
 vinegar.run = fake_run
 
@@ -1413,6 +1472,18 @@ check("an effort the review command does not know refuses to start",
 check("every effort the config allows still starts",
       all(_config_with(effort=e) == "started" for e in vinegar.EFFORTS),
       [e for e in vinegar.EFFORTS if _config_with(effort=e) != "started"])
+# Refused at startup rather than discovered on the token bill. Past this the
+# checkout and review together ask for a whole token's life, no cached token
+# can satisfy that, and every call mints a new one with nothing logged.
+# Raising CHECKOUT_GRACE to 1500 brought the boundary within reach of an
+# ordinary edit to a documented setting.
+_over = vinegar.TOKEN_LIFE - vinegar.CHECKOUT_GRACE
+check("a review_timeout that would mint a token per call refuses to start",
+      "every call mints" in _config_with(review_timeout=_over),
+      _config_with(review_timeout=_over))
+check("the largest review_timeout inside the cap still starts",
+      _config_with(review_timeout=_over - 1) == "started",
+      _config_with(review_timeout=_over - 1))
 
 
 def _refuses(**over):
@@ -1659,6 +1730,50 @@ check("the posting timeout is short enough to be worth having",
 # could be deleted with the suite green.
 reset_stubs()
 APP = {"app_id": 1, "private_key": "/dev/null"}
+
+# The signing openssl is the one subprocess in the file that does not go
+# through run(), so it is invisible to anyone auditing run()'s callers, and
+# it ran unbounded. A private key on a mount that stops answering parks it in
+# the kernel, and the one poll thread with it, while the watchdog reads a
+# live pid as healthy. Swapping the module is how the call is reachable at
+# all from here; app_jwt takes no injection point.
+_openssl = []
+
+
+class FakeSubprocess(object):
+    """Enough of the module for app_jwt, recording what it was handed."""
+    TimeoutExpired = subprocess.TimeoutExpired
+
+    def __init__(self, hang=False):
+        self.hang = hang
+
+    def run(self, cmd, **kw):
+        _openssl.append(kw.get("timeout"))
+        if self.hang:
+            raise subprocess.TimeoutExpired(cmd, kw.get("timeout") or 0)
+        return subprocess.CompletedProcess(cmd, 0, b"signature", b"")
+
+
+_real_subprocess = vinegar.subprocess
+vinegar.subprocess = FakeSubprocess()
+vinegar.app_jwt(1, "/dev/null")
+check("the signing openssl is bounded like everything else on the thread",
+      _openssl == [vinegar.DIFF_TIMEOUT], _openssl)
+vinegar.subprocess = FakeSubprocess(hang=True)
+try:
+    vinegar.app_jwt(1, "/dev/null")
+    _sign_hung = "returned normally"
+except subprocess.TimeoutExpired:
+    _sign_hung = "TimeoutExpired escaped"
+except RuntimeError as err:
+    _sign_hung = str(err)
+vinegar.subprocess = _real_subprocess
+# Converted, not raised through: installation_token's caller logs "cannot
+# mint a token" and a bare TimeoutExpired there names neither openssl nor
+# the key, which is the file the operator has to go and look at.
+check("a signing that hangs says openssl and names the key",
+      "openssl" in _sign_hung and "/dev/null" in _sign_hung, _sign_hung)
+
 _real_jwt, _real_api = vinegar.app_jwt, vinegar.github_api
 
 
@@ -1703,6 +1818,18 @@ check("the posting mints a token with time to finish posting",
 # threaded through three call sites and changes no decision anywhere.
 check("the posting grace is long enough to cover a slow post",
       vinegar.POST_GRACE >= vinegar.POST_TIMEOUT, vinegar.POST_GRACE)
+# One token covers the checkout and the review, and the checkout runs first,
+# so the grace has to outlast what the checkout can actually spend. The head
+# fetch alone is FETCH_TIMEOUT; a grace under that hands the review a token
+# that died during the fetch it was minted to survive.
+check("the checkout grace outlasts the fetch it has to survive",
+      vinegar.CHECKOUT_GRACE >= vinegar.FETCH_TIMEOUT, vinegar.CHECKOUT_GRACE)
+# And the sum stays inside a token's life, or the cache can never serve one
+# and every call mints a fresh token. Nothing fails when it does: it is
+# silent, and it once ran at about 1440 tokens a day per open pull request.
+check("the checkout and review together stay inside a token's life",
+      vinegar.checkout_grace(CONFIG) < vinegar.TOKEN_LIFE,
+      (vinegar.checkout_grace(CONFIG), vinegar.TOKEN_LIFE))
 vinegar.github_env = _real_env
 
 # --- reviewer_brief ------------------------------------------------------
