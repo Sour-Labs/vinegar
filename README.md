@@ -355,8 +355,18 @@ request is attacker-controlled.
 `review-settings.json` allows reading and searching, a fixed list of read-only
 `git` and `gh` subcommands, and the text utilities a review pipes through. It
 denies writing and editing files, fetching the web, every shell and
-interpreter, and anything that changes state. Denials beat allows, and anything
-not listed is refused rather than granted.
+interpreter, and anything that changes state.
+
+**Denials bind; the allow list does not, once the sandbox is on.** Measured on
+2.1.221: `env` is refused without the sandbox and runs with it, recorded in
+neither case as anything but a denial in the first. Turning the sandbox on
+means Claude Code approves sandboxed Bash rather than gating it on the allow
+list, so a command that is neither allowed nor denied — `date`, `env`,
+`printenv` — now runs. Read that list as what a review is *expected* to need,
+and the deny list plus the sandbox as what actually stops it. Nothing the
+reviewer can run reaches the network or writes outside a temporary directory,
+and it is handed no credential (see below), which is what the confinement now
+rests on.
 
 The same file turns on Claude Code's sandbox, which is what actually confines
 writes. The permission rules cannot: they match the start of a command and
@@ -491,6 +501,17 @@ whatever command it finds to run. It is stated rather than assumed —
 `sandbox.network` is sent as `{"allowedDomains": []}` on every review, because
 a property the reviewer is told about should not rest on a default that a
 future release is free to change.
+
+**And the reviewer is handed no GitHub credential.** The environment the
+review inherits is the one `checkout()` used, so it carried the App
+installation token, and with the allow list no longer gating Bash a review
+could simply print it — measured end to end with a fake token: `env | grep
+GH_TOKEN` printed the value and the model quoted it straight back, which is
+the text Vinegar publishes on the pull request. `GH_TOKEN` and `GITHUB_TOKEN`
+are stripped from what the reviewer runs under. Nothing is lost: with no
+network, `gh` cannot use a token, and the git the reviewer runs is read-only
+in a checkout that is already on disk. The posting keeps its own credential,
+minted separately when there is a review to send.
 
 `CHECKOUT_DIR` moves with `VINEGAR_HOME` so that one machine can run isolated
 instances, so no fixed string in the settings file is right for every install.

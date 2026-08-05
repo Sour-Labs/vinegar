@@ -1230,6 +1230,34 @@ check("the paths as configured are still accepted",
 check("the environment asks for the tool contract",
       (claude_run.env or {}).get("CLAUDE_CODE_REPORT_FINDINGS") == "1",
       sorted(claude_run.env or {})[:5])
+
+# The reviewer is given no GitHub credential, and this is a leak rather
+# than tidiness. The environment handed to review() is the one checkout()
+# used, so it carries the App installation token, and enabling the sandbox
+# stopped the allow list gating Bash: measured, `env` is refused without
+# the sandbox and runs with it. A reviewer reading an attacker-authored
+# branch could print the token, and finding text reaches the pull request
+# verbatim.
+_tokened = {"GH_TOKEN": "ghs_installation_token",
+            "GITHUB_TOKEN": "ghp_operator_token", "PATH": "/usr/bin"}
+del posted[:]
+# Passed by reference deliberately: handing over a copy would make the
+# untouched-caller check below unable to fail, which is what it did first.
+vinegar.review(ROOT, "o/r", PR, CONFIG, _tokened, {})
+check("the reviewer is not given the installation token",
+      "GH_TOKEN" not in (claude_run.env or {}), sorted(claude_run.env or {}))
+check("nor an operator's own GitHub token",
+      "GITHUB_TOKEN" not in (claude_run.env or {}),
+      sorted(claude_run.env or {}))
+check("the rest of the environment still reaches the reviewer",
+      (claude_run.env or {}).get("PATH") == "/usr/bin"
+      and (claude_run.env or {}).get("CLAUDE_CODE_REPORT_FINDINGS") == "1",
+      sorted(claude_run.env or {}))
+# And the caller's own copy is untouched, because posting_env() falls back
+# to it when minting a fresh token fails — the path that gets a finished
+# review posted during a GitHub blip.
+check("removing it from the reviewer does not disarm the posting fallback",
+      _tokened.get("GH_TOKEN") == "ghs_installation_token", _tokened)
 # A stream that stops before its result event, with findings already in it.
 claude_run.stream = stream(call(FINDINGS[:4]))
 del posted[:]

@@ -2537,7 +2537,31 @@ def review(path, repo, pr, config, env, tokens, resent=False):
     # The env var is what makes the choice deterministic. Without it the
     # decision falls through to a server-side flag that is off by default,
     # and the reviewer goes back to printing text.
-    env = dict(env or os.environ, CLAUDE_CODE_REPORT_FINDINGS="1")
+    #
+    # Without the token, and this is the whole of a credential leak rather
+    # than tidiness. The environment handed in here is the one checkout()
+    # used, so it carries the App installation token, and enabling the
+    # sandbox stopped the allow list gating Bash at all: measured, `env`
+    # is refused without the sandbox and runs with it, with nothing in
+    # `permission_denials`. So the reviewer could print the token, and a
+    # reviewer reading an attacker-authored branch publishes what it is
+    # told to — finding text goes to the pull request verbatim. Measured
+    # end to end with a fake token: `env | grep GH_TOKEN` printed the
+    # value and the model quoted it back.
+    #
+    # Nothing is lost by removing it. The reviewer has no network, so
+    # `gh` cannot reach GitHub whatever credential it holds, and the git
+    # it does run is read-only inside a checkout that is already on disk.
+    # GITHUB_TOKEN goes too: `gh` reads either, and either would be an
+    # operator's own credential rather than one scoped to this repository.
+    #
+    # The caller's `env` is left alone, because posting_env() falls back
+    # to it when minting a fresh token fails, and that fallback is what
+    # gets a finished review onto the pull request during a GitHub blip.
+    env = env or os.environ
+    reviewing = dict(env, CLAUDE_CODE_REPORT_FINDINGS="1")
+    for carried in ("GH_TOKEN", "GITHUB_TOKEN"):
+        reviewing.pop(carried, None)
 
     label = pr_key(repo, pr)
 
@@ -2586,7 +2610,8 @@ def review(path, repo, pr, config, env, tokens, resent=False):
 
     started = time.monotonic()
     try:
-        result = run(cmd, cwd=path, timeout=config["review_timeout"], env=env)
+        result = run(cmd, cwd=path, timeout=config["review_timeout"],
+                     env=reviewing)
     except subprocess.TimeoutExpired as expired:
         # A timeout burned the budget it burned. Retrying would burn it again.
         log("%s: killed after %ds" % (label, config["review_timeout"]))
