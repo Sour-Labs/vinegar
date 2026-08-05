@@ -588,6 +588,14 @@ def load_state():
                           or isinstance(done[field], bool)
                           for field in ("attempts", "announce_tries",
                                         "post_tries")
+                          if field in done)
+                   # The flags too, and for the same reason: this file is
+                   # hand-edited on the log's own advice, and a bare
+                   # truthiness test reads `"announced": "no"` as yes.
+                   # Someone writing that means the opposite, and gets a
+                   # pull request that is never told Vinegar gave up.
+                   or any(not isinstance(done[field], bool)
+                          for field in ("announced", "unposted")
                           if field in done)]
             for key in bad:
                 log("%s: its entry in %s cannot be read, so it is forgotten "
@@ -681,7 +689,20 @@ def checkout(repo, pr, env):
              ["git", "clean", "-qfd"],
              ["git", "checkout", "--quiet", "--detach", pr["headRefOid"]])
     for step in steps:
-        result = run(step, cwd=path, env=env)
+        # Bounded, unlike the clone above it. The exemption beside
+        # LIST_TIMEOUT is for a first clone over a slow link; reset, clean
+        # and detach are local work, and on a filesystem that stops
+        # answering they block in the kernel with no ceiling at all. The
+        # poll loop is one thread, so that parks the daemon on every
+        # repository while the watchdog sees a live pid and calls it
+        # healthy — which is the failure DIFF_TIMEOUT exists to prevent,
+        # reached through the call site beside it. The fetch shares the
+        # budget because it is one ref from one remote, not a clone.
+        try:
+            result = run(step, cwd=path, env=env, timeout=DIFF_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("%s did not finish within %ds" % (
+                " ".join(step), DIFF_TIMEOUT))
         if result.returncode != 0:
             raise RuntimeError("%s failed: %s" % (" ".join(step),
                                                   result.stderr.strip()))
@@ -1205,13 +1226,11 @@ def split_findings(findings, covered, root, label):
             inline.append({"path": name, "line": line, "side": "RIGHT",
                            "body": clamp(label, describe(finding))})
         else:
-            # Carried with the path made relative where it resolved.
-            # Reviewers do report absolute paths — repo_path exists for
-            # that — and a finding that could not be anchored was
-            # rendered verbatim into the review comment, putting the
-            # daemon's own checkout directory on a public pull request
-            # and giving the reader a path that means nothing to them.
-            general.append(dict(finding, file=name) if name else finding)
+            # As it arrived. finish() has already put every `file`
+            # through repo_path, above the transcript and every posting
+            # path, so normalising a second time here would be a second
+            # place to keep a path rule in step.
+            general.append(finding)
     return inline, general
 
 
@@ -1754,36 +1773,31 @@ def finish(label, repo, pr, path, text, findings, config, env, tokens,
     else:
         wrote = save_or_log(label, lambda: log("%s: transcript at %s" % (
             label, save_transcript(repo, pr, text, findings, note))))
+    # Marked before the posting, not after. Written afterwards it was
+    # skipped entirely by anything that raised out of post_review — `gh`
+    # missing from PATH, a fork that cannot allocate — so a transcript
+    # that was safely on disk had nothing pointing at it and could never
+    # be sent, while the log told the operator nothing had been saved and
+    # invited them to pay for the review again. Optimistic and then
+    # cleared is the safe order: the worst a stale marker costs is one
+    # extra send, and already_posted answers that.
+    marker = unposted_path(repo, pr)
+    if config["comment"] and not preserve and wrote:
+        save_or_log(label, lambda: write_atomic(
+            marker, "%s\n" % pr["headRefOid"]))
+
     posted = post_review(label, repo, pr, path, text, findings, config,
                          posting_env(label, config, repo, tokens, env), note,
                          verb, resent)
-    # A review the endpoint refused is marked for another try on a later
-    # poll, from the transcript, without re-running the review. Without
-    # this the outcome was recorded DONE around a pull request carrying
-    # nothing, `review_on_push` is false, and it was never looked at
-    # again: the silence the README forbids, reached by the one path that
-    # had no retry of its own. The give-up has its own bounded retry and
-    # does not need this one.
-    if config["comment"] and not preserve:
-        marker = unposted_path(repo, pr)
-        try:
-            if posted:
-                forget(marker)
-            elif wrote:
-                # `wrote`, not "a file is there". save_or_log swallows a
-                # failed write, and an earlier keep() may have left a
-                # transcript of a *failed attempt* under the same name.
-                # Marking on its existence pointed the repost at a partial
-                # narration headed "It is not a review", and published it
-                # as one.
-                #
-                # The whole commit goes inside it. The name carries seven
-                # characters and the reviews endpoint wants forty, and by
-                # the time this is read the head may have moved on.
-                write_atomic(marker, "%s\n" % pr["headRefOid"])
-        except OSError as err:
-            log("%s: cannot record whether the review was posted: %s" % (
-                label, err))
+    # Cleared once it is on the pull request. What is left behind says a
+    # review is saved and waiting, which is what handle_pr acts on: the
+    # outcome is recorded DONE either way, `review_on_push` is false, and
+    # without this the pull request was never looked at again — the
+    # silence the README forbids, reached by the one path that had no
+    # retry of its own. The give-up has its own bounded retry and is
+    # never marked.
+    if posted:
+        forget(marker)
     return posted
 
 
@@ -1912,21 +1926,42 @@ def repost(key, repo, pr, config, state, tokens, done, marker, sha):
             env = github_env(config, repo, tokens, good_for=POST_GRACE)
             log("%s: posting the review that was refused earlier (attempt "
                 "%d of %d)" % (key, tries, MAX_ATTEMPTS))
-            body = clamp(key, "%s\n\nThis review was refused when it was "
-                              "written and is posted from the transcript, "
-                              "so its findings are not anchored in the "
-                              "diff.\n\n---\n\n%s" % (
-                                  review_heading(at, config), body))
-            # Not on the first try. The marker is written only after
-            # post_review has established that GitHub created nothing, so
-            # the first read here can only answer no, at the price of a
-            # paginated walk of every review on the pull request. The
-            # give-up path makes the same distinction.
-            landed = (tries > 1 and already_posted(key, repo, at, env)) or (
-                submit_review(
-                    key, repo, at,
-                    {"event": "COMMENT", "commit_id": at["headRefOid"],
-                     "body": body}, env) == POSTED)
+            opening = ("%s\n\nThis review was refused when it was written "
+                       "and is posted from the transcript, so its findings "
+                       "are not anchored in the diff.\n\n---\n\n" % (
+                           review_heading(at, config),))
+            # Cut from the front, not the back. save_transcript puts the
+            # findings last, and clamp() truncates the end, so an
+            # oversized transcript kept the reviewer's narration in full
+            # and sheared off exactly what the repost exists to deliver.
+            room = MAX_BODY - len(opening) - 80
+            if len(body) > room:
+                log("%s: the saved review is %d characters, sending the "
+                    "last %d so the findings survive" % (
+                        key, len(body), room))
+                body = ("(the beginning was cut to fit GitHub's comment "
+                        "limit)\n\n" + body[-room:])
+            # Not on the first try. The marker is written before the post
+            # is attempted, so the first read here can only answer no, at
+            # the price of a paginated walk of every review on the pull
+            # request. The give-up path makes the same distinction.
+            settled = (POSTED if tries > 1
+                       and already_posted(key, repo, at, env) else
+                       submit_review(
+                           key, repo, at,
+                           {"event": "COMMENT",
+                            "commit_id": at["headRefOid"],
+                            "body": opening + body}, env))
+            landed = settled == POSTED
+            if settled == THROTTLED:
+                # Refused by a limit, not by the request. Spending an
+                # attempt on it meant a rate-limit window that outlasts
+                # three polls — three minutes against a limit that resets
+                # hourly — abandoned a finished review for good.
+                log("%s: the posting is rate limited, so this attempt is "
+                    "not counted against the %d" % (key, MAX_ATTEMPTS))
+                tries -= 1
+                give_up_on_it = False
         except Exception as err:
             log("%s: the saved review could not be sent: %s" % (key, err))
 
@@ -1935,11 +1970,19 @@ def repost(key, repo, pr, config, state, tokens, done, marker, sha):
     elif give_up_on_it:
         log("%s: the saved review could not be posted in %d attempts. It "
             "stays in %s" % (key, tries, saved))
+    # `unposted` comes off with the marker. Leaving it set kept the scan
+    # gate armed for ever: once the head moved, every poll listed a
+    # directory that only grows to learn that a marker already deleted is
+    # still gone.
     if landed or give_up_on_it:
         forget(marker)
-        if give_up_on_it:
-            state[key] = dict(done, post_tries=MAX_ATTEMPTS)
-            save_state(state)
+        entry = dict(done,
+                     post_tries=MAX_ATTEMPTS if give_up_on_it else tries)
+        entry.pop("unposted", None)
+        state[key] = entry
+    else:
+        state[key] = dict(done, post_tries=tries)
+    save_state(state)
 
 
 def partial_note(cause):
@@ -2513,7 +2556,9 @@ def handle_pr(repo, pr, config, state, tokens):
     # what an interrupted attempt is, and because MAX_ATTEMPTS then bounds the
     # damage at three rather than leaving it open-ended. The real outcome
     # overwrites it a few lines below.
-    state[key] = state_entry(head, FAILED, attempts)
+    state[key] = state_entry(head, FAILED, attempts,
+                             post_tries=done.get("post_tries", 0),
+                             unposted=done.get("unposted", False))
     save_state(state)
 
     try:
@@ -2540,6 +2585,7 @@ def handle_pr(repo, pr, config, state, tokens):
     # Recorded with whether a saved review is waiting behind it, so the
     # next poll can find that out without listing a directory.
     state[key] = state_entry(head, outcome, attempts,
+                             post_tries=done.get("post_tries", 0),
                              unposted=os.path.exists(
                                  unposted_path(repo, pr)))
     save_state(state)

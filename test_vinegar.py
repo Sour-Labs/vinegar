@@ -408,16 +408,21 @@ check("absolute path is made repo-relative",
 check("inline comments anchor on the head side",
       all(c["side"] == "RIGHT" for c in inline), inline)
 check("out-of-diff findings go general", len(general) == 4, general)
-# A finding the reviewer reported with an absolute path, too far outside
-# the diff to anchor, used to be rendered into the public comment with
-# the daemon's own checkout directory in it.
-_abs_general = vinegar.split_findings(
+# Reviewers report absolute paths into the checkout, and every route to
+# the pull request has to carry them relative. One helper does it, above
+# the transcript and every posting path; the routes themselves are
+# checked where finish() is driven.
+_abs_rel = vinegar.relative_findings(
     [{"file": os.path.join(ROOT, "src/app.py"), "line": 9000,
-      "summary": "far outside the diff"}], covered, ROOT, L)[1]
-check("an unanchored finding does not carry the daemon's own paths",
-      _abs_general[0]["file"] == "src/app.py"
-      and ROOT not in vinegar.finding_bullet(_abs_general[0]),
-      _abs_general[0]["file"])
+      "summary": "far outside the diff"},
+     {"file": "/etc/passwd", "line": 1, "summary": "outside the checkout"}],
+    ROOT)
+check("a finding's path is made relative where it resolves",
+      _abs_rel[0]["file"] == "src/app.py"
+      and ROOT not in vinegar.finding_bullet(_abs_rel[0]),
+      _abs_rel[0]["file"])
+check("a path that resolves nowhere is left as the reviewer sent it",
+      _abs_rel[1]["file"] == "/etc/passwd", _abs_rel[1]["file"])
 check("the category reaches the comment body",
       "(correctness)" in vinegar.describe(
           {"summary": "s", "category": "correctness"}),
@@ -1326,6 +1331,21 @@ with open(vinegar.STATE_PATH, "w") as h:
             '"post_tries": "1"}}')
 check("a post_tries that is not a number is dropped too",
       vinegar.load_state() == {}, vinegar.load_state())
+
+# The flags are hand-edited too, and a bare truthiness test reads
+# `"announced": "no"` as yes — the opposite of what someone writing that
+# means, and a pull request never told Vinegar gave up.
+with open(vinegar.STATE_PATH, "w") as h:
+    h.write('{"o/r#12": {"outcome": "failed", "sha": "a", '
+            '"announced": "no"},'
+            ' "o/r#13": {"outcome": "reviewed", "sha": "a", '
+            '"unposted": "false"},'
+            ' "o/r#14": {"outcome": "reviewed", "sha": "a", '
+            '"announced": true}}')
+_flags = vinegar.load_state()
+check("a flag that is not a boolean is dropped",
+      "o/r#12" not in _flags and "o/r#13" not in _flags
+      and _flags.get("o/r#14", {}).get("announced") is True, _flags)
 check("dropping a bad entry does not quarantine the good ones",
       not _quarantined(), _quarantined())
 os.remove(vinegar.STATE_PATH)
@@ -2092,6 +2112,30 @@ _launder_skip = {_skip_key: {"outcome": vinegar.FAILED,
                              "sha": PR_SKIP["headRefOid"], "attempts": 1,
                              "post_tries": 2}}
 vinegar.handle_pr("o/r", PR_SKIP, CONFIG, _launder_skip, {})
+# And by a review that runs. Both of handle_pr's own rebuilds dropped it,
+# so the budget was already gone before the one site that preserves it
+# looked.
+PR_RERUN = dict(PR_LIVE, number=88, headRefOid="c0ffeec0ffee")
+_rerun_key = vinegar.pr_key("o/r", PR_RERUN)
+_rerun = {_rerun_key: {"outcome": vinegar.FAILED,
+                       "sha": PR_RERUN["headRefOid"], "attempts": 1,
+                       "post_tries": 2}}
+_rerun_real = (vinegar.review, vinegar.checkout, vinegar.save_state)
+_rerun_saved = []
+vinegar.review = lambda *a, **k: vinegar.DONE
+vinegar.checkout = lambda repo, pr, env: ROOT
+vinegar.save_state = lambda st: _rerun_saved.append(dict(st[_rerun_key]))
+vinegar.handle_pr("o/r", PR_RERUN, CONFIG, _rerun, {})
+(vinegar.review, vinegar.checkout, vinegar.save_state) = _rerun_real
+check("the repost budget is not handed back by a fresh review",
+      _rerun[_rerun_key].get("post_tries") == 2, _rerun)
+# The marker written before the review runs carries it too. Only that
+# entry survives a process killed mid-review, and it is the entry the
+# next poll reads.
+check("the marker written before a review carries the repost budget",
+      _rerun_saved and _rerun_saved[0].get("post_tries") == 2,
+      _rerun_saved[:1])
+
 check("the repost budget is not handed back by a skip",
       _launder_skip[_skip_key].get("outcome") == "skipped"
       and _launder_skip[_skip_key].get("post_tries") == 2, _launder_skip)
@@ -2220,6 +2264,47 @@ vinegar.run = _no_gh
 for _ in range(4):
     vinegar.handle_pr("o/r", PR_LOST, CONFIG, _raise_state, {})
 vinegar.run = fake_run
+# A rate limit refuses the request without judging it, and resets on its
+# own clock. Spending an attempt on it meant three polls — three minutes
+# against a limit that resets hourly — abandoned a finished review.
+with open(_lost_marker, "w") as h:
+    h.write("%s\n" % PR_LOST["headRefOid"])
+_rl_state = {_lost_key: {"outcome": vinegar.DONE,
+                         "sha": PR_LOST["headRefOid"], "attempts": 1,
+                         "unposted": True}}
+fake_run.rc = 1
+fake_run.post_err = "gh: API rate limit exceeded (HTTP 403)"
+for _ in range(4):
+    vinegar.handle_pr("o/r", PR_LOST, CONFIG, _rl_state, {})
+check("a rate-limited repost does not spend the budget",
+      _rl_state[_lost_key].get("post_tries", 0) == 0
+      and os.path.exists(_lost_marker), _rl_state)
+fake_run.post_err = "HTTP 403 Resource not accessible"
+vinegar.forget(_lost_marker)
+
+# The transcript puts its findings last, so an oversized one has to be
+# cut from the front: cutting the end kept the narration and dropped
+# exactly what the repost exists to deliver.
+vinegar.save_transcript("o/r", PR_LOST,
+                        "narration " * 9000, FINDINGS[:1])
+with open(_lost_marker, "w") as h:
+    h.write("%s\n" % PR_LOST["headRefOid"])
+_big_state = {_lost_key: {"outcome": vinegar.DONE,
+                          "sha": PR_LOST["headRefOid"], "attempts": 1,
+                          "unposted": True}}
+fake_run.rc = 0
+del posted[:]
+vinegar.handle_pr("o/r", PR_LOST, CONFIG, _big_state, {})
+check("an oversized saved review keeps its findings, not its narration",
+      len(posted) == 1
+      and len(posted[0][1]["body"]) <= vinegar.MAX_BODY
+      and "## Findings" in posted[0][1]["body"]
+      and "the beginning was cut" in posted[0][1]["body"],
+      len(posted[0][1]["body"]) if posted else "nothing posted")
+check("a posted saved review stops arming the directory scan",
+      _big_state[_lost_key].get("unposted") is None, _big_state)
+fake_run.rc = 1
+
 check("a repost that raises still spends its attempt and stops",
       _raise_state[_lost_key].get("post_tries") == vinegar.MAX_ATTEMPTS
       and not os.path.exists(_lost_marker), _raise_state)
