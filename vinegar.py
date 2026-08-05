@@ -588,10 +588,12 @@ def diff_lines(path, base, env, label):
     review or none of it, so a single badly anchored comment would throw away
     every finding alongside it.
 
-    `--unified=0` so the ranges are the changed lines themselves rather than
-    the context around them. A deletion-only hunk reports `+n,0`, which is an
-    empty range and correctly contributes no line: nothing was added there for
-    a comment to sit on.
+    Three lines of context, because that is what GitHub shows and therefore
+    what it accepts a comment on. At `--unified=0` the ranges held only added
+    lines, so a finding about an unchanged line two below an edit, which
+    GitHub would have taken happily, was demoted to the general comment for
+    no reason. A hunk that contributes no head-side line at all still reports
+    `+n,0`, an empty range, and correctly yields nothing.
 
     The prefixes are pinned rather than assumed. `diff.noprefix` and
     `diff.mnemonicPrefix` are both real settings that change what precedes
@@ -622,7 +624,7 @@ def diff_lines(path, base, env, label):
     # external driver does not print a unified diff at all, which is the
     # harmless half of the same setting.
     result = run(["git", "-c", "core.quotepath=false", "-c", "color.ui=false",
-                  "diff", "--unified=0", "--no-color",
+                  "diff", "--unified=3", "--no-color",
                   "--no-textconv", "--no-ext-diff",
                   "--src-prefix=a/", "--dst-prefix=b/",
                   "%s...HEAD" % base], cwd=path, env=env)
@@ -673,8 +675,12 @@ def repo_path(name, root):
     if not isinstance(name, str) or not name.strip():
         return None
     name = name.strip()
-    name = (os.path.relpath(name, root) if os.path.isabs(name)
-            else os.path.normpath(name))
+    # realpath both sides, as check_paths() already does for its own check.
+    # A checkout directory reached through a symlink resolves one way for the
+    # reviewer's tools and another for this comparison, and every absolute
+    # path it reports would then look like it sits outside the checkout.
+    name = (os.path.relpath(os.path.realpath(name), os.path.realpath(root))
+            if os.path.isabs(name) else os.path.normpath(name))
     # The component, not the two characters. `..config.py` is an ordinary
     # file name and rejecting it would send a perfectly anchorable finding to
     # the general comment.
@@ -699,7 +705,10 @@ def finding_line(finding):
         return None
     try:
         return int(line)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError because json.loads accepts the non-standard
+        # `Infinity` and `1e400`, and int(float("inf")) raises it. Uncaught,
+        # one bad line number in one finding took the whole review with it.
         return None
 
 
@@ -779,7 +788,7 @@ def review_body(label, pr, config, inline, general, raw=None,
     return clamp(label, "\n".join(lines))
 
 
-def submit_review(repo, pr, payload, env):
+def submit_review(label, repo, pr, payload, env):
     """Post one review, as one request, and say whether it landed.
 
     Bounded, because every other call out of this process is. `run()` waits
@@ -801,8 +810,8 @@ def submit_review(repo, pr, payload, env):
         # have accepted the review and been slow to say so. Retrying that
         # posts the review twice. Callers retry a definite refusal and leave
         # this alone.
-        log("%s#%d: posting the review timed out after %ds, so it may or may "
-            "not have landed" % (repo, pr["number"], POST_TIMEOUT))
+        log("%s: posting the review timed out after %ds, so it may or may "
+            "not have landed" % (label, POST_TIMEOUT))
         return None
     if result.returncode == 0:
         return True
@@ -810,11 +819,31 @@ def submit_review(repo, pr, payload, env):
     # own body on stdout, and the body is the half that names which comment
     # was refused and why. Logging stderr alone left the retry's comment
     # telling the reader to consult an error that does not say.
-    log("%s#%d: posting the review failed: %s" % (
-        repo, pr["number"],
+    log("%s: posting the review failed: %s" % (
+        label,
         " ".join(part.strip() for part in (result.stderr, result.stdout)
                  if part and part.strip())[:600]))
     return False
+
+
+def posting_env(label, config, repo, tokens, fallback):
+    """Credentials for the posting: a fresh token, or the review's own.
+
+    Minting here is a live API call, and the endpoint it calls is one
+    handle_pr() already documents as prone to transient 5xx. Letting that
+    decide the fate of a finished review is the wrong trade: the token the
+    run has been using is in scope and, at any `review_timeout` short of the
+    hour a token lives, usually has time left on it. A one-second network
+    blip should not cost a review that is sitting there ready to post.
+    """
+    if not config["comment"]:
+        return None
+    try:
+        return github_env(config, repo, tokens, good_for=POST_GRACE)
+    except Exception as err:
+        log("%s: could not mint a token to post with (%s), using the one the "
+            "review ran on" % (label, err))
+        return fallback
 
 
 def announce(label, post):
@@ -841,7 +870,7 @@ def announce(label, post):
         log("%s: the review is not posted: %s" % (label, err))
 
 
-def post_timeout(repo, pr, config, seconds, env):
+def post_timeout(label, pr, repo, seconds, env):
     """Say on the pull request that the review was killed.
 
     A timeout returns no text at all, so there is nothing for post_review() to
@@ -850,8 +879,6 @@ def post_timeout(repo, pr, config, seconds, env):
     That was survivable only while the reviewer posted its findings as it
     went, which left whatever it had found before the kill.
     """
-    if not config["comment"]:
-        return
     payload = {
         "event": "COMMENT",
         "commit_id": pr["headRefOid"],
@@ -863,8 +890,8 @@ def post_timeout(repo, pr, config, seconds, env):
     # Twice, for the reason post_review() retries: this comment carries no
     # inline anchors, so a refusal is a transient one, and losing it leaves a
     # pull request silent about a review that really did run.
-    if submit_review(repo, pr, payload, env) is False:
-        submit_review(repo, pr, payload, env)
+    if submit_review(label, repo, pr, payload, env) is False:
+        submit_review(label, repo, pr, payload, env)
 
 
 def post_review(repo, pr, path, text, findings, config, env):
@@ -895,7 +922,7 @@ def post_review(repo, pr, path, text, findings, config, env):
     if inline:
         payload["comments"] = inline
 
-    landed = submit_review(repo, pr, payload, env)
+    landed = submit_review(label, repo, pr, payload, env)
     if landed:
         log("%s: posted %d inline comment(s) and the review comment" % (
             label, len(inline)))
@@ -913,7 +940,7 @@ def post_review(repo, pr, path, text, findings, config, env):
         # one 502 and the pull request received nothing at all, for good:
         # the outcome is recorded reviewed and `review_on_push` is false.
         log("%s: retrying the review comment" % label)
-        submit_review(repo, pr, payload, env)
+        submit_review(label, repo, pr, payload, env)
         return
 
     # The endpoint took none of it, and the likeliest reason is an anchor it
@@ -927,7 +954,7 @@ def post_review(repo, pr, path, text, findings, config, env):
     payload["body"] = review_body(
         label, pr, config, [], findings,
         heading="GitHub refused the inline comments, so all of it is here:")
-    submit_review(repo, pr, payload, env)
+    submit_review(label, repo, pr, payload, env)
 
 
 def review(path, repo, pr, config, env, tokens):
@@ -979,8 +1006,8 @@ def review(path, repo, pr, config, env, tokens):
         log("%s: killed after %ds" % (label, config["review_timeout"]))
         if config["comment"]:
             announce(label, lambda: post_timeout(
-                repo, pr, config, config["review_timeout"],
-                github_env(config, repo, tokens, good_for=POST_GRACE)))
+                label, pr, repo, config["review_timeout"],
+                posting_env(label, config, repo, tokens, env)))
         return DONE
     took = round(time.monotonic() - started)
 
@@ -1003,10 +1030,18 @@ def review(path, repo, pr, config, env, tokens):
     # Claude Code 2.1.220.
     denied = output.get("permission_denials") or []
     if denied:
-        tools = sorted({entry.get("tool_name", "?") for entry in denied})
-        log("%s: %d permission denial(s) for %s. The review ran with less "
-            "than it asked for; widen review-settings.json" % (
-                label, len(denied), ", ".join(tools)))
+        # The command, not just the tool name. "denied 4 Bash calls" is not
+        # something anyone can act on, and this line's own advice is to widen
+        # the allow list, which needs to know what to widen.
+        for entry in denied:
+            asked = entry.get("tool_input") or {}
+            log("%s: denied %s %s" % (
+                label, entry.get("tool_name", "?"),
+                str(asked.get("command") or asked.get("file_path")
+                    or asked)[:160]))
+        log("%s: %d permission denial(s). The review ran with less than it "
+            "asked for; widen review-settings.json if it needed them" % (
+                label, len(denied)))
 
     # `or ""`, not a `get` default: the key is present and null on some
     # outcomes, and a default only applies to a key that is absent. Missing
@@ -1052,8 +1087,7 @@ def review(path, repo, pr, config, env, tokens):
     # safe cheaply. A dry run mints nothing, having nothing to post.
     announce(label, lambda: post_review(
         repo, pr, path, text, findings, config,
-        github_env(config, repo, tokens, good_for=POST_GRACE)
-        if config["comment"] else None))
+        posting_env(label, config, repo, tokens, env)))
     return DONE
 
 
