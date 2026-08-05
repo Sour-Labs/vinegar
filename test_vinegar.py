@@ -317,7 +317,8 @@ check("the retry does not blame anchoring for GitHub's refusal",
 fake_run.rc = 0
 
 del posted[:]
-vinegar.post_review("o/r", PR, ROOT, text, FINDINGS[:4], dict(CONFIG, comment=False), None)
+vinegar.post_review("o/r", PR, ROOT, text, FINDINGS[:4],
+                    dict(CONFIG, comment=False), None)
 check("a dry run posts nothing at all", not posted, posted)
 
 del posted[:]
