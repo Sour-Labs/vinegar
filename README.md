@@ -439,8 +439,18 @@ operating system level rather than by pattern:
 
 `failIfUnavailable` matters as much as `enabled`. Without it a sandbox that
 cannot start is skipped and the review runs unconfined, which looks exactly
-like a successful review. `check_paths()` refuses to start when any of the
-three is missing or changed, the same way it refuses without the read deny.
+like a successful review.
+
+**Vinegar builds that stanza itself for every review and does not trust the
+file for it.** `check_paths()` reads the file once, at startup, while reviews
+run every poll: a file edited to chase a denial, or replaced by a `git pull`
+of the program directory, would otherwise launch the next review unconfined
+with nothing to refuse it. Building it also drops any key left in the file
+that would widen the sandbox back out, such as an `allowWrite`. The file keeps
+its own copy because it is what you read to learn what the reviewer may do,
+and what a hand-run `claude --settings review-settings.json` uses, and
+`check_paths()` refuses to start when the two disagree — so the file cannot
+quietly describe a weaker sandbox than the one in force.
 
 **The checkout is denied writes as well, and Vinegar adds that rule itself.**
 The sandbox leaves the workspace writable, and the workspace is the checkout.
@@ -453,10 +463,12 @@ survives `reset --hard` and `clean -qfd` too, so one line written into
 
 `CHECKOUT_DIR` moves with `VINEGAR_HOME` so that one machine can run isolated
 instances, so no fixed string in the settings file is right for every install.
-Vinegar reads the file, adds the checkout to `sandbox.filesystem.denyWrite`,
-and passes the result to `claude --settings` as JSON. Nothing legitimate is
-lost: every read-only git command a review runs works with the checkout
-read-only.
+Vinegar puts the checkout in `sandbox.filesystem.denyWrite` and passes the
+result to `claude --settings` as JSON. The resolved path goes in as well as
+the written one, because the kernel judges a write by the path it resolves to:
+denying only `~/.vinegar-checkouts` when that is a symlink lets the write
+through, measured. Nothing legitimate is lost — every read-only git command a
+review runs works with the checkout read-only.
 
 ### What is still open
 

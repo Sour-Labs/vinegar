@@ -505,7 +505,13 @@ def check_paths():
             permissions = settings.get("permissions") or {}
             allowed = permissions.get("allow") or []
             denied = permissions.get("deny") or []
-            sandbox = settings.get("sandbox") or {}
+            # isinstance, like the two above are guarded by `or []`. A
+            # hand-edited `"sandbox": "true"` is truthy and passes through
+            # unchanged, and the .get below it would then raise
+            # AttributeError outside this try — a launchd traceback every
+            # 30 seconds instead of the sentence that says what to fix.
+            sandbox = settings.get("sandbox")
+            sandbox = sandbox if isinstance(sandbox, dict) else {}
     except Exception as err:
         sys.exit("%s cannot be read (%s), and the reviewer runs under it."
                  % (SETTINGS_PATH, err))
@@ -549,12 +555,18 @@ def check_paths():
                 "`git show --output=`, which the allow list matches as an "
                 "ordinary read." % (name, str(wanted).lower(), why))
 
-    # The checkout is denied writes too, but reviewer_settings() adds that
-    # rather than this checking for it. CHECKOUT_DIR moves with
-    # VINEGAR_HOME by design, so a fixed file cannot name it for every
-    # instance, and a rule the operator has to keep in step is a rule that
-    # falls out of step. The file's own entry covers the default install;
-    # the guarantee is in code.
+    # What this loop checks is that the file agrees with the program, not
+    # that the reviewer is confined: reviewer_settings() builds the stanza
+    # it sends from SANDBOX_RULES and never trusts the file, because this
+    # function runs once and a review runs every poll. The file is still
+    # what a person reads to learn what the reviewer may do, and what a
+    # hand-run `claude --settings review-settings.json` uses, so a copy
+    # that describes a weaker sandbox than the one in force is a lie worth
+    # refusing to start over.
+    #
+    # The checkout deny is not checked here at all. CHECKOUT_DIR moves
+    # with VINEGAR_HOME by design, so no fixed string suits every
+    # instance, and reviewer_settings() derives it.
 
 
 def reviewer_settings():
@@ -572,9 +584,15 @@ def reviewer_settings():
 
     CHECKOUT_DIR is derived from VINEGAR_HOME so that one machine can run
     isolated instances, which means no fixed string in review-settings.json
-    is right for all of them. Deriving it here cannot drift; the file's
-    own entry is the same path for a default install, kept so the file
-    still reads as what it does.
+    is right for all of them. Deriving it here cannot drift.
+
+    The whole stanza is built here rather than taken from the file, so
+    what runs cannot be weakened by editing that file while the daemon
+    polls. The file keeps its own copy because it is what a person reads
+    to learn what the reviewer may do, and what a hand-run
+    `claude --settings review-settings.json` uses; check_paths() refuses
+    to start when the two disagree, so the file cannot quietly describe a
+    weaker sandbox than the one in force.
 
     Nothing legitimate is lost. Every read-only git command a review runs
     — diff, log, show, blame, status, ls-files, rev-parse — works with the
@@ -582,11 +600,29 @@ def reviewer_settings():
     """
     with open(SETTINGS_PATH, encoding="utf-8") as handle:
         settings = json.load(handle)
-    filesystem = settings.setdefault("sandbox", {}).setdefault(
-        "filesystem", {})
-    denied = filesystem.setdefault("denyWrite", [])
-    if CHECKOUT_DIR not in denied:
-        denied.append(CHECKOUT_DIR)
+    # Built from SANDBOX_RULES, not inherited from the file. check_paths()
+    # reads that file once, at startup, and this runs again for every
+    # review: an operator who edits it to chase a denial, or a `git pull`
+    # of this directory, would otherwise launch the next review with the
+    # stanza weakened and nothing would refuse or say so — the failure
+    # that looks exactly like a successful review. Overwriting also drops
+    # any key that is not checked, since an `allowWrite` left in the file
+    # would widen what three validated keys still describe as closed, and
+    # means a hand-edited `"sandbox": null` cannot raise out of here into
+    # a give-up comment about a local typo.
+    denied = [CHECKOUT_DIR]
+    # The resolved path too, because the kernel judges the write by it.
+    # Measured: denying only the symlink path let the write through, and
+    # `ln -s <elsewhere> ~/.vinegar-checkouts` is the shortcut people take
+    # to avoid re-cloning on upgrade — the one components() names too.
+    # Both forms are sent, since an entry that matches nothing costs
+    # nothing and guessing which one the sandbox canonicalises does not.
+    real = os.path.realpath(CHECKOUT_DIR)
+    if real != CHECKOUT_DIR:
+        denied.append(real)
+    settings["sandbox"] = dict(
+        ((name, wanted) for name, wanted, _ in SANDBOX_RULES),
+        filesystem={"denyWrite": denied})
     return json.dumps(settings)
 
 

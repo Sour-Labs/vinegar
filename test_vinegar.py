@@ -850,67 +850,139 @@ def _with_sandbox(sandbox):
 
 _good = {"enabled": True, "failIfUnavailable": True,
          "allowUnsandboxedCommands": False}
+# Bound once each: `check` evaluates its detail argument whether or not the
+# condition fails, so calling the helper there ran check_paths() a second
+# time and reported a different execution than the one asserted on.
+_said = _with_sandbox(_good)
 check("the sandbox stanza as shipped starts cleanly",
-      _with_sandbox(_good) == "started", _with_sandbox(_good))
-check("no sandbox at all refuses to start",
-      "sandbox.enabled" in _with_sandbox({}), _with_sandbox({}))
+      _said == "started", _said)
+_said = _with_sandbox({})
+check("no sandbox at all refuses to start", "sandbox.enabled" in _said, _said)
+_said = _with_sandbox(dict(_good, enabled=False))
 check("a disabled sandbox refuses to start",
-      "sandbox.enabled" in _with_sandbox(dict(_good, enabled=False)),
-      _with_sandbox(dict(_good, enabled=False)))
+      "sandbox.enabled" in _said, _said)
 # `"true"` is a non-empty string, so reading these flags for truth rather
 # than for value would take a hand-edited quote as an enabled sandbox. It
 # is the same slip load_config refuses in config.json, in the file
 # operators edit far more often.
+_said = _with_sandbox(dict(_good, enabled="true"))
 check("a quoted true is not an enabled sandbox",
-      "sandbox.enabled" in _with_sandbox(dict(_good, enabled="true")),
-      _with_sandbox(dict(_good, enabled="true")))
+      "sandbox.enabled" in _said, _said)
 # And `1 == True` in Python, so comparing with `==` accepts a number where
 # a flag belongs. `is` is what makes these three keys mean what they say.
+_said = _with_sandbox(dict(_good, enabled=1))
 check("a sandbox enabled with 1 rather than true refuses to start",
-      "sandbox.enabled" in _with_sandbox(dict(_good, enabled=1)),
-      _with_sandbox(dict(_good, enabled=1)))
+      "sandbox.enabled" in _said, _said)
+_said = _with_sandbox(dict(_good, allowUnsandboxedCommands=0))
 check("unsandboxed commands allowed as 0 rather than false refuses",
-      "allowUnsandboxedCommands" in _with_sandbox(
-          dict(_good, allowUnsandboxedCommands=0)),
-      _with_sandbox(dict(_good, allowUnsandboxedCommands=0)))
+      "allowUnsandboxedCommands" in _said, _said)
 # Without this, a sandbox that cannot start is skipped and the review runs
 # unconfined, which is the failure that looks exactly like success.
+_said = _with_sandbox(dict(_good, failIfUnavailable=False))
 check("a sandbox allowed to be unavailable refuses to start",
-      "failIfUnavailable" in _with_sandbox(
-          dict(_good, failIfUnavailable=False)),
-      _with_sandbox(dict(_good, failIfUnavailable=False)))
+      "failIfUnavailable" in _said, _said)
+_said = _with_sandbox(dict(_good, allowUnsandboxedCommands=True))
 check("letting commands run unsandboxed refuses to start",
-      "allowUnsandboxedCommands" in _with_sandbox(
-          dict(_good, allowUnsandboxedCommands=True)),
-      _with_sandbox(dict(_good, allowUnsandboxedCommands=True)))
+      "allowUnsandboxedCommands" in _said, _said)
+# A stanza that is not an object at all must produce that same sentence.
+# Truthy and unguarded, it reached a .get outside the try that guards the
+# read, so launchd restarted into a traceback every 30 seconds.
+_said = _with_sandbox("true")
+check("a sandbox that is not an object is refused with a sentence",
+      "sandbox.enabled" in _said, _said)
 
-# reviewer_settings() is where the checkout deny comes from, and it has to
-# survive a settings file that carries no sandbox stanza at all: the
-# guarantee is in code, not in the file.
-_bare = os.path.join(_home, "bare-settings.json")
-with open(_bare, "w") as h:
-    json.dump({"permissions": {"allow": ["Read"], "deny": []}}, h)
-vinegar.SETTINGS_PATH = _bare
-_built = json.loads(vinegar.reviewer_settings())
-vinegar.SETTINGS_PATH = _sp_real
-check("the checkout deny is added even to settings that carry no sandbox",
-      vinegar.CHECKOUT_DIR in
-      _built["sandbox"]["filesystem"]["denyWrite"],
-      json.dumps(_built.get("sandbox")))
-# A settings file that already names the checkout must not have it added a
-# second time. Re-reading the file makes every call start clean, so only a
-# file that carries the path can drive the branch that decides this.
-_named = os.path.join(_home, "named-checkout-settings.json")
-with open(_named, "w") as h:
-    json.dump({"permissions": {"allow": ["Read"], "deny": []},
-               "sandbox": {"filesystem": {
-                   "denyWrite": [vinegar.CHECKOUT_DIR]}}}, h)
-vinegar.SETTINGS_PATH = _named
-_twice = json.loads(vinegar.reviewer_settings())["sandbox"]["filesystem"][
-    "denyWrite"]
-vinegar.SETTINGS_PATH = _sp_real
-check("a checkout the file already denies is not denied twice",
-      _twice.count(vinegar.CHECKOUT_DIR) == 1, _twice)
+
+def _built_with(sandbox):
+    """The settings reviewer_settings() sends when the file holds this."""
+    path = os.path.join(_home, "built-settings.json")
+    with open(path, "w") as handle:
+        json.dump({"permissions": {"allow": ["Read"], "deny": []},
+                   "sandbox": sandbox} if sandbox is not _absent
+                  else {"permissions": {"allow": ["Read"], "deny": []}},
+                  handle)
+    vinegar.SETTINGS_PATH = path
+    try:
+        return json.loads(vinegar.reviewer_settings())
+    finally:
+        # In a finally like _with_sandbox above, because reviewer_settings()
+        # can raise: without it one failure leaves this global pointing at a
+        # temp file for the remaining two thousand checks.
+        vinegar.SETTINGS_PATH = _sp_real
+
+
+_absent = object()
+# What is sent is built here, not inherited. check_paths() reads the file
+# once at startup; this runs again for every review, so a file edited to
+# chase a denial — or replaced by `git pull` — would otherwise launch the
+# next review unconfined with nothing refusing and nothing logged.
+for _label, _stanza in (("carries no sandbox", _absent),
+                        ("has a null sandbox", None),
+                        ("disables the sandbox", {"enabled": False}),
+                        ("nulls the filesystem",
+                         {"enabled": True, "filesystem": None}),
+                        ("nulls the deny list",
+                         {"enabled": True, "filesystem": {
+                             "denyWrite": None}}),
+                        ("makes the deny list a string",
+                         {"enabled": True, "filesystem": {
+                             "denyWrite": "~/.vinegar-checkouts"}})):
+    _sent = _built_with(_stanza)["sandbox"]
+    check("a settings file that %s still sends an enabled sandbox" % _label,
+          _sent.get("enabled") is True, json.dumps(_sent))
+    check("a settings file that %s still denies the checkout" % _label,
+          vinegar.CHECKOUT_DIR in _sent["filesystem"]["denyWrite"],
+          json.dumps(_sent["filesystem"]))
+# Every key that can turn confinement off is set here, so one left in the
+# file — an allowWrite, or anything else Claude Code honours — cannot ride
+# along beside three keys that still read true, true, false.
+_sent = _built_with({"enabled": True, "failIfUnavailable": True,
+                     "allowUnsandboxedCommands": False,
+                     "filesystem": {"allowWrite": ["/"]},
+                     "network": {"allowedDomains": ["*"]}})["sandbox"]
+check("a widening key left in the file is not passed on",
+      "allowWrite" not in _sent["filesystem"] and "network" not in _sent,
+      json.dumps(_sent))
+
+# The path the kernel judges the write by, not the one that was typed.
+# Measured against the real binary: a sandbox given only the symlink path
+# let `git show --output=` create the file inside it.
+_link_root = os.path.join(_home, "linked-checkouts")
+os.makedirs(os.path.join(_home, "real-checkouts"), exist_ok=True)
+if not os.path.islink(_link_root):
+    os.symlink(os.path.join(_home, "real-checkouts"), _link_root)
+_cd = vinegar.CHECKOUT_DIR
+vinegar.CHECKOUT_DIR = _link_root
+try:
+    _linked = json.loads(vinegar.reviewer_settings())["sandbox"][
+        "filesystem"]["denyWrite"]
+finally:
+    vinegar.CHECKOUT_DIR = _cd
+# realpath on the expectation too: the temp root this suite runs under is
+# itself reached through a symlink on macOS (/var/folders -> /private/...),
+# so the literal join would differ from what the kernel resolves to for a
+# reason that has nothing to do with what is being checked.
+check("a symlinked checkout is denied by the path it resolves to",
+      os.path.realpath(os.path.join(_home, "real-checkouts")) in _linked,
+      _linked)
+
+# What these checks cannot reach, said plainly rather than left implied.
+# They prove what Vinegar sends. Whether `sandbox.filesystem.denyWrite`
+# actually beats the sandbox's own workspace-writable grant is a fact
+# about Claude Code, and the only honest way to learn it is to run one —
+# which costs money and needs a login, so it stays out of the suite.
+#
+# Measured by hand on Claude Code 2.1.221, macOS 26.6, and worth
+# repeating whenever that version moves. From a git repository inside a
+# directory the emitted denyWrite names:
+#
+#   claude -p 'Run exactly: git show -s --format=%B --output=./x.txt HEAD' \
+#     --settings "$(python3 -c 'import vinegar; print(vinegar.reviewer_settings())')" \
+#     --setting-sources "" --strict-mcp-config --model claude-haiku-4-5
+#
+# Then: `git log` exits 0, the write exits 128 with "Operation not
+# permitted", and no file appears — inside the checkout or in $HOME.
+# Use a repository whose commit messages are innocuous, or the model
+# refuses the command on its own and measures nothing.
 
 # And the key has to be somewhere that rule reaches. check_paths argues
 # the key is safe because HOME carries the denied component; the key's
