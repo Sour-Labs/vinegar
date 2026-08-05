@@ -28,7 +28,7 @@ The reviewer is not something Vinegar implements. Claude Code already ships a
 and runs non-interactively:
 
 ```sh
-claude -p '/code-review 123' --output-format stream-json
+claude -p '/code-review 123' --output-format stream-json --verbose
 ```
 
 Vinegar is the trigger, the router, and the calibration around that. It also

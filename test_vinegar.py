@@ -34,6 +34,8 @@ invented.
 """
 import json
 import os
+import atexit
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -41,7 +43,9 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # Before the import: the module reads this at import time to place its state,
 # and a test run must not go looking at the real one.
-os.environ["VINEGAR_HOME"] = os.path.join(tempfile.mkdtemp(), ".vinegar")
+_home = tempfile.mkdtemp(prefix="vinegar-test-home-")
+atexit.register(shutil.rmtree, _home, True)
+os.environ["VINEGAR_HOME"] = os.path.join(_home, ".vinegar")
 import vinegar
 
 PR = {"number": 12, "headRefOid": "a1b2c3d4e5f6", "baseRefName": "release-2",
@@ -136,6 +140,15 @@ check("an empty findings list is a clean review, not silence",
       vinegar.read_stream(stream(call([]), DONE_EVENT))[1] == [])
 check("a later call corrects an earlier one",
       vinegar.read_stream(stream(call([]), call(REAL), DONE_EVENT))[1] == REAL)
+check("a subagent's call does not replace the review's own",
+      vinegar.read_stream(stream(
+          call(REAL),
+          dict(call([{"file": "sub.py", "line": 1, "summary": "candidate"}]),
+               parent_tool_use_id="toolu_01"),
+          DONE_EVENT))[1] == REAL)
+check("a findings list holding a non-object is refused whole",
+      vinegar.read_stream(
+          stream(call(["a bug", {"file": "a.py"}]), DONE_EVENT))[1] is None)
 check("another tool's call is not mistaken for findings",
       vinegar.read_stream(stream(call(REAL, name="Bash"), DONE_EVENT))[1]
       is None)
@@ -173,9 +186,13 @@ check("a failed diff anchors nothing rather than guessing",
 fake_run.diff_rc = 0
 
 # A checkout reached through a symlink must resolve the same either way.
-import tempfile as _tf
-_real = _tf.mkdtemp()
-_link = _os_link = _tf.mktemp()
+# Everything this run creates lives under one directory, removed on the way
+# out, so repeated runs do not fill the system temp directory.
+SCRATCH = tempfile.mkdtemp(prefix="vinegar-test-")
+atexit.register(shutil.rmtree, SCRATCH, True)
+_real = os.path.join(SCRATCH, "real")
+_link = os.path.join(SCRATCH, "link")
+os.mkdir(_real)
 os.symlink(_real, _link)
 
 # --- split_findings ------------------------------------------------------
@@ -358,7 +375,7 @@ check("a posting failure cannot escape and cost a re-review",
 # handle_pr does not wrap the call, so anything escaping leaves no state and
 # the pull request is re-reviewed at full cost on every poll from then on.
 real_env, real_transcript = vinegar.github_env, vinegar.save_transcript
-vinegar.save_transcript = lambda repo, pr, text: "/dev/null"
+vinegar.save_transcript = lambda repo, pr, text, findings=None: "/dev/null"
 
 
 def exploding_env(*a, **k):
@@ -367,7 +384,7 @@ def exploding_env(*a, **k):
 
 def claude_run(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
     if cmd[0] == "claude":
-        claude_run.saw = cmd
+        claude_run.saw, claude_run.env = cmd, env
         return subprocess.CompletedProcess(cmd, 0, claude_run.stream, "")
     return fake_run(cmd, cwd, timeout, env, stdin_text)
 
@@ -377,7 +394,7 @@ def result_event(**over):
                  "result": text, "total_cost_usd": 1.0}, **over)
 
 
-claude_run.saw = []
+claude_run.saw, claude_run.env = [], {}
 claude_run.stream = stream(call(FINDINGS[:4]), result_event())
 
 
@@ -417,19 +434,74 @@ check("an error holding nothing is retried, not posted",
 
 claude_run.stream = stream(result_event(result=None))
 del posted[:]
-check("a null result never posts the word None",
-      len(posted) == 0 or "None" not in posted[0][1]["body"])
 vinegar.review(ROOT, "o/r", PR, CONFIG, None, {})
 check("a null result is announced as nothing produced",
       len(posted) == 1 and "produced nothing" in posted[0][1]["body"],
       posted[0][1]["body"] if posted else "nothing posted")
+check("a null result never posts the word None",
+      posted and "None" not in posted[0][1]["body"],
+      posted[0][1]["body"] if posted else "nothing posted")
 
 claude_run.stream = stream(call(FINDINGS[:4]), result_event())
+del posted[:]
+vinegar.review(ROOT, "o/r", PR, CONFIG, None, {})
 check("the review asks for the stream the tool call arrives in",
       "stream-json" in claude_run.saw and "--verbose" in claude_run.saw,
       claude_run.saw)
 check("the reporting tool is not withheld any more",
       "--disallowedTools" not in claude_run.saw, claude_run.saw)
+check("the environment asks for the tool contract",
+      (claude_run.env or {}).get("CLAUDE_CODE_REPORT_FINDINGS") == "1",
+      sorted(claude_run.env or {})[:5])
+# Killed mid-summary, after the findings were already reported.
+def timing_out(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
+    if cmd[0] == "claude":
+        raise subprocess.TimeoutExpired(
+            cmd, timeout or 0,
+            output=stream(call(FINDINGS[:4]), ).encode())
+    return fake_run(cmd, cwd, timeout, env, stdin_text)
+
+
+vinegar.run = timing_out
+del posted[:]
+check("a kill after the findings were reported still posts them",
+      vinegar.review(ROOT, "o/r", PR, CONFIG, None, {}) == vinegar.DONE
+      and len(posted) == 1
+      and "comments" in posted[0][1], (len(posted),))
+check("a salvaged review is not announced as having produced nothing",
+      posted and "killed after" not in posted[0][1]["body"],
+      posted[0][1]["body"][:120] if posted else "nothing posted")
+
+
+def timing_out_early(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
+    if cmd[0] == "claude":
+        raise subprocess.TimeoutExpired(cmd, timeout or 0, output=b"")
+    return fake_run(cmd, cwd, timeout, env, stdin_text)
+
+
+vinegar.run = timing_out_early
+del posted[:]
+check("a kill with nothing reported still says so on the pull request",
+      vinegar.review(ROOT, "o/r", PR, CONFIG, None, {}) == vinegar.DONE
+      and len(posted) == 1 and "killed after" in posted[0][1]["body"],
+      posted[0][1]["body"][:120] if posted else "nothing posted")
+
+vinegar.run = claude_run
+claude_run.stream = stream(call(FINDINGS[:4]),
+                           result_event(is_error=True,
+                                        subtype="error_during_execution"))
+del posted[:]
+check("an error after the findings arrived posts them, not a retry",
+      vinegar.review(ROOT, "o/r", PR, CONFIG, None, {}) == vinegar.DONE
+      and len(posted) == 1, (len(posted),))
+
+claude_run.stream = stream(call(FINDINGS[:4]), result_event())
+del posted[:]
+vinegar.review(ROOT, "o/r", PR, CONFIG, None, {})
+check("the brief reaches the reviewer",
+      "--append-system-prompt" in claude_run.saw
+      and any("release-2...HEAD" in a for a in claude_run.saw),
+      claude_run.saw)
 
 vinegar.run, vinegar.github_env = fake_run, real_env
 vinegar.save_transcript = real_transcript

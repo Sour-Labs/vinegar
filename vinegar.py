@@ -462,14 +462,33 @@ def checkout(repo, pr, env):
     return path
 
 
-def save_transcript(repo, pr, text):
+def save_transcript(repo, pr, text, findings=None):
+    """Write the review to disk, findings included.
+
+    They have to be written explicitly now. The reviewer reports them through
+    a tool and is told not to repeat them as text, so `result` is a closing
+    sentence and nothing else. Without this the transcript directory, which
+    is the entire output of a dry run and the copy that survives a failed
+    post, would hold that sentence and no findings at all.
+    """
     os.makedirs(REVIEW_DIR, exist_ok=True)
     name = "%s__%d__%s.md" % (repo.replace("/", "__"), pr["number"],
                               pr["headRefOid"][:7])
     path = os.path.join(REVIEW_DIR, name)
+    body = text
+    if findings:
+        body += "\n\n## Findings\n\n" + "\n\n".join(
+            "- `%s%s`: %s" % (
+                str(finding.get("file") or "(no file)").strip(),
+                ":%d" % finding_line(finding)
+                if finding_line(finding) is not None else "",
+                describe(finding).replace("\n\n", "\n  "))
+            for finding in findings)
+    elif findings is not None:
+        body += "\n\n## Findings\n\nNone.\n"
     with open(path, "w") as handle:
         handle.write("# %s#%d %s\n\n%s\n\n---\n\n%s\n" % (
-            repo, pr["number"], pr["headRefOid"][:7], pr["url"], text))
+            repo, pr["number"], pr["headRefOid"][:7], pr["url"], body))
     return path
 
 
@@ -569,13 +588,26 @@ def read_stream(stdout):
         if event.get("type") == "result":
             result = event
             continue
+        # A subagent's call is not the review's answer. Finder subagents are
+        # what the default `high` prompt spawns, `Task` is in the allow list,
+        # and with --verbose their messages arrive here as ordinary assistant
+        # events tagged with the tool call that started them. Without this,
+        # two candidates from one angle would replace fifteen from the whole
+        # review, because the last call wins.
+        if event.get("parent_tool_use_id"):
+            continue
         message = event.get("message")
         content = message.get("content") if isinstance(message, dict) else None
         for block in content if isinstance(content, list) else ():
             if (isinstance(block, dict) and block.get("type") == "tool_use"
                     and block.get("name") == REPORT_TOOL):
                 reported = (block.get("input") or {}).get("findings")
-                if isinstance(reported, list):
+                # Every entry an object, because the rest of this file reads
+                # them with .get(). One string in the list would raise inside
+                # split_findings, and announce() would swallow the review
+                # whole rather than lose the one bad entry.
+                if isinstance(reported, list) and all(
+                        isinstance(item, dict) for item in reported):
                     findings = reported
     return result, findings
 
@@ -971,7 +1003,7 @@ def review(path, repo, pr, config, env, tokens):
     #
     # /code-review picks how it reports from whether ReportFindings is in the
     # session and what the output format is. `stream-json` plus the env var
-    #選 selects the tool; `json` or `text` selects a JSON array printed in the
+    # selects the tool; `json` or `text` selects a JSON array printed in the
     # final message instead. The tool is the better half of that choice: it
     # is the reviewer's own structured output, so nothing has to be picked
     # back out of prose, and it carries a category and a short summary that
@@ -1001,10 +1033,31 @@ def review(path, repo, pr, config, env, tokens):
     started = time.monotonic()
     try:
         result = run(cmd, cwd=path, timeout=config["review_timeout"], env=env)
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as expired:
         # A timeout burned the budget it burned. Retrying would burn it again.
         log("%s: killed after %ds" % (label, config["review_timeout"]))
-        if config["comment"]:
+
+        # What it managed to say before the kill is still in hand. The review
+        # reports its findings and then writes a closing summary, so a kill
+        # during that summary lands after the tool call: the findings exist,
+        # they are in this buffer, and throwing it away would tell the pull
+        # request the review "returned nothing" while holding all of them.
+        # It is bytes even in text mode, because the timeout path skips the
+        # decoding the normal one does.
+        salvaged = expired.stdout or ""
+        if isinstance(salvaged, bytes):
+            salvaged = salvaged.decode(errors="replace")
+        _, findings = read_stream(salvaged)
+
+        if findings:
+            log("%s: it had already reported %d finding(s), posting those"
+                % (label, len(findings)))
+            transcript = save_transcript(repo, pr, salvaged[-4000:], findings)
+            log("%s: transcript at %s" % (label, transcript))
+            announce(label, lambda: post_review(
+                repo, pr, path, "", findings, config,
+                posting_env(label, config, repo, tokens, env)))
+        elif config["comment"]:
             announce(label, lambda: post_timeout(
                 label, pr, repo, config["review_timeout"],
                 posting_env(label, config, repo, tokens, env)))
@@ -1049,28 +1102,26 @@ def review(path, repo, pr, config, env, tokens):
     # posted as though the reviewer had written them.
     text = str(output.get("result") or "")
 
-    # The turn limit is the one error that spends the whole subscription and
-    # still hands back the review: `result` holds the findings rather than a
-    # message about why there are none. Treating it as FAILED lost them and
-    # then charged for them twice more, since FAILED means "worth retrying"
-    # and MAX_ATTEMPTS allows three.
+    # Whether findings arrived, not which error subtype did. An error can
+    # land after the reviewer has already reported: the turn limit is the
+    # obvious one, but a session can fail during the closing summary just as
+    # easily, and a release can add a subtype nobody here has heard of. In
+    # every one of those cases the subscription is spent and the findings are
+    # in hand, so discarding them loses the review and then charges for it
+    # twice more, because FAILED means "worth retrying" and MAX_ATTEMPTS
+    # allows three.
     #
-    # Named explicitly, because every other error also arrives with text in
-    # `result` and that text is an error message. Deciding on whether there
-    # was any text posted "Claude AI usage limit reached" to the pull request
-    # as though the reviewer had written it, and recorded the pull request
-    # reviewed for good, which is worse than the loss it was meant to fix.
-    # An unrecognised subtype is FAILED for the same reason: retrying costs
-    # at most three attempts, and MAX_ATTEMPTS bounds it, while the other
-    # mistake is silent and permanent.
+    # Nothing reported means nothing to post, and that is the case retrying
+    # is for. Deciding this on the text instead posted "Claude AI usage limit
+    # reached" as though the reviewer had written it, so the text has no vote.
     if output.get("is_error"):
         log("%s: review failed after %ds: %s" % (label, took, text[:400]))
-        if output.get("subtype") != "error_max_turns" or not text.strip():
+        if findings is None:
             return FAILED
-        log("%s: it ran out of turns with a review in hand, so that is what "
-            "is posted" % label)
+        log("%s: it failed with %d finding(s) already reported, so those are "
+            "posted" % (label, len(findings)))
 
-    transcript = save_transcript(repo, pr, text)
+    transcript = save_transcript(repo, pr, text, findings)
     cost = output.get("total_cost_usd")
     priced = ", %.2f USD equivalent" % cost if isinstance(cost, float) else ""
     log("%s: reviewed in %ds%s, transcript at %s" % (
@@ -1316,8 +1367,8 @@ def main():
             # shape, not just the `#`, since a half-check leaves the same
             # error to be discovered later by the call it was meant to guard.
             repo, _, number = args.pr.partition("#")
-            if not number.isdigit() or repo.count("/") != 1 or not all(
-                    part for part in repo.split("/")):
+            if (not number.isdigit() or repo.count("/") != 1
+                    or not all(repo.split("/"))):
                 sys.exit("--pr wants owner/repo#number, got %s" % args.pr)
             # The same sum handle_pr() asks for, and for the same reason: one
             # token covers the checkout and the review that follows it. The
