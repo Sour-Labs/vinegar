@@ -420,7 +420,13 @@ def check_paths():
     # path checks above exist to refuse at startup.
     try:
         with open(SETTINGS_PATH, encoding="utf-8") as handle:
-            allowed = json.load(handle).get("permissions", {}).get("allow", [])
+            # `or []` rather than a get default: the default only covers an
+            # absent key, and a hand-edited `"allow": null` would otherwise
+            # raise TypeError out of the check below, giving a traceback
+            # every 30 seconds under launchd in place of the one sentence
+            # that says what to add.
+            allowed = json.load(handle).get(
+                "permissions", {}).get("allow") or []
     except Exception as err:
         sys.exit("%s cannot be read (%s), and the reviewer runs under it."
                  % (SETTINGS_PATH, err))
@@ -1582,6 +1588,20 @@ def post_review(label, repo, pr, path, text, findings, config, env,
     return landed(submit_review(label, repo, pr, payload, env))
 
 
+def save_or_log(label, write):
+    """Write a transcript, and never let that failure escape.
+
+    Three callers do this and each spelled the guard out, with the same
+    sentence for the failure: keep(), and both branches of finish(). The
+    write is the cheap local copy and must not be able to take the posting
+    down with it, which is one policy, so it lives in one place.
+    """
+    try:
+        write()
+    except Exception as err:
+        log("%s: the transcript is not saved: %s" % (label, err))
+
+
 def keep(label, repo, pr, text, why):
     """Save what a failed attempt said, since nothing else will.
 
@@ -1593,13 +1613,11 @@ def keep(label, repo, pr, text, why):
     """
     if not text.strip():
         return
-    try:
-        log("%s: %s, its words are in %s" % (label, why, save_transcript(
+    save_or_log(label, lambda: log(
+        "%s: %s, its words are in %s" % (label, why, save_transcript(
             repo, pr, text, None,
             "This attempt did not finish, so this is what it said before it "
-            "stopped. It is not a review.")))
-    except Exception as err:
-        log("%s: the transcript is not saved: %s" % (label, err))
+            "stopped. It is not a review."))))
 
 
 def finish(label, repo, pr, path, text, findings, config, env, tokens,
@@ -1647,38 +1665,126 @@ def finish(label, repo, pr, path, text, findings, config, env, tokens,
     # caller that preserves is the give-up, and it always brings a note
     # saying why, so a preserve-without-note branch was three lines no
     # test could reach and a reader still had to account for.
+    def append_ending():
+        # Rewritten whole through a rename, like save_transcript, not
+        # appended in place. This branch trusts the existence of the file
+        # to mean the attempts left words worth keeping, and an append
+        # that dies half-way would hand the next reader a file that
+        # passes that test and ends mid-note.
+        with open(path_kept, encoding="utf-8", errors="replace") as handle:
+            whole = handle.read()
+        # Once, however many times the announcement is retried. The
+        # give-up is attempted on up to MAX_ATTEMPTS polls while the
+        # posting keeps failing, and each attempt used to append another
+        # identical ending to the file that is a dry run's only artifact.
+        if note in whole:
+            log("%s: the transcript already records this ending" % label)
+        else:
+            write_atomic(path_kept, whole + "\n\n---\n\n%s\n" % note)
+            log("%s: the ending is appended to the transcript the attempts "
+                "left" % label)
+
     if preserve and note and os.path.exists(path_kept):
-        try:
-            # Rewritten whole through a rename, like save_transcript, not
-            # appended in place. This branch trusts the existence of the
-            # file to mean the attempts left words worth keeping, and an
-            # append that dies half-way would hand the next reader a file
-            # that passes that test and ends mid-note.
-            with open(path_kept, encoding="utf-8",
-                      errors="replace") as handle:
-                whole = handle.read()
-            # Once, however many times the announcement is retried. The
-            # give-up is attempted on up to MAX_ATTEMPTS polls while the
-            # posting keeps failing, and each attempt used to append
-            # another identical ending to the file that is a dry run's
-            # only artifact.
-            if note in whole:
-                log("%s: the transcript already records this ending" % label)
-            else:
-                write_atomic(path_kept, whole + "\n\n---\n\n%s\n" % note)
-                log("%s: the ending is appended to the transcript the "
-                    "attempts left" % label)
-        except Exception as err:
-            log("%s: the transcript is not saved: %s" % (label, err))
+        save_or_log(label, append_ending)
     else:
+        save_or_log(label, lambda: log("%s: transcript at %s" % (
+            label, save_transcript(repo, pr, text, findings, note))))
+    posted = post_review(label, repo, pr, path, text, findings, config,
+                         posting_env(label, config, repo, tokens, env), note,
+                         verb, resent)
+    # A review the endpoint refused is marked for another try on a later
+    # poll, from the transcript, without re-running the review. Without
+    # this the outcome was recorded DONE around a pull request carrying
+    # nothing, `review_on_push` is false, and it was never looked at
+    # again: the silence the README forbids, reached by the one path that
+    # had no retry of its own. The give-up has its own bounded retry and
+    # does not need this one.
+    if config["comment"] and not preserve:
+        marker = unposted_path(repo, pr)
         try:
-            log("%s: transcript at %s" % (
-                label, save_transcript(repo, pr, text, findings, note)))
-        except Exception as err:
-            log("%s: the transcript is not saved: %s" % (label, err))
-    return post_review(label, repo, pr, path, text, findings, config,
-                       posting_env(label, config, repo, tokens, env), note,
-                       verb, resent)
+            if posted:
+                forget(marker)
+            elif os.path.exists(transcript_path(repo, pr)):
+                write_atomic(marker, "%s\n" % label)
+        except OSError as err:
+            log("%s: cannot record whether the review was posted: %s" % (
+                label, err))
+    return posted
+
+
+def unposted_path(repo, pr):
+    """The marker saying this pull request's review never reached it."""
+    return transcript_path(repo, pr) + ".unposted"
+
+
+def forget(path):
+    """Remove a marker, without minding that it was already gone."""
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def repost(key, repo, pr, config, state, tokens, done):
+    """Send a review that GitHub refused, again, from the transcript.
+
+    The review itself is not re-run: the subscription is spent and the
+    findings are on disk. What is retried is only the posting, which is
+    the part that failed, and it is retried as one plain comment because
+    the anchors are what GitHub is most likely to have refused and the
+    transcript holds every finding either way.
+
+    Bounded like the give-up, and for the same reason: an App without
+    `pull_requests: write` refuses every time, and an unbounded retry is
+    two API calls a minute per pull request for ever. When the budget is
+    spent the marker is removed and the review stays where the log says
+    it is.
+    """
+    marker = unposted_path(repo, pr)
+    tries = done.get("post_tries", 0)
+    try:
+        env = github_env(config, repo, tokens, good_for=POST_GRACE)
+    except Exception as err:
+        log("%s: cannot mint a token to post the saved review: %s" % (
+            key, err))
+        env = None
+        if config.get("github_app"):
+            state[key] = dict(done, post_tries=tries + 1)
+            save_state(state)
+            return
+    try:
+        with open(transcript_path(repo, pr), encoding="utf-8",
+                  errors="replace") as handle:
+            body = handle.read()
+    except OSError as err:
+        log("%s: the saved review cannot be read (%s), so it is given up "
+            "on" % (key, err))
+        forget(marker)
+        state[key] = dict(done, post_tries=MAX_ATTEMPTS)
+        save_state(state)
+        return
+
+    log("%s: posting the review that was refused earlier (attempt %d of %d)"
+        % (key, tries + 1, MAX_ATTEMPTS))
+    body = clamp(key, "%s at %s effort\n\nThis review was refused when it "
+                      "was written and is posted from the transcript, so "
+                      "its findings are not anchored in the diff."
+                      "\n\n---\n\n%s" % (
+                          posted_mark(pr, "reviewed"), config["effort"], body))
+    landed = already_posted(key, repo, pr, env) or submit_review(
+        key, repo, pr, {"event": "COMMENT", "commit_id": pr["headRefOid"],
+                        "body": body}, env) == POSTED
+
+    tries += 1
+    if landed:
+        log("%s: the saved review is on the pull request" % key)
+    elif tries >= MAX_ATTEMPTS:
+        log("%s: the saved review could not be posted in %d attempts. It "
+            "stays in %s" % (key, tries, transcript_path(repo, pr)))
+    if landed or tries >= MAX_ATTEMPTS:
+        forget(marker)
+    state[key] = dict(done, post_tries=tries)
+    save_state(state)
 
 
 def partial_note(cause):
@@ -1693,7 +1799,7 @@ def partial_note(cause):
             "then and not a finished round." % cause)
 
 
-def review(path, repo, pr, config, env, tokens):
+def review(path, repo, pr, config, env, tokens, resent=False):
     prompt = "/code-review %s %d" % (config["effort"], pr["number"])
 
     # The review reads a diff that Vinegar did not write, so it runs under
@@ -1749,7 +1855,7 @@ def review(path, repo, pr, config, env, tokens):
         """
         if announce(label, lambda: finish(
                 label, repo, pr, path, text, findings, config, env, tokens,
-                note)):
+                note, resent=resent)):
             return True
         if config["comment"]:
             log("%s: nothing reached the pull request. The review is in "
@@ -2017,6 +2123,14 @@ def handle_pr(repo, pr, config, state, tokens):
     head = pr["headRefOid"]
     done = state.get(key) or {}
 
+    # A review that was written but never reached the pull request is
+    # finished work waiting on one API call, so it is retried before
+    # anything else decides this pull request is done.
+    if (config["comment"] and done.get("post_tries", 0) < MAX_ATTEMPTS
+            and os.path.exists(unposted_path(repo, pr))):
+        repost(key, repo, pr, config, state, tokens, done)
+        return
+
     # Only a finished review closes a pull request off. A skip is decided
     # again on every poll, because the filter that caused it can stop
     # applying: a draft is marked ready, an oversized pull request is split
@@ -2134,7 +2248,18 @@ def handle_pr(repo, pr, config, state, tokens):
         if (done.get("outcome") != "checkout" or done.get("sha") != head
                 or done.get("reason") != said):
             log("%s: %s" % (key, said))
-            state[key] = state_entry(head, "checkout", reason=said)
+            # Everything already true of this head rides along, exactly as
+            # it does through a skip. Writing a bare entry here handed the
+            # retry budget back: a flapping clone alternated failure and
+            # success for ever, re-reviewing at full cost on every other
+            # poll while MAX_ATTEMPTS was never reached. Recording nothing
+            # at all, which is what this branch used to do, preserved the
+            # entry by accident; this preserves it on purpose.
+            kept = done if done.get("sha") == head else {}
+            state[key] = state_entry(head, "checkout",
+                                     kept.get("attempts", 0), said,
+                                     kept.get("announced", False),
+                                     kept.get("announce_tries", 0))
             save_state(state)
         return
 
@@ -2309,10 +2434,16 @@ def main():
     # remembering nothing would review every open pull request again on
     # every poll at full cost.
     if not config["comment"]:
-        global STATE_PATH
+        global STATE_PATH, REVIEW_DIR
         STATE_PATH = STATE_PATH + ".dry"
-        log("posting nothing, so what has been reviewed is remembered in %s"
-            % STATE_PATH)
+        # The transcripts too. They are named from repo, number and sha, so
+        # a rehearsal of a pull request the daemon has already reviewed
+        # writes over that review's transcript — and when a post has failed
+        # that file is the only copy there is, the one the log tells the
+        # operator to send by hand.
+        REVIEW_DIR = REVIEW_DIR + ".dry"
+        log("posting nothing, so this run remembers in %s and writes its "
+            "transcripts to %s" % (STATE_PATH, REVIEW_DIR))
 
     # Both paths take the lock. A manual --pr run shares the daemon's checkout
     # for that repo, so without it the manual run would reset and re-check-out
@@ -2344,8 +2475,15 @@ def main():
             if reason:
                 log("%s: would be skipped (%s), reviewing anyway" % (
                     args.pr, reason))
-            review(checkout(repo, pr, env), repo, pr, config, env,
-                   tokens)
+            # Asked to check before posting, because this is the path a
+            # person re-runs by hand: to try another `--model`, or because
+            # they did not notice the first one landed. The daemon knows
+            # from its state file that it has already reviewed a commit;
+            # a second `--pr` run knows nothing, and without the check it
+            # posts a complete second review with duplicate inline
+            # comments.
+            review(checkout(repo, pr, env), repo, pr, config, env, tokens,
+                   resent=True)
             return
 
         state = load_state()

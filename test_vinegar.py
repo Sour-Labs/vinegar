@@ -1131,7 +1131,8 @@ check("a dry run's give-up counts as said, not as a silence",
 # A checkout that keeps failing is retried, deliberately, but it must not
 # say so once a minute for ever: the failures here are mostly transient and
 # retrying costs no subscription, so the noise is what was worth fixing.
-_ck_state = {}
+_ck_state = {L: {"outcome": vinegar.FAILED, "sha": PR["headRefOid"],
+                 "attempts": 2}}
 _ck_log = []
 vinegar.review = lambda *a, **k: vinegar.DONE
 vinegar.save_state = lambda st: None
@@ -1151,6 +1152,11 @@ check("a failing checkout is reported once, not once a poll",
       len([m for m in _ck_log if "could not clone" in m]) == 1, _ck_log)
 check("a failing checkout is still retried rather than abandoned",
       _ck_state[L]["outcome"] == "checkout", _ck_state)
+# The mirror of "a skip keeps the attempts burned at this head". A bare
+# entry here hands the budget back, and a flapping clone then re-reviews
+# at full cost on every other poll for ever.
+check("a failing checkout keeps the attempts burned at this head",
+      _ck_state[L].get("attempts") == 2, _ck_state)
 
 vinegar.review, vinegar.save_state = _real_review, _real_save_state
 vinegar.checkout, vinegar.github_env = _real_checkout, _real_github_env
@@ -1649,8 +1655,46 @@ del _rs_posts[:]
 _said = vinegar.give_up(L, "o/r", PR, CONFIG, 3, {}, tries=0)
 check("the first announcement does not pay for that read",
       len(_rs_posts) == 1, len(_rs_posts))
+
+# A hand re-run of `--pr` is the one path a person repeats, and it knows
+# nothing of the state file, so it asks before posting a second complete
+# review over the first.
+vinegar.run = watch_posts
+fake_run.look_out = "%s reviewed `a1b2c3d` at high effort\n" % (
+    vinegar.BODY_MARK)
+del _rs_posts[:]
+vinegar.post_review(L, "o/r", PR, ROOT, "x", [], CONFIG, None, resent=True)
+check("a re-run against a reviewed commit does not post twice",
+      not _rs_posts, len(_rs_posts))
+del _rs_posts[:]
+vinegar.post_review(L, "o/r", PR, ROOT, "x", [], CONFIG, None)
+check("the daemon's own first post does not ask",
+      len(_rs_posts) == 1, len(_rs_posts))
 fake_run.look_out = ""
 vinegar.run = fake_run
+
+# Through main(), so it is the entry point that is pinned and not a
+# string in its source.
+_pr_kw = {}
+_pr_real = (vinegar.review, vinegar.find_pr, vinegar.checkout,
+            vinegar.github_env, sys.argv)
+os.makedirs(os.environ["VINEGAR_HOME"], exist_ok=True)
+with open(os.path.join(os.environ["VINEGAR_HOME"], "config.json"), "w") as h:
+    json.dump({"repos": ["o/r"]}, h)
+vinegar.review = lambda *a, **k: _pr_kw.update(k) or vinegar.DONE
+vinegar.find_pr = lambda repo, number, env: PR_LIVE
+vinegar.checkout = lambda repo, pr, env: ROOT
+vinegar.github_env = lambda *a, **k: None
+sys.argv = ["vinegar.py", "--pr", "o/r#12"]
+try:
+    vinegar.main()
+except SystemExit as err:
+    _pr_kw["exited"] = str(err)
+finally:
+    (vinegar.review, vinegar.find_pr, vinegar.checkout,
+     vinegar.github_env, sys.argv) = _pr_real
+check("a --pr run asks before posting over an earlier review",
+      _pr_kw.get("resent") is True, _pr_kw)
 check("the give-up itself is recorded beneath them",
       "tried to review this 3 times" in body
       and body.find("Twenty minutes") < body.find("tried to review"),
@@ -1691,6 +1735,82 @@ check("a give-up with no words still leaves a trace",
 check("the transcript write leaves nothing temporary behind",
       not [f for f in os.listdir(_tx_home) if f.endswith(".tmp")],
       os.listdir(_tx_home))
+
+# A review GitHub refused is finished work waiting on one API call. It is
+# marked, and a later poll sends it from the transcript rather than
+# re-running a review the subscription already paid for.
+PR_LOST = dict(PR_LIVE, headRefOid="1051051051aa")
+_lost_key = "o/r#%d" % PR_LOST["number"]
+_lost_marker = vinegar.unposted_path("o/r", PR_LOST)
+fake_run.rc, fake_run.post_err = 1, "HTTP 403 Resource not accessible"
+fake_run.look_out = ""
+vinegar.run, vinegar.github_env = claude_run, lambda *a, **k: None
+claude_run.stream = stream(call(FINDINGS[:1]), result_event())
+del posted[:]
+vinegar.review(ROOT, "o/r", PR_LOST, CONFIG, None, {})
+check("a review GitHub refused is marked for another attempt",
+      os.path.exists(_lost_marker), _lost_marker)
+
+_lost_state = {_lost_key: {"outcome": vinegar.DONE,
+                           "sha": PR_LOST["headRefOid"], "attempts": 1}}
+fake_run.rc = 0
+vinegar.run = fake_run
+del posted[:]
+vinegar.handle_pr("o/r", PR_LOST, CONFIG, _lost_state, {})
+check("the saved review is posted on a later poll, without re-reviewing",
+      len(posted) == 1
+      and "posted from the transcript" in posted[0][1]["body"], len(posted))
+check("a posted review clears the mark",
+      not os.path.exists(_lost_marker), _lost_marker)
+
+# The same cleanup on the ordinary path: a review that posts must clear a
+# mark an earlier attempt at the same commit left, or the next poll sends
+# the transcript over a review that is already up. Checked without going
+# through repost(), which does its own cleanup and would hide this.
+fake_run.rc = 1
+vinegar.run = claude_run
+del posted[:]
+vinegar.review(ROOT, "o/r", PR_LOST, CONFIG, None, {})
+_marked = os.path.exists(_lost_marker)
+fake_run.rc = 0
+vinegar.review(ROOT, "o/r", PR_LOST, CONFIG, None, {})
+check("a review that posts clears an earlier attempt's mark",
+      _marked and not os.path.exists(_lost_marker),
+      (_marked, os.path.exists(_lost_marker)))
+vinegar.run = fake_run
+
+# Bounded, or an App that can never post retries every minute for ever.
+fake_run.rc, fake_run.post_err = 1, "HTTP 403 Resource not accessible"
+vinegar.run = claude_run
+del posted[:]
+vinegar.review(ROOT, "o/r", PR_LOST, CONFIG, None, {})
+vinegar.run = fake_run
+_bound_state = {_lost_key: {"outcome": vinegar.DONE,
+                            "sha": PR_LOST["headRefOid"], "attempts": 1}}
+_bound_posts = 0
+for _ in range(6):
+    del posted[:]
+    vinegar.handle_pr("o/r", PR_LOST, CONFIG, _bound_state, {})
+    _bound_posts += len(posted)
+check("a review that can never post stops being retried",
+      _bound_posts == vinegar.MAX_ATTEMPTS
+      and not os.path.exists(_lost_marker),
+      (_bound_posts, _bound_state))
+
+# The budget is what stops it, not the mark: removing the mark can itself
+# fail, and a mark left behind with the budget spent must not restart the
+# retries.
+with open(_lost_marker, "w") as h:
+    h.write("left behind\n")
+_spent_state = {_lost_key: {"outcome": vinegar.DONE,
+                            "sha": PR_LOST["headRefOid"], "attempts": 1,
+                            "post_tries": vinegar.MAX_ATTEMPTS}}
+del posted[:]
+vinegar.handle_pr("o/r", PR_LOST, CONFIG, _spent_state, {})
+check("a spent post budget is not retried even if the mark remains",
+      not posted, (len(posted), _spent_state))
+os.remove(_lost_marker)
+fake_run.rc, fake_run.post_err = 0, "HTTP 422"
 
 vinegar.REVIEW_DIR = _tx_real
 
@@ -1778,6 +1898,29 @@ check("a dry run keeps its bookkeeping out of the live state file",
       "state.json.dry" in _dry_out, _dry_out[-200:])
 check("a live run still uses the live state file",
       "state.json.dry" not in _entry().stdout, _entry().stdout[-200:])
+# The transcripts too: they are named from repo, number and sha, so a
+# rehearsal of a pull request the daemon already reviewed would write over
+# that review's only copy — the one the log tells the operator to send.
+check("a dry run writes its transcripts somewhere else as well",
+      "reviews.dry" in _dry_out, _dry_out[-200:])
+
+# A settings file whose allow list is present-and-null must produce the
+# sentence that says what to add, not a traceback every 30 seconds.
+_null_settings = os.path.join(_home, "null-allow.json")
+with open(_null_settings, "w") as h:
+    json.dump({"permissions": {"allow": None, "deny": []}}, h)
+_sp = vinegar.SETTINGS_PATH
+vinegar.SETTINGS_PATH = _null_settings
+try:
+    vinegar.check_paths()
+    _null_said = "started"
+except SystemExit as err:
+    _null_said = str(err)
+except TypeError as err:
+    _null_said = "raised TypeError: %s" % err
+vinegar.SETTINGS_PATH = _sp
+check("an allow list that is null is refused with a sentence, not a stack",
+      "does not allow" in _null_said, _null_said)
 
 print()
 print("FAILED: %s" % ", ".join(fails) if fails else "all checks passed")
