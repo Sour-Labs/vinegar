@@ -439,7 +439,7 @@ def check_paths():
 
 
 def state_entry(head, outcome, attempts=0, reason=None, announced=False,
-                tries=0, post_tries=0, unposted=False):
+                tries=0, post_tries=0, unposted=False, waivers=0):
     """One pull request's record, built the one way.
 
     Four sites used to spell this out as a fresh literal, each deciding for
@@ -475,6 +475,11 @@ def state_entry(head, outcome, attempts=0, reason=None, announced=False,
         # which the poll did for every pull request that had ever been
         # pushed past, for ever.
         entry["unposted"] = True
+    if waivers:
+        # Carried for the same reason as post_tries: it bounds how many
+        # rate-limited sends are forgiven, and any rebuild that dropped
+        # it handed those waivers back.
+        entry["post_waivers"] = waivers
     return entry
 
 
@@ -587,7 +592,8 @@ def load_state():
                    or any(not isinstance(done[field], int)
                           or isinstance(done[field], bool)
                           for field in ("attempts", "announce_tries",
-                                        "post_tries", "post_waivers")
+                                        "post_tries", "post_waivers",
+                                        "announce_waivers")
                           if field in done)
                    # The flags too, and for the same reason: this file is
                    # hand-edited on the log's own advice, and a bare
@@ -732,8 +738,20 @@ def checkout(repo, pr, env):
     # would log one line per poll forever with the pull request never reviewed
     # and never given up on.
     base = pr["baseRefName"]
-    result = run(["git", "fetch", "--quiet", "--force", "origin",
-                  "%s:%s" % (base, base)], cwd=path, env=env)
+    # Bounded like the steps above it, and more so: this one goes to the
+    # network, which is the call most likely to hang. A remote that
+    # accepts and never answers — a dropped VPN, a proxy holding the
+    # connection — would park the one poll thread here for ever while the
+    # watchdog saw a live pid and called it healthy. Non-fatal either
+    # way: a stale base widens the diff, it does not lose the review.
+    try:
+        result = run(["git", "fetch", "--quiet", "--force", "origin",
+                      "%s:%s" % (base, base)], cwd=path, env=env,
+                     timeout=DIFF_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        log("%s#%d: base %s not refreshed after %ds, the diff may include "
+            "merged work" % (repo, pr["number"], base, DIFF_TIMEOUT))
+        return path
     if result.returncode != 0:
         log("%s#%d: base %s not refreshed, the diff may include merged work: %s"
             % (repo, pr["number"], base, result.stderr.strip()))
@@ -1213,11 +1231,20 @@ def relative_findings(findings, root):
     return out
 
 
-def split_findings(findings, covered, root, label):
-    """Route each finding to an inline comment or to the general comment."""
+def split_findings(findings, covered, label):
+    """Route each finding to an inline comment or to the general comment.
+
+    The path is taken as it arrived. finish() has already put every
+    `file` through repo_path, above the transcript and every posting
+    path, so resolving it a second time here would be a second place to
+    keep one rule in step. Nothing is lost by trusting it: `covered` is
+    keyed on the names git itself printed, so anything absolute, escaping
+    or unresolvable simply fails to match and goes to the general
+    comment, which is where it belonged.
+    """
     inline, general = [], []
     for finding in findings:
-        name = repo_path(finding.get("file"), root)
+        name = str(finding.get("file") or "").strip()
         line = finding_line(finding)
         if name and line is not None and line in covered.get(name, ()):
             # Capped like the top-level body. GitHub applies the same ceiling
@@ -1226,10 +1253,6 @@ def split_findings(findings, covered, root, label):
             inline.append({"path": name, "line": line, "side": "RIGHT",
                            "body": clamp(label, describe(finding))})
         else:
-            # As it arrived. finish() has already put every `file`
-            # through repo_path, above the transcript and every posting
-            # path, so normalising a second time here would be a second
-            # place to keep a path rule in step.
             general.append(finding)
     return inline, general
 
@@ -1549,6 +1572,10 @@ def post_review(label, repo, pr, path, text, findings, config, env,
             label, len(findings) if findings else 0))
         return True
 
+    # Asked again after each send, deliberately. Every one of these three
+    # reads is separated from the next by a submit_review that may have
+    # landed, so a cached answer would be exactly the stale one that
+    # produces the duplicate the read exists to prevent.
     if resent and already_posted(label, repo, pr, env, verb):
         log("%s: the review is already on the pull request" % label)
         return True
@@ -1566,8 +1593,7 @@ def post_review(label, repo, pr, path, text, findings, config, env,
         inline, general, raw = [], [], None
     else:
         inline, general = split_findings(
-            findings, diff_lines(path, pr["baseRefName"], env, label),
-            path, label)
+            findings, diff_lines(path, pr["baseRefName"], env, label), label)
         raw = None
 
     payload = {"event": "COMMENT",
@@ -1627,9 +1653,16 @@ def post_review(label, repo, pr, path, text, findings, config, env,
     if settled == THROTTLED:
         # Retrying now would be refused for the same reason. The review is
         # on disk, and saying where says more than a second failure would.
+        #
+        # THROTTLED, not False. A limit refuses without judging the
+        # request and lifts on its own clock, so a caller that counts
+        # failures against a budget must not count this one: the give-up
+        # was marked announced after three throttled polls against a
+        # limit that resets hourly, and the pull request was then never
+        # told anything at all.
         log("%s: the posting is rate limited, so the review is only in the "
             "transcript for now. It is sent again on a later poll" % label)
-        return False
+        return THROTTLED
 
     # A definite refusal created nothing, so there is nothing to go and
     # look for: the status code already answered the question the
@@ -1996,6 +2029,16 @@ def repost(key, repo, pr, config, state, tokens, done, marker, sha):
                      post_tries=MAX_ATTEMPTS if give_up_on_it else tries)
         entry.pop("unposted", None)
         entry.pop("post_waivers", None)
+        if landed:
+            # The pull request has its review, whatever the entry said
+            # before. It can say FAILED here: the marker is written
+            # inside review() and the outcome only after, so a process
+            # killed between the two leaves one behind. Left as FAILED,
+            # the next poll announced "Vinegar tried to review this 3
+            # times and each attempt failed" on a pull request that had
+            # received a full review a minute earlier, and already_posted
+            # could not suppress it because it matches a different verb.
+            entry["outcome"] = DONE
         state[key] = entry
     else:
         state[key] = dict(done, post_tries=tries)
@@ -2352,17 +2395,39 @@ def spend_announce(key, config, state, head, attempts, tries, said):
     """
     if not config["comment"]:
         return
+    if said == THROTTLED:
+        # Waived, and bounded like repost()'s. A rate limit refuses
+        # without judging the request, so spending an attempt on it let
+        # three polls a minute apart against a limit that resets hourly
+        # mark the entry announced — and a pull request that was never
+        # told anything is the silence the README does not allow.
+        waived = state.get(key, {}).get("announce_waivers", 0)
+        if waived < MAX_ATTEMPTS:
+            log("%s: the give-up is rate limited, so this attempt is not "
+                "counted against the %d (%d of %d such waivers)" % (
+                    key, MAX_ATTEMPTS, waived + 1, MAX_ATTEMPTS))
+            state[key] = dict(state.get(key, {}),
+                              announce_waivers=waived + 1)
+            save_state(state)
+            return
+        said = False
     tries += 1
     spent = tries >= MAX_ATTEMPTS
     if not said and spent:
         log("%s: the give-up could not be posted in %d attempts, so it "
             "stays in this log only" % (key, tries))
-    state[key] = state_entry(head, FAILED, attempts,
-                             announced=said or spent, tries=tries,
-                             post_tries=state.get(key, {}).get(
-                                 "post_tries", 0),
-                             unposted=state.get(key, {}).get("unposted",
-                                                             False))
+    was = state.get(key, {})
+    entry = state_entry(head, FAILED, attempts,
+                        announced=bool(said) or spent, tries=tries,
+                        post_tries=was.get("post_tries", 0),
+                        unposted=was.get("unposted", False),
+                        waivers=was.get("post_waivers", 0))
+    # Carried like every other counter. Dropped here, the waivers reset
+    # on each counted attempt, so a permanent throttle alternated between
+    # waiving three and charging one and never reached the cap at all.
+    if was.get("announce_waivers"):
+        entry["announce_waivers"] = was["announce_waivers"]
+    state[key] = entry
     save_state(state)
 
 
@@ -2381,7 +2446,8 @@ def record_once(state, key, done, head, outcome, reason):
     kept = done if done.get("sha") == head else {}
     state[key] = state_entry(head, outcome, kept.get("attempts", 0), reason,
                              post_tries=kept.get("post_tries", 0),
-                             unposted=kept.get("unposted", False))
+                             unposted=kept.get("unposted", False),
+                             waivers=kept.get("post_waivers", 0))
     save_state(state)
 
 
@@ -2587,7 +2653,8 @@ def handle_pr(repo, pr, config, state, tokens):
     kept = done if done.get("sha") == head else {}
     state[key] = state_entry(head, FAILED, attempts,
                              post_tries=kept.get("post_tries", 0),
-                             unposted=kept.get("unposted", False))
+                             unposted=kept.get("unposted", False),
+                             waivers=kept.get("post_waivers", 0))
     save_state(state)
 
     try:
@@ -2616,7 +2683,8 @@ def handle_pr(repo, pr, config, state, tokens):
     state[key] = state_entry(head, outcome, attempts,
                              post_tries=kept.get("post_tries", 0),
                              unposted=os.path.exists(
-                                 unposted_path(repo, pr)))
+                                 unposted_path(repo, pr)),
+                             waivers=kept.get("post_waivers", 0))
     save_state(state)
 
     if outcome == FAILED and attempts >= MAX_ATTEMPTS:

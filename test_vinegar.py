@@ -401,7 +401,10 @@ check("the base is named unambiguously, so a tag cannot win",
       any(a.startswith("refs/heads/release-2...") for a in last_git_diff[0]),
       last_git_diff[0])
 
-inline, general = vinegar.split_findings(FINDINGS, covered, ROOT, L)
+# Routed on the paths as they arrive, which finish() has already made
+# relative; anything that did not resolve simply fails to match the diff.
+inline, general = vinegar.split_findings(
+    vinegar.relative_findings(FINDINGS, ROOT), covered, L)
 check("in-diff findings become inline comments", len(inline) == 2, inline)
 check("absolute path is made repo-relative",
       all(c["path"] == "vinegar.py" for c in inline), inline)
@@ -461,7 +464,11 @@ reset_stubs()
 text = "Summary of the review."
 
 del posted[:]
-vinegar.post_review(L, "o/r", PR, ROOT, text, FINDINGS[:4], CONFIG, None)
+# As finish() would hand them over: paths already made relative, which is
+# where that rule lives now.
+vinegar.post_review(L, "o/r", PR, ROOT, text,
+                    vinegar.relative_findings(FINDINGS[:4], ROOT), CONFIG,
+                    None)
 check("one review request, not one per finding", len(posted) == 1, len(posted))
 cmd, payload = posted[0]
 check("posts to the reviews endpoint",
@@ -1109,6 +1116,24 @@ check("a give-up does not delete another review's mark",
 vinegar.forget(_gu_marker)
 fake_run.look_out = ""
 
+# A rate limit refuses the give-up without judging it, so spending an
+# attempt on it marked the entry announced after three throttled polls
+# and the pull request was never told anything at all.
+_ga_throttle = {L: {"outcome": vinegar.FAILED, "sha": PR["headRefOid"],
+                    "attempts": vinegar.MAX_ATTEMPTS}}
+fake_run.rc = 1
+fake_run.post_err = "gh: API rate limit exceeded (HTTP 403)"
+for _ in range(vinegar.MAX_ATTEMPTS):
+    vinegar.handle_pr("o/r", PR_LIVE, CONFIG, _ga_throttle, {})
+check("a rate-limited give-up does not spend its budget",
+      _ga_throttle[L].get("announced") is not True
+      and _ga_throttle[L].get("announce_tries") is None, _ga_throttle)
+for _ in range(vinegar.MAX_ATTEMPTS * 2):
+    vinegar.handle_pr("o/r", PR_LIVE, CONFIG, _ga_throttle, {})
+check("a give-up throttled for ever still ends",
+      _ga_throttle[L].get("announced") is True, _ga_throttle)
+fake_run.rc, fake_run.post_err = 0, "HTTP 422"
+
 # A give-up whose announcement never landed must not be marked as said,
 # or the pull request stays silent for ever on the strength of one bad
 # minute at GitHub.
@@ -1556,8 +1581,11 @@ _logged_rl = []
 vinegar.log = lambda m: _logged_rl.append(m)
 _rl = vinegar.post_review(L, "o/r", PR, ROOT, "clean", [], CONFIG, None)
 vinegar.log = lambda message: None
+# THROTTLED, not False: a limit refuses without judging the request and
+# lifts on its own clock, so a caller counting failures against a budget
+# has to be able to tell the two apart.
 check("a rate-limited post is not retried in the same millisecond",
-      len(_tries) == 1 and _rl is False, (len(_tries), _rl))
+      len(_tries) == 1 and _rl == vinegar.THROTTLED, (len(_tries), _rl))
 check("a rate-limited post says where the review actually is",
       any("only in the transcript" in m for m in _logged_rl), _logged_rl)
 # Back to the reviewer stub the checks below this one expect.
@@ -2183,6 +2211,29 @@ vinegar.handle_pr("o/r", PR_LOST, CONFIG, _orphan_state, {})
 check("a marker with no entry behind it is forgotten, not posted",
       not [p for p in posted if "posted from the transcript" in p[1]["body"]]
       and not os.path.exists(_lost_marker), (len(posted), _lost_marker))
+
+# A saved review that lands leaves the pull request reviewed, whatever
+# the entry said before. Left as FAILED, the next poll announced "Vinegar
+# tried to review this 3 times and each attempt failed" on a pull request
+# that had received a full review a minute earlier.
+vinegar.save_transcript("o/r", PR_LOST, "The review that was refused.", [])
+with open(_lost_marker, "w") as h:
+    h.write("%s\n" % PR_LOST["headRefOid"])
+_crash_done = {_lost_key: {"outcome": vinegar.FAILED,
+                           "sha": PR_LOST["headRefOid"],
+                           "attempts": vinegar.MAX_ATTEMPTS}}
+fake_run.rc = 0
+del posted[:]
+vinegar.handle_pr("o/r", PR_LOST, CONFIG, _crash_done, {})
+check("a landed repost leaves the pull request recorded as reviewed",
+      _crash_done[_lost_key].get("outcome") == vinegar.DONE, _crash_done)
+del posted[:]
+vinegar.handle_pr("o/r", PR_LOST, CONFIG, _crash_done, {})
+check("and no give-up is announced over the review it just posted",
+      not posted, (len(posted), _crash_done))
+fake_run.rc = 1
+fake_run.look_out = ""
+vinegar.forget(_lost_marker)
 
 # The marker is written inside review(), before handle_pr records how the
 # review ended, so a process killed in that window leaves it beside a
