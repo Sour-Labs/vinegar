@@ -552,6 +552,20 @@ def load_state():
         with open(STATE_PATH, encoding="utf-8") as handle:
             state = json.load(handle)
         if isinstance(state, dict):
+            # Each entry too, not only the top level. handle_pr() reads
+            # every value with .get, so one `"o/r#12": "reviewed"` left by
+            # the hand-edit this file's own log recommends raises
+            # AttributeError for that pull request on every poll, for
+            # ever, with nothing rewriting it. A bad entry is dropped
+            # rather than taking the file with it: the pull request is
+            # reviewed once more and the entry heals itself.
+            bad = [key for key, done in state.items()
+                   if not isinstance(done, dict)]
+            for key in bad:
+                log("%s: its entry in %s is %s, not an object, so it is "
+                    "forgotten and will be reviewed again" % (
+                        key, STATE_PATH, type(state[key]).__name__))
+                del state[key]
             return state
         why = "it holds %s, not an object" % type(state).__name__
     except FileNotFoundError:
@@ -791,6 +805,24 @@ def clamp(label, body):
     return body[:MAX_BODY] + "\n\n(cut to fit GitHub's comment limit)"
 
 
+def cap_spoken(text):
+    """The reviewer's own prose, cut to what a comment should carry.
+
+    Applied wherever that prose reaches the pull request, not only where
+    it was first read. The stream's version was capped here while the
+    result event's went out at whatever length the reviewer wrote, so the
+    same "its own words follow unedited" sentence introduced four thousand
+    characters or fifty thousand depending on which ending produced them.
+    """
+    text = text.strip()
+    if len(text) <= MAX_SPOKEN:
+        return text
+    # Said, not silently done. review_body introduces this text with "its
+    # own words follow unedited", and a closing summary keeps its
+    # conclusion at the end, which is the half a silent cut removes.
+    return text[:MAX_SPOKEN] + "\n\n(cut after %d characters)" % (MAX_SPOKEN,)
+
+
 def stream_lines(text):
     """The stream one line at a time, without a second copy of the whole.
 
@@ -902,14 +934,7 @@ def read_stream(stdout, label="review"):
                 # nothing, while its analysis sat one block earlier.
                 said = str(block.get("text") or "")
                 spoken = said if said.strip() else spoken
-    spoken = spoken.strip()
-    if len(spoken) > MAX_SPOKEN:
-        # Said, not silently done. review_body introduces this text with
-        # "its own words follow unedited", and a closing summary keeps its
-        # conclusion at the end, which is the half a silent cut removes.
-        spoken = spoken[:MAX_SPOKEN] + "\n\n(cut after %d characters)" % (
-            MAX_SPOKEN,)
-    return result, findings, spoken
+    return result, findings, cap_spoken(spoken)
 
 
 def diff_lines(path, base, env, label):
@@ -1433,7 +1458,9 @@ def post_review(label, repo, pr, path, text, findings, config, env,
         log("%s: %s, posting its text as the review" % (
             label, "the review stopped before reporting" if note else
             "the reviewer reported no findings through %s" % REPORT_TOOL))
-        inline, general, raw = [], [], text
+        # Capped here as well as in read_stream: this text can come from
+        # the result event, which nothing had cut.
+        inline, general, raw = [], [], cap_spoken(text)
     elif not findings:
         # Nothing to anchor, so nothing to work the diff out for. That is a
         # `git diff` over the whole pull request saved on every clean review.
@@ -1524,12 +1551,16 @@ def post_review(label, repo, pr, path, text, findings, config, env,
             heading="GitHub refused the inline comments, so all of it is "
                     "here:")
     else:
-        # Nothing to strip out, so the same request again. A review with no
-        # inline comments cannot have been refused over an anchor, which
-        # leaves the transient failures a second attempt is exactly right
-        # for. Without this a clean review, or the reviewer's own words, met
-        # one 502 and the pull request received nothing at all, for good.
-        log("%s: retrying the review comment" % label)
+        # Nothing to strip out and nothing to change, so nothing to retry.
+        # This branch is reachable only for REFUSED now: the transient
+        # failures it was written for, a 502 or a dropped connection, are
+        # UNSURE and were resent by the block above. Sending identical
+        # bytes to an endpoint that has already judged them buys one
+        # guaranteed refusal, and on an archived repository one per
+        # give-up retry as well.
+        log("%s: GitHub refused the review and there is nothing to change "
+            "about the request. It is in the transcript" % label)
+        return False
     return landed(submit_review(label, repo, pr, payload, env))
 
 
@@ -1554,7 +1585,7 @@ def keep(label, repo, pr, text, why):
 
 
 def finish(label, repo, pr, path, text, findings, config, env, tokens,
-           note=None, verb="reviewed"):
+           note=None, verb="reviewed", preserve=False):
     """Record the review on disk and post it, whatever ended the run.
 
     Answers post_review()'s answer: whether the pull request carries it.
@@ -1585,8 +1616,16 @@ def finish(label, repo, pr, path, text, findings, config, env, tokens,
     # a dry run this file is the only place the giving-up can be recorded
     # at all. Skipping the write entirely kept the words but left the
     # ending nowhere but a log nobody is watching.
+    # `preserve` is passed by the give-up, not inferred from the ending
+    # being empty. Inferring it caught a different case that looks the
+    # same from here: a review that ran to completion and reported
+    # nothing at all. That left an earlier attempt's words on disk under
+    # a header saying they are not a review, while the comment said the
+    # run produced nothing, so the transcript and the pull request
+    # disagreed about what happened, which is the asymmetry this function
+    # exists to remove.
     path_kept = transcript_path(repo, pr)
-    if not text.strip() and findings is None and os.path.exists(path_kept):
+    if preserve and os.path.exists(path_kept):
         if note:
             try:
                 # Rewritten whole through a rename, like save_transcript,
@@ -1913,43 +1952,37 @@ def give_up(key, repo, pr, config, attempts, tokens, path=None, env=None,
              "failed before it could report anything. Read that as the "
              "review not running, not as the change being clean." % (
                  attempts,),
-        verb="gave up on"))
-
-
-def record_give_up(key, repo, pr, config, state, tokens, head, attempts,
-                   tries, path=None, env=None):
-    """Announce the give-up, bounded, and record what came of it.
-
-    Both moments record it the same way, because they used to record it
-    twice over and the two copies are what drift.
-
-    Bounded because unmarked means "try again next poll": an App without
-    `pull_requests: write`, a locked pull request or an archived
-    repository refuses every time, and without a cap that is two API calls
-    and a log line a minute, per stuck pull request, for ever. After
-    MAX_ATTEMPTS tries the entry is marked anyway and the giving-up stays
-    in the log, which is the honest end of a pull request Vinegar cannot
-    write to at all. spend_announce() keeps that budget.
-    """
-    said = give_up(key, repo, pr, config, attempts, tokens, path, env, tries)
-    spend_announce(key, config, state, head, attempts, tries, said)
-    return said
+        verb="gave up on", preserve=True))
 
 
 def spend_announce(key, config, state, head, attempts, tries, said):
     """Count one attempt at announcing a give-up, and record where it left
     things.
 
-    Separate from record_give_up() because the mint-failure path spends an
-    attempt without having anything to send, and spelling the same
-    budget rule out in both places is how the two would come to disagree
-    about when a pull request is abandoned.
+    One place, called by three: the in-process give-up, the discovery of
+    a spent budget on a later poll, and the mint failure that has nothing
+    to send at all. The rule for when a pull request is abandoned lives
+    here so those three cannot come to disagree about it.
+
+    Bounded because unmarked means "try again next poll": an App without
+    `pull_requests: write`, a locked pull request or an archived
+    repository refuses every time, and without a cap that is two API calls
+    and a log line a minute, per stuck pull request, for ever. After
+    MAX_ATTEMPTS the entry is marked anyway and the giving-up stays in the
+    log, which is the honest end of a pull request Vinegar cannot write to.
 
     A dry run never marks anything announced. post_review() answers True
     there because posting nothing is what a dry run asked for, but that
     answer must not reach `state.json`: one `--dry-run` against the real
     VINEGAR_HOME would otherwise tell the live daemon the give-up had
     already been said, and the pull request would stay silent for good.
+
+    It writes nothing at all for a dry run, not even the attempt count.
+    What keeps that from becoming an endless retry is handle_pr(), which
+    does not enter the discovery branch when commenting is off: a dry run
+    has nothing to announce, so there is nothing for it to come back and
+    try again. Counting here as well would spend the live daemon's budget
+    on a run that never posted anything.
     """
     if not config["comment"]:
         return
@@ -1994,7 +2027,11 @@ def handle_pr(repo, pr, config, state, tokens):
             # a spent budget that no one ever announced, and every later
             # poll returned here with the pull request permanently silent.
             # The discovery announces it instead, once.
-            if not done.get("announced"):
+            # A dry run has nothing to announce and no token to mint for
+            # it. The in-process give-up already wrote its transcript,
+            # which is a dry run's whole output; coming back here every
+            # poll to re-say it would be the log spam the bound forbids.
+            if not done.get("announced") and config["comment"]:
                 # Its own token, minted here. posting_env() falls back to
                 # what it is given, and this path had nothing to give: the
                 # give-up would have gone out under the operator's own
@@ -2016,8 +2053,10 @@ def handle_pr(repo, pr, config, state, tokens):
                 # None is not a failure here: it is what github_env answers
                 # when no App is configured, and ambient `gh` is then the
                 # credential the operator chose.
-                record_give_up(key, repo, pr, config, state, tokens, head,
-                               done["attempts"], tries, env=post_env)
+                spend_announce(key, config, state, head, done["attempts"],
+                               tries, give_up(key, repo, pr, config,
+                                              done["attempts"], tokens,
+                                              env=post_env, tries=tries))
             return
 
     reason = skip_reason(pr, config)
@@ -2102,8 +2141,10 @@ def handle_pr(repo, pr, config, state, tokens):
         # Marked only if it was said, so the restart path knows. Without
         # the mark a daemon restart would say it all again; with it applied
         # regardless, a failed announcement was never retried at all.
-        record_give_up(key, repo, pr, config, state, tokens, head, attempts,
-                       done.get("announce_tries", 0), path, env)
+        tries = done.get("announce_tries", 0)
+        spend_announce(key, config, state, head, attempts, tries,
+                       give_up(key, repo, pr, config, attempts, tokens, path,
+                               env, tries))
 
 
 def find_pr(repo, number, env):

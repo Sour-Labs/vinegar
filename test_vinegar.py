@@ -197,6 +197,16 @@ _long = vinegar.read_stream(stream(
     DONE_EVENT))[2]
 check("the reviewer's words are capped before they reach a comment",
       len(_long) < 90000 and _long.startswith("x"), len(_long))
+# The same cap wherever that prose reaches a comment. A result event
+# carrying 50000 characters used to go out whole under the very sentence
+# that promises the reviewer's words follow unedited, while a killed run
+# saying the same thing was cut at MAX_SPOKEN with a note.
+del posted[:]
+vinegar.post_review(L, "o/r", PR, ROOT, "z" * 50000, None, CONFIG, None)
+check("a long result message is capped like a salvaged one",
+      posted and "cut after" in posted[0][1]["body"]
+      and len(posted[0][1]["body"]) < 10000,
+      len(posted[0][1]["body"]) if posted else "nothing posted")
 check("a cut is admitted rather than passed off as the whole message",
       "cut after" in _long, _long[-60:])
 check("another tool's call is not mistaken for findings",
@@ -528,9 +538,19 @@ check("an oversize body is cut rather than refused",
 
 del posted[:]
 fake_run.rc = 1
+fake_run.post_err = "HTTP 502 Bad Gateway"
+fake_run.look_out = ""
 vinegar.post_review(L, "o/r", PR, ROOT, "clean", [], CONFIG, None)
-check("a refused clean review is tried again, not abandoned",
+check("a clean review lost to a transient failure is tried again",
       len(posted) == 2 and "comments" not in posted[1][1], len(posted))
+
+# A definite refusal of a comment with nothing to strip out is not resent:
+# the same bytes to the same endpoint buy one more guaranteed refusal.
+del posted[:]
+fake_run.post_err = "HTTP 422 Unprocessable Entity"
+vinegar.post_review(L, "o/r", PR, ROOT, "clean", [], CONFIG, None)
+check("a refused review with nothing to change is not resent",
+      len(posted) == 1, len(posted))
 fake_run.rc = 0
 
 del posted[:]
@@ -812,11 +832,14 @@ check("under a note the empty ending adds no sentence of its own",
       posted[0][1]["body"][:200] if posted else "nothing posted")
 
 fake_run.rc = 1
+fake_run.post_err = "HTTP 502 Bad Gateway"
+fake_run.look_out = ""
 del posted[:]
 vinegar.review(ROOT, "o/r", PR, CONFIG, None, {})
-check("the killed notice is retried when refused",
+check("the killed notice is retried when the failure is transient",
       len(posted) == 2, len(posted))
 fake_run.rc = 0
+fake_run.post_err = "HTTP 422"
 
 
 # Killed after narrating but before reporting: the words are in the buffer
@@ -1065,8 +1088,37 @@ _gd_state = {L: {"outcome": vinegar.FAILED, "sha": PR["headRefOid"],
 del posted[:]
 vinegar.handle_pr("o/r", PR_LIVE, dict(CONFIG, comment=False), _gd_state, {})
 check("a dry run does not record the give-up as announced",
-      not posted and _gd_state[L].get("announced") is not True
-      and _gd_state[L].get("announce_tries") is None, _gd_state)
+      not posted and _gd_state[L].get("announced") is not True, _gd_state)
+
+# It must not come back to say it again either. A dry run has nothing to
+# announce, so the discovery branch is not entered at all; entering it
+# logged the give-up afresh on every poll, for ever, which is the loop the
+# budget exists to bound. Watched through the log, because with nothing
+# posted that is the only trace the branch leaves.
+_gd_log = []
+vinegar.log = lambda m: _gd_log.append(m)
+for _ in range(5):
+    vinegar.handle_pr("o/r", PR_LIVE, dict(CONFIG, comment=False),
+                      _gd_state, {})
+vinegar.log = lambda message: None
+check("a dry run's give-up does not re-announce on every poll",
+      not [m for m in _gd_log if "leaving it alone" in m or "gave up" in m],
+      _gd_log[:3])
+
+# And the in-process give-up, which a dry run does reach: it writes its
+# transcript, and nothing about the announcement, because that state is
+# shared with the live daemon.
+_di_state = {L: {"outcome": vinegar.FAILED, "sha": PR["headRefOid"],
+                 "attempts": vinegar.MAX_ATTEMPTS - 1}}
+_di_review, _di_checkout = vinegar.review, vinegar.checkout
+vinegar.review = lambda *a, **k: vinegar.FAILED
+vinegar.checkout = lambda repo, pr, env: ROOT
+del posted[:]
+vinegar.handle_pr("o/r", PR_LIVE, dict(CONFIG, comment=False), _di_state, {})
+check("a dry run's own give-up leaves the announce state alone",
+      not posted and _di_state[L].get("announced") is None
+      and _di_state[L].get("announce_tries") is None, _di_state)
+vinegar.review, vinegar.checkout = _di_review, _di_checkout
 del posted[:]
 vinegar.handle_pr("o/r", PR_LIVE, CONFIG, _gd_state, {})
 check("the live daemon still announces after a dry run looked",
@@ -1119,11 +1171,14 @@ check("state that is not an object is refused like unreadable state",
       vinegar.load_state() == {} and len(_quarantined()) == 3,
       _quarantined())
 
-# A root-owned or otherwise unreadable file is the same outage, and the
-# narrow catch did not cover it.
-with open(vinegar.STATE_PATH, "w") as h:
-    h.write('{"o/r#12": {}}')
-os.chmod(vinegar.STATE_PATH, 0)
+# A file open() cannot read at all is the same outage, and the narrow
+# catch did not cover it. A directory in its place rather than chmod 0:
+# root ignores the mode bits, so under sudo that test failed against
+# perfectly correct code, and this repository's own docs describe a
+# ~/.vinegar left root-owned by a sudo run as a thing that happens.
+if os.path.exists(vinegar.STATE_PATH):
+    os.remove(vinegar.STATE_PATH)
+os.makedirs(vinegar.STATE_PATH)
 try:
     _st = vinegar.load_state()
 except Exception as err:
@@ -1131,7 +1186,19 @@ except Exception as err:
 check("a state file that cannot be opened is quarantined too",
       _st == {} and len(_quarantined()) == 4, (_st, _quarantined()))
 for _f in _quarantined():
-    os.remove(os.path.join(os.path.dirname(vinegar.STATE_PATH), _f))
+    _aside = os.path.join(os.path.dirname(vinegar.STATE_PATH), _f)
+    shutil.rmtree(_aside) if os.path.isdir(_aside) else os.remove(_aside)
+
+# An entry that is not an object is the same crash one level down, and it
+# is what the give-up log's own "delete its entry" advice invites.
+with open(vinegar.STATE_PATH, "w") as h:
+    h.write('{"o/r#12": "reviewed", "o/r#13": {"outcome": "reviewed"}}')
+_mixed = vinegar.load_state()
+check("an entry that is not an object is dropped, not kept to crash",
+      _mixed == {"o/r#13": {"outcome": "reviewed"}}, _mixed)
+check("dropping a bad entry does not quarantine the good ones",
+      not _quarantined(), _quarantined())
+os.remove(vinegar.STATE_PATH)
 
 # --- a resend must not duplicate a review that already landed --------------
 # A 5xx is ambiguous the way a timeout is; a 4xx created nothing and is
@@ -1256,8 +1323,22 @@ fake_run.post_err = "HTTP 422"
 del posted[:]
 del looked[:]
 vinegar.review(ROOT, "o/r", PR, CONFIG, None, {})
-check("a definite refusal retries without the landed-review read",
-      len(posted) == 2 and len(looked) == 0, (len(posted), len(looked)))
+check("a definite refusal never asks whether it landed",
+      len(looked) == 0, (len(posted), len(looked)))
+check("a definite refusal of a clean review is not resent",
+      len(posted) == 1, len(posted))
+
+# With inline comments there *is* something to change, so the anchorless
+# retry still runs, and still without the read a 4xx already answered.
+claude_run.stream = stream(call(FINDINGS[:1]), result_event())
+del posted[:]
+del looked[:]
+vinegar.review(ROOT, "o/r", PR, CONFIG, None, {})
+check("a refused anchor is still retried without the read",
+      len(posted) == 2 and len(looked) == 0
+      and "comments" in posted[0][1] and "comments" not in posted[1][1],
+      (len(posted), len(looked)))
+claude_run.stream = stream(call([]), result_event())
 
 # An ambiguous first post whose resend is then judged must still reach the
 # anchor-stripping retry: that retry is the only thing that saves the
@@ -1490,10 +1571,20 @@ vinegar.keep(L, "o/r", PR_GAVE, "Twenty minutes of analysis.",
              "the review failed")
 vinegar.finish(L, "o/r", PR_GAVE, ROOT, "", None,
                dict(CONFIG, comment=False), None, {},
-               note="Vinegar tried to review this 3 times.")
+               note="Vinegar tried to review this 3 times.", preserve=True)
 body = open(vinegar.transcript_path("o/r", PR_GAVE)).read()
 check("the give-up leaves the words the attempts saved",
       "Twenty minutes of analysis." in body, body[:200])
+
+# Through give_up() itself, which is what has to ask for that: the check
+# above calls finish() directly and would pass even if nothing did.
+PR_GU = dict(PR, headRefOid="cafe1234beef")
+vinegar.keep(L, "o/r", PR_GU, "What attempt three said.", "the review failed")
+vinegar.give_up(L, "o/r", PR_GU, dict(CONFIG, comment=False), 3, {})
+_gu_body = open(vinegar.transcript_path("o/r", PR_GU)).read()
+check("give_up asks for the attempts' words to be kept",
+      "What attempt three said." in _gu_body
+      and "tried to review this 3 times" in _gu_body, _gu_body[:200])
 check("the give-up itself is recorded beneath them",
       "tried to review this 3 times" in body
       and body.find("Twenty minutes") < body.find("tried to review"),
@@ -1508,6 +1599,19 @@ body = open(vinegar.transcript_path("o/r", PR_GAVE)).read()
 check("a retried give-up does not stack endings in the transcript",
       body.count("tried to review this 3 times") == 1,
       body.count("tried to review this 3 times"))
+
+# Only the give-up asks for preservation. A review that ran to completion
+# and reported nothing writes its own transcript, or the file keeps an
+# earlier attempt's words under a header saying they are not a review
+# while the comment says the run produced nothing.
+PR_QUIET2 = dict(PR, headRefOid="beadfeedcafe")
+vinegar.keep(L, "o/r", PR_QUIET2, "Attempt one's words.", "the review failed")
+vinegar.finish(L, "o/r", PR_QUIET2, ROOT, "", None,
+               dict(CONFIG, comment=False), None, {})
+_quiet2 = open(vinegar.transcript_path("o/r", PR_QUIET2)).read()
+check("a finished review that said nothing writes its own transcript",
+      "Attempt one's words." not in _quiet2 and "not a review" not in _quiet2,
+      _quiet2[:200])
 
 PR_QUIET = dict(PR, headRefOid="deadbeefcafe")
 vinegar.finish(L, "o/r", PR_QUIET, ROOT, "", None,
@@ -1552,16 +1656,20 @@ check("bytes that are not UTF-8 are read, not raised",
 # the C locale (PEP 540); the two PYTHON* variables switch that rescue off,
 # which is also only one operator-set environment variable away in life.
 _tx_script = (
-    "import os, tempfile\n"
-    "os.environ['VINEGAR_HOME'] = tempfile.mkdtemp()\n"
+    "import os\n"
     "import vinegar\n"
     "p = vinegar.save_transcript('o/r', {'number': 1, 'headRefOid':"
     " 'abc1234def', 'url': 'u'}, 'caf\\u00e9', None)\n"
     "print(ascii(open(p, encoding='utf-8').read()))\n")
+# The child writes under this run's own home, which is removed on the way
+# out. Letting it mkdtemp() for itself left one directory per run in the
+# system temp directory, which is the invariant this file's header claims
+# to keep.
 _tx_proc = subprocess.run(
     [sys.executable, "-c", _tx_script], capture_output=True, text=True,
     cwd=here_dir, env=dict(os.environ, LC_ALL="C", LANG="C",
-                           PYTHONUTF8="0", PYTHONCOERCECLOCALE="0"))
+                           PYTHONUTF8="0", PYTHONCOERCECLOCALE="0",
+                           VINEGAR_HOME=os.path.join(_home, "c-locale")))
 check("a transcript survives the C locale with its quotes intact",
       _tx_proc.returncode == 0 and "caf\\xe9" in _tx_proc.stdout,
       (_tx_proc.returncode, (_tx_proc.stderr or _tx_proc.stdout)[:200]))
