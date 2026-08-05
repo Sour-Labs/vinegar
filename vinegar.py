@@ -81,16 +81,6 @@ DONE, FAILED = "reviewed", "failed"
 # into a review every minute forever.
 MAX_ATTEMPTS = 3
 
-def checkout_grace(config):
-    """Token life the checkout and the review need between them.
-
-    Both the daemon and the `--pr` path ask for this, and each used to spell
-    the sum out with a comment saying it had to match the other. Drift shows
-    up only under a slow clone, at review time, on a real pull request.
-    """
-    return CHECKOUT_GRACE + config["review_timeout"]
-
-
 # Seconds of token life reserved for the checkout, on top of the review's own
 # budget. One token covers both and the checkout runs first: a clone of a
 # large repository over a slow link is minutes, so asking only for
@@ -175,6 +165,16 @@ DEFAULTS = {
     "review_timeout": 1800,
     "github_app": None,
 }
+
+
+def checkout_grace(config):
+    """Token life the checkout and the review need between them.
+
+    Both the daemon and the `--pr` path ask for this, and each used to spell
+    the sum out with a comment saying it had to match the other. Drift shows
+    up only under a slow clone, at review time, on a real pull request.
+    """
+    return CHECKOUT_GRACE + config["review_timeout"]
 
 
 def log(message):
@@ -519,6 +519,19 @@ def checkout(repo, pr, env):
     return path
 
 
+def transcript_path(repo, pr):
+    """Where the transcript of this pull request at this commit lives.
+
+    One derivation, shared by the writer and by the check in finish() that
+    an ending with nothing to say is not about to replace a transcript that
+    says something. A second copy of this name is all it would take for
+    "a different file" to quietly mean "the same file".
+    """
+    name = "%s__%d__%s.md" % (repo.replace("/", "__"), pr["number"],
+                              pr["headRefOid"][:7])
+    return os.path.join(REVIEW_DIR, name)
+
+
 def save_transcript(repo, pr, text, findings=None, note=None):
     """Write the review to disk, findings included.
 
@@ -529,9 +542,7 @@ def save_transcript(repo, pr, text, findings=None, note=None):
     post, would hold that sentence and no findings at all.
     """
     os.makedirs(REVIEW_DIR, exist_ok=True)
-    name = "%s__%d__%s.md" % (repo.replace("/", "__"), pr["number"],
-                              pr["headRefOid"][:7])
-    path = os.path.join(REVIEW_DIR, name)
+    path = transcript_path(repo, pr)
     # The same marker the comment gets. Without it a run killed after
     # reporting an empty list wrote a file saying "## Findings / None." with
     # nothing to say it never finished, and on a dry run that file is the
@@ -651,6 +662,16 @@ def read_stream(stdout, label="review"):
             # A single unreadable line must not cost the whole stream: the
             # result event may still be further down it.
             continue
+        # A subagent's event is not the review's, whatever its type. Finder
+        # subagents are what the default `high` prompt spawns, `Task` is in
+        # the allow list, and with --verbose their events arrive here as
+        # ordinary events tagged with the tool call that started them.
+        # Unfiltered, an assistant event of theirs replaces the review's
+        # findings with two candidates from one angle, because the last call
+        # wins, and a terminal event of theirs stands in as the ending of a
+        # run that was cut off before reaching its own.
+        if event.get("parent_tool_use_id"):
+            continue
         if event.get("type") == "result":
             result = event
             continue
@@ -662,14 +683,6 @@ def read_stream(stdout, label="review"):
         # parse let exactly that through, and on this repository it saved
         # nothing: any echoed source file contains "ReportFindings".
         if event.get("type") != "assistant":
-            continue
-        # A subagent's call is not the review's answer. Finder subagents are
-        # what the default `high` prompt spawns, `Task` is in the allow list,
-        # and with --verbose their messages arrive here as ordinary assistant
-        # events tagged with the tool call that started them. Without this,
-        # two candidates from one angle would replace fifteen from the whole
-        # review, because the last call wins.
-        if event.get("parent_tool_use_id"):
             continue
         message = event.get("message")
         content = message.get("content") if isinstance(message, dict) else None
@@ -948,13 +961,16 @@ def review_body(label, pr, config, inline, general, raw=None,
     total = len(inline) + len(general)
     if raw is not None and not raw.strip():
         # Distinct from unreadable output, because the two send you to
-        # different places: this one to whether the reviewer ran at all. And
-        # note-aware, because under a note saying the run was killed, "the
-        # review finished" would contradict the line above it.
-        lines += ["", "It said nothing before it stopped." if note else
-                      "The review finished without saying anything. There are "
-                      "no findings to show and no words to quote, which means "
-                      "the run produced nothing, not that the change is clean."]
+        # different places: this one to whether the reviewer ran at all.
+        # Under a note the note stands alone. It already says how the run
+        # ended and how to read that, and the sentence this branch used to
+        # add described a single run that stopped, which the give-up after
+        # MAX_ATTEMPTS, arriving here with the same empty text, is not.
+        if not note:
+            lines += ["", "The review finished without saying anything. "
+                          "There are no findings to show and no words to "
+                          "quote, which means the run produced nothing, not "
+                          "that the change is clean."]
     elif raw is not None:
         # Note-aware like the branches around it. Under a note saying the run
         # was killed, "did not return its findings in a form Vinegar could
@@ -1087,16 +1103,39 @@ def already_posted(label, repo, pr, env):
     It answers "no" when it cannot tell. A duplicate review is worse than one
     review; no review at all is worse than both.
     """
+    # Full pages. The whole paginated read shares one POST_TIMEOUT, and at
+    # GitHub's default of thirty a pull request with two hundred reviews is
+    # seven sequential calls where two would do. The timeout's answer is
+    # "no", and "no" is the answer that resends.
+    #
+    # split("\\n"), so the jq program carries the two-character escape
+    # rather than a raw newline byte. The program is assembled here as a
+    # Python string and handed to whatever engine gh embeds, and the middle
+    # of a string literal is the wrong place to learn how that engine feels
+    # about a bare line break. The tests never execute this filter, so it
+    # has to be unambiguous by construction.
     try:
         result = run(["gh", "api", "--paginate", "-X", "GET",
+                      "-f", "per_page=100",
                       "repos/%s/pulls/%d/reviews" % (repo, pr["number"]),
                       "--jq", '.[] | select(.commit_id == "%s") '
-                              '| (.body // "") | split("\n")[0]'
+                              '| (.body // "") | split("\\n")[0]'
                               % pr["headRefOid"]],
                      env=env, timeout=POST_TIMEOUT)
     except subprocess.TimeoutExpired:
+        # Still "no", but never silently: this is the answer that resends,
+        # and a duplicate review with nothing in the log saying the check
+        # could not tell reads as the check never having run.
+        log("%s: the landed-review read timed out after %ds, so the resend "
+            "goes ahead unchecked" % (label, POST_TIMEOUT))
         return False
     if result.returncode != 0:
+        log("%s: the landed-review read failed (%s), so the resend goes "
+            "ahead unchecked" % (
+                label,
+                " ".join(part.strip() for part in (result.stderr,
+                                                   result.stdout)
+                         if part and part.strip())[:200]))
         return False
     return any(line.startswith(BODY_MARK)
                for line in result.stdout.splitlines())
@@ -1140,43 +1179,49 @@ def post_review(label, repo, pr, path, text, findings, config, env,
         log("%s: posted %d inline comment(s) and the review comment" % (
             label, len(inline)))
         return
-    if landed is None:
-        # It timed out on this side, so it may already be on the pull
-        # request. Sending it again would post the review twice.
-        return
 
-    # Before either retry, not just the anchorless one. A 5xx can arrive
-    # after GitHub has already created the review, and both retries would
-    # then add a second: the anchorless one resends the same body, the
-    # anchored one resends a different body, and the pull request carries two
-    # reviews either way. This is the ambiguity submit_review refuses to
-    # guess at on a timeout; here one cheap read settles it.
+    # Before any retry, the timed-out post as much as the refused one. A 5xx
+    # can arrive after GitHub has already created the review, and a timeout
+    # is the same ambiguity with less information: either way a resend can
+    # leave two reviews where the operator asked for one, and one cheap read
+    # settles it.
     if already_posted(label, repo, pr, env):
         log("%s: the review is already on the pull request" % label)
         return
 
-    if not inline:
+    if landed is None:
+        # Timed out, and the read above says nothing landed. Returning here
+        # instead recorded DONE around a pull request carrying no review at
+        # all, and with `review_on_push` false nothing ever came back for
+        # it: the one silence the README does not allow. The resend can
+        # duplicate only inside the window the read cannot see, and the
+        # ordering already_posted() documents stands: a duplicate is worse
+        # than one review, silence is worse than both.
+        log("%s: the post timed out and nothing landed, so it is sent again"
+            % label)
+        submit_review(label, repo, pr, payload, env)
+        return
+
+    if inline:
+        # The endpoint took none of it, and the likeliest reason is an
+        # anchor it disagrees with: a comment lands only on a line inside
+        # the diff *it* computed, and checkout() deliberately carries on
+        # when the base branch cannot be refreshed, which widens the local
+        # diff past GitHub's. Rather than lose ten findings to one line
+        # number, say all of it in the comment that needs no anchor at all.
+        log("%s: retrying with every finding in the review comment" % label)
+        payload.pop("comments")
+        payload["body"] = review_body(
+            label, pr, config, [], findings, note=note,
+            heading="GitHub refused the inline comments, so all of it is "
+                    "here:")
+    else:
         # Nothing to strip out, so the same request again. A review with no
         # inline comments cannot have been refused over an anchor, which
         # leaves the transient failures a second attempt is exactly right
         # for. Without this a clean review, or the reviewer's own words, met
-        # one 502 and the pull request received nothing at all, for good:
-        # the outcome is recorded reviewed and `review_on_push` is false.
+        # one 502 and the pull request received nothing at all, for good.
         log("%s: retrying the review comment" % label)
-        submit_review(label, repo, pr, payload, env)
-        return
-
-    # The endpoint took none of it, and the likeliest reason is an anchor it
-    # disagrees with: a comment lands only on a line inside the diff *it*
-    # computed, and checkout() deliberately carries on when the base branch
-    # cannot be refreshed, which widens the local diff past GitHub's. Rather
-    # than lose ten findings to one line number, say all of it in the comment
-    # that needs no anchor at all.
-    log("%s: retrying with every finding in the review comment" % label)
-    payload.pop("comments")
-    payload["body"] = review_body(
-        label, pr, config, [], findings, note=note,
-        heading="GitHub refused the inline comments, so all of it is here:")
     submit_review(label, repo, pr, payload, env)
 
 
@@ -1220,11 +1265,24 @@ def finish(label, repo, pr, path, text, findings, config, env, tokens,
     # write first and unguarded meant a `~/.vinegar/reviews` left root-owned
     # by one `sudo` run silenced every review from then on, while the outcome
     # was still recorded reviewed.
-    try:
-        log("%s: transcript at %s" % (
-            label, save_transcript(repo, pr, text, findings, note)))
-    except Exception as err:
-        log("%s: the transcript is not saved: %s" % (label, err))
+    #
+    # An ending with nothing to say must not replace one that said
+    # something. The give-up after MAX_ATTEMPTS arrives here with no text
+    # and no findings, seconds after keep() saved what the third attempt
+    # said, and the write would truncate that file: same repository, same
+    # number, same sha, so transcript_path() names the file keep() just
+    # wrote. The note it carries goes to the pull request either way; the
+    # reviewer's words exist nowhere else.
+    if (not text.strip() and findings is None
+            and os.path.exists(transcript_path(repo, pr))):
+        log("%s: the transcript already holds what the attempts said, "
+            "leaving it" % label)
+    else:
+        try:
+            log("%s: transcript at %s" % (
+                label, save_transcript(repo, pr, text, findings, note)))
+        except Exception as err:
+            log("%s: the transcript is not saved: %s" % (label, err))
     post_review(label, repo, pr, path, text, findings, config,
                 posting_env(label, config, repo, tokens, env), note)
 

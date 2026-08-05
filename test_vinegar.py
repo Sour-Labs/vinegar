@@ -209,6 +209,10 @@ check("one unreadable line does not cost the rest of the stream",
       == REAL)
 check("no result event at all is reported as no result",
       vinegar.read_stream(stream(call(REAL)))[0] is None)
+check("a subagent's result event is not the review's ending",
+      vinegar.read_stream(stream(
+          call(REAL),
+          dict(DONE_EVENT, parent_tool_use_id="toolu_01")))[0] is None)
 check("injected instructions are not mistaken for the reviewer's words",
       "ReportFindings instructions" not in vinegar.read_stream(stream(
           {"type": "user", "message": {"content": [
@@ -678,7 +682,12 @@ check("a kill with nothing reported still says so on the pull request",
       posted[0][1]["body"][:120] if posted else "nothing posted")
 check("a killed review does not read as clean",
       posted and "not as the change being clean" in posted[0][1]["body"]
-      and "said nothing before it stopped" in posted[0][1]["body"],
+      and "No findings" not in posted[0][1]["body"],
+      posted[0][1]["body"][:200] if posted else "nothing posted")
+check("under a note the empty ending adds no sentence of its own",
+      posted and "said nothing before it stopped"
+      not in posted[0][1]["body"]
+      and "The review finished" not in posted[0][1]["body"],
       posted[0][1]["body"][:200] if posted else "nothing posted")
 
 fake_run.rc = 1
@@ -834,6 +843,10 @@ check("the landed-review question asks every page",
       "--paginate" in looked[0], looked[0])
 check("the landed-review question survives a review with no body",
       any('// ""' in a for a in looked[0]), looked[0])
+check("the landed-review question reads full pages",
+      any("per_page=100" in a for a in looked[0]), looked[0])
+check("the landed-review jq carries the escape, not a raw newline",
+      all("\n" not in a for a in looked[0]), looked[0])
 
 # The anchored retry is the common path and was the unguarded one.
 claude_run.stream = stream(call(FINDINGS[:1]), result_event())
@@ -865,6 +878,60 @@ check("an empty result field falls back to the reviewer's own words",
       posted[0][1]["body"][:180] if posted else "nothing posted")
 fake_run.rc = 0
 vinegar.run = fake_run
+
+# A post that times out may never have landed. Left unchecked that was
+# recorded DONE, and with review_on_push false the pull request kept no
+# review for ever: the one silence the README does not allow.
+post_tries = []
+
+
+def timing_out_post(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
+    if cmd[:2] == ["gh", "api"] and "-X" not in cmd:
+        post_tries.append(cmd)
+        raise subprocess.TimeoutExpired(cmd, timeout or 0)
+    return fake_run(cmd, cwd, timeout, env, stdin_text)
+
+
+vinegar.run = timing_out_post
+fake_run.look_out = ""
+del looked[:]
+vinegar.post_review(L, "o/r", PR, ROOT, "clean", [], CONFIG, None)
+check("a timed-out post that did not land is sent again",
+      len(post_tries) == 2 and len(looked) == 1,
+      (len(post_tries), len(looked)))
+del post_tries[:]
+fake_run.look_out = vinegar.BODY_MARK + " reviewed `a1b2c3d` ...\n"
+vinegar.post_review(L, "o/r", PR, ROOT, "clean", [], CONFIG, None)
+check("a timed-out post that landed is not sent twice",
+      len(post_tries) == 1, len(post_tries))
+fake_run.look_out = ""
+vinegar.run = fake_run
+
+# The duplicate check answering "no" because it could not tell must say so:
+# that answer is what resends, and the resend is what duplicates.
+_ap_logged = []
+vinegar.log = lambda m: _ap_logged.append(m)
+fake_run.look_rc = 1
+check("a landed-review read that fails says so in the log",
+      vinegar.already_posted(L, "o/r", PR, None) is False
+      and any("landed-review read failed" in m for m in _ap_logged),
+      _ap_logged)
+fake_run.look_rc = 0
+
+
+def timing_out_look(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
+    if cmd[:2] == ["gh", "api"] and "-X" in cmd:
+        raise subprocess.TimeoutExpired(cmd, timeout or 0)
+    return fake_run(cmd, cwd, timeout, env, stdin_text)
+
+
+vinegar.run = timing_out_look
+del _ap_logged[:]
+check("a landed-review read that hangs says so in the log",
+      vinegar.already_posted(L, "o/r", PR, None) is False
+      and any("timed out" in m for m in _ap_logged), _ap_logged)
+vinegar.run = fake_run
+vinegar.log = lambda message: None
 
 logged = []
 vinegar.log = lambda m: logged.append(m)
@@ -947,6 +1014,27 @@ check("a killed transcript is never a clean transcript",
 body = open(vinegar.save_transcript("o/r", PR, "Text.", None)).read()
 check("a transcript with nothing reported has no findings section",
       "## Findings" not in body, body[:160])
+
+# The give-up after MAX_ATTEMPTS arrives with nothing to say, seconds after
+# keep() saved what the last attempt said. It must not replace that file.
+PR_GAVE = dict(PR, headRefOid="feedfacecafe")
+vinegar.keep(L, "o/r", PR_GAVE, "Twenty minutes of analysis.",
+             "the review failed")
+vinegar.finish(L, "o/r", PR_GAVE, ROOT, "", None,
+               dict(CONFIG, comment=False), None, {},
+               note="Vinegar tried to review this 3 times.")
+body = open(vinegar.transcript_path("o/r", PR_GAVE)).read()
+check("the give-up leaves the words the attempts saved",
+      "Twenty minutes of analysis." in body, body[:200])
+
+PR_QUIET = dict(PR, headRefOid="deadbeefcafe")
+vinegar.finish(L, "o/r", PR_QUIET, ROOT, "", None,
+               dict(CONFIG, comment=False), None, {},
+               note="Vinegar tried to review this 3 times.")
+_quiet = vinegar.transcript_path("o/r", PR_QUIET)
+check("a give-up with no words still leaves a trace",
+      os.path.exists(_quiet)
+      and "tried to review this 3 times" in open(_quiet).read(), _quiet)
 
 vinegar.REVIEW_DIR = _tx_real
 
