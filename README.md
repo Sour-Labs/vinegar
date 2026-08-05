@@ -24,14 +24,22 @@ Vinegar keeps the reviews and removes the per-review bill.
 ## How it works
 
 The reviewer is not something Vinegar implements. Claude Code already ships a
-`/code-review` command that takes a PR number, posts its findings as inline
-comments with `--comment`, and runs non-interactively:
+`/code-review` command that takes a PR number, returns its findings as JSON,
+and runs non-interactively:
 
 ```sh
-claude -p '/code-review 123 --comment'
+CLAUDE_CODE_REPORT_FINDINGS=1 \
+  claude -p '/code-review 123' --output-format stream-json --verbose
 ```
 
-Vinegar is the trigger, the router, and the calibration around that.
+That environment variable is not decoration. It, the two stream flags, and the
+`ReportFindings` allow-list entry are the three settings "The review" describes,
+and dropping any one sends the findings somewhere Vinegar cannot read them.
+
+Vinegar is the trigger, the router, and the calibration around that. It also
+does the posting: the reviewer returns findings and Vinegar submits them as one
+review, rather than letting comments trickle out while the reviewer works. See
+"The review".
 
 ```
 new PR (or a new head commit)
@@ -40,8 +48,11 @@ new PR (or a new head commit)
    triage: a cheap model reads the diff  ──▶  posts a sticky comment on the PR
         │
         ├─ skip    nothing here needs a reviewer
-        ├─ light   claude -p '/code-review <n> --comment'   (low/medium effort)
-        └─ full    claude -p '/code-review <n> --comment'   (high effort)
+        ├─ light   claude -p '/code-review <n>'   (low/medium effort)
+        └─ full    claude -p '/code-review <n>'   (high effort)
+                          │
+                          ▼
+                   findings returned  ──▶  one review posted on the PR
 ```
 
 A daemon on an always-on machine polls GitHub for pull requests whose head
@@ -80,8 +91,11 @@ Review one pull request by hand, posting nothing, to see what you would get:
 python3 vinegar.py --pr owner/repo#123 --dry-run
 ```
 
-The review lands in `~/.vinegar/reviews/`. When it reads well, poll once, then
-run the loop:
+The review lands in `~/.vinegar/reviews.dry/`. A run that posts nothing keeps
+its transcripts and its bookkeeping beside the real ones rather than in them,
+so a rehearsal cannot overwrite a review that failed to post or tell the daemon
+a pull request is already done. When it reads well, poll once, then run the
+loop:
 
 ```sh
 python3 vinegar.py --once                # one pass, then exit
@@ -89,7 +103,23 @@ python3 vinegar.py                       # poll forever
 ```
 
 Vinegar keeps its own state under `~/.vinegar`: `config.json`, `state.json`
-(the head commit it last handled per pull request), and `reviews/`.
+(the head commit it last handled per pull request), and `reviews/`. A run that
+posts nothing uses `state.json.dry` and `reviews.dry/` instead. A review that
+GitHub refused leaves a `.unposted` marker beside its transcript, and a later
+poll sends that transcript rather than reviewing again.
+
+There are tests, and they need nothing installed:
+
+```sh
+python3 test_vinegar.py
+```
+
+They cover the part between the reviewer finishing and the review appearing:
+reading findings out of the stream, working out which can be anchored in the
+diff, and deciding what to post. Nothing in them touches the network, GitHub,
+git or Claude. That is deliberate rather than tidy: a review costs real money
+and several minutes, so the behaviour that can be checked for free is checked
+for free, and every case in there is one a live review got wrong once.
 
 Clones live outside that directory, in `~/.vinegar-checkouts/`, one per repo,
 which only Vinegar touches. They are deliberately not under `~/.vinegar`: the
@@ -126,9 +156,9 @@ Every key in `config.example.json`:
 | --- | --- | --- |
 | `repos` | none | Repositories to poll, as `owner/name`. Required. |
 | `poll_interval` | `60` | Seconds between polls. |
-| `effort` | `"high"` | Effort passed to `/code-review`: `low`, `medium`, `high`, `xhigh`, `max`. `ultra` is rejected. |
-| `comment` | `true` | Post findings on the pull request. False runs the review and writes only to `~/.vinegar/reviews/`. |
-| `model` | `null` | Model for the review. Null uses your Claude Code default. |
+| `effort` | `"high"` | Effort passed to `/code-review`: `low`, `medium`, `high`, `xhigh`, `max`. `ultra` is rejected. Read the note below before pairing it with `model`. |
+| `comment` | `true` | Post findings on the pull request. False runs the review and writes only to `~/.vinegar/reviews.dry/`, remembering what it did in `state.json.dry`. |
+| `model` | `null` | Model for the review. Null uses your Claude Code default. Read the note below before setting it. |
 | `review_on_push` | `false` | Review again when the head commit changes. |
 | `max_changed_lines` | `3000` | Skip pull requests larger than this. |
 | `skip_drafts` | `true` | Skip drafts. |
@@ -142,6 +172,14 @@ The last five are budget and safety controls, not optimizations. Automated
 reviews spend the same subscription limits as your interactive Claude Code
 work.
 
+**`model` and `effort` together decide how good the review is.**
+`/code-review` picks its prompt from a table keyed by both. Opus 5 at `high`
+or `medium` selects a single-pass prompt; `xhigh` runs ten finder angles and a
+sweep. On this repository `xhigh` found 15 findings for $1.65 where `high`
+found between 2 and 6 for $1.31 to $2.18, so the deeper setting was both
+better and cheaper per finding. Measure on your own repository before
+believing that.
+
 ### Posting as Vinegar instead of as you
 
 Out of the box `gh` uses the account you logged in with, so reviews arrive under
@@ -150,9 +188,10 @@ request. A GitHub App gives Vinegar its own name, its own icon, and a `bot`
 badge.
 
 It is worth doing for a second reason. An App's installation token can be
-scoped to a single repository, so a review that gets talked into calling
-`gh api` cannot reach anything else your account can see. That is the one
-sandbox limit the allow list could not close.
+scoped to a single repository, so a review that gets talked into calling `gh`
+cannot reach anything else your account can see. The allow list names only
+read-only `gh` subcommands, but a prefix rule cannot see the flags that follow
+one, and the token is what bounds the damage when a rule is not enough.
 
 Create the App once, in your organisation's settings under **Developer
 settings → GitHub Apps → New GitHub App**:
@@ -336,11 +375,22 @@ is any shell redirection out of an allowed command. That is a useful backstop
 and not something to rely on, so `find`, `awk`, `sed`, `perl`, `xargs`, and
 `tee` are denied outright.
 
+`gh api` is denied outright, alongside `curl` and `wget`, because it is the
+same thing they are: a way to reach the network with whatever the reviewer
+decides to send. It was allowed once, and only because posting an inline
+comment was `gh api repos/OWNER/REPO/pulls/N/comments`. The matcher compares
+whole space-separated tokens, so `Bash(gh api repos/*/pulls/*/comments:*)`
+matches nothing and it was `gh api` or no posted comments at all. Vinegar
+submits the review itself now, and the reviewer is told to post nothing, so
+the reason is gone and so is the entry. The named read-only subcommands above
+are what remain, and a review that wants more than those says so: a refused
+`Bash` command is recorded in `permission_denials`, which the log reports
+after every run.
+
 Reads are path-denied for `~/.vinegar`, `~/.claude`, `~/.ssh`, `~/.aws`,
 `~/.gnupg`, `~/.config/gh`, `.netrc` and `.env`. Without that, the App's own
-private key is a file the reviewer can read and `gh api` is a channel it can
-post through, and that key is the one credential that is **not** scoped to a
-single repository.
+private key is a file the reviewer can read, and that key is the one
+credential that is **not** scoped to a single repository.
 
 That is why clones live in `~/.vinegar-checkouts/` rather than under
 `~/.vinegar`. A blanket deny on a directory catches everything you later put
@@ -363,13 +413,7 @@ rule can distinguish it from the `git diff origin/main...HEAD` that every
 review legitimately runs. Removing `git diff` would close it, and would also
 remove the command the reviewer actually gets its diff from, so it stays.
 
-Two more that stay open for the same kind of reason:
-
-**`gh api` cannot be narrowed.** Posting an inline comment is
-`gh api repos/OWNER/REPO/pulls/N/comments`, and the matcher compares whole
-space-separated tokens, so `Bash(gh api repos/*/pulls/*/comments:*)` matches
-nothing. It is `gh api` or no posted comments. The GitHub App is what bounds
-this: the token reaches one repository, not everything you can see.
+One more stays open for the same kind of reason:
 
 **A `CLAUDE.md` in the checkout is still read.** `--setting-sources ''` covers
 `settings.json`, not the memory files, so a `CLAUDE.md` or `AGENTS.md` in the
@@ -476,6 +520,64 @@ The summary describes what the diff touches. It never claims the change is
 correct, safe, or complete: a small model will occasionally be confidently
 wrong, and a wrong summary pinned to the top of a PR is worse than none, because
 it misleads a human skimming and can anchor the reviewer that runs next.
+
+## The review
+
+The reviewer returns its findings instead of posting them, and Vinegar submits
+the whole review in one request when the run finishes. Findings still arrive as
+separate inline comments anchored to their line; what changed is that they all
+appear at the same moment.
+
+The findings arrive as a `ReportFindings` tool call, which is the reviewer's
+own structured output: a list of objects with a file, a line, a summary, a
+concrete failure scenario and a category. Nothing has to be recovered from
+prose, which matters more than it sounds. An earlier version read a JSON block
+out of the final message, and nearly every bug found in seven rounds of review
+was a bug in the code that did that: fences paired wrongly, an array quoted in
+passing mistaken for the answer, `[]` in a sentence read as "no findings".
+
+Three settings make it work and they only work together. `/code-review` is run
+with `--output-format stream-json --verbose`, `ReportFindings` is allowed in
+`review-settings.json`, and `CLAUDE_CODE_REPORT_FINDINGS=1` is set in the
+reviewer's environment. Drop any one and the command goes back to printing a
+JSON array in its final message, which Vinegar no longer reads, so the review
+posts as one raw-text comment with no inline anchors. The log says
+`reported no findings through ReportFindings` when that happens.
+
+This is a detail of a command Vinegar does not own, so treat it as true of the
+Claude Code version you have rather than forever.
+
+That timing is the point. The comments appearing is how you know the round is
+finished and the feedback is complete enough to hand to an agent. While the
+reviewer posted as it worked, three comments could mean three findings or could
+mean a review that died after three.
+
+Every review carries a top-level comment as well, and it says how many findings
+there were, including when there were none:
+
+> **Vinegar** · reviewed `a1b2c3d` at high effort
+>
+> 4 findings, 3 posted inline.
+>
+> These could not be anchored in the diff:
+>
+> - `vinegar.py:812`: The caller this relies on drops the error.
+>   Failure: a failed fetch returns None and the loop treats it as empty.
+>   (correctness)
+
+A finding lands inline only when its line is part of the diff. Reviews at high
+effort read whole files, so some findings land on code the PR did not touch, and
+GitHub rejects a review comment anchored outside the diff. Those go in the
+top-level comment rather than being dropped.
+
+**Vinegar is never silent about a pull request it looked at.** A clean review
+says so. A review whose findings cannot be read back posts the reviewer's own
+words unedited. A review GitHub refuses is posted again with every finding in
+the top-level comment, which needs no anchor. Silence means something broke, and
+that is the only thing it is allowed to mean.
+
+Reviews are submitted with `event: COMMENT`. Vinegar never approves and never
+requests changes, so it cannot hold up a merge. See "What this is not".
 
 ## What it costs, honestly
 
