@@ -805,7 +805,25 @@ def hanging_run(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
 
 vinegar.run = hanging_run
 check("a stalled post is ambiguous, not a refusal",
-      vinegar.submit_review(L, "o/r", PR, {"body": "x"}, None) is None)
+      vinegar.submit_review(L, "o/r", PR, {"body": "x"}, None)
+      == vinegar.UNSURE)
+vinegar.run = fake_run
+fake_run.rc = 1
+for _err, _want, _name in (
+        ("HTTP 422 Unprocessable Entity", vinegar.REFUSED, "a 422"),
+        ("HTTP 502 Bad Gateway", vinegar.UNSURE, "a 502"),
+        ("boom, no status at all", vinegar.UNSURE, "an error with no status"),
+        ("gh: API rate limit exceeded (HTTP 403)", vinegar.THROTTLED,
+         "a rate-limited 403"),
+        ("HTTP 429 Too Many Requests", vinegar.THROTTLED, "a 429"),
+        ("HTTP 403 Resource not accessible by integration", vinegar.REFUSED,
+         "a 403 that is a permission error")):
+    fake_run.post_err = _err
+    check("%s settles as %s" % (_name, _want),
+          vinegar.submit_review(L, "o/r", PR, {"body": "x"}, None) == _want,
+          _err)
+fake_run.rc = 0
+fake_run.post_err = "HTTP 422"
 vinegar.run = fake_run
 check("the posting request carries a timeout",
       vinegar.POST_TIMEOUT and vinegar.POST_TIMEOUT <= 300,
@@ -895,6 +913,31 @@ check("the crash-discovered give-up is announced once, not every poll",
       len(posted) == 1 and _ga_state[L].get("announced") is True,
       (len(posted), _ga_state))
 
+# A give-up whose announcement never landed must not be marked as said,
+# or the pull request stays silent for ever on the strength of one bad
+# minute at GitHub.
+_gf_state = {L: {"outcome": vinegar.FAILED, "sha": PR["headRefOid"],
+                 "attempts": vinegar.MAX_ATTEMPTS}}
+_real_post_for_gu = vinegar.post_review
+vinegar.post_review = lambda *a, **k: False
+del posted[:]
+vinegar.handle_pr("o/r", PR_LIVE, CONFIG, _gf_state, {})
+check("a give-up that did not reach GitHub is not marked as said",
+      _gf_state[L].get("announced") is not True, _gf_state)
+vinegar.post_review = lambda *a, **k: (_ for _ in ()).throw(
+    RuntimeError("GitHub is unreachable"))
+vinegar.handle_pr("o/r", PR_LIVE, CONFIG, _gf_state, {})
+check("a give-up whose posting raised is not marked as said",
+      _gf_state[L].get("announced") is not True, _gf_state)
+vinegar.post_review = _real_post_for_gu
+vinegar.handle_pr("o/r", PR_LIVE, CONFIG, _gf_state, {})
+check("the give-up is retried on a later poll until it lands",
+      _gf_state[L].get("announced") is True, _gf_state)
+
+check("a dry run's give-up counts as said, not as a silence",
+      vinegar.post_review(L, "o/r", PR, ROOT, "", None,
+                          dict(CONFIG, comment=False), None) is True)
+
 vinegar.review, vinegar.save_state = _real_review, _real_save_state
 vinegar.checkout, vinegar.github_env = _real_checkout, _real_github_env
 
@@ -909,11 +952,48 @@ try:
 except SystemExit:
     _st = "exited"
 check("an unreadable state file is quarantined, not fatal", _st == {}, _st)
+
+
+def _quarantined():
+    where = os.path.dirname(vinegar.STATE_PATH)
+    return sorted(f for f in os.listdir(where) if f.endswith(".unreadable"))
+
+
+_kept = _quarantined()
 check("the quarantined state is kept for the operator",
-      os.path.exists(vinegar.STATE_PATH + ".unreadable")
-      and "{,}" in open(vinegar.STATE_PATH + ".unreadable").read(),
-      vinegar.STATE_PATH)
-os.remove(vinegar.STATE_PATH + ".unreadable")
+      len(_kept) == 1 and "{,}" in open(
+          os.path.join(os.path.dirname(vinegar.STATE_PATH), _kept[0])).read(),
+      _kept)
+
+# A second corruption must not overwrite the copy the first one was kept
+# for: repairing from it is usually how the second one gets made.
+with open(vinegar.STATE_PATH, "w") as h:
+    h.write('{"o/r#12": [[[')
+vinegar.load_state()
+check("a second quarantine does not overwrite the first",
+      len(_quarantined()) == 2, _quarantined())
+
+# Valid JSON that is not an object parses, then raises on the first .get
+# in handle_pr, once per pull request per poll, for ever.
+with open(vinegar.STATE_PATH, "w") as h:
+    h.write('["o/r#12"]')
+check("state that is not an object is refused like unreadable state",
+      vinegar.load_state() == {} and len(_quarantined()) == 3,
+      _quarantined())
+
+# A root-owned or otherwise unreadable file is the same outage, and the
+# narrow catch did not cover it.
+with open(vinegar.STATE_PATH, "w") as h:
+    h.write('{"o/r#12": {}}')
+os.chmod(vinegar.STATE_PATH, 0)
+try:
+    _st = vinegar.load_state()
+except Exception as err:
+    _st = "raised %s" % type(err).__name__
+check("a state file that cannot be opened is quarantined too",
+      _st == {} and len(_quarantined()) == 4, (_st, _quarantined()))
+for _f in _quarantined():
+    os.remove(os.path.join(os.path.dirname(vinegar.STATE_PATH), _f))
 
 # --- a resend must not duplicate a review that already landed --------------
 # A 5xx is ambiguous the way a timeout is; a 4xx created nothing and is
@@ -956,6 +1036,17 @@ fake_run.look_out = "LGTM\n\nQuoting: %s reviewed `a1b2c3d` ...\n" % (
     vinegar.BODY_MARK)
 check("vinegar's marker quoted mid-line is not vinegar's review",
       vinegar.already_posted(L, "o/r", PR, None) is False)
+# splitlines() also breaks on \v, \f, \x1c-\x1e and \x85, so a body
+# carrying one before a quoted marker would forge a line that starts with
+# it. That answer suppresses the resend, and a suppressed resend is silence.
+for _sep in ("\v", "\f", "\x1c", "\x85", " "):
+    fake_run.look_out = "A human said:%s%s reviewed `a1b2c3d` ...\n" % (
+        _sep, vinegar.BODY_MARK)
+    check("a %r inside someone's review cannot forge vinegar's line"
+          % _sep,
+          vinegar.already_posted(L, "o/r", PR, None) is False,
+          fake_run.look_out)
+fake_run.look_out = ""
 
 # The anchored retry is the common path and was the unguarded one.
 claude_run.stream = stream(call(FINDINGS[:1]), result_event())
@@ -979,6 +1070,66 @@ del looked[:]
 vinegar.review(ROOT, "o/r", PR, CONFIG, None, {})
 check("a definite refusal retries without the landed-review read",
       len(posted) == 2 and len(looked) == 0, (len(posted), len(looked)))
+
+# An ambiguous first post whose resend is then judged must still reach the
+# anchor-stripping retry: that retry is the only thing that saves the
+# findings when one anchor is bad, and a 5xx before it used to lose them.
+_seq = []
+
+
+def flaky_post(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
+    if cmd[:2] == ["gh", "api"] and "-X" not in cmd:
+        _seq.append(json.loads(stdin_text))
+        fake_run.post_err = "HTTP 502" if len(_seq) == 1 else "HTTP 422"
+        fake_run.rc = 1
+    return fake_run(cmd, cwd, timeout, env, stdin_text)
+
+
+fake_run.look_out = ""
+claude_run.stream = stream(call(FINDINGS[:1]), result_event())
+
+
+def claude_then_flaky(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
+    if cmd[0] == "claude":
+        return claude_run(cmd, cwd, timeout, env, stdin_text)
+    return flaky_post(cmd, cwd, timeout, env, stdin_text)
+
+
+vinegar.run = claude_then_flaky
+del posted[:]
+del _seq[:]
+vinegar.review(ROOT, "o/r", PR, CONFIG, None, {})
+check("a resend refused over an anchor still reaches the anchorless retry",
+      len(_seq) == 3 and "comments" in _seq[0] and "comments" in _seq[1]
+      and "comments" not in _seq[2], [sorted(p) for p in _seq])
+vinegar.run = claude_run
+fake_run.rc = 0
+fake_run.post_err = "HTTP 422"
+
+# A rate limit is refused as well, but retrying in the same millisecond
+# cannot help, so the pointless second request is not made.
+_tries = []
+
+
+def throttled_post(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
+    if cmd[:2] == ["gh", "api"] and "-X" not in cmd:
+        _tries.append(cmd)
+        return subprocess.CompletedProcess(
+            cmd, 1, "", "gh: API rate limit exceeded (HTTP 403)")
+    return fake_run(cmd, cwd, timeout, env, stdin_text)
+
+
+vinegar.run = throttled_post
+_logged_rl = []
+vinegar.log = lambda m: _logged_rl.append(m)
+_rl = vinegar.post_review(L, "o/r", PR, ROOT, "clean", [], CONFIG, None)
+vinegar.log = lambda message: None
+check("a rate-limited post is not retried in the same millisecond",
+      len(_tries) == 1 and _rl is False, (len(_tries), _rl))
+check("a rate-limited post says where the review actually is",
+      any("only in the transcript" in m for m in _logged_rl), _logged_rl)
+# Back to the reviewer stub the checks below this one expect.
+vinegar.run = claude_run
 
 # A result field that is empty must not discard what the reviewer said.
 fake_run.rc = 0
