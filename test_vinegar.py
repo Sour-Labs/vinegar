@@ -162,6 +162,14 @@ check("one unreadable line does not cost the rest of the stream",
       == REAL)
 check("no result event at all is reported as no result",
       vinegar.read_stream(stream(call(REAL)))[0] is None)
+check("injected instructions are not mistaken for the reviewer's words",
+      "ReportFindings instructions" not in vinegar.read_stream(stream(
+          {"type": "user", "message": {"content": [
+              {"type": "text",
+               "text": "ReportFindings instructions: report through it."}]}},
+          {"type": "assistant", "message": {"content": [
+              {"type": "text", "text": "My own words."}]}},
+          DONE_EVENT))[2])
 check("the reviewer's own words come back for the transcript",
       "Reviewed it." in vinegar.read_stream(stream(
           {"type": "assistant", "message": {"content": [
@@ -189,6 +197,56 @@ fake_run.diff_rc = 1
 check("a failed diff anchors nothing rather than guessing",
       vinegar.diff_lines(ROOT, "release-2", None, "o/r#12") == {})
 fake_run.diff_rc = 0
+check("the diff is bounded so it cannot wedge the poll loop",
+      last_git_diff[1] is not None and last_git_diff[1] <= 600,
+      last_git_diff[1])
+
+
+def git_hangs(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
+    if cmd[0] == "git":
+        raise subprocess.TimeoutExpired(cmd, timeout or 0)
+    return fake_run(cmd, cwd, timeout, env, stdin_text)
+
+
+vinegar.run = git_hangs
+try:
+    _hung = vinegar.diff_lines(ROOT, "release-2", None, L) == {}
+except Exception as err:
+    _hung = "raised %r" % err
+check("a git diff that times out anchors nothing rather than crashing",
+      _hung is True, _hung)
+vinegar.run = fake_run
+
+listing = [None]
+
+
+def gh_list(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
+    if cmd[:3] == ["gh", "pr", "list"]:
+        listing[0] = timeout
+        return subprocess.CompletedProcess(cmd, 0, "[]", "")
+    return fake_run(cmd, cwd, timeout, env, stdin_text)
+
+
+vinegar.run = gh_list
+check("the listing returns and is bounded",
+      vinegar.open_prs("o/r", None) == [] and listing[0] is not None,
+      listing[0])
+
+
+def gh_list_hangs(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
+    if cmd[:3] == ["gh", "pr", "list"]:
+        raise subprocess.TimeoutExpired(cmd, timeout or 0)
+    return fake_run(cmd, cwd, timeout, env, stdin_text)
+
+
+vinegar.run = gh_list_hangs
+try:
+    _listed = vinegar.open_prs("o/r", None) == []
+except Exception as err:
+    _listed = "raised %r" % err
+check("a listing that hangs is skipped rather than wedging the poll",
+      _listed is True, _listed)
+vinegar.run = fake_run
 
 # A checkout reached through a symlink must resolve the same either way.
 # Everything this run creates lives under one directory, removed on the way
@@ -290,7 +348,7 @@ check("unreadable output is quoted verbatim",
 text = "Summary of the review."
 
 del posted[:]
-vinegar.post_review("o/r", PR, ROOT, text, FINDINGS[:4], CONFIG, None)
+vinegar.post_review(L, "o/r", PR, ROOT, text, FINDINGS[:4], CONFIG, None)
 check("one review request, not one per finding", len(posted) == 1, len(posted))
 cmd, payload = posted[0]
 check("posts to the reviews endpoint",
@@ -304,7 +362,7 @@ check("carries the inline comments in one array",
 check("carries a body alongside them", bool(payload["body"]), payload)
 
 del posted[:]
-vinegar.post_review("o/r", PR, ROOT, "no json here", None, CONFIG, None)
+vinegar.post_review(L, "o/r", PR, ROOT, "no json here", None, CONFIG, None)
 check("unparseable review still posts something", len(posted) == 1,
       len(posted))
 check("unparseable review posts no inline comments",
@@ -313,14 +371,14 @@ check("unparseable review body keeps the reviewer's words",
       "no json here" in posted[0][1]["body"], posted[0][1]["body"])
 
 del posted[:]
-vinegar.post_review("o/r", PR, ROOT, "clean", [], CONFIG, None)
+vinegar.post_review(L, "o/r", PR, ROOT, "clean", [], CONFIG, None)
 check("a clean review is announced, not skipped",
       len(posted) == 1 and "No findings." in posted[0][1]["body"],
       posted[0][1]["body"] if posted else "nothing posted")
 
 del posted[:]
 fake_run.rc = 1
-vinegar.post_review("o/r", PR, ROOT, text, FINDINGS[:4], CONFIG, None)
+vinegar.post_review(L, "o/r", PR, ROOT, text, FINDINGS[:4], CONFIG, None)
 check("a rejected review is retried without anchors", len(posted) == 2,
       len(posted))
 check("the retry drops the inline comments",
@@ -335,42 +393,27 @@ check("the retry does not blame anchoring for GitHub's refusal",
 fake_run.rc = 0
 
 del posted[:]
-vinegar.post_review("o/r", PR, ROOT, text, FINDINGS[:4],
+vinegar.post_review(L, "o/r", PR, ROOT, text, FINDINGS[:4],
                     dict(CONFIG, comment=False), None)
 check("a dry run posts nothing at all", not posted, posted)
 
 del posted[:]
 huge = "x" * 90000
-vinegar.post_review("o/r", PR, ROOT, huge, None, CONFIG, None)
+vinegar.post_review(L, "o/r", PR, ROOT, huge, None, CONFIG, None)
 check("an oversize body is cut rather than refused",
       len(posted) == 1 and len(posted[0][1]["body"]) < 65536,
       len(posted[0][1]["body"]) if posted else "nothing posted")
 
-del posted[:]
-vinegar.post_timeout(L, "o/r", PR, 1800, None)
-check("a killed review still says so on the pull request",
-      len(posted) == 1 and "killed after 1800s" in posted[0][1]["body"],
-      posted[0][1]["body"] if posted else "nothing posted")
-check("a killed review does not read as clean",
-      "not as the change being clean" in posted[0][1]["body"],
-      posted[0][1]["body"])
-
-fake_run.rc = 1
-del posted[:]
-vinegar.post_timeout(L, "o/r", PR, 1800, None)
-check("the timeout notice is retried when refused",
-      len(posted) == 2, len(posted))
-fake_run.rc = 0
 
 del posted[:]
 fake_run.rc = 1
-vinegar.post_review("o/r", PR, ROOT, "clean", [], CONFIG, None)
+vinegar.post_review(L, "o/r", PR, ROOT, "clean", [], CONFIG, None)
 check("a refused clean review is tried again, not abandoned",
       len(posted) == 2 and "comments" not in posted[1][1], len(posted))
 fake_run.rc = 0
 
 del posted[:]
-vinegar.post_review("o/r", PR, ROOT, "", None, CONFIG, None)
+vinegar.post_review(L, "o/r", PR, ROOT, "", None, CONFIG, None)
 check("a review that said nothing says so distinctly",
       len(posted) == 1
       and "produced nothing" in posted[0][1]["body"]
@@ -570,6 +613,39 @@ check("a kill with nothing reported still says so on the pull request",
       vinegar.review(ROOT, "o/r", PR, CONFIG, None, {}) == vinegar.DONE
       and len(posted) == 1 and "killed after" in posted[0][1]["body"],
       posted[0][1]["body"][:120] if posted else "nothing posted")
+check("a killed review does not read as clean",
+      posted and "not as the change being clean" in posted[0][1]["body"]
+      and "said nothing before it stopped" in posted[0][1]["body"],
+      posted[0][1]["body"][:200] if posted else "nothing posted")
+
+fake_run.rc = 1
+del posted[:]
+vinegar.review(ROOT, "o/r", PR, CONFIG, None, {})
+check("the killed notice is retried when refused",
+      len(posted) == 2, len(posted))
+fake_run.rc = 0
+
+
+# Killed after narrating but before reporting: the words are in the buffer
+# and the pull request gets them, not a claim that nothing came back.
+def timing_out_prose(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
+    if cmd[0] == "claude":
+        raise subprocess.TimeoutExpired(cmd, timeout or 0, output=stream(
+            {"type": "assistant", "message": {"content": [
+                {"type": "text",
+                 "text": "Halfway through: the diff looks risky."}]}}
+        ).encode())
+    return fake_run(cmd, cwd, timeout, env, stdin_text)
+
+
+vinegar.run = timing_out_prose
+del posted[:]
+check("a kill after prose alone still posts the reviewer's words",
+      vinegar.review(ROOT, "o/r", PR, CONFIG, None, {}) == vinegar.DONE
+      and len(posted) == 1
+      and "the diff looks risky" in posted[0][1]["body"]
+      and "killed after" in posted[0][1]["body"],
+      posted[0][1]["body"][:200] if posted else "nothing posted")
 
 vinegar.run = claude_run
 claude_run.stream = stream(call(FINDINGS[:4]),
@@ -631,6 +707,27 @@ check("brief gives a fallback for a base ref that does not resolve",
       "gh pr diff 12" in brief, brief)
 check("brief does not promise the base ref is definitely there",
       "already fetched" not in brief, brief)
+
+# --- the --pr guard, through the real entry point -------------------------
+# A mistyped target must be refused before anything is minted or asked of
+# GitHub. Unicode digits are the trap: "²".isdigit() and "١٢".isdigit() are
+# both true, and either would otherwise reach the gh call and fail there,
+# reporting the wrong problem. These run vinegar.py for real, so they need
+# the config the module would otherwise exit over; nothing else is touched
+# because the guard exits first.
+os.makedirs(os.environ["VINEGAR_HOME"], exist_ok=True)
+with open(os.path.join(os.environ["VINEGAR_HOME"], "config.json"), "w") as h:
+    json.dump({"repos": ["o/r"]}, h)
+here = os.path.dirname(os.path.abspath(__file__))
+for target in ("nonsense", "o/r#2x", "o/r#²", "o/r#١٢"):
+    proc = subprocess.run(
+        [sys.executable, os.path.join(here, "vinegar.py"), "--pr", target],
+        capture_output=True, text=True)
+    refused = (proc.returncode != 0
+               and "wants owner/repo#number" in (proc.stdout + proc.stderr)
+               and "cannot read" not in (proc.stdout + proc.stderr))
+    check("--pr %r is refused before anything is asked of GitHub" % target,
+          refused, (proc.returncode, (proc.stdout + proc.stderr)[:120]))
 
 print()
 print("FAILED: %s" % ", ".join(fails) if fails else "all checks passed")
