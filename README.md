@@ -121,6 +121,32 @@ git or Claude. That is deliberate rather than tidy: a review costs real money
 and several minutes, so the behaviour that can be checked for free is checked
 for free, and every case in there is one a live review got wrong once.
 
+A green suite is not by itself evidence that its checks work, so there is a
+second script that breaks each guard in `vinegar.py` and confirms the suite
+notices:
+
+```sh
+python3 mutate.py                        # every mutation, about four minutes
+python3 mutate.py post-timeout           # one, by name
+```
+
+It edits `vinegar.py` in place and puts it back, verifying the restore. Add
+an entry when you add a check. This is not ceremony: four checks shipped once
+that passed against the very regression they were named for, and each was
+found only by running the mutation. One entry is expected to survive and one
+to abort, both explained in the file.
+
+**Run it in a scratch worktree if a daemon executes the checkout**, because a
+broken `vinegar.py` is on disk for a few seconds per entry and a `KeepAlive`
+restart landing in one of those windows starts the daemon on it. A process
+already running is unaffected; Python reads the source once at import.
+
+```sh
+git worktree add /tmp/vinegar-mutate HEAD
+cd /tmp/vinegar-mutate && python3 mutate.py
+cd - && git worktree remove /tmp/vinegar-mutate
+```
+
 Clones live outside that directory, in `~/.vinegar-checkouts/`, one per repo,
 which only Vinegar touches. They are deliberately not under `~/.vinegar`: the
 reviewer is denied every read there so that a diff cannot talk it into reading
