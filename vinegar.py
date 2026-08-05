@@ -43,6 +43,11 @@ from datetime import datetime, timezone
 # that, and refuses to start when they disagree.
 DENIED_COMPONENT = ".vinegar"
 
+# The deny rule itself, spelled the way review-settings.json spells it.
+# check_paths() refuses to start without it: the two path checks reason
+# about what this glob covers, and neither of them notices if it is gone.
+DENY_HOME = "Read(//**/.vinegar/**)"
+
 # abspath, not just expanduser, so a trailing slash or a relative path cannot
 # make either of these look like it sits somewhere it does not.
 HOME = os.path.abspath(
@@ -438,8 +443,9 @@ def check_paths():
             # raise TypeError out of the check below, giving a traceback
             # every 30 seconds under launchd in place of the one sentence
             # that says what to add.
-            allowed = json.load(handle).get(
-                "permissions", {}).get("allow") or []
+            permissions = json.load(handle).get("permissions", {})
+            allowed = permissions.get("allow") or []
+            denied = permissions.get("deny") or []
     except Exception as err:
         sys.exit("%s cannot be read (%s), and the reviewer runs under it."
                  % (SETTINGS_PATH, err))
@@ -449,6 +455,40 @@ def check_paths():
             "told to report through a tool it cannot call, and every review "
             "would come back as prose with no findings. Add %s to "
             "permissions.allow." % (REPORT_TOOL, REPORT_TOOL))
+    # And the rule the two path checks above spend thirty lines reasoning
+    # about. They confirm HOME sits where the glob covers; nothing
+    # confirmed the glob was still there. Dropped or mistyped while
+    # widening the deny list, every path check still passes, the daemon
+    # starts, and a review can read the App private key — the one
+    # credential not scoped to a single repository, and the thing this
+    # whole function exists to keep unreadable.
+    if DENY_HOME not in denied:
+        sys.exit(
+            "review-settings.json must deny %s. That rule is what stops a "
+            "review reading the App private key under %s, and both path "
+            "checks above assume it is there. Add it to permissions.deny."
+            % (DENY_HOME, HOME))
+
+
+def waive(key, what, waived):
+    """Whether a rate-limited attempt is forgiven rather than counted.
+
+    A limit refuses without judging the request and lifts on its own
+    clock, so counting it spent a budget on time passing: three polls a
+    minute apart against a limit that resets hourly abandoned finished
+    work. Bounded all the same, because a caller that returns straight
+    after this would otherwise be pinned on one pull request for ever.
+
+    Both budgets that can meet a limit ask here, rather than each
+    spelling the rule out, which is how the two came to say it in two
+    sentences with two different bounds in mind.
+    """
+    if waived >= MAX_ATTEMPTS:
+        return False
+    log("%s: %s is rate limited, so this attempt is not counted against "
+        "the %d (%d of %d such waivers)" % (
+            key, what, MAX_ATTEMPTS, waived + 1, MAX_ATTEMPTS))
+    return True
 
 
 def carry_forward(kept):
@@ -1209,6 +1249,12 @@ def finding_line(finding):
     """
     line = finding.get("line")
     if isinstance(line, bool):
+        return None
+    # A fraction is not a line number. int() floors it, which anchored
+    # the comment one line above the code the finding described — a
+    # wrong line, confidently placed, which diff_lines' own docstring
+    # calls worse than no line at all.
+    if isinstance(line, float) and not line.is_integer():
         return None
     try:
         return int(line)
@@ -2080,21 +2126,7 @@ def repost(key, repo, pr, config, state, tokens, done, marker, sha):
                             "commit_id": at["headRefOid"],
                             "body": opening + body}, env))
             landed = settled == POSTED
-            if settled == THROTTLED and waived < MAX_ATTEMPTS:
-                # Refused by a limit, not by the request. Spending an
-                # attempt on it meant a rate-limit window that outlasts
-                # three polls — three minutes against a limit that resets
-                # hourly — abandoned a finished review for good.
-                #
-                # Bounded all the same. Refunding every time pinned the
-                # pull request in this branch: handle_pr returns straight
-                # after a repost, so while a throttle persisted the
-                # review was never re-run at a new head, never
-                # re-evaluated by skip_reason and never abandoned, at one
-                # token mint and one call per poll for ever.
-                log("%s: the posting is rate limited, so this attempt is "
-                    "not counted against the %d (%d of %d such waivers)"
-                    % (key, MAX_ATTEMPTS, waived + 1, MAX_ATTEMPTS))
+            if settled == THROTTLED and waive(key, "the posting", waived):
                 waived += 1
                 tries -= 1
                 give_up_on_it = False
@@ -2103,6 +2135,11 @@ def repost(key, repo, pr, config, state, tokens, done, marker, sha):
 
     if landed:
         log("%s: the saved review is on the pull request" % key)
+    elif body is None:
+        # Nothing was sent, so it cannot be reported as attempts spent,
+        # and the file the give-up line points at is the one the line
+        # above just said could not be read.
+        log("%s: there is nothing left to send for this pull request" % key)
     elif give_up_on_it:
         log("%s: the saved review could not be posted in %d attempts. It "
             "stays in %s" % (key, tries, saved))
@@ -2492,10 +2529,7 @@ def spend_announce(key, config, state, head, attempts, tries, said):
         # mark the entry announced — and a pull request that was never
         # told anything is the silence the README does not allow.
         waived = state.get(key, {}).get("announce_waivers", 0)
-        if waived < MAX_ATTEMPTS:
-            log("%s: the give-up is rate limited, so this attempt is not "
-                "counted against the %d (%d of %d such waivers)" % (
-                    key, MAX_ATTEMPTS, waived + 1, MAX_ATTEMPTS))
+        if waive(key, "the give-up", waived):
             state[key] = dict(state.get(key, {}),
                               announce_waivers=waived + 1)
             save_state(state)
@@ -2801,7 +2835,15 @@ def find_pr(repo, number, env):
         sys.exit("cannot read %s: timed out after %ds" % (target, LIST_TIMEOUT))
     if result.returncode != 0:
         sys.exit("cannot read %s: %s" % (target, result.stderr.strip()))
-    return json.loads(result.stdout)
+    # Said in one sentence like the two failures above it. `gh` exiting
+    # zero with something that is not the object asked for is unlikely
+    # and not impossible, and a traceback out of here reads as a bug in
+    # Vinegar rather than as an answer it could not use.
+    try:
+        return json.loads(result.stdout)
+    except ValueError as err:
+        sys.exit("cannot read %s: %s did not answer with the pull request "
+                 "(%s)" % (target, "gh pr view", err))
 
 
 # The locked descriptor, held open for the life of the process. Closing it,
@@ -2965,40 +3007,41 @@ def main():
             if reason:
                 log("%s: would be skipped (%s), reviewing anyway" % (
                     args.pr, reason))
-            # Asked to check before posting, because this is the path a
-            # person re-runs by hand: to try another `--model`, or because
-            # they did not notice the first one landed. The daemon knows
-            # from its state file that it has already reviewed a commit;
-            # a second `--pr` run knows nothing, and without the check it
-            # posts a complete second review with duplicate inline
-            # comments.
             # Deliberately not `resent`. A person running this has asked
-            # for a review and expects to see one: the reason the comment
-            # below gives for re-running by hand — trying another
-            # `--model` — is a case that asking first makes impossible,
-            # because Vinegar's own line is already up at that commit and
-            # the second review would be paid for and then thrown away.
-            # An unwanted duplicate is visible and harmless; a discarded
-            # review is neither.
-            review(checkout(repo, pr, env), repo, pr, config, env, tokens)
-            # A manual run writes no state, which is right: it is not the
-            # daemon's record of what has been reviewed. But a refused
-            # post leaves a marker the daemon only honours when an entry
-            # stands behind it, so without this the next poll reads that
-            # marker as left over from a run nobody remembers and deletes
-            # it. On a pull request the daemon skips — a draft, a fork,
-            # one over max_changed_lines — nothing would ever replace the
-            # review it threw away.
-            # This run's own head only. The scan would find a marker left
-            # at some *other* head by the daemon and record a DONE entry
-            # for this one, which claims a review was saved when none was
-            # and moves the entry's sha away from the marker that needed
-            # it — orphaning that saved review for good.
-            if unposted_for(repo, pr, scan=False)[0]:
-                state = load_state()
-                state[pr_key(repo, pr)] = state_entry(
-                    pr["headRefOid"], DONE, 1, unposted=True)
-                save_state(state)
+            # for a review and expects to see one, and asking GitHub
+            # first makes the commonest reason for a second run — trying
+            # another `--model` — impossible: Vinegar's own line is
+            # already up at that commit, so the review would be paid for
+            # and then thrown away. An unwanted duplicate is visible and
+            # harmless; a discarded review is neither.
+            try:
+                where = checkout(repo, pr, env)
+            except Exception as err:
+                # One sentence, like the daemon gives for the same
+                # failure, rather than a traceback through the lock.
+                sys.exit("%s: checkout failed: %s" % (args.pr, err))
+            review(where, repo, pr, config, env, tokens)
+
+            # Recorded, always. A manual run is still a review of that
+            # commit, and leaving no trace meant the daemon reviewed the
+            # same head a minute later at full cost and posted a second
+            # complete review — its first attempt does not ask, because
+            # the state file is what usually tells it. Two reviews and
+            # two subscriptions for one commit.
+            #
+            # This run's own head only for the marker: the scan would
+            # find one the daemon left at some other head, claim a review
+            # was saved when none was, and move the entry's sha away from
+            # the marker that needed it.
+            state = load_state()
+            was = state.get(pr_key(repo, pr), {})
+            kept = was if was.get("sha") == pr["headRefOid"] else {}
+            state[pr_key(repo, pr)] = state_entry(
+                pr["headRefOid"], DONE, kept.get("attempts", 0) + 1,
+                **dict(carry_forward(kept),
+                       unposted=bool(unposted_for(repo, pr, scan=False)[0])))
+            save_state(state)
+            if state[pr_key(repo, pr)].get("unposted"):
                 log("%s: the review is saved to be posted on a later poll"
                     % args.pr)
             return

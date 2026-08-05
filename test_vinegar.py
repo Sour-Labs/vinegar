@@ -372,6 +372,11 @@ check("a line number given as a string still anchors",
       vinegar.finding_line({"line": "43"}) == 43)
 check("a line number given as a float still anchors",
       vinegar.finding_line({"line": 43.0}) == 43)
+# A fraction is not a line number: int() floors it and the comment lands
+# one line above the code the finding is about.
+check("a fractional line number anchors nothing rather than the line above",
+      vinegar.finding_line({"line": 812.7}) is None,
+      vinegar.finding_line({"line": 812.7}))
 check("an infinite line number anchors nothing rather than raising",
       vinegar.finding_line({"line": float("inf")}) is None)
 check("a boolean line number anchors nothing",
@@ -777,6 +782,21 @@ except SystemExit:
 vinegar.REPORT_TOOL = _rt
 check("a reporting tool the settings do not allow refuses to start",
       _agreed == "refused", _agreed)
+
+# The rule the two path checks reason about. They confirm HOME sits where
+# the glob covers; nothing confirmed the glob was still there, so dropping
+# it while widening the deny list left every check passing and the App
+# private key readable.
+_dh = vinegar.DENY_HOME
+vinegar.DENY_HOME = "Read(//**/.not-in-the-file/**)"
+try:
+    vinegar.check_paths()
+    _denied = "started"
+except SystemExit as err:
+    _denied = str(err)
+vinegar.DENY_HOME = _dh
+check("a missing private-key deny rule refuses to start",
+      "must deny" in _denied, _denied)
 
 
 def _refuses(**over):
@@ -1964,6 +1984,27 @@ check("a manual run's unpostable review is left for the daemon to send",
       and _mr_state.get(L, {}).get("sha") == PR_LIVE["headRefOid"],
       _mr_state)
 vinegar.forget(_mr_marker)
+
+# And a manual run whose post landed records it too. Leaving no trace
+# meant the daemon reviewed the same head a minute later at full cost
+# and posted a second complete review, because its first attempt does
+# not ask GitHub — the state file is what usually tells it.
+vinegar.review = lambda *a, **k: vinegar.DONE
+vinegar.find_pr = lambda repo, number, env: PR_LIVE
+vinegar.checkout = lambda repo, pr, env: ROOT
+vinegar.github_env = lambda *a, **k: None
+sys.argv = ["vinegar.py", "--pr", "o/r#12"]
+try:
+    vinegar.main()
+except SystemExit:
+    pass
+finally:
+    (vinegar.review, vinegar.find_pr, vinegar.checkout,
+     vinegar.github_env, sys.argv) = _pr_real
+_ok_state = vinegar.load_state()
+check("a manual run that posted is recorded, so the daemon does not repeat it",
+      _ok_state.get(L, {}).get("outcome") == vinegar.DONE
+      and _ok_state.get(L, {}).get("unposted") is None, _ok_state)
 
 # Announcing is retried while it fails to land, and each retry used to
 # append the same ending again to the file a dry run is judged by.
