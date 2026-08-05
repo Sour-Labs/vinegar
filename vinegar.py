@@ -128,6 +128,12 @@ LIST_TIMEOUT = 120
 # unanswered socket would otherwise hold it for as long as TCP allows.
 POST_TIMEOUT = 60
 
+# Characters of the reviewer's own prose worth carrying when it never
+# reported. It stands in for a closing summary, so a couple of paragraphs is
+# the shape wanted; a killed run's narration is not, and the pull request is
+# not the place to discover the difference.
+MAX_SPOKEN = 4000
+
 # The tool the reviewer reports its findings through. Named here because
 # review() has to make it available and read_stream() has to recognise it,
 # and the two must agree or findings arrive nowhere.
@@ -361,11 +367,25 @@ def check_paths():
 
 
 def load_state():
+    """Everything Vinegar remembers about which pull requests it has done.
+
+    A missing file is a first run and starts empty. A file that exists but
+    cannot be parsed is refused instead, because the two are worlds apart in
+    cost: treating a truncated state file as empty re-reviews every open pull
+    request in every configured repository, at roughly two dollars each, and
+    the operator's only clue would be the bill. Exiting stops the daemon,
+    which the watchdog reports within minutes.
+    """
     try:
         with open(STATE_PATH) as handle:
             return json.load(handle)
-    except (FileNotFoundError, json.JSONDecodeError):
+    except FileNotFoundError:
         return {}
+    except json.JSONDecodeError as err:
+        sys.exit("%s is unreadable (%s). It records which pull requests have "
+                 "been reviewed, and starting without it would review every "
+                 "open one again. Repair or delete it deliberately." % (
+                     STATE_PATH, err))
 
 
 def save_state(state):
@@ -484,7 +504,7 @@ def checkout(repo, pr, env):
     return path
 
 
-def save_transcript(repo, pr, text, findings=None):
+def save_transcript(repo, pr, text, findings=None, note=None):
     """Write the review to disk, findings included.
 
     They have to be written explicitly now. The reviewer reports them through
@@ -497,12 +517,19 @@ def save_transcript(repo, pr, text, findings=None):
     name = "%s__%d__%s.md" % (repo.replace("/", "__"), pr["number"],
                               pr["headRefOid"][:7])
     path = os.path.join(REVIEW_DIR, name)
-    body = text
+    # The same marker the comment gets. Without it a run killed after
+    # reporting an empty list wrote a file saying "## Findings / None." with
+    # nothing to say it never finished, and on a dry run that file is the
+    # only artifact there is. The comment and the transcript disagreeing
+    # about whether a review completed is the exact asymmetry finish() was
+    # written to remove, one layer down.
+    body = "%s\n\n%s" % (note, text) if note else text
     if findings:
         body += "\n\n## Findings\n\n" + "\n\n".join(
             finding_bullet(finding) for finding in findings)
     elif findings is not None:
-        body += "\n\n## Findings\n\nNone.\n"
+        body += "\n\n## Findings\n\n%s\n" % (
+            "None reported before it stopped." if note else "None.")
     with open(path, "w") as handle:
         handle.write("# %s#%d %s\n\n%s\n\n---\n\n%s\n" % (
             repo, pr["number"], pr["headRefOid"][:7], pr["url"], body))
@@ -634,7 +661,9 @@ def read_stream(stdout, label="review"):
         for block in content if isinstance(content, list) else ():
             if (isinstance(block, dict) and block.get("type") == "tool_use"
                     and block.get("name") == REPORT_TOOL):
-                reported = (block.get("input") or {}).get("findings")
+                asked = block.get("input")
+                reported = asked.get("findings") if isinstance(asked, dict) \
+                    else None
                 # Every entry an object, because the rest of this file reads
                 # them with .get(). One string in the list would raise inside
                 # split_findings, and announce() would swallow the review
@@ -652,8 +681,13 @@ def read_stream(stdout, label="review"):
                     log("%s: a %s call was not shaped like findings and was "
                         "ignored" % (label, REPORT_TOOL))
             elif isinstance(block, dict) and block.get("type") == "text":
-                spoken.append(str(block.get("text") or ""))
-    return result, findings, "\n\n".join(part for part in spoken if part)
+                # Only the most recent block is kept. A finished review's
+                # closing summary is one block, but a run killed at minute
+                # thirty has been narrating throughout, and posting all of it
+                # put a wall of "let me read the enclosing function" on the
+                # pull request in place of a review.
+                spoken[:] = [str(block.get("text") or "")]
+    return result, findings, (spoken[0].strip() if spoken else "")[:MAX_SPOKEN]
 
 
 def diff_lines(path, base, env, label):
@@ -891,7 +925,13 @@ def review_body(label, pr, config, inline, general, raw=None,
                       "no findings to show and no words to quote, which means "
                       "the run produced nothing, not that the change is clean."]
     elif raw is not None:
-        lines += ["", "The reviewer did not return its findings in a form "
+        # Note-aware like the branches around it. Under a note saying the run
+        # was killed, "did not return its findings in a form Vinegar could
+        # read" names the wrong cause and sends the reader to check the three
+        # coupled settings when the answer is a longer review_timeout.
+        lines += ["", "It did not reach the point of reporting findings, so "
+                      "its own words follow unedited." if note else
+                      "The reviewer did not return its findings in a form "
                       "Vinegar could read, so its own words follow unedited.",
                   "", "---", "", raw.strip()]
     elif not total:
@@ -994,6 +1034,29 @@ def announce(label, post):
         log("%s: the review is not posted: %s" % (label, err))
 
 
+def already_posted(label, repo, pr, env):
+    """Whether a review for this commit is already on the pull request.
+
+    Asked before resending one that may have failed after landing. A 5xx or
+    a dropped connection is reported the same way whether GitHub committed
+    the review or not, so a blind retry can leave two reviews where the
+    operator asked for one. Reading is cheap and settles it.
+
+    A failure here answers "not sure", which resends: a duplicate review is
+    a worse outcome than one review, and no review at all is worse than both.
+    """
+    try:
+        result = run(["gh", "api", "-X", "GET",
+                      "repos/%s/pulls/%d/reviews" % (repo, pr["number"]),
+                      "--jq", ".[].commit_id"],
+                     env=env, timeout=POST_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return False
+    if result.returncode != 0:
+        return False
+    return pr["headRefOid"] in result.stdout.split()
+
+
 def post_review(label, repo, pr, path, text, findings, config, env,
                 note=None):
     """Turn what the reviewer reported into one review on the pull request."""
@@ -1040,6 +1103,14 @@ def post_review(label, repo, pr, path, text, findings, config, env,
         # for. Without this a clean review, or the reviewer's own words, met
         # one 502 and the pull request received nothing at all, for good:
         # the outcome is recorded reviewed and `review_on_push` is false.
+        #
+        # Asked first, because a 5xx can arrive after GitHub has already
+        # created the review and a blind resend would leave two. That is the
+        # same ambiguity submit_review refuses to guess at on a timeout; here
+        # one cheap read settles it instead of guessing.
+        if already_posted(label, repo, pr, env):
+            log("%s: the review is already on the pull request" % label)
+            return
         log("%s: retrying the review comment" % label)
         submit_review(label, repo, pr, payload, env)
         return
@@ -1080,7 +1151,7 @@ def finish(label, repo, pr, path, text, findings, config, env, tokens,
     # was still recorded reviewed.
     try:
         log("%s: transcript at %s" % (
-            label, save_transcript(repo, pr, text, findings)))
+            label, save_transcript(repo, pr, text, findings, note)))
     except Exception as err:
         log("%s: the transcript is not saved: %s" % (label, err))
     post_review(label, repo, pr, path, text, findings, config,
@@ -1125,6 +1196,18 @@ def review(path, repo, pr, config, env, tokens):
     env = dict(env or os.environ, CLAUDE_CODE_REPORT_FINDINGS="1")
 
     label = "%s#%d" % (repo, pr["number"])
+
+    def deliver(text, findings, note=None):
+        """Record and post one ending, whichever ending it turned out to be.
+
+        Every way this function returns DONE goes through here. The three
+        endings used to repeat the same nine arguments, and finish()'s own
+        docstring records what that cost the last time: the partial-run
+        marker was added to one path and not the other.
+        """
+        announce(label, lambda: finish(
+            label, repo, pr, path, text, findings, config, env, tokens, note))
+
     log("%s: reviewing at %s effort%s" % (
         label, config["effort"], "" if config["comment"] else ", dry run"))
 
@@ -1167,9 +1250,7 @@ def review(path, repo, pr, config, env, tokens):
             note = ("This review was killed after %ds. Read that as the "
                     "review not finishing, not as the change being clean."
                     % config["review_timeout"])
-        announce(label, lambda: finish(
-            label, repo, pr, path, spoken, findings, config, env, tokens,
-            note))
+        deliver(spoken, findings, note)
         return DONE
     took = round(time.monotonic() - started)
 
@@ -1186,11 +1267,9 @@ def review(path, repo, pr, config, env, tokens):
             return FAILED
         log("%s: it had reported %d finding(s) first, posting those"
             % (label, len(findings)))
-        announce(label, lambda: finish(
-            label, repo, pr, path, spoken, findings, config, env, tokens,
-            note="This review stopped before it finished, so these are the "
-                 "findings it had reported by then and not a finished "
-                 "round."))
+        deliver(spoken, findings,
+                "This review stopped before it finished, so these are the "
+                "findings it had reported by then and not a finished round.")
         return DONE
 
     # A non-empty list is worth acting on. An empty one proves nothing.
@@ -1207,12 +1286,27 @@ def review(path, repo, pr, config, env, tokens):
         # The command, not just the tool name. "denied 4 Bash calls" is not
         # something anyone can act on, and this line's own advice is to widen
         # the allow list, which needs to know what to widen.
+        # Deduplicated and capped. A reviewer that keeps reaching for a
+        # denied command produces one entry per attempt, and fifty identical
+        # lines bury the summary beneath them in a log several repositories
+        # share. Entries that are not objects are described rather than
+        # dereferenced: an AttributeError here would discard the finished
+        # review that is sitting one line further down.
+        seen = []
         for entry in denied:
-            asked = entry.get("tool_input") or {}
-            log("%s: denied %s %s" % (
-                label, entry.get("tool_name", "?"),
-                str(asked.get("command") or asked.get("file_path")
-                    or asked)[:160]))
+            asked = entry.get("tool_input") if isinstance(entry, dict) else None
+            said = (asked.get("command") or asked.get("file_path") or asked
+                    if isinstance(asked, dict) else entry)
+            tool = entry.get("tool_name", "?") if isinstance(entry, dict) \
+                else "?"
+            line = "%s %s" % (tool, str(said)[:160])
+            if line not in seen:
+                seen.append(line)
+        for line in seen[:10]:
+            log("%s: denied %s" % (label, line))
+        if len(seen) > 10:
+            log("%s: and %d more distinct denied command(s)" % (
+                label, len(seen) - 10))
         log("%s: %d permission denial(s). The review ran with less than it "
             "asked for; widen review-settings.json if it needed them" % (
                 label, len(denied)))
@@ -1258,8 +1352,7 @@ def review(path, repo, pr, config, env, tokens):
     # near the hour a token lives it cannot be guaranteed to. Posting is the
     # entire output of the run, and this is the last moment it can be made
     # safe cheaply. A dry run mints nothing, having nothing to post.
-    announce(label, lambda: finish(
-        label, repo, pr, path, text, findings, config, env, tokens, note))
+    deliver(text, findings, note)
     return DONE
 
 
@@ -1349,8 +1442,31 @@ def handle_pr(repo, pr, config, state, tokens):
         log("%s: checkout failed: %s" % (key, err))
         return
 
-    outcome = review(path, repo, pr, config, env, tokens)
     attempts = done.get("attempts", 0) + 1 if done.get("sha") == head else 1
+
+    # Recorded before the review runs, not after. Nothing inside review() can
+    # protect against the process simply ceasing to exist: a SIGKILL, a power
+    # cut, launchd booting the job out mid-review. Without a mark already on
+    # disk, the restart finds no entry, reviews the same pull request again,
+    # and does so on every restart for ever. Written as FAILED because that is
+    # what an interrupted attempt is, and because MAX_ATTEMPTS then bounds the
+    # damage at three rather than leaving it open-ended. The real outcome
+    # overwrites it a few lines below.
+    state[key] = {"outcome": FAILED, "sha": head, "attempts": attempts}
+    save_state(state)
+
+    try:
+        outcome = review(path, repo, pr, config, env, tokens)
+    except Exception as err:
+        # The subscription is spent by the time most of these can happen, and
+        # an unrecorded pull request is reviewed again on the very next poll,
+        # at full cost, for ever. announce() covers the posting; this covers
+        # everything else review() touches, including the two read_stream
+        # calls and `claude` missing from PATH entirely. Recording FAILED
+        # keeps MAX_ATTEMPTS in charge of how many times that may repeat.
+        log("%s: the review did not complete: %s" % (key, err))
+        outcome = FAILED
+
     state[key] = {"outcome": outcome, "sha": head, "attempts": attempts}
     save_state(state)
 
@@ -1363,8 +1479,14 @@ def handle_pr(repo, pr, config, state, tokens):
 def find_pr(repo, number, env):
     """Read the one pull request named by an `owner/repo#number` target."""
     target = "%s#%s" % (repo, number)
-    result = run(["gh", "pr", "view", number, "-R", repo,
-                  "--json", PR_FIELDS], env=env)
+    # Bounded like the listing it mirrors. A `--pr` run holds the lock for
+    # as long as it lasts, so an unanswered socket here also keeps the daemon
+    # from starting.
+    try:
+        result = run(["gh", "pr", "view", number, "-R", repo,
+                      "--json", PR_FIELDS], env=env, timeout=LIST_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        sys.exit("cannot read %s: timed out after %ds" % (target, LIST_TIMEOUT))
     if result.returncode != 0:
         sys.exit("cannot read %s: %s" % (target, result.stderr.strip()))
     return json.loads(result.stdout)

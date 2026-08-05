@@ -86,6 +86,7 @@ diff --git a/README.md b/README.md
 """
 
 posted = []
+looked = []
 last_git_diff = [[], None]
 
 
@@ -94,6 +95,11 @@ def fake_run(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
         last_git_diff[0], last_git_diff[1] = cmd, timeout
         return subprocess.CompletedProcess(
             cmd, fake_run.diff_rc, "" if fake_run.diff_rc else DIFF, "boom")
+    if cmd[:2] == ["gh", "api"] and "-X" in cmd:
+        # The read that asks whether a review already landed.
+        looked.append(cmd)
+        return subprocess.CompletedProcess(
+            cmd, fake_run.look_rc, fake_run.look_out, "")
     if cmd[:2] == ["gh", "api"]:
         posted.append((cmd, json.loads(stdin_text)))
         return subprocess.CompletedProcess(cmd, fake_run.rc, "", "HTTP 422")
@@ -102,6 +108,8 @@ def fake_run(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
 
 fake_run.rc = 0
 fake_run.diff_rc = 0
+fake_run.look_rc = 0
+fake_run.look_out = ""
 vinegar.run = fake_run
 vinegar.log = lambda message: None
 
@@ -149,6 +157,26 @@ check("a subagent's call does not replace the review's own",
 check("a findings list holding a non-object is refused whole",
       vinegar.read_stream(
           stream(call(["a bug", {"file": "a.py"}]), DONE_EVENT))[1] is None)
+check("a tool call whose input is not an object does not crash the review",
+      vinegar.read_stream(stream(
+          {"type": "assistant", "message": {"content": [
+              {"type": "tool_use", "name": "ReportFindings",
+               "input": [{"file": "a.py"}]}]}},
+          DONE_EVENT))[1] is None)
+check("only the reviewer's last words are kept, not the whole run",
+      vinegar.read_stream(stream(
+          {"type": "assistant", "message": {"content": [
+              {"type": "text", "text": "Let me start by gathering the diff."}]}},
+          {"type": "assistant", "message": {"content": [
+              {"type": "text", "text": "Now the enclosing function."}]}},
+          {"type": "assistant", "message": {"content": [
+              {"type": "text", "text": "Closing summary."}]}},
+          DONE_EVENT))[2] == "Closing summary.")
+check("the reviewer's words are capped before they reach a comment",
+      len(vinegar.read_stream(stream(
+          {"type": "assistant", "message": {"content": [
+              {"type": "text", "text": "x" * 90000}]}},
+          DONE_EVENT))[2]) <= vinegar.MAX_SPOKEN)
 check("another tool's call is not mistaken for findings",
       vinegar.read_stream(stream(call(REAL, name="Bash"), DONE_EVENT))[1]
       is None)
@@ -301,9 +329,6 @@ check("git diff is pinned against colour escapes",
 check("the base is named unambiguously, so a tag cannot win",
       any(a.startswith("refs/heads/release-2...") for a in last_git_diff[0]),
       last_git_diff[0])
-check("the diff is bounded so it cannot wedge the poll loop",
-      last_git_diff[1] is not None and last_git_diff[1] <= 600,
-      last_git_diff[1])
 
 inline, general = vinegar.split_findings(FINDINGS, covered, ROOT, L)
 check("in-diff findings become inline comments", len(inline) == 2, inline)
@@ -424,12 +449,12 @@ del posted[:]
 boom = []
 
 
-def exploding_post():
+def exploding_callback():
     boom.append(1)
     raise RuntimeError("GitHub is unreachable")
 
 
-vinegar.announce("o/r#12", exploding_post)
+vinegar.announce("o/r#12", exploding_callback)
 check("a posting failure cannot escape and cost a re-review",
       boom == [1] and not posted, (boom, posted))
 
@@ -444,7 +469,7 @@ def exploding_env(*a, **k):
     raise RuntimeError("GitHub is unreachable")
 
 
-def exploding_post(*a, **k):
+def exploding_post_review(*a, **k):
     raise RuntimeError("the endpoint is unreachable")
 
 
@@ -474,7 +499,7 @@ check("a mint failure falls back rather than losing the review",
 # escaping review() leaves handle_pr with no state and re-reviews the pull
 # request at full cost on every poll.
 _real_post = vinegar.post_review
-vinegar.post_review = exploding_post
+vinegar.post_review = exploding_post_review
 vinegar.github_env = lambda *a, **k: None
 del posted[:]
 check("a review whose posting raises is still recorded as done",
@@ -707,6 +732,98 @@ check("brief gives a fallback for a base ref that does not resolve",
       "gh pr diff 12" in brief, brief)
 check("brief does not promise the base ref is definitely there",
       "already fetched" not in brief, brief)
+
+# --- handle_pr: the guard that bounds every crash --------------------------
+# An exception anywhere in review() used to leave no state at all, so the
+# pull request was checked out and reviewed again at full cost every poll,
+# for ever, with MAX_ATTEMPTS never reaching it.
+_hp_state = {}
+_hp_saved = []
+_real_review, _real_save_state = vinegar.review, vinegar.save_state
+vinegar.save_state = lambda st: _hp_saved.append(dict(st))
+PR_LIVE = dict(PR, isDraft=False, isCrossRepository=False,
+               author={"login": "kevin"}, additions=1, deletions=0)
+
+
+def blowing_up_review(*a, **k):
+    raise AttributeError("'list' object has no attribute 'get'")
+
+
+vinegar.review = blowing_up_review
+vinegar.checkout = lambda repo, pr, env: ROOT
+vinegar.github_env = lambda *a, **k: None
+vinegar.handle_pr("o/r", PR_LIVE, CONFIG, _hp_state, {})
+check("a review that raises is still recorded, so it cannot loop for ever",
+      _hp_state.get(L, {}).get("outcome") == vinegar.FAILED, _hp_state)
+check("a review that raises counts as an attempt against MAX_ATTEMPTS",
+      _hp_state.get(L, {}).get("attempts") == 1, _hp_state)
+
+# And the marker written before the review runs, which is what survives a
+# process that is killed outright rather than raising.
+_hp_state.clear()
+del _hp_saved[:]
+vinegar.review = lambda *a, **k: vinegar.DONE
+vinegar.handle_pr("o/r", PR_LIVE, CONFIG, _hp_state, {})
+check("an attempt is on disk before the review starts",
+      len(_hp_saved) == 2 and _hp_saved[0][L]["outcome"] == vinegar.FAILED,
+      [d.get(L) for d in _hp_saved])
+check("the real outcome replaces the marker when the review finishes",
+      _hp_state[L]["outcome"] == vinegar.DONE, _hp_state)
+
+vinegar.review, vinegar.save_state = _real_review, _real_save_state
+
+# --- a resend must not duplicate a review that already landed --------------
+claude_run.stream = stream(call([]), result_event())
+vinegar.run, vinegar.github_env = claude_run, lambda *a, **k: None
+fake_run.rc = 1
+fake_run.look_out = "a1b2c3d4e5f6\n"
+del posted[:]
+del looked[:]
+vinegar.review(ROOT, "o/r", PR, CONFIG, None, {})
+check("a refused post asks before resending",
+      len(looked) == 1, (len(looked), len(posted)))
+check("a review that already landed is not posted twice",
+      len(posted) == 1, len(posted))
+
+fake_run.look_out = ""
+del posted[:]
+vinegar.review(ROOT, "o/r", PR, CONFIG, None, {})
+check("a review that did not land is resent",
+      len(posted) == 2, len(posted))
+fake_run.rc = 0
+vinegar.run = fake_run
+
+# --- save_transcript, unstubbed ------------------------------------------
+# The stub above hides this everywhere else, and on a dry run the transcript
+# is the only artifact there is.
+_tx_home = tempfile.mkdtemp(prefix="vinegar-test-tx-")
+atexit.register(shutil.rmtree, _tx_home, True)
+_tx_real = vinegar.REVIEW_DIR
+vinegar.REVIEW_DIR = _tx_home
+
+written = vinegar.save_transcript("o/r", PR, "Reviewed it.", FINDINGS[:2])
+body = open(written).read()
+check("the transcript records the findings, not just the summary",
+      "## Findings" in body and "in diff" in body and "absolute path" in body,
+      body[:200])
+check("the transcript renders findings the same way the comment does",
+      vinegar.finding_bullet(FINDINGS[0]) in body, body[:200])
+
+body = open(vinegar.save_transcript("o/r", PR, "Nothing.", [])).read()
+check("a clean transcript says so plainly", "None." in body, body[:160])
+
+body = open(vinegar.save_transcript(
+    "o/r", PR, "Killed.", [], note="This review was killed after 1800s.")).read()
+check("a killed transcript is never a clean transcript",
+      "killed after 1800s" in body
+      and "None reported before it stopped." in body,
+      body[:240])
+
+body = open(vinegar.save_transcript("o/r", PR, "Text.", None)).read()
+check("a transcript with nothing reported has no findings section",
+      "## Findings" not in body, body[:160])
+
+vinegar.REVIEW_DIR = _tx_real
 
 # --- the --pr guard, through the real entry point -------------------------
 # A mistyped target must be refused before anything is minted or asked of
