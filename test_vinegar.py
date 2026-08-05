@@ -443,7 +443,7 @@ _co_ran = []
 
 
 def co_run(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
-    _co_ran.append((cmd, timeout))
+    _co_ran.append((cmd, cwd, timeout))
     if cmd[:3] == ["gh", "repo", "clone"]:
         os.makedirs(os.path.join(cmd[4], ".git"), exist_ok=True)
         return subprocess.CompletedProcess(cmd, 0, "", "")
@@ -471,23 +471,34 @@ check("a lock left by a killed run is cleared, not inherited",
 # a local step parks the poll thread on a filesystem that stops answering,
 # and the local budget on the fetch turned a slow repository into a pull
 # request that was never reviewed and never given up on.
-_co_fetch = [t for c, t in _co_ran if c[:2] == ["git", "fetch"]]
-_co_local = [t for c, t in _co_ran if c[:2] == ["git", "reset"]]
+_co_fetch = [t for c, _w, t in _co_ran if c[:2] == ["git", "fetch"]]
+_co_local = [t for c, _w, t in _co_ran if c[:2] == ["git", "reset"]]
 check("the head fetch is given the network budget",
       _co_fetch and _co_fetch[0] == vinegar.FETCH_TIMEOUT, _co_fetch)
 check("the local steps are bounded as well, and more tightly",
       _co_local and _co_local[0] == vinegar.DIFF_TIMEOUT, _co_local)
 check("the credential helper is written on every pass, not only at clone",
-      any(c[:3] == ["git", "config", "--local"] for c, _t in _co_ran),
-      [c[:3] for c, _t in _co_ran])
+      any(c[:3] == ["git", "config", "--local"] for c, _w, _t in _co_ran),
+      [c[:3] for c, _w, _t in _co_ran])
+# Every git step in the checkout it prepared, not wherever the daemon sits.
+# run() defaults cwd to None, so dropping it does not fail: `git reset
+# --quiet --hard` and `git clean -qfd` run somewhere else. Under launchd
+# that is `/`, where they error and every poll loses its checkout instead;
+# run by hand from the repository, as the README tells you to for --pr,
+# they wipe your own working tree. The reviewer invocation records its cwd
+# for exactly this reason and this section did not, so all of it passed
+# with `cwd=path` deleted.
+_co_where = [w for c, w, _t in _co_ran if c[0] == "git"]
+check("every git step runs inside the checkout it prepared",
+      _co_where and all(w == _co_path for w in _co_where), _co_where)
 # A clone killed part-way leaves a .git git itself refuses to open. Skipping
 # the clone because .git exists uses that repository for ever.
 co_run.usable = 1
 del _co_ran[:]
 vinegar.checkout("o/r", PR, None)
 check("a checkout git cannot open is cloned again rather than reused",
-      any(c[:3] == ["gh", "repo", "clone"] for c, _t in _co_ran),
-      [c[:3] for c, _t in _co_ran])
+      any(c[:3] == ["gh", "repo", "clone"] for c, _w, _t in _co_ran),
+      [c[:3] for c, _w, _t in _co_ran])
 co_run.usable = 0
 vinegar.CHECKOUT_DIR = _co_dir
 vinegar.run = fake_run
@@ -1777,8 +1788,18 @@ check("a branch under the changed-lines cap is reviewed",
       _skipped({"additions": 2000, "deletions": 999}))
 # A deleted account leaves no author object at all, and reading .get on it
 # is what turns "skip this one" into a traceback on every poll.
+#
+# Wrapped, because that traceback is the failure. Called plainly, breaking
+# the guard ends the run here rather than failing this check, and the 163
+# checks below never run: measured, 221 of 384. Every other raise-guard
+# check in this file is wrapped for the same reason, and this one, whose
+# own comment says the failure is a raise, was not.
+try:
+    _gone_author = _skipped({"author": None})
+except Exception as err:
+    _gone_author = "raised %r" % err
 check("a pull request whose author is gone is still judged, not raised",
-      _skipped({"author": None}) is None, _skipped({"author": None}))
+      _gone_author is None, _gone_author)
 
 
 def blowing_up_review(*a, **k):
@@ -1849,10 +1870,20 @@ check("a lifted skip cannot re-run a review whose budget is spent",
 _ga_state = {L: {"outcome": vinegar.FAILED, "sha": PR["headRefOid"],
                  "attempts": vinegar.MAX_ATTEMPTS}}
 del posted[:]
+del _asked[:]
+_env_at_give_up = vinegar.github_env
+vinegar.github_env = recording_env
 vinegar.handle_pr("o/r", PR_LIVE, CONFIG, _ga_state, {})
+vinegar.github_env = _env_at_give_up
 check("a give-up interrupted by a crash is announced on restart",
       len(posted) == 1 and "gave up on" in posted[0][1]["body"],
       (len(posted), _ga_state))
+# This branch mints its own token rather than reusing one, because there is
+# no run to inherit from: the attempt that spent the budget was killed. A
+# token with no life asked of it can expire between the mint and the post,
+# and then the one thing this path exists to say never gets said.
+check("the rediscovered give-up mints a token with time to post it",
+      _asked and all(g == vinegar.POST_GRACE for g in _asked), _asked)
 
 vinegar.handle_pr("o/r", PR_LIVE, CONFIG, _ga_state, {})
 check("the crash-discovered give-up is announced once, not every poll",
@@ -3474,7 +3505,8 @@ check("a dry run writes its transcripts somewhere else as well",
 reset_stubs()
 _polled = []
 _real_listing, _real_handling = vinegar.open_prs, vinegar.handle_pr
-vinegar.github_env = lambda *a, **k: None
+del _asked[:]
+vinegar.github_env = recording_env
 
 
 def refusing_listing(repo, env):
@@ -3504,6 +3536,12 @@ check("a repository whose listing fails does not stop the ones after it",
       ("o/r", 1) in _polled, _polled)
 check("one pull request that raises does not stop the ones after it",
       ("o/r", 2) in _polled, _polled)
+# The listing asks for its own grace, and a shorter one than the posting:
+# it is a read that either answers or is skipped, where a post that expires
+# half way loses a finished review. Without any, a token minted seconds
+# before a seven-page paginated read can expire inside it.
+check("the listing mints a token with time to finish listing",
+      _asked and all(g == vinegar.LISTING_GRACE for g in _asked), _asked)
 vinegar.open_prs, vinegar.handle_pr = _real_listing, _real_handling
 reset_stubs()
 
@@ -3516,7 +3554,24 @@ reset_stubs()
 # the lock belongs to the open file description and each os.open makes a new
 # one; that was measured here rather than assumed.
 reset_stubs()
-vinegar.acquire_lock()
+# The file is already here: main() ran earlier in this file and the lock is
+# deliberately never unlinked, which is also the deployed state from the
+# first start onwards. So this first call is the case the pid-file design
+# would get wrong, and it is checked by making the call rather than by
+# asking whether the file exists. Asserting the file's presence said nothing
+# about starting: a version that refused whenever the file was there passed
+# it. The precondition is asserted rather than assumed, because the check
+# means nothing if the file happens to be absent.
+_lock_was_there = os.path.exists(vinegar.LOCK_PATH)
+# Wrapped like the calls below it. A refusal here is a SystemExit, so an
+# unwrapped call would end the run instead of failing this check.
+try:
+    vinegar.acquire_lock()
+    _first = "started"
+except SystemExit as err:
+    _first = str(err)
+check("a lock file left behind does not by itself refuse a start",
+      _lock_was_there and _first == "started", (_lock_was_there, _first))
 check("the lock file records the pid holding it",
       vinegar.locked_by() == os.getpid(), vinegar.locked_by())
 try:
@@ -3535,10 +3590,11 @@ except SystemExit as err:
 check("the lock is free again once it is released", _after == "started",
       _after)
 vinegar.release_lock()
-# The file outlives the process deliberately, so its mere presence must not
-# be read as "a Vinegar is running": every start after a clean shutdown
-# would fail, and the daemon KeepAlive-restarts into the same message.
-check("a lock file left behind does not by itself refuse a start",
+# Released, not unlinked. Removing it would open the race the lock closes:
+# a second Vinegar holding the old inode while a third creates a new file
+# at the same path and locks that, leaving two holders who cannot see each
+# other.
+check("releasing the lock leaves the file where it was",
       os.path.exists(vinegar.LOCK_PATH), vinegar.LOCK_PATH)
 
 # A settings file whose allow list is present-and-null must produce the

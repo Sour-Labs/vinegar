@@ -119,6 +119,14 @@ MUTATIONS = [
     ("good-for-repost",
      "            env = github_env(config, repo, tokens, good_for=POST_GRACE)",
      "            env = github_env(config, repo, tokens)"),
+    ("good-for-give-up",
+     "                    post_env = github_env(config, repo, tokens,\n"
+     "                                          good_for=POST_GRACE)",
+     "                    post_env = github_env(config, repo, tokens)"),
+    ("good-for-listing",
+     "            prs = open_prs(repo, github_env(config, repo, tokens,\n"
+     "                                            good_for=LISTING_GRACE))",
+     "            prs = open_prs(repo, github_env(config, repo, tokens))"),
 
     # --- anchoring, in diff_lines --------------------------------------
     ("diff-failure-gate",
@@ -177,6 +185,12 @@ MUTATIONS = [
     ("skip-size-cap",
      '    if changed > config["max_changed_lines"]:',
      "    if False:"),
+    ("skip-bots",
+     '    if config["skip_bots"] and author.get("is_bot"):',
+     "    if False:"),
+    ("skip-author-gone",
+     '    author = pr.get("author") or {}',
+     '    author = pr["author"]'),
     ("effort-gate",
      '    if config["effort"] not in EFFORTS:\n'
      '        sys.exit("%s: effort must be one of %s" % (path, ", ".join(EFFORTS)))',
@@ -188,6 +202,9 @@ MUTATIONS = [
      '        log("%s: clearing a lock left by a killed run" % repo)\n'
      "        forget(stale)",
      "    pass"),
+    ("checkout-cwd",
+     "            result = run(step, cwd=path, env=env, timeout=bound)",
+     "            result = run(step, env=env, timeout=bound)"),
     ("checkout-unusable-repo",
      "        if not usable:\n"
      '            log("%s: the checkout is not a usable repository, cloning it "\n'
@@ -207,6 +224,15 @@ MUTATIONS = [
     ("acquire-flock",
      "        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)",
      "        pass"),
+    # The pid-file design the lock docstring argues against: a file that
+    # outlives its process would then refuse every start after a crash.
+    ("acquire-refuses-on-file",
+     "    global _lock_handle\n"
+     "    os.makedirs(HOME, exist_ok=True)",
+     "    global _lock_handle\n"
+     "    os.makedirs(HOME, exist_ok=True)\n"
+     "    if os.path.exists(LOCK_PATH):\n"
+     '        sys.exit("vinegar is already running as pid %s" % locked_by())'),
 
     # --- constants -----------------------------------------------------
     ("max-attempts", "MAX_ATTEMPTS = 3", "MAX_ATTEMPTS = 99"),
