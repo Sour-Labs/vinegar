@@ -1008,10 +1008,24 @@ vinegar.handle_pr("o/r", PR_LIVE, CONFIG, _ga_state, {})
 check("a give-up interrupted by a crash is announced on restart",
       len(posted) == 1 and "gave up on" in posted[0][1]["body"],
       (len(posted), _ga_state))
+
 vinegar.handle_pr("o/r", PR_LIVE, CONFIG, _ga_state, {})
 check("the crash-discovered give-up is announced once, not every poll",
       len(posted) == 1 and _ga_state[L].get("announced") is True,
       (len(posted), _ga_state))
+
+# The crash this branch exists for kills the process between posting and
+# recording, so `announce_tries` is 0 on the very run that must not post
+# again. Trusting the count skipped the check exactly there.
+_gc_state = {L: {"outcome": vinegar.FAILED, "sha": PR["headRefOid"],
+                 "attempts": vinegar.MAX_ATTEMPTS}}
+fake_run.look_out = "%s gave up on `a1b2c3d` at high effort\n" % (
+    vinegar.BODY_MARK)
+del posted[:]
+vinegar.handle_pr("o/r", PR_LIVE, CONFIG, _gc_state, {})
+check("a give-up already up is not repeated after a crash",
+      not posted, (len(posted), _gc_state))
+fake_run.look_out = ""
 
 # A give-up whose announcement never landed must not be marked as said,
 # or the pull request stays silent for ever on the strength of one bad
@@ -1239,6 +1253,14 @@ _typed = vinegar.load_state()
 check("an attempts that is not a number is dropped",
       "o/r#12" not in _typed and "o/r#13" not in _typed
       and _typed.get("o/r#14", {}).get("attempts") == 2, _typed)
+
+# Every counter, not the two that existed when the check was written:
+# post_tries is compared with < on the poll path the same way.
+with open(vinegar.STATE_PATH, "w") as h:
+    h.write('{"o/r#12": {"outcome": "reviewed", "sha": "a", '
+            '"post_tries": "1"}}')
+check("a post_tries that is not a number is dropped too",
+      vinegar.load_state() == {}, vinegar.load_state())
 check("dropping a bad entry does not quarantine the good ones",
       not _quarantined(), _quarantined())
 os.remove(vinegar.STATE_PATH)
@@ -1666,6 +1688,14 @@ del _rs_posts[:]
 vinegar.post_review(L, "o/r", PR, ROOT, "x", [], CONFIG, None, resent=True)
 check("a re-run against a reviewed commit does not post twice",
       not _rs_posts, len(_rs_posts))
+# And it asks before doing the work it would throw away: routing findings
+# means a full `git diff` over the pull request, which is the same reason
+# the dry-run check sits above the routing rather than below it.
+del last_git_diff[0][:]
+vinegar.post_review(L, "o/r", PR, ROOT, "x", FINDINGS[:2], CONFIG, None,
+                    resent=True)
+check("a review already up costs no diff to discover",
+      not last_git_diff[0], last_git_diff[0])
 del _rs_posts[:]
 vinegar.post_review(L, "o/r", PR, ROOT, "x", [], CONFIG, None)
 check("the daemon's own first post does not ask",
@@ -1777,6 +1807,27 @@ vinegar.review(ROOT, "o/r", PR_LOST, CONFIG, None, {})
 check("a review that posts clears an earlier attempt's mark",
       _marked and not os.path.exists(_lost_marker),
       (_marked, os.path.exists(_lost_marker)))
+
+# A transcript that could not be written must not be marked for
+# reposting. save_or_log swallows the failure, and an earlier attempt may
+# have left a file under the same name saying "It is not a review" —
+# which the repost would then publish as one.
+PR_NOWRITE = dict(PR_LIVE, headRefOid="badbadbad001")
+_nw_marker = vinegar.unposted_path("o/r", PR_NOWRITE)
+vinegar.keep(L, "o/r", PR_NOWRITE, "Attempt one narration.",
+             "the review failed")
+_nw_save = vinegar.save_transcript
+vinegar.save_transcript = exploding_save
+fake_run.rc = 1
+vinegar.run = claude_run
+del posted[:]
+vinegar.review(ROOT, "o/r", PR_NOWRITE, CONFIG, None, {})
+vinegar.save_transcript = _nw_save
+check("a transcript that could not be written is not marked for reposting",
+      not os.path.exists(_nw_marker)
+      and "not a review" in open(
+          vinegar.transcript_path("o/r", PR_NOWRITE)).read(), _nw_marker)
+fake_run.rc = 0
 vinegar.run = fake_run
 
 # Bounded, or an App that can never post retries every minute for ever.
@@ -1810,6 +1861,44 @@ vinegar.handle_pr("o/r", PR_LOST, CONFIG, _spent_state, {})
 check("a spent post budget is not retried even if the mark remains",
       not posted, (len(posted), _spent_state))
 os.remove(_lost_marker)
+
+# A marker whose state entry is gone is left over from a review nobody
+# remembers. Reposting it defeats the repair the log recommends: the
+# operator deletes the entry to get a fresh review and gets the stale
+# transcript posted instead, then a real review after that.
+with open(_lost_marker, "w") as h:
+    h.write("orphan\n")
+_orphan_state = {}
+del posted[:]
+vinegar.handle_pr("o/r", PR_LOST, CONFIG, _orphan_state, {})
+check("a marker with no entry behind it is forgotten, not posted",
+      not [p for p in posted if "posted from the transcript" in p[1]["body"]]
+      and not os.path.exists(_lost_marker), (len(posted), _lost_marker))
+
+# The mint failure inside repost() must clear the marker when the budget
+# runs out, or it survives to restart the cycle later. Reachable only with
+# a github_env that can fail, which the stub above cannot.
+with open(_lost_marker, "w") as h:
+    h.write("left\n")
+_mint_state = {_lost_key: {"outcome": vinegar.DONE,
+                           "sha": PR_LOST["headRefOid"], "attempts": 1,
+                           "post_tries": vinegar.MAX_ATTEMPTS - 1}}
+_mint_env = vinegar.github_env
+
+
+def _mint_fails(*a, **k):
+    raise RuntimeError("the App key is gone")
+
+
+vinegar.github_env = _mint_fails
+del posted[:]
+vinegar.handle_pr("o/r", PR_LOST, dict(CONFIG, github_app={"id": 1}),
+                  _mint_state, {})
+vinegar.github_env = _mint_env
+check("a token that never mints does not leave the mark behind",
+      not os.path.exists(_lost_marker)
+      and _mint_state[_lost_key]["post_tries"] == vinegar.MAX_ATTEMPTS,
+      (os.path.exists(_lost_marker), _mint_state))
 fake_run.rc, fake_run.post_err = 0, "HTTP 422"
 
 vinegar.REVIEW_DIR = _tx_real

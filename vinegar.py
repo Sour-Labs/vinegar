@@ -574,7 +574,8 @@ def load_state():
                    if not isinstance(done, dict)
                    or any(not isinstance(done[field], int)
                           or isinstance(done[field], bool)
-                          for field in ("attempts", "announce_tries")
+                          for field in ("attempts", "announce_tries",
+                                        "post_tries")
                           if field in done)]
             for key in bad:
                 log("%s: its entry in %s cannot be read, so it is forgotten "
@@ -1172,6 +1173,17 @@ def split_findings(findings, covered, root, label):
     return inline, general
 
 
+def review_heading(pr, config, verb="reviewed"):
+    """The first line of everything Vinegar posts.
+
+    already_posted() recognises Vinegar's own work by matching the start
+    of it, so the shape has one definition: the repost path spelled it out
+    again and the two could have drifted into saying different things
+    about the same commit.
+    """
+    return "%s at %s effort" % (posted_mark(pr, verb), config["effort"])
+
+
 def overflow_note(dropped):
     """What the comment says about the findings that did not fit."""
     return ("%d finding(s) did not fit GitHub's comment limit and are only "
@@ -1198,7 +1210,7 @@ def review_body(label, pr, config, inline, general, raw=None,
     # `verb` because the give-up posts through here too, and its first line
     # used to claim a review happened when none ever ran. The marker itself
     # stays fixed: already_posted() matches it as a prefix.
-    lines = ["%s at %s effort" % (posted_mark(pr, verb), config["effort"])]
+    lines = [review_heading(pr, config, verb)]
 
     # A run that was killed or that errored still reports whatever it had
     # got to, and without this that is indistinguishable from a finished
@@ -1455,10 +1467,16 @@ def post_review(label, repo, pr, path, text, findings, config, env,
     marks itself announced on that answer, so "posted nothing and said so"
     must not read the same as "posted".
     """
+    # Before the routing, both of these. Working out which findings could
+    # be anchored means a full `git diff` over the pull request and up to
+    # 60KB of assembled markdown, and neither of these endings looks at
+    # any of it.
+    if resent and already_posted(label, repo, pr, env, verb):
+        log("%s: the review is already on the pull request" % label)
+        return True
+
     if not config["comment"]:
-        # Before the routing, not after. Working out which findings could be
-        # anchored means a full `git diff` over the pull request, and a dry
-        # run discards the answer to print two counts.
+        # A dry run discards the answer to print two counts.
         #
         # True because a dry run wanted nothing posted: it is the one
         # ending where an empty pull request is the correct outcome, and
@@ -1512,16 +1530,6 @@ def post_review(label, repo, pr, path, text, findings, config, env,
         return settled == UNSURE and already_posted(
             label, repo, pr, env, verb)
 
-    # A send that is already a retry from an earlier poll asks first. The
-    # checks below only fire when *this* send is ambiguous, which covers a
-    # retry inside one call and misses the one across calls: the give-up
-    # whose post landed while Vinegar could not tell, recorded unannounced,
-    # comes back a minute later and says it again. Every duplicate this
-    # code has produced came through that door.
-    if resent and already_posted(label, repo, pr, env, verb):
-        log("%s: the review is already on the pull request" % label)
-        return True
-
     settled = submit_review(label, repo, pr, payload, env)
     if settled == POSTED:
         return landed(settled)
@@ -1553,8 +1561,7 @@ def post_review(label, repo, pr, path, text, findings, config, env,
         # Retrying now would be refused for the same reason. The review is
         # on disk, and saying where says more than a second failure would.
         log("%s: the posting is rate limited, so the review is only in the "
-            "transcript. Post it by hand, or delete the entry from %s to "
-            "review it again" % (label, STATE_PATH))
+            "transcript for now. It is sent again on a later poll" % label)
         return False
 
     # A definite refusal created nothing, so there is nothing to go and
@@ -1595,11 +1602,16 @@ def save_or_log(label, write):
     sentence for the failure: keep(), and both branches of finish(). The
     write is the cheap local copy and must not be able to take the posting
     down with it, which is one policy, so it lives in one place.
+
+    Answers whether it was written, because a caller that goes on to point
+    at that file needs to know it is the file it thinks it is.
     """
     try:
         write()
+        return True
     except Exception as err:
         log("%s: the transcript is not saved: %s" % (label, err))
+        return False
 
 
 def keep(label, repo, pr, text, why):
@@ -1685,9 +1697,9 @@ def finish(label, repo, pr, path, text, findings, config, env, tokens,
                 "left" % label)
 
     if preserve and note and os.path.exists(path_kept):
-        save_or_log(label, append_ending)
+        wrote = save_or_log(label, append_ending)
     else:
-        save_or_log(label, lambda: log("%s: transcript at %s" % (
+        wrote = save_or_log(label, lambda: log("%s: transcript at %s" % (
             label, save_transcript(repo, pr, text, findings, note))))
     posted = post_review(label, repo, pr, path, text, findings, config,
                          posting_env(label, config, repo, tokens, env), note,
@@ -1704,7 +1716,13 @@ def finish(label, repo, pr, path, text, findings, config, env, tokens,
         try:
             if posted:
                 forget(marker)
-            elif os.path.exists(transcript_path(repo, pr)):
+            elif wrote:
+                # `wrote`, not "a file is there". save_or_log swallows a
+                # failed write, and an earlier keep() may have left a
+                # transcript of a *failed attempt* under the same name.
+                # Marking on its existence pointed the repost at a partial
+                # narration headed "It is not a review", and published it
+                # as one.
                 write_atomic(marker, "%s\n" % label)
         except OSError as err:
             log("%s: cannot record whether the review was posted: %s" % (
@@ -1749,7 +1767,17 @@ def repost(key, repo, pr, config, state, tokens, done):
             key, err))
         env = None
         if config.get("github_app"):
-            state[key] = dict(done, post_tries=tries + 1)
+            tries += 1
+            # Cleared here too when the budget runs out. Returning early
+            # without it left the marker on disk for ever, and a later
+            # deletion of the state entry then restarted the whole retry
+            # cycle against a transcript nothing was going to accept.
+            if tries >= MAX_ATTEMPTS:
+                log("%s: the saved review could not be posted in %d "
+                    "attempts. It stays in %s" % (
+                        key, tries, transcript_path(repo, pr)))
+                forget(marker)
+            state[key] = dict(done, post_tries=tries)
             save_state(state)
             return
     try:
@@ -1766,11 +1794,10 @@ def repost(key, repo, pr, config, state, tokens, done):
 
     log("%s: posting the review that was refused earlier (attempt %d of %d)"
         % (key, tries + 1, MAX_ATTEMPTS))
-    body = clamp(key, "%s at %s effort\n\nThis review was refused when it "
-                      "was written and is posted from the transcript, so "
-                      "its findings are not anchored in the diff."
-                      "\n\n---\n\n%s" % (
-                          posted_mark(pr, "reviewed"), config["effort"], body))
+    body = clamp(key, "%s\n\nThis review was refused when it was written "
+                      "and is posted from the transcript, so its findings "
+                      "are not anchored in the diff.\n\n---\n\n%s" % (
+                          review_heading(pr, config), body))
     landed = already_posted(key, repo, pr, env) or submit_review(
         key, repo, pr, {"event": "COMMENT", "commit_id": pr["headRefOid"],
                         "body": body}, env) == POSTED
@@ -1859,8 +1886,9 @@ def review(path, repo, pr, config, env, tokens, resent=False):
             return True
         if config["comment"]:
             log("%s: nothing reached the pull request. The review is in "
-                "%s; post it by hand, or delete this pull request's entry "
-                "from %s to review it again" % (
+                "%s and posting it again is already scheduled; to review "
+                "from scratch instead, stop Vinegar, delete this pull "
+                "request's entry from %s, and start it again" % (
                     label, transcript_path(repo, pr), STATE_PATH))
         return False
 
@@ -2036,7 +2064,7 @@ def poll_once(config, state, tokens):
 
 
 def give_up(key, repo, pr, config, attempts, tokens, path=None, env=None,
-            tries=0):
+            tries=0, resent=False):
     """Say, once, that Vinegar has stopped trying to review this.
 
     Called from two moments that must say the same thing: the last attempt
@@ -2063,7 +2091,7 @@ def give_up(key, repo, pr, config, attempts, tokens, path=None, env=None,
             "%d)" % (key, tries + 1, MAX_ATTEMPTS))
     else:
         log("%s: %d failed attempts, leaving it alone. Fix the cause, then "
-            "delete its entry from %s to try again" % (
+            "stop Vinegar, delete its entry from %s, and start it again" % (
                 key, attempts, STATE_PATH))
     # Said on the pull request, not only in a log nobody is watching.
     # Silence has to keep meaning that something broke, which is only true
@@ -2074,7 +2102,7 @@ def give_up(key, repo, pr, config, attempts, tokens, path=None, env=None,
              "failed before it could report anything. Read that as the "
              "review not running, not as the change being clean." % (
                  attempts,),
-        verb="gave up on", preserve=True, resent=bool(tries)))
+        verb="gave up on", preserve=True, resent=resent or bool(tries)))
 
 
 def spend_announce(key, config, state, head, attempts, tries, said):
@@ -2126,10 +2154,20 @@ def handle_pr(repo, pr, config, state, tokens):
     # A review that was written but never reached the pull request is
     # finished work waiting on one API call, so it is retried before
     # anything else decides this pull request is done.
-    if (config["comment"] and done.get("post_tries", 0) < MAX_ATTEMPTS
-            and os.path.exists(unposted_path(repo, pr))):
-        repost(key, repo, pr, config, state, tokens, done)
-        return
+    if config["comment"] and os.path.exists(unposted_path(repo, pr)):
+        # Tied to the entry that produced it. Without that, the repair the
+        # log recommends — delete the entry and let it be reviewed again —
+        # made the next poll post the *old* transcript instead, and the
+        # poll after that review and post again: two reviews, which is
+        # what the operator was trying to avoid. A marker with no entry
+        # behind it is left over from a review that has been forgotten.
+        if done.get("sha") != head or done.get("outcome") != DONE:
+            log("%s: an unposted review is left over from a run that is no "
+                "longer recorded, so it is forgotten" % key)
+            forget(unposted_path(repo, pr))
+        elif done.get("post_tries", 0) < MAX_ATTEMPTS:
+            repost(key, repo, pr, config, state, tokens, done)
+            return
 
     # Only a finished review closes a pull request off. A skip is decided
     # again on every poll, because the filter that caused it can stop
@@ -2183,10 +2221,17 @@ def handle_pr(repo, pr, config, state, tokens):
                 # None is not a failure here: it is what github_env answers
                 # when no App is configured, and ambient `gh` is then the
                 # credential the operator chose.
+                # `resent` whatever the count says. This branch is a
+                # rediscovery by definition, and the case it exists for —
+                # a process killed between posting and recording — leaves
+                # `announce_tries` at 0, so trusting the count skipped the
+                # check on exactly the run that needed it and posted the
+                # give-up twice.
                 spend_announce(key, config, state, head, done["attempts"],
                                tries, give_up(key, repo, pr, config,
                                               done["attempts"], tokens,
-                                              env=post_env, tries=tries))
+                                              env=post_env, tries=tries,
+                                              resent=True))
             return
 
     reason = skip_reason(pr, config)
