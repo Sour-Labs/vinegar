@@ -109,6 +109,11 @@ CHECKOUT_GRACE = 600
 # arrives, while GitHub set the real one before sending it.
 LISTING_GRACE = 60
 
+# How many open pull requests one listing asks for. GitHub's own default
+# is 30; this is deliberately higher, and open_prs says so when a
+# repository reaches it, because anything past the cap is never seen.
+PR_LIMIT = 50
+
 PR_FIELDS = ("number,title,headRefOid,baseRefName,isDraft,author,additions,"
              "deletions,isCrossRepository,url")
 
@@ -446,6 +451,19 @@ def check_paths():
             "permissions.allow." % (REPORT_TOOL, REPORT_TOOL))
 
 
+def carry_forward(kept):
+    """The fields a rebuilt entry keeps, as keywords for state_entry.
+
+    Four sites spelled this out, and the one that inlined its own version
+    instead is exactly where a counter reset on every charged attempt. A
+    fifth persisted field should be one edit, not four.
+    """
+    return {"post_tries": kept.get("post_tries", 0),
+            "unposted": kept.get("unposted", False),
+            "waivers": kept.get("post_waivers", 0),
+            "announce_waivers": kept.get("announce_waivers", 0)}
+
+
 def state_entry(head, outcome, attempts=0, reason=None, announced=False,
                 tries=0, post_tries=0, unposted=False, waivers=0,
                 announce_waivers=0):
@@ -646,7 +664,8 @@ def open_prs(repo, env):
     # nothing, while the watchdog sees a live pid and calls it healthy.
     try:
         result = run(["gh", "pr", "list", "-R", repo, "--state", "open",
-                      "--limit", "50", "--json", PR_FIELDS], env=env,
+                      "--limit", str(PR_LIMIT), "--json", PR_FIELDS],
+                     env=env,
                      timeout=LIST_TIMEOUT)
     except subprocess.TimeoutExpired:
         log("%s: gh pr list timed out after %ds" % (repo, LIST_TIMEOUT))
@@ -654,7 +673,15 @@ def open_prs(repo, env):
     if result.returncode != 0:
         log("%s: gh pr list failed: %s" % (repo, result.stderr.strip()))
         return []
-    return json.loads(result.stdout)
+    prs = json.loads(result.stdout)
+    # Said out loud when the cap is reached. Anything past it is never
+    # handed to handle_pr: not skipped, not reviewed, not recorded and
+    # not mentioned — indistinguishable from Vinegar having judged it,
+    # which is the one thing silence is not allowed to mean.
+    if len(prs) >= PR_LIMIT:
+        log("%s: %d open pull requests is the most this asks for, so any "
+            "beyond that are not seen at all" % (repo, PR_LIMIT))
+    return prs
 
 
 def skip_reason(pr, config):
@@ -1203,7 +1230,13 @@ def finding_bullet(finding):
     line = finding_line(finding)
     if line is not None:
         where += ":%d" % line
-    return "- `%s`: %s" % (where, describe(finding).replace("\n\n", "\n  "))
+    # Runs of blank lines collapse first. Replacing "\n\n" alone left a
+    # whitespace-only line behind whenever the reviewer's own prose ended
+    # a field with a blank line, and GitHub reads two spaces on their own
+    # as the end of the list item: the failure scenario and the category
+    # rendered at column zero, detached from the finding they belong to.
+    body = re.sub(r"\n{2,}", "\n  ", describe(finding))
+    return "- `%s`: %s" % (where, body)
 
 
 def describe(finding):
@@ -1648,8 +1681,14 @@ def post_review(label, repo, pr, path, text, findings, config, env,
             log("%s: posted %d inline comment(s) and the review comment" % (
                 label, len(payload.get("comments", ()))))
             return POSTED
-        return POSTED if settled == UNSURE and already_posted(
-            label, repo, pr, env, verb) else False
+        if settled == UNSURE:
+            return POSTED if already_posted(
+                label, repo, pr, env, verb) else False
+        # THROTTLED passes through. Flattening it to False here undid the
+        # distinction the callers were just taught to make: a limit met
+        # on the anchor-stripping retry would have been reported as a
+        # refusal, and the marker that resends it dropped.
+        return settled if settled == THROTTLED else False
 
     settled = submit_review(label, repo, pr, payload, env)
     if settled == POSTED:
@@ -2015,13 +2054,18 @@ def repost(key, repo, pr, config, state, tokens, done, marker, sha):
             # findings last, and clamp() truncates the end, so an
             # oversized transcript kept the reviewer's narration in full
             # and sheared off exactly what the repost exists to deliver.
-            room = MAX_BODY - len(opening) - 80
+            cut_said = ("(the beginning was cut to fit GitHub's comment "
+                        "limit)\n\n")
+            # Measured, not a hand-picked slack. The old constant was
+            # chosen for the length of the sentence above it, so
+            # rewording that sentence longer would have pushed the body
+            # over the ceiling with nothing to catch it.
+            room = MAX_BODY - len(opening) - len(cut_said)
             if len(body) > room:
                 log("%s: the saved review is %d characters, sending the "
                     "last %d so the findings survive" % (
                         key, len(body), room))
-                body = ("(the beginning was cut to fit GitHub's comment "
-                        "limit)\n\n" + body[-room:])
+                body = cut_said + body[-room:]
             # Always, including the first try. Skipping it there assumed
             # post_review had already established that nothing landed —
             # true only when *its* landed-review read succeeded, and that
@@ -2389,8 +2433,11 @@ def give_up(key, repo, pr, config, attempts, tokens, path=None, env=None,
     # "leaving it alone" lines in a log several repositories share read as
     # three separate pull requests being abandoned.
     if tries:
-        log("%s: trying again to say that Vinegar gave up (attempt %d of "
-            "%d)" % (key, tries + 1, MAX_ATTEMPTS))
+        # No count against the bound. `tries` here includes attempts that
+        # were waived for being rate limited, so printing it against
+        # MAX_ATTEMPTS produced "attempt 5 of 3", which reads as a broken
+        # bound rather than as three forgiven attempts.
+        log("%s: trying again to say that Vinegar gave up" % key)
     else:
         log("%s: %d failed attempts, leaving it alone. Fix the cause, then "
             "stop Vinegar, delete its entry from %s, and start it again" % (
@@ -2462,10 +2509,7 @@ def spend_announce(key, config, state, head, attempts, tries, said):
     was = state.get(key, {})
     entry = state_entry(head, FAILED, attempts,
                         announced=said == POSTED or spent, tries=tries,
-                        post_tries=was.get("post_tries", 0),
-                        unposted=was.get("unposted", False),
-                        waivers=was.get("post_waivers", 0),
-                        announce_waivers=was.get("announce_waivers", 0))
+                        **carry_forward(was))
     state[key] = entry
     save_state(state)
 
@@ -2484,10 +2528,7 @@ def record_once(state, key, done, head, outcome, reason):
     log("%s: %s" % (key, reason))
     kept = done if done.get("sha") == head else {}
     state[key] = state_entry(head, outcome, kept.get("attempts", 0), reason,
-                             post_tries=kept.get("post_tries", 0),
-                             unposted=kept.get("unposted", False),
-                             waivers=kept.get("post_waivers", 0),
-                             announce_waivers=kept.get("announce_waivers", 0))
+                             **carry_forward(kept))
     save_state(state)
 
 
@@ -2506,9 +2547,15 @@ def handle_pr(repo, pr, config, state, tokens):
         # reviewed and then pushed to listed the whole reviews directory
         # once a minute for the life of the daemon, looking for a prefix
         # that was never going to be there.
+        # FAILED counts as "a marker may be out there" as well as the
+        # flag does. The flag is written after review() returns while the
+        # marker is written inside it, so a process killed between the
+        # two leaves a marker behind and an entry that denies it; if the
+        # head then moved, nothing would ever look for it again.
         marker, saved_sha = unposted_for(
             repo, pr,
-            scan=bool(done.get("unposted")) and done.get("sha") != head)
+            scan=done.get("sha") != head and bool(
+                done.get("unposted") or done.get("outcome") == FAILED))
         if marker and saved_sha is None:
             # Unreadable, which is not the same as belonging to another
             # commit. Believing the entry rather than deleting a paid-for
@@ -2699,10 +2746,7 @@ def handle_pr(repo, pr, config, state, tokens):
     # review unpostable the moment it was written.
     kept = done if done.get("sha") == head else {}
     state[key] = state_entry(head, FAILED, attempts,
-                             post_tries=kept.get("post_tries", 0),
-                             unposted=kept.get("unposted", False),
-                             waivers=kept.get("post_waivers", 0),
-                             announce_waivers=kept.get("announce_waivers", 0))
+                             **carry_forward(kept))
     save_state(state)
 
     try:
@@ -2729,11 +2773,9 @@ def handle_pr(repo, pr, config, state, tokens):
     # Recorded with whether a saved review is waiting behind it, so the
     # next poll can find that out without listing a directory.
     state[key] = state_entry(head, outcome, attempts,
-                             post_tries=kept.get("post_tries", 0),
-                             unposted=os.path.exists(
-                                 unposted_path(repo, pr)),
-                             waivers=kept.get("post_waivers", 0),
-                             announce_waivers=kept.get("announce_waivers", 0))
+                             **dict(carry_forward(kept),
+                                    unposted=os.path.exists(
+                                        unposted_path(repo, pr))))
     save_state(state)
 
     if outcome == FAILED and attempts >= MAX_ATTEMPTS:

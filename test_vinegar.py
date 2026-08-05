@@ -1765,6 +1765,39 @@ body = open(written).read()
 check("the transcript records the findings, not just the summary",
       "## Findings" in body and "in diff" in body and "absolute path" in body,
       body[:200])
+# A blank line inside the reviewer's own prose — describe() strips the
+# ends, so only a middle one survives — used to leave a two-space line,
+# which GitHub reads as the end of the list item: the failure scenario
+# and the category then rendered outside the bullet naming the finding.
+_blank = vinegar.finding_bullet(
+    {"file": "a.py", "line": 1, "summary": "one\n\n\ntwo",
+     "failure_scenario": "boom", "category": "correctness"})
+check("a blank line in a finding does not break out of its bullet",
+      "\n  \n" not in _blank and "\n\n" not in _blank
+      and "Failure: boom" in _blank, repr(_blank))
+# A repository with more open pull requests than one listing asks for
+# must say so: anything past the cap is never handed to handle_pr at all,
+# which is indistinguishable from Vinegar having judged it.
+_cap_log = []
+
+
+def listing_at_cap(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
+    if cmd[:3] == ["gh", "pr", "list"]:
+        return subprocess.CompletedProcess(
+            cmd, 0, json.dumps([dict(PR, number=n)
+                                for n in range(vinegar.PR_LIMIT)]), "")
+    return fake_run(cmd, cwd, timeout, env, stdin_text)
+
+
+vinegar.run = listing_at_cap
+vinegar.log = lambda m: _cap_log.append(m)
+_capped = vinegar.open_prs("o/r", None)
+vinegar.log = lambda message: None
+vinegar.run = fake_run
+check("a repository at the listing cap says so",
+      len(_capped) == vinegar.PR_LIMIT
+      and any("not seen at all" in m for m in _cap_log), _cap_log)
+
 check("the transcript renders findings the same way the comment does",
       vinegar.finding_bullet(FINDINGS[0]) in body, body[:200])
 
@@ -2007,6 +2040,33 @@ with open(_empty, "w") as h:
     h.write("   \n")
 check("an empty marker is not read as another commit",
       vinegar.read_mark(_empty) is None, vinegar.read_mark(_empty))
+
+# A limit met on the anchor-stripping retry is still a limit. Flattening
+# it to False there would drop the marker that resends the review.
+PR_TR = dict(PR_LIVE, headRefOid="8508508508aa")
+_tr_marker = vinegar.unposted_path("o/r", PR_TR)
+fake_run.look_out = ""
+
+
+def refuse_then_throttle(cmd, cwd=None, timeout=None, env=None,
+                         stdin_text=None):
+    if cmd[:2] == ["gh", "api"] and "-X" not in cmd:
+        fake_run.rc = 1
+        fake_run.post_err = ("HTTP 422 Unprocessable Entity" if not posted
+                             else "gh: API rate limit exceeded (HTTP 403)")
+    return fake_run(cmd, cwd, timeout, env, stdin_text)
+
+
+vinegar.run = refuse_then_throttle
+del posted[:]
+_tr = vinegar.finish(L, "o/r", PR_TR, ROOT, "words", FINDINGS[:1], CONFIG,
+                     None, {})
+vinegar.run = fake_run
+check("a limit on the anchorless retry is reported as a limit",
+      _tr == vinegar.THROTTLED and os.path.exists(_tr_marker),
+      (_tr, os.path.exists(_tr_marker)))
+vinegar.forget(_tr_marker)
+fake_run.rc, fake_run.post_err = 1, "HTTP 403 Resource not accessible"
 check("the entry says a saved review is waiting behind it",
       vinegar.state_entry("x", vinegar.DONE, 1, unposted=True)["unposted"]
       is True)
