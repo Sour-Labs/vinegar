@@ -81,6 +81,16 @@ DONE, FAILED = "reviewed", "failed"
 # into a review every minute forever.
 MAX_ATTEMPTS = 3
 
+def checkout_grace(config):
+    """Token life the checkout and the review need between them.
+
+    Both the daemon and the `--pr` path ask for this, and each used to spell
+    the sum out with a comment saying it had to match the other. Drift shows
+    up only under a slow clone, at review time, on a real pull request.
+    """
+    return CHECKOUT_GRACE + config["review_timeout"]
+
+
 # Seconds of token life reserved for the checkout, on top of the review's own
 # budget. One token covers both and the checkout runs first: a clone of a
 # large repository over a slow link is minutes, so asking only for
@@ -127,6 +137,11 @@ LIST_TIMEOUT = 120
 # the point is only that it ends: the poll loop is one thread and an
 # unanswered socket would otherwise hold it for as long as TCP allows.
 POST_TIMEOUT = 60
+
+# How every review Vinegar posts opens, and how it recognises its own when
+# asking whether one already landed. The two uses must agree, so they read
+# it from here rather than each spelling it out.
+BODY_MARK = "**Vinegar** \u00b7"
 
 # Characters of the reviewer's own prose worth carrying when it never
 # reported. It stands in for a closing summary, so a couple of paragraphs is
@@ -625,7 +640,7 @@ def read_stream(stdout, label="review"):
     The last call wins. The contract asks for one, and a second would be a
     correction of the first.
     """
-    result, findings, spoken = None, None, []
+    result, findings, spoken = None, None, ""
     for line in stdout.split("\n"):
         line = line.strip()
         if not line.startswith("{"):
@@ -686,8 +701,15 @@ def read_stream(stdout, label="review"):
                 # thirty has been narrating throughout, and posting all of it
                 # put a wall of "let me read the enclosing function" on the
                 # pull request in place of a review.
-                spoken[:] = [str(block.get("text") or "")]
-    return result, findings, (spoken[0].strip() if spoken else "")[:MAX_SPOKEN]
+                spoken = str(block.get("text") or "")
+    spoken = spoken.strip()
+    if len(spoken) > MAX_SPOKEN:
+        # Said, not silently done. review_body introduces this text with
+        # "its own words follow unedited", and a closing summary keeps its
+        # conclusion at the end, which is the half a silent cut removes.
+        spoken = spoken[:MAX_SPOKEN] + "\n\n(cut after %d characters)" % (
+            MAX_SPOKEN,)
+    return result, findings, spoken
 
 
 def diff_lines(path, base, env, label):
@@ -903,8 +925,8 @@ def review_body(label, pr, config, inline, general, raw=None,
     diff_lines and the base branch instead of to the error submit_review
     logged.
     """
-    lines = ["**Vinegar** · reviewed `%s` at %s effort" % (
-        pr["headRefOid"][:7], config["effort"])]
+    lines = ["%s reviewed `%s` at %s effort" % (
+        BODY_MARK, pr["headRefOid"][:7], config["effort"])]
 
     # A run that was killed or that errored still reports whatever it had
     # got to, and without this that is indistinguishable from a finished
@@ -1035,34 +1057,49 @@ def announce(label, post):
 
 
 def already_posted(label, repo, pr, env):
-    """Whether a review for this commit is already on the pull request.
+    """Whether one of *Vinegar's own* reviews of this commit is already up.
 
     Asked before resending one that may have failed after landing. A 5xx or
     a dropped connection is reported the same way whether GitHub committed
     the review or not, so a blind retry can leave two reviews where the
     operator asked for one. Reading is cheap and settles it.
 
-    A failure here answers "not sure", which resends: a duplicate review is
-    a worse outcome than one review, and no review at all is worse than both.
+    Three things this has to get right, each of which it got wrong first.
+
+    It matches on Vinegar's own first line, not merely on the commit. Asking
+    whether *any* review exists at this sha lets a human reviewing the same
+    commit suppress Vinegar's entirely, and a suppressed review is silence,
+    which is the one outcome that is never allowed.
+
+    It paginates. GitHub returns thirty per page, oldest first, so on a busy
+    pull request the review that just landed is on the last page and a single
+    page would miss precisely the case this exists for.
+
+    It answers "no" when it cannot tell. A duplicate review is worse than one
+    review; no review at all is worse than both.
     """
     try:
-        result = run(["gh", "api", "-X", "GET",
+        result = run(["gh", "api", "--paginate", "-X", "GET",
                       "repos/%s/pulls/%d/reviews" % (repo, pr["number"]),
-                      "--jq", ".[].commit_id"],
+                      "--jq", '.[] | select(.commit_id == "%s") '
+                              '| .body | split("\n")[0]'
+                              % pr["headRefOid"]],
                      env=env, timeout=POST_TIMEOUT)
     except subprocess.TimeoutExpired:
         return False
     if result.returncode != 0:
         return False
-    return pr["headRefOid"] in result.stdout.split()
+    return any(line.startswith(BODY_MARK)
+               for line in result.stdout.splitlines())
 
 
 def post_review(label, repo, pr, path, text, findings, config, env,
                 note=None):
     """Turn what the reviewer reported into one review on the pull request."""
     if findings is None:
-        log("%s: the reviewer reported no findings through %s, posting its "
-            "text as the review" % (label, REPORT_TOOL))
+        log("%s: %s, posting its text as the review" % (
+            label, "the review stopped before reporting" if note else
+            "the reviewer reported no findings through %s" % REPORT_TOOL))
         inline, general, raw = [], [], text
     elif not findings:
         # Nothing to anchor, so nothing to work the diff out for. That is a
@@ -1096,6 +1133,16 @@ def post_review(label, repo, pr, path, text, findings, config, env,
         # request. Sending it again would post the review twice.
         return
 
+    # Before either retry, not just the anchorless one. A 5xx can arrive
+    # after GitHub has already created the review, and both retries would
+    # then add a second: the anchorless one resends the same body, the
+    # anchored one resends a different body, and the pull request carries two
+    # reviews either way. This is the ambiguity submit_review refuses to
+    # guess at on a timeout; here one cheap read settles it.
+    if already_posted(label, repo, pr, env):
+        log("%s: the review is already on the pull request" % label)
+        return
+
     if not inline:
         # Nothing to strip out, so the same request again. A review with no
         # inline comments cannot have been refused over an anchor, which
@@ -1103,14 +1150,6 @@ def post_review(label, repo, pr, path, text, findings, config, env,
         # for. Without this a clean review, or the reviewer's own words, met
         # one 502 and the pull request received nothing at all, for good:
         # the outcome is recorded reviewed and `review_on_push` is false.
-        #
-        # Asked first, because a 5xx can arrive after GitHub has already
-        # created the review and a blind resend would leave two. That is the
-        # same ambiguity submit_review refuses to guess at on a timeout; here
-        # one cheap read settles it instead of guessing.
-        if already_posted(label, repo, pr, env):
-            log("%s: the review is already on the pull request" % label)
-            return
         log("%s: retrying the review comment" % label)
         submit_review(label, repo, pr, payload, env)
         return
@@ -1260,7 +1299,7 @@ def review(path, repo, pr, config, env, tokens):
         # for memory, a segfault, a truncated pipe. If it had already reported
         # its findings that is still a review, and throwing it away would lose
         # it and then charge for it twice more, since FAILED is retried.
-        detail = (result.stderr or result.stdout).strip()
+        detail = (result.stderr or result.stdout)[:400].strip()
         log("%s: claude printed no result after %ds: %s" % (
             label, took, detail[:400]))
         if findings is None:
@@ -1315,7 +1354,11 @@ def review(path, repo, pr, config, env, tokens):
     # outcomes, and a default only applies to a key that is absent. Missing
     # that turned "the review said nothing" into the four characters "None",
     # posted as though the reviewer had written them.
-    text = str(output.get("result") or "")
+    # Falling back to what the reviewer actually said. `result` arrives
+    # present-and-null on some outcomes, and posting "the run produced
+    # nothing" while holding its closing message is a false statement about
+    # a review that spoke. Both salvage paths already prefer `spoken`.
+    text = str(output.get("result") or "") or spoken
 
     # Whether findings arrived, not which error subtype did. An error can
     # land after the reviewer has already reported: the turn limit is the
@@ -1432,7 +1475,7 @@ def handle_pr(repo, pr, config, state, tokens):
     # knowing when revisiting it: past that point the guarantee is gone rather
     # than merely expensive.
     env = github_env(config, repo, tokens,
-                     good_for=CHECKOUT_GRACE + config["review_timeout"])
+                     good_for=checkout_grace(config))
 
     try:
         path = checkout(repo, pr, env)
@@ -1620,7 +1663,7 @@ def main():
             # token covers the checkout and the review that follows it. The
             # posting asks for its own, in review().
             env = github_env(config, repo, tokens,
-                             good_for=CHECKOUT_GRACE + config["review_timeout"])
+                             good_for=checkout_grace(config))
             pr = find_pr(repo, number, env)
             reason = skip_reason(pr, config)
             if reason:

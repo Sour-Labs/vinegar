@@ -32,6 +32,7 @@ went wrong in a way the docstrings now describe.
 The event shapes were copied from a stream a real review produced, not
 invented.
 """
+import inspect
 import json
 import os
 import atexit
@@ -40,7 +41,8 @@ import subprocess
 import sys
 import tempfile
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+here_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, here_dir)
 # Before the import: the module reads this at import time to place its state,
 # and a test run must not go looking at the real one.
 _home = tempfile.mkdtemp(prefix="vinegar-test-home-")
@@ -172,11 +174,14 @@ check("only the reviewer's last words are kept, not the whole run",
           {"type": "assistant", "message": {"content": [
               {"type": "text", "text": "Closing summary."}]}},
           DONE_EVENT))[2] == "Closing summary.")
+_long = vinegar.read_stream(stream(
+    {"type": "assistant", "message": {"content": [
+        {"type": "text", "text": "x" * 90000}]}},
+    DONE_EVENT))[2]
 check("the reviewer's words are capped before they reach a comment",
-      len(vinegar.read_stream(stream(
-          {"type": "assistant", "message": {"content": [
-              {"type": "text", "text": "x" * 90000}]}},
-          DONE_EVENT))[2]) <= vinegar.MAX_SPOKEN)
+      len(_long) < 90000 and _long.startswith("x"), len(_long))
+check("a cut is admitted rather than passed off as the whole message",
+      "cut after" in _long, _long[-60:])
 check("another tool's call is not mistaken for findings",
       vinegar.read_stream(stream(call(REAL, name="Bash"), DONE_EVENT))[1]
       is None)
@@ -462,7 +467,22 @@ check("a posting failure cannot escape and cost a re-review",
 # handle_pr does not wrap the call, so anything escaping leaves no state and
 # the pull request is re-reviewed at full cost on every poll from then on.
 real_env, real_transcript = vinegar.github_env, vinegar.save_transcript
-vinegar.save_transcript = lambda repo, pr, text, findings=None: "/dev/null"
+# Signature-checked against the real function. A stub that quietly rejects
+# the call it stands in for sends every test through finish()'s
+# transcript-failed branch while still passing, which is what happened when
+# save_transcript gained its `note` argument.
+_tx_calls = []
+
+
+def stub_transcript(repo, pr, text, findings=None, note=None):
+    _tx_calls.append((repo, pr, text, findings, note))
+    return "/dev/null"
+
+
+assert (inspect.signature(stub_transcript).parameters.keys()
+        == inspect.signature(vinegar.save_transcript).parameters.keys()), \
+    "the save_transcript stub no longer matches the real signature"
+vinegar.save_transcript = stub_transcript
 
 
 def exploding_env(*a, **k):
@@ -566,8 +586,10 @@ vinegar.review(ROOT, "o/r", PR, CONFIG, None, {})
 check("the review asks for the stream the tool call arrives in",
       "stream-json" in claude_run.saw and "--verbose" in claude_run.saw,
       claude_run.saw)
-check("the reporting tool is not withheld any more",
-      "--disallowedTools" not in claude_run.saw, claude_run.saw)
+check("the reporting tool is allowed, which is what makes it reachable",
+      "ReportFindings" in json.load(
+          open(os.path.join(here_dir, "review-settings.json"))
+      )["permissions"]["allow"])
 check("the environment asks for the tool contract",
       (claude_run.env or {}).get("CLAUDE_CODE_REPORT_FINDINGS") == "1",
       sorted(claude_run.env or {})[:5])
@@ -776,7 +798,7 @@ vinegar.review, vinegar.save_state = _real_review, _real_save_state
 claude_run.stream = stream(call([]), result_event())
 vinegar.run, vinegar.github_env = claude_run, lambda *a, **k: None
 fake_run.rc = 1
-fake_run.look_out = "a1b2c3d4e5f6\n"
+fake_run.look_out = vinegar.BODY_MARK + " reviewed `a1b2c3d` ...\n"
 del posted[:]
 del looked[:]
 vinegar.review(ROOT, "o/r", PR, CONFIG, None, {})
@@ -784,12 +806,44 @@ check("a refused post asks before resending",
       len(looked) == 1, (len(looked), len(posted)))
 check("a review that already landed is not posted twice",
       len(posted) == 1, len(posted))
+fake_run.look_out = "A human reviewed this at the same commit.\n"
+del posted[:]
+vinegar.review(ROOT, "o/r", PR, CONFIG, None, {})
+check("someone else's review at the same commit does not suppress ours",
+      len(posted) == 2, len(posted))
 
+check("the landed-review question asks every page",
+      "--paginate" in looked[0], looked[0])
+
+# The anchored retry is the common path and was the unguarded one.
+claude_run.stream = stream(call(FINDINGS[:1]), result_event())
+fake_run.look_out = vinegar.BODY_MARK + " reviewed `a1b2c3d` ...\n"
+del posted[:]
+del looked[:]
+vinegar.review(ROOT, "o/r", PR, CONFIG, None, {})
+check("a landed review is not resent by the anchored retry either",
+      len(posted) == 1 and len(looked) == 1, (len(posted), len(looked)))
+
+claude_run.stream = stream(call([]), result_event())
 fake_run.look_out = ""
 del posted[:]
 vinegar.review(ROOT, "o/r", PR, CONFIG, None, {})
 check("a review that did not land is resent",
       len(posted) == 2, len(posted))
+
+# A result field that is empty must not discard what the reviewer said.
+fake_run.rc = 0
+claude_run.stream = stream(
+    {"type": "assistant", "message": {"content": [
+        {"type": "text", "text": "I could not finish, but the risk is here."}]}},
+    result_event(result=None))
+del posted[:]
+vinegar.review(ROOT, "o/r", PR, CONFIG, None, {})
+check("an empty result field falls back to the reviewer's own words",
+      posted and "the risk is here" in posted[0][1]["body"]
+      and "produced nothing" not in posted[0][1]["body"],
+      posted[0][1]["body"][:180] if posted else "nothing posted")
+fake_run.rc = 1
 fake_run.rc = 0
 vinegar.run = fake_run
 
@@ -835,10 +889,9 @@ vinegar.REVIEW_DIR = _tx_real
 os.makedirs(os.environ["VINEGAR_HOME"], exist_ok=True)
 with open(os.path.join(os.environ["VINEGAR_HOME"], "config.json"), "w") as h:
     json.dump({"repos": ["o/r"]}, h)
-here = os.path.dirname(os.path.abspath(__file__))
 for target in ("nonsense", "o/r#2x", "o/r#²", "o/r#١٢"):
     proc = subprocess.run(
-        [sys.executable, os.path.join(here, "vinegar.py"), "--pr", target],
+        [sys.executable, os.path.join(here_dir, "vinegar.py"), "--pr", target],
         capture_output=True, text=True)
     refused = (proc.returncode != 0
                and "wants owner/repo#number" in (proc.stdout + proc.stderr)
