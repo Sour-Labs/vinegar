@@ -115,6 +115,11 @@ POST_GRACE = 300
 # unanswered socket would otherwise hold it for as long as TCP allows.
 POST_TIMEOUT = 60
 
+# The tool the reviewer reports its findings through. Named here because
+# review() has to make it available and read_stream() has to recognise it,
+# and the two must agree or findings arrive nowhere.
+REPORT_TOOL = "ReportFindings"
+
 # Characters a review comment may carry. GitHub's own ceiling is 65536 and it
 # refuses the whole review for going over, which on the path that posts the
 # reviewer's message verbatim would mean posting nothing at all. The reviewer
@@ -484,9 +489,11 @@ def reviewer_brief(pr):
     one piece, so a finding the reviewer keeps to itself is a finding nobody
     ever sees.
 
-    That half spells the contract out rather than deferring to the one
-    /code-review sets, which an earlier version did, to its cost. See the
-    --disallowedTools note in review() for why the two used to disagree.
+    That half names the same tool /code-review asks for rather than a
+    competing format. An earlier version deferred to "your output contract"
+    and then, when that turned out to mean a tool whose output Vinegar could
+    not see, argued with it instead. Both cost live reviews. Agreeing with
+    the command is the only arrangement that has worked.
 
     Both go in the system prompt rather than after the command, because
     everything after the effort level is collapsed into /code-review's review
@@ -508,14 +515,12 @@ def reviewer_brief(pr):
         "resolve, fall back to `gh pr diff %d` and say in your summary that "
         "you did. Do not substitute a branch of your own choosing, and do not "
         "assume `main`.\n\n"
-        "Post nothing to GitHub yourself. End your final message with a "
-        "fenced ```json block holding an array of every finding, each an "
-        "object with `file`, `line`, `summary` and `failure_scenario`. Use an "
-        "empty array when you found nothing, and give `file` relative to the "
-        "repository root. That block is the only part of your answer Vinegar "
-        "can read, and it posts the whole review from it, so a finding "
-        "missing from it is a finding nobody sees."
-        % (pr["number"], base, base, pr["number"]))
+        "Post nothing to GitHub yourself. Report every finding through the "
+        "%s tool, including when you found none, and give `file` relative to "
+        "the repository root. Vinegar reads that call and posts the whole "
+        "review from it, so a finding you leave out of it is a finding "
+        "nobody sees."
+        % (pr["number"], base, base, pr["number"], REPORT_TOOL))
 
 
 def clamp(label, body):
@@ -532,92 +537,47 @@ def clamp(label, body):
     return body[:MAX_BODY] + "\n\n(cut to fit GitHub's comment limit)"
 
 
-def is_findings(value):
-    """Whether a decoded JSON value is a non-empty array of findings.
+def read_stream(stdout):
+    """The reviewer's findings, and the result event that ends its stream.
 
-    "Array of objects" is a shape plenty of other things have, this file's own
-    `comments` payload among them, and a review explaining itself quotes one.
-    So at least one entry has to carry a field a finding carries.
+    Findings arrive as a ReportFindings tool call rather than as text in the
+    final message. That call is the reviewer's own structured output, so
+    there is nothing to parse out of prose: no fences to track, no arrays to
+    tell apart from arrays it happened to quote, and no way for a `[]` in a
+    sentence to be mistaken for the answer. Seven rounds of review found bugs
+    in the code that did all that, and this replaces it.
+
+    Returns findings as None when no call was made, which is different from
+    an empty list. None means the reviewer said nothing Vinegar can act on
+    and its own words get posted instead; an empty list means it looked and
+    found nothing.
+
+    The last call wins. The contract asks for one, and a second would be a
+    correction of the first.
     """
-    return (isinstance(value, list) and value
-            and all(isinstance(item, dict) for item in value)
-            and any(key in item for item in value
-                    for key in ("file", "summary", "failure_scenario")))
-
-
-def parse_findings(text):
-    """The reviewer's findings array, or None if it did not return one.
-
-    None and `[]` are different answers and the caller treats them that way:
-    an empty array is the reviewer saying it found nothing, while None is the
-    reviewer having said something Vinegar cannot read.
-
-    An array whose entries are not all objects is not findings, and reading it
-    as an empty review would put a confident "No findings." on a pull request
-    that had some. It counts as unreadable instead.
-
-    Fenced blocks are found by tracking the fences down the message rather
-    than by pairing them with a regex. A regex pairs them left to right, so
-    one earlier code block in the summary shifts every pair after it and the
-    real block at the end is never seen.
-
-    An array with no fence around it is tried after that. `raw_decode` reads
-    one value and ignores what follows, so a closing sentence, or a stray
-    bracket in the prose, cannot swallow or truncate it.
-
-    An array has to hold something shaped like a finding, because "objects"
-    alone is a shape plenty of other things have. A review that quotes a JSON
-    payload while explaining itself, this file's own `comments` array being
-    the obvious one, hands over a nested array of dicts that would otherwise
-    be accepted the moment the real block failed to parse. The result would be
-    a confident review of one finding with no file and no summary, posted in
-    place of the reviewer's actual words.
-    """
-    # split("\n"), not splitlines(). splitlines() also breaks on \x0b, \x0c,
-    # \x1c to \x1e, \x85 and U+2028/U+2029, every one of which is legal inside
-    # a JSON string. Rejoining those pieces with \n rewrites the block into
-    # something that no longer parses, and a review is lost to a form feed
-    # someone quoted.
-    fenced, block, open_fence = [], None, False
-    for line in text.split("\n"):
-        marker = line.strip().startswith("```")
-        if marker and not open_fence:
-            block, open_fence = [], True
-        elif marker and open_fence:
-            fenced.append("\n".join(block))
-            block, open_fence = None, False
-        elif open_fence:
-            block.append(line)
-
-    # The last fenced block is the answer, and only that one. Reading past it
-    # to an earlier block was how an empty array quoted while explaining the
-    # format came to answer for a review whose real block was truncated, and
-    # "No findings." is the one thing this must never say by accident.
-    #
-    # A last block that is not an array leaves the question open rather than
-    # settling it, so a review that ends with some other snippet falls to the
-    # scan below. That scan never returns an empty array, so nothing down
-    # there can invent a clean review either.
-    if fenced:
-        try:
-            answer = json.loads(fenced[-1])
-        except json.JSONDecodeError:
-            answer = None
-        if isinstance(answer, list):
-            return answer if is_findings(answer) or not answer else None
-
-    # Only now, and only because nothing fenced parsed as an array at all. It
-    # walks the message once per `[`, so running it when a fenced block
-    # already answered would cost the message's length squared for nothing.
-    decoder = json.JSONDecoder()
-    for start in reversed([hit.start() for hit in re.finditer(r"\[", text)]):
-        try:
-            findings, _ = decoder.raw_decode(text[start:])
-        except ValueError:
+    result, findings = None, None
+    for line in stdout.split("\n"):
+        line = line.strip()
+        if not line.startswith("{"):
             continue
-        if is_findings(findings):
-            return findings
-    return None
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            # A single unreadable line must not cost the whole stream: the
+            # result event may still be further down it.
+            continue
+        if event.get("type") == "result":
+            result = event
+            continue
+        message = event.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        for block in content if isinstance(content, list) else ():
+            if (isinstance(block, dict) and block.get("type") == "tool_use"
+                    and block.get("name") == REPORT_TOOL):
+                reported = (block.get("input") or {}).get("findings")
+                if isinstance(reported, list):
+                    findings = reported
+    return result, findings
 
 
 def diff_lines(path, base, env, label):
@@ -907,13 +867,12 @@ def post_timeout(repo, pr, config, seconds, env):
         submit_review(repo, pr, payload, env)
 
 
-def post_review(repo, pr, path, text, config, env):
-    """Turn what the reviewer returned into one review on the pull request."""
+def post_review(repo, pr, path, text, findings, config, env):
+    """Turn what the reviewer reported into one review on the pull request."""
     label = "%s#%d" % (repo, pr["number"])
-    findings = parse_findings(text)
     if findings is None:
-        log("%s: the reviewer returned no findings array, posting its text "
-            "as the review" % label)
+        log("%s: the reviewer reported no findings through %s, posting its "
+            "text as the review" % (label, REPORT_TOOL))
         inline, general, raw = [], [], text
     elif not findings:
         # Nothing to anchor, so nothing to work the diff out for. That is a
@@ -980,30 +939,33 @@ def review(path, repo, pr, config, env, tokens):
     # This does not cover a CLAUDE.md in the checkout, which is still read as
     # project instructions. See "What the reviewer is allowed to do".
     #
-    # ReportFindings is withheld, and that is what makes any of this work.
-    # /code-review picks its output contract from whether that tool is in the
-    # session: with it, the review is told to report through the tool and
-    # *not* to print the findings as text; without it, to end with a JSON
-    # array in its final message. Only the final message reaches this process.
-    # So while the tool was available the findings went somewhere Vinegar
-    # cannot see, and asking for the array in the system prompt just argued
-    # with the command. Two live reviews were lost that way, both coming back
-    # as prose with no array. Removing the tool makes /code-review ask for the
-    # array itself, which agrees with reviewer_brief() instead of fighting it.
+    # Three settings that only work together, and the reviewer's findings
+    # arrive nowhere if any one of them is dropped.
     #
-    # It is a flag rather than a deny in review-settings.json because that
-    # file is the security boundary, and this is not about danger. Withholding
-    # it costs nothing: the tool renders findings for an interactive UI that
-    # a daemon does not have.
+    # /code-review picks how it reports from whether ReportFindings is in the
+    # session and what the output format is. `stream-json` plus the env var
+    #選 selects the tool; `json` or `text` selects a JSON array printed in the
+    # final message instead. The tool is the better half of that choice: it
+    # is the reviewer's own structured output, so nothing has to be picked
+    # back out of prose, and it carries a category and a short summary that
+    # text never did.
+    #
+    # `--verbose` because the tool call is an event in the stream rather than
+    # part of the final result, and this is the combination that was measured
+    # working rather than the one that reads most likely.
     cmd = ["claude", "-p", prompt,
            "--append-system-prompt", reviewer_brief(pr),
-           "--disallowedTools", "ReportFindings",
-           "--output-format", "json",
+           "--output-format", "stream-json", "--verbose",
            "--settings", SETTINGS_PATH,
            "--setting-sources", "",
            "--strict-mcp-config"]
     if config["model"]:
         cmd += ["--model", config["model"]]
+
+    # The env var is what makes the choice deterministic. Without it the
+    # decision falls through to a server-side flag that is off by default,
+    # and the reviewer goes back to printing text.
+    env = dict(env or os.environ, CLAUDE_CODE_REPORT_FINDINGS="1")
 
     label = "%s#%d" % (repo, pr["number"])
     log("%s: reviewing at %s effort%s" % (
@@ -1022,9 +984,9 @@ def review(path, repo, pr, config, env, tokens):
         return DONE
     took = round(time.monotonic() - started)
 
-    try:
-        output = json.loads(result.stdout)
-    except json.JSONDecodeError:
+    output, findings = read_stream(result.stdout)
+    if output is None:
+        # No terminal result event, so the process did not finish a review.
         detail = (result.stderr or result.stdout).strip()
         log("%s: claude printed no result after %ds: %s" % (
             label, took, detail[:400]))
@@ -1089,9 +1051,9 @@ def review(path, repo, pr, config, env, tokens):
     # entire output of the run, and this is the last moment it can be made
     # safe cheaply. A dry run mints nothing, having nothing to post.
     announce(label, lambda: post_review(
-        repo, pr, path, text, config,
+        repo, pr, path, text, findings, config,
         github_env(config, repo, tokens, good_for=POST_GRACE)
-        if config["comment"] else env))
+        if config["comment"] else None))
     return DONE
 
 

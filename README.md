@@ -28,7 +28,7 @@ The reviewer is not something Vinegar implements. Claude Code already ships a
 and runs non-interactively:
 
 ```sh
-claude -p '/code-review 123' --output-format json
+claude -p '/code-review 123' --output-format stream-json
 ```
 
 Vinegar is the trigger, the router, and the calibration around that. It also
@@ -148,21 +148,13 @@ The last five are budget and safety controls, not optimizations. Automated
 reviews spend the same subscription limits as your interactive Claude Code
 work.
 
-**`model` and `effort` together decide whether findings come back at all.**
-`/code-review` picks its prompt from a table keyed by both, and not every
-prompt in it can be asked for structured output. Pinning `model` to Opus 5 and
-leaving `effort` at `high` or `medium` selects one that cannot: it asks the
-reviewer for a tool call plus a prose restatement, so Vinegar reads no findings
-and posts the reviewer's text as one comment with no inline anchors. It happens
-quietly, because a review is still posted and still says useful things.
-
-With Opus 5 pinned, use `xhigh` or `max`. With `model` left null, `high` is
-fine. If your reviews stop arriving as inline comments, this pairing is the
-first thing to check, and `~/.vinegar/logs/` says
-`the reviewer returned no findings array` on every affected run.
-
-This is a detail of a command Vinegar does not own, so treat it as true of the
-Claude Code version you have rather than forever.
+**`model` and `effort` together decide how good the review is.**
+`/code-review` picks its prompt from a table keyed by both. Opus 5 at `high`
+or `medium` selects a single-pass prompt; `xhigh` runs ten finder angles and a
+sweep. On this repository `xhigh` found 15 findings for $1.65 where `high`
+found between 2 and 6 for $1.31 to $2.18, so the deeper setting was both
+better and cheaper per finding. Measure on your own repository before
+believing that.
 
 ### Posting as Vinegar instead of as you
 
@@ -512,14 +504,24 @@ the whole review in one request when the run finishes. Findings still arrive as
 separate inline comments anchored to their line; what changed is that they all
 appear at the same moment.
 
-Getting the findings back takes one non-obvious flag: `/code-review` is run with
-`--disallowedTools ReportFindings`. That command picks its output contract from
-whether that tool is in the session. With it, the review reports through the
-tool and is told not to print its findings as text, and a tool call does not
-reach the process's final message, which is all Vinegar reads. Withholding it
-makes `/code-review` ask for a JSON array in the message instead. Two live
-reviews were lost before this was understood: both came back as prose, and both
-were posted as raw text with no inline comments.
+The findings arrive as a `ReportFindings` tool call, which is the reviewer's
+own structured output: a list of objects with a file, a line, a summary, a
+concrete failure scenario and a category. Nothing has to be recovered from
+prose, which matters more than it sounds. An earlier version read a JSON block
+out of the final message, and nearly every bug found in seven rounds of review
+was a bug in the code that did that: fences paired wrongly, an array quoted in
+passing mistaken for the answer, `[]` in a sentence read as "no findings".
+
+Three settings make it work and they only work together. `/code-review` is run
+with `--output-format stream-json --verbose`, `ReportFindings` is allowed in
+`review-settings.json`, and `CLAUDE_CODE_REPORT_FINDINGS=1` is set in the
+reviewer's environment. Drop any one and the command goes back to printing a
+JSON array in its final message, which Vinegar no longer reads, so the review
+posts as one raw-text comment with no inline anchors. The log says
+`reported no findings through ReportFindings` when that happens.
+
+This is a detail of a command Vinegar does not own, so treat it as true of the
+Claude Code version you have rather than forever.
 
 That timing is the point. The comments appearing is how you know the round is
 finished and the feedback is complete enough to hand to an agent. While the
