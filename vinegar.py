@@ -1216,8 +1216,13 @@ def review_body(label, pr, config, inline, general, raw=None,
         fixed = len("\n".join(lines + ["", heading, ""]))
         running = sum(len(bullet) + 1 for bullet in bullets)
         dropped = 0
+        # +2, not +1: the note is appended as ["", note], so joining costs
+        # a newline for the blank line and another before the note itself.
+        # Budgeting one left a body that could land on MAX_BODY + 1 and
+        # fall into clamp(), which shears the note it just wrote and adds
+        # a second, contradicting truncation notice.
         while bullets and fixed + running + (
-                len(overflow_note(dropped)) + 1 if dropped else 0) > MAX_BODY:
+                len(overflow_note(dropped)) + 2 if dropped else 0) > MAX_BODY:
             running -= len(bullets.pop()) + 1
             dropped += 1
         if dropped:
@@ -1456,8 +1461,12 @@ def post_review(label, repo, pr, path, text, findings, config, env,
         prevent, on the one path that never ran it.
         """
         if settled == POSTED:
+            # What the payload carries now, not what was routed at the
+            # top: the anchor-stripping retry pops the comments, and
+            # reporting three inline comments on a request that sent none
+            # tells whoever is debugging that anchoring worked.
             log("%s: posted %d inline comment(s) and the review comment" % (
-                label, len(inline)))
+                label, len(payload.get("comments", ()))))
             return True
         return settled == UNSURE and already_posted(
             label, repo, pr, env, verb)
@@ -1589,9 +1598,18 @@ def finish(label, repo, pr, path, text, findings, config, env, tokens,
                 with open(path_kept, encoding="utf-8",
                           errors="replace") as handle:
                     whole = handle.read()
-                write_atomic(path_kept, whole + "\n\n---\n\n%s\n" % note)
-                log("%s: the ending is appended to the transcript the "
-                    "attempts left" % label)
+                # Once, however many times the announcement is retried.
+                # record_give_up() calls this up to MAX_ATTEMPTS times
+                # while the posting keeps failing, and each call used to
+                # append another identical ending to the file that is a
+                # dry run's only artifact.
+                if note in whole:
+                    log("%s: the transcript already records this ending" %
+                        label)
+                else:
+                    write_atomic(path_kept, whole + "\n\n---\n\n%s\n" % note)
+                    log("%s: the ending is appended to the transcript the "
+                        "attempts left" % label)
             except Exception as err:
                 log("%s: the transcript is not saved: %s" % (label, err))
         else:
@@ -1666,9 +1684,24 @@ def review(path, repo, pr, config, env, tokens):
         endings used to repeat the same nine arguments, and finish()'s own
         docstring records what that cost the last time: the partial-run
         marker was added to one path and not the other.
+
+        The outcome stays DONE whatever the posting answers, because the
+        subscription is spent and re-running the review is the one repair
+        nobody wants. But a refusal must not read like a success: the
+        pull request is closed off at this point, `review_on_push` is
+        false, and the findings exist only on disk. Saying which findings
+        and where is what makes that recoverable by hand.
         """
-        announce(label, lambda: finish(
-            label, repo, pr, path, text, findings, config, env, tokens, note))
+        if announce(label, lambda: finish(
+                label, repo, pr, path, text, findings, config, env, tokens,
+                note)):
+            return True
+        if config["comment"]:
+            log("%s: nothing reached the pull request. The review is in "
+                "%s; post it by hand, or delete this pull request's entry "
+                "from %s to review it again" % (
+                    label, transcript_path(repo, pr), STATE_PATH))
+        return False
 
     log("%s: reviewing at %s effort%s" % (
         label, config["effort"], "" if config["comment"] else ", dry run"))
@@ -1841,7 +1874,8 @@ def poll_once(config, state, tokens):
                     repo, pr.get("number", "?"), err))
 
 
-def give_up(key, repo, pr, config, attempts, tokens, path=None, env=None):
+def give_up(key, repo, pr, config, attempts, tokens, path=None, env=None,
+            tries=0):
     """Say, once, that Vinegar has stopped trying to review this.
 
     Called from two moments that must say the same thing: the last attempt
@@ -1859,8 +1893,17 @@ def give_up(key, repo, pr, config, attempts, tokens, path=None, env=None):
     turned one bad minute at GitHub into permanent silence: every later
     poll saw the mark and returned.
     """
-    log("%s: %d failed attempts, leaving it alone. Fix the cause, then "
-        "delete its entry from %s to try again" % (key, attempts, STATE_PATH))
+    # The decision once, the retries as retries. This runs again on every
+    # poll while the announcement fails to land, and three identical
+    # "leaving it alone" lines in a log several repositories share read as
+    # three separate pull requests being abandoned.
+    if tries:
+        log("%s: trying again to say that Vinegar gave up (attempt %d of "
+            "%d)" % (key, tries + 1, MAX_ATTEMPTS))
+    else:
+        log("%s: %d failed attempts, leaving it alone. Fix the cause, then "
+            "delete its entry from %s to try again" % (
+                key, attempts, STATE_PATH))
     # Said on the pull request, not only in a log nobody is watching.
     # Silence has to keep meaning that something broke, which is only true
     # if the giving-up is announced.
@@ -1886,9 +1929,30 @@ def record_give_up(key, repo, pr, config, state, tokens, head, attempts,
     and a log line a minute, per stuck pull request, for ever. After
     MAX_ATTEMPTS tries the entry is marked anyway and the giving-up stays
     in the log, which is the honest end of a pull request Vinegar cannot
-    write to at all.
+    write to at all. spend_announce() keeps that budget.
     """
-    said = give_up(key, repo, pr, config, attempts, tokens, path, env)
+    said = give_up(key, repo, pr, config, attempts, tokens, path, env, tries)
+    spend_announce(key, config, state, head, attempts, tries, said)
+    return said
+
+
+def spend_announce(key, config, state, head, attempts, tries, said):
+    """Count one attempt at announcing a give-up, and record where it left
+    things.
+
+    Separate from record_give_up() because the mint-failure path spends an
+    attempt without having anything to send, and spelling the same
+    budget rule out in both places is how the two would come to disagree
+    about when a pull request is abandoned.
+
+    A dry run never marks anything announced. post_review() answers True
+    there because posting nothing is what a dry run asked for, but that
+    answer must not reach `state.json`: one `--dry-run` against the real
+    VINEGAR_HOME would otherwise tell the live daemon the give-up had
+    already been said, and the pull request would stay silent for good.
+    """
+    if not config["comment"]:
+        return
     tries += 1
     spent = tries >= MAX_ATTEMPTS
     if not said and spent:
@@ -1897,7 +1961,6 @@ def record_give_up(key, repo, pr, config, state, tokens, head, attempts,
     state[key] = state_entry(head, FAILED, attempts,
                              announced=said or spent, tries=tries)
     save_state(state)
-    return said
 
 
 def handle_pr(repo, pr, config, state, tokens):
@@ -1947,10 +2010,8 @@ def handle_pr(repo, pr, config, state, tokens):
                     # for ever, which is the bound this branch is under.
                     log("%s: cannot mint a token to announce the give-up: "
                         "%s" % (key, err))
-                    state[key] = state_entry(
-                        head, FAILED, done["attempts"],
-                        announced=tries + 1 >= MAX_ATTEMPTS, tries=tries + 1)
-                    save_state(state)
+                    spend_announce(key, config, state, head,
+                                   done["attempts"], tries, False)
                     return
                 # None is not a failure here: it is what github_env answers
                 # when no App is configured, and ambient `gh` is then the

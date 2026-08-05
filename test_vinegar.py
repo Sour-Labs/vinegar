@@ -493,6 +493,26 @@ for _pad in range(0, 20):
 check("the overflow note is counted in what has to fit",
       all(_sweep), _sweep)
 
+# And counted to the character. The note is appended as ["", note], which
+# costs two newlines once joined, not one; budgeting one puts the body at
+# exactly MAX_BODY + 1 and hands it to clamp(), which shears the note it
+# just wrote and adds a second, contradicting one. Only a one-character
+# step finds that, so the ceiling is lowered to keep the sweep cheap and
+# every offset in a bullet's width is tried.
+_real_max = vinegar.MAX_BODY
+vinegar.MAX_BODY = 2000
+_fine = []
+for _pad in range(0, 160):
+    _small = [{"file": "a.py", "summary": "s", "category": "correctness",
+               "failure_scenario": "y" * 100} for _ in range(30)]
+    _small[0]["failure_scenario"] = "y" * (100 + _pad)
+    _b = vinegar.review_body(L, PR, CONFIG, [], _small)
+    _fine.append(len(_b) <= vinegar.MAX_BODY
+                 and "cut to fit GitHub's comment limit" not in _b)
+vinegar.MAX_BODY = _real_max
+check("the overflow note's own newlines are counted",
+      all(_fine), _fine.count(False))
+
 del posted[:]
 vinegar.post_review(L, "o/r", PR, ROOT, text, FINDINGS[:4],
                     dict(CONFIG, comment=False), None)
@@ -680,6 +700,37 @@ except SystemExit:
 vinegar.REPORT_TOOL = _rt
 check("a reporting tool the settings do not allow refuses to start",
       _agreed == "refused", _agreed)
+
+
+def _refuses(**over):
+    """Whether check_paths exits with these module paths in place."""
+    keep = {name: getattr(vinegar, name) for name in over}
+    for name, value in over.items():
+        setattr(vinegar, name, value)
+    try:
+        vinegar.check_paths()
+        return False
+    except SystemExit:
+        return True
+    finally:
+        for name, value in keep.items():
+            setattr(vinegar, name, value)
+
+
+# The checkout must not sit where the reviewer is denied every read: it
+# would review from API fetches instead, worse and more expensive, while
+# permission_denials stays empty and the log reads healthy.
+check("a checkout inside the denied component refuses to start",
+      _refuses(CHECKOUT_DIR="/Users/x/.vinegar/checkouts"))
+check("a checkout whose case only differs still refuses",
+      _refuses(CHECKOUT_DIR="/Users/x/.Vinegar/checkouts"))
+# And the direction that exposes the App private key: HOME has to carry
+# the component the sandbox denies, or nothing stops a review reading the
+# one credential that is not scoped to a single repository.
+check("a home the sandbox does not cover refuses to start",
+      _refuses(HOME="/Users/x/vinegar-home"))
+check("the paths as configured are still accepted",
+      not _refuses())
 check("the environment asks for the tool contract",
       (claude_run.env or {}).get("CLAUDE_CODE_REPORT_FINDINGS") == "1",
       sorted(claude_run.env or {})[:5])
@@ -1007,6 +1058,20 @@ check("a token that cannot be minted counts as an attempt",
       (len(posted), _gm_state))
 vinegar.github_env = lambda *a, **k: None
 
+# A dry run must not tell the live daemon the give-up was already said:
+# they share state.json, and the daemon would then never post it.
+_gd_state = {L: {"outcome": vinegar.FAILED, "sha": PR["headRefOid"],
+                 "attempts": vinegar.MAX_ATTEMPTS}}
+del posted[:]
+vinegar.handle_pr("o/r", PR_LIVE, dict(CONFIG, comment=False), _gd_state, {})
+check("a dry run does not record the give-up as announced",
+      not posted and _gd_state[L].get("announced") is not True
+      and _gd_state[L].get("announce_tries") is None, _gd_state)
+del posted[:]
+vinegar.handle_pr("o/r", PR_LIVE, CONFIG, _gd_state, {})
+check("the live daemon still announces after a dry run looked",
+      len(posted) == 1, (len(posted), _gd_state))
+
 check("a dry run's give-up counts as said, not as a silence",
       vinegar.post_review(L, "o/r", PR, ROOT, "", None,
                           dict(CONFIG, comment=False), None) is True)
@@ -1149,6 +1214,36 @@ del looked[:]
 vinegar.review(ROOT, "o/r", PR, CONFIG, None, {})
 check("a landed review is not resent by the anchored retry either",
       len(posted) == 1 and len(looked) == 1, (len(posted), len(looked)))
+
+# The anchor-stripping retry sends no inline comments, so the line that
+# says how many were posted must not report the ones it just removed.
+_il_logged = []
+_il_sent = []
+
+
+def refuse_then_take(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
+    """Refuse the anchored post, take the anchorless retry."""
+    if cmd[:2] == ["gh", "api"] and "-X" not in cmd:
+        _il_sent.append(cmd)
+        fake_run.rc = 0 if len(_il_sent) > 1 else 1
+    return fake_run(cmd, cwd, timeout, env, stdin_text)
+
+
+vinegar.log = lambda m: _il_logged.append(m)
+vinegar.run = refuse_then_take
+fake_run.look_out = ""
+fake_run.post_err = "HTTP 422"
+del posted[:]
+vinegar.post_review(L, "o/r", PR, ROOT, "x", FINDINGS[:1], CONFIG, None)
+vinegar.log = lambda message: None
+check("the anchorless retry does not claim inline comments it removed",
+      any("posted 0 inline comment(s)" in m for m in _il_logged)
+      and not any("posted 1 inline comment(s)" in m for m in _il_logged),
+      [m for m in _il_logged if "inline comment" in m])
+# Back to what the checks below were left expecting: a refused post that
+# is ambiguous, and no review already up.
+vinegar.run = claude_run
+fake_run.rc, fake_run.post_err = 1, "HTTP 502"
 
 claude_run.stream = stream(call([]), result_event())
 fake_run.look_out = ""
@@ -1403,6 +1498,16 @@ check("the give-up itself is recorded beneath them",
       "tried to review this 3 times" in body
       and body.find("Twenty minutes") < body.find("tried to review"),
       body[:300])
+
+# Announcing is retried while it fails to land, and each retry used to
+# append the same ending again to the file a dry run is judged by.
+vinegar.finish(L, "o/r", PR_GAVE, ROOT, "", None,
+               dict(CONFIG, comment=False), None, {},
+               note="Vinegar tried to review this 3 times.")
+body = open(vinegar.transcript_path("o/r", PR_GAVE)).read()
+check("a retried give-up does not stack endings in the transcript",
+      body.count("tried to review this 3 times") == 1,
+      body.count("tried to review this 3 times"))
 
 PR_QUIET = dict(PR, headRefOid="deadbeefcafe")
 vinegar.finish(L, "o/r", PR_QUIET, ROOT, "", None,
