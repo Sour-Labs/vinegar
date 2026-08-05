@@ -467,6 +467,32 @@ check("overflow drops whole findings and says how many",
       len(_body) <= vinegar.MAX_BODY and "did not fit" in _body
       and "cut to fit GitHub's comment limit" not in _body, len(_body))
 
+# Every bullet dropped: the heading would introduce nothing at all.
+_huge = [{"file": "a.py", "summary": "s", "failure_scenario": "x" * 70000,
+          "category": "correctness"}]
+_body1 = vinegar.review_body(L, PR, CONFIG, [], _huge)
+check("a heading is not left introducing nothing",
+      "could not be anchored" not in _body1 and "did not fit" in _body1
+      and len(_body1) <= vinegar.MAX_BODY, _body1[:200])
+
+# The note itself takes room. With bullets small enough that dropping one
+# leaves less slack than the note needs, forgetting to count it puts the
+# body back over the limit and hands it to clamp, which shears a bullet in
+# half. Swept across the boundary rather than guessed at.
+_sweep = []
+for _pad in range(0, 20):
+    # 254 bullets of ~279 characters overshoot MAX_BODY by about 11000, so
+    # the loop runs; the padding walks the last kept bullet across the
+    # boundary, and six of these twenty leave less slack than the note.
+    _many = [{"file": "a.py", "summary": "s", "category": "correctness",
+              "failure_scenario": "y" * 240} for _ in range(254)]
+    _many[0]["failure_scenario"] = "y" * (240 + _pad * 40)
+    _b = vinegar.review_body(L, PR, CONFIG, [], _many)
+    _sweep.append(len(_b) <= vinegar.MAX_BODY
+                  and "cut to fit GitHub's comment limit" not in _b)
+check("the overflow note is counted in what has to fit",
+      all(_sweep), _sweep)
+
 del posted[:]
 vinegar.post_review(L, "o/r", PR, ROOT, text, FINDINGS[:4],
                     dict(CONFIG, comment=False), None)
@@ -934,6 +960,53 @@ vinegar.handle_pr("o/r", PR_LIVE, CONFIG, _gf_state, {})
 check("the give-up is retried on a later poll until it lands",
       _gf_state[L].get("announced") is True, _gf_state)
 
+# Retried, but not for ever: an App without write access, a locked pull
+# request or an archived repository refuses every time, and unbounded that
+# is two API calls and a log line a minute per stuck pull request.
+_gb_state = {L: {"outcome": vinegar.FAILED, "sha": PR["headRefOid"],
+                 "attempts": vinegar.MAX_ATTEMPTS}}
+vinegar.post_review = lambda *a, **k: False
+_gb_posts = 0
+for _ in range(8):
+    _before = _gb_state[L].get("announce_tries", 0)
+    vinegar.handle_pr("o/r", PR_LIVE, CONFIG, _gb_state, {})
+    if _gb_state[L].get("announce_tries", 0) != _before:
+        _gb_posts += 1
+check("a give-up that can never post stops trying",
+      _gb_posts == vinegar.MAX_ATTEMPTS
+      and _gb_state[L].get("announced") is True, (_gb_posts, _gb_state))
+vinegar.post_review = _real_post_for_gu
+
+# github_env answers None when no App is configured, and ambient `gh` is
+# then the credential the operator chose. Reading that as "no token" once
+# disabled the announcement for every non-App deployment.
+_gn_state = {L: {"outcome": vinegar.FAILED, "sha": PR["headRefOid"],
+                 "attempts": vinegar.MAX_ATTEMPTS}}
+vinegar.github_env = lambda *a, **k: None
+del posted[:]
+vinegar.handle_pr("o/r", PR_LIVE, dict(CONFIG, github_app=None), _gn_state,
+                  {})
+check("a deployment with no App still announces its give-up",
+      len(posted) == 1, (len(posted), _gn_state))
+
+# And a mint that raises is counted, or a repository whose token never
+# mints retries every minute for ever.
+_gm_state = {L: {"outcome": vinegar.FAILED, "sha": PR["headRefOid"],
+                 "attempts": vinegar.MAX_ATTEMPTS}}
+
+
+def _no_token(*a, **k):
+    raise RuntimeError("the App is not installed on o/r")
+
+
+vinegar.github_env = _no_token
+del posted[:]
+vinegar.handle_pr("o/r", PR_LIVE, CONFIG, _gm_state, {})
+check("a token that cannot be minted counts as an attempt",
+      not posted and _gm_state[L].get("announce_tries") == 1,
+      (len(posted), _gm_state))
+vinegar.github_env = lambda *a, **k: None
+
 check("a dry run's give-up counts as said, not as a silence",
       vinegar.post_review(L, "o/r", PR, ROOT, "", None,
                           dict(CONFIG, comment=False), None) is True)
@@ -1039,6 +1112,26 @@ check("vinegar's marker quoted mid-line is not vinegar's review",
 # splitlines() also breaks on \v, \f, \x1c-\x1e and \x85, so a body
 # carrying one before a quoted marker would forge a line that starts with
 # it. That answer suppresses the resend, and a suppressed resend is silence.
+# A give-up already posted at this commit must not make a later, finished
+# review look like a duplicate of itself: the marker has to name which
+# kind of comment is up, not merely that Vinegar wrote one.
+fake_run.look_out = "%s gave up on `a1b2c3d` at high effort\n" % (
+    vinegar.BODY_MARK)
+check("a give-up already up does not suppress a real review",
+      vinegar.already_posted(L, "o/r", PR, None) is False)
+check("the give-up still recognises its own note",
+      vinegar.already_posted(L, "o/r", PR, None, "gave up on") is True)
+fake_run.look_out = "%s reviewed `a1b2c3d` at high effort\n" % (
+    vinegar.BODY_MARK)
+check("a review already up is still recognised as one",
+      vinegar.already_posted(L, "o/r", PR, None) is True)
+check("a review already up is not mistaken for a give-up",
+      vinegar.already_posted(L, "o/r", PR, None, "gave up on") is False)
+fake_run.look_out = "%s reviewed `9999999` at high effort\n" % (
+    vinegar.BODY_MARK)
+check("a review of another commit is not this commit's review",
+      vinegar.already_posted(L, "o/r", PR, None) is False)
+
 for _sep in ("\v", "\f", "\x1c", "\x85", " "):
     fake_run.look_out = "A human said:%s%s reviewed `a1b2c3d` ...\n" % (
         _sep, vinegar.BODY_MARK)
@@ -1163,8 +1256,11 @@ vinegar.run = timing_out_post
 fake_run.look_out = ""
 del looked[:]
 vinegar.post_review(L, "o/r", PR, ROOT, "clean", [], CONFIG, None)
+# Two reads, not one: the second asks whether the *resend* landed. Without
+# it an ambiguous resend is recorded as "not posted", and the give-up path
+# says the whole thing again on the next poll.
 check("a timed-out post that did not land is sent again",
-      len(post_tries) == 2 and len(looked) == 1,
+      len(post_tries) == 2 and len(looked) == 2,
       (len(post_tries), len(looked)))
 del post_tries[:]
 fake_run.look_out = vinegar.BODY_MARK + " reviewed `a1b2c3d` ...\n"
