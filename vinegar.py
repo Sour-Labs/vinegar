@@ -203,12 +203,29 @@ PR_FIELDS = ("number,title,headRefOid,baseRefName,isDraft,author,additions,"
 POST_GRACE = 300
 
 # Seconds a fetch may take. Generous because it is the network and a
-# first fetch after a long gap legitimately runs for minutes, which is
-# the same reason the clone is exempted entirely; the point is only that
-# it cannot hang for ever. A failed checkout is retried on every poll and
-# never counted against MAX_ATTEMPTS, so a cap tight enough to bite would
-# mean a pull request that is never reviewed and never given up on.
+# first fetch after a long gap legitimately runs for minutes; the point is
+# only that it cannot hang for ever. A failed checkout is retried on every
+# poll and never counted against MAX_ATTEMPTS, so a cap tight enough to
+# bite would mean a pull request that is never reviewed and never given up
+# on.
 FETCH_TIMEOUT = 600
+
+# Seconds a first clone may take. Longer than the fetch above because it is
+# the whole history rather than one ref, and a large repository over a slow
+# link legitimately runs for many minutes. The cost of setting this too
+# tight is the one FETCH_TIMEOUT describes: a repository that is re-cloned
+# and re-abandoned on every poll, reviewing nothing and giving up on
+# nothing.
+#
+# Bounded at all because this was the last call on the poll thread that
+# could hang for ever. A socket that is open and never answers is not an
+# error anyone raises, so `run()` with no timeout waits as long as TCP
+# allows, no repository is polled meanwhile, and the watchdog reads a live
+# pid with no log lines as healthy, which is what it reads from a genuinely
+# quiet week. Half an hour parked is bad and it ends; for ever ends when
+# somebody notices that no reviews have arrived. A clone still running
+# after this long is not a slow link.
+CLONE_TIMEOUT = 1800
 
 # Seconds `git diff` may take before the poll loop gives up on it. Local
 # work, so generous is already absurd; the point is that a checkout on a
@@ -216,11 +233,10 @@ FETCH_TIMEOUT = 600
 DIFF_TIMEOUT = 120
 
 # Seconds `gh pr list` may take. One HTTP call, made once a minute per
-# repository on the poll thread, which makes it the daemon's biggest
+# repository on the poll thread, which makes it the daemon's most frequent
 # exposure to a socket that answers nothing. The clone and fetch in
-# checkout() stay unbounded on purpose: a first clone of a large repository
-# over a slow link legitimately runs for minutes, and a cap tight enough to
-# matter would break exactly that case.
+# checkout() get far longer bounds rather than none, for the reasons
+# written beside each. Nothing on this thread is unbounded.
 LIST_TIMEOUT = 120
 
 # Seconds a single posting request may take. Generous for one API call, and
@@ -1070,8 +1086,15 @@ def checkout(repo, pr, env):
     if not os.path.isdir(os.path.join(path, ".git")):
         os.makedirs(CHECKOUT_DIR, exist_ok=True)
         log("%s: cloning into %s" % (repo, path))
-        result = run(["gh", "repo", "clone", repo, path, "--", "--quiet"],
-                     env=env)
+        # Bounded like the steps below, and reported the same way: the
+        # caller tells them apart only by the message, and "timed out" and
+        # "failed" send whoever reads the log to different places.
+        clone = ["gh", "repo", "clone", repo, path, "--", "--quiet"]
+        try:
+            result = run(clone, env=env, timeout=CLONE_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("the clone did not finish within %ds"
+                               % CLONE_TIMEOUT)
         if result.returncode != 0:
             raise RuntimeError("clone failed: %s" % result.stderr.strip())
 
@@ -1796,8 +1819,8 @@ def submit_review(label, repo, pr, payload, env):
     request looks like, is not an error anyone raises. The poll loop is one
     thread: it would sit here, no repository would be polled, and the watchdog
     would see a live pid producing no log lines and call that healthy. The
-    clone and fetch in checkout() are the deliberate exception; the constant
-    beside LIST_TIMEOUT says why.
+    clone and fetch in checkout() get far longer bounds than this, for the
+    reasons written beside each, but they are bounded too.
     """
     try:
         result = run(["gh", "api",

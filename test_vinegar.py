@@ -499,6 +499,41 @@ vinegar.checkout("o/r", PR, None)
 check("a checkout git cannot open is cloned again rather than reused",
       any(c[:3] == ["gh", "repo", "clone"] for c, _w, _t in _co_ran),
       [c[:3] for c, _w, _t in _co_ran])
+# The clone reaches the network on the one poll thread, and it ran unbounded
+# until issue #13: a socket that is open and never answers is not an error
+# anyone raises, so nothing polled and the watchdog called a live pid with
+# no log lines healthy. Generous rather than tight, because a cap that bites
+# costs the repository every review.
+_co_clone = [t for c, _w, t in _co_ran if c[:3] == ["gh", "repo", "clone"]]
+check("the clone is bounded so it cannot park the poll thread",
+      _co_clone and _co_clone[0] == vinegar.CLONE_TIMEOUT, _co_clone)
+check("the clone is given longer than the fetch, not less",
+      vinegar.CLONE_TIMEOUT >= vinegar.FETCH_TIMEOUT,
+      (vinegar.CLONE_TIMEOUT, vinegar.FETCH_TIMEOUT))
+
+
+def clone_hangs(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
+    if cmd[:3] == ["gh", "repo", "clone"]:
+        raise subprocess.TimeoutExpired(cmd, timeout or 0)
+    return co_run(cmd, cwd, timeout, env, stdin_text)
+
+
+# The bound is only half of it. Left to raise TimeoutExpired, the failure
+# reaches handle_pr's generic handler and logs "checkout failed: Command
+# '[...]' timed out", which names a subprocess rather than the clone and
+# reads like the tree is broken rather than like the network is. The steps
+# loop already converts its own timeout for that reason.
+vinegar.run = clone_hangs
+shutil.rmtree(_co_path, ignore_errors=True)
+try:
+    vinegar.checkout("o/r", PR, None)
+    _co_hung = "returned normally"
+except subprocess.TimeoutExpired:
+    _co_hung = "TimeoutExpired escaped"
+except RuntimeError as err:
+    _co_hung = str(err)
+check("a clone that hangs is reported as a clone that hung",
+      "did not finish within" in _co_hung, _co_hung)
 co_run.usable = 0
 vinegar.CHECKOUT_DIR = _co_dir
 vinegar.run = fake_run

@@ -202,6 +202,15 @@ MUTATIONS = [
      '        log("%s: clearing a lock left by a killed run" % repo)\n'
      "        forget(stale)",
      "    pass"),
+    ("clone-timeout",
+     "            result = run(clone, env=env, timeout=CLONE_TIMEOUT)",
+     "            result = run(clone, env=env)"),
+    ("clone-timeout-message",
+     "        except subprocess.TimeoutExpired:\n"
+     '            raise RuntimeError("the clone did not finish within %ds"\n'
+     "                               % CLONE_TIMEOUT)",
+     "        except subprocess.TimeoutExpired:\n"
+     "            raise"),
     ("checkout-cwd",
      "            result = run(step, cwd=path, env=env, timeout=bound)",
      "            result = run(step, env=env, timeout=bound)"),
