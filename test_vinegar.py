@@ -511,10 +511,11 @@ check("findings survive a stream that never reached its result event",
       and len(posted) == 1
       and "not a finished round" in posted[0][1]["body"], (len(posted),))
 
-claude_run.stream = stream(result_event())
+claude_run.stream = ""
 del posted[:]
 check("a truncated stream with nothing reported is retried",
-      vinegar.review(ROOT, "o/r", PR, CONFIG, None, {}) == vinegar.DONE)
+      vinegar.review(ROOT, "o/r", PR, CONFIG, None, {}) == vinegar.FAILED
+      and not posted, (posted,))
 
 # Killed mid-summary, after the findings were already reported.
 def timing_out(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
