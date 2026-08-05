@@ -442,15 +442,21 @@ cannot start is skipped and the review runs unconfined, which looks exactly
 like a successful review.
 
 **Vinegar builds that stanza itself for every review and does not trust the
-file for it.** `check_paths()` reads the file once, at startup, while reviews
-run every poll: a file edited to chase a denial, or replaced by a `git pull`
-of the program directory, would otherwise launch the next review unconfined
-with nothing to refuse it. Building it also drops any key left in the file
-that would widen the sandbox back out, such as an `allowWrite`. The file keeps
-its own copy because it is what you read to learn what the reviewer may do,
-and what a hand-run `claude --settings review-settings.json` uses, and
-`check_paths()` refuses to start when the two disagree — so the file cannot
-quietly describe a weaker sandbox than the one in force.
+file for it.** A file edited to chase a denial, or replaced by a `git pull` of
+the program directory, would otherwise launch the next review unconfined with
+nothing to refuse it — startup checks cannot help, because a review runs every
+poll and startup happens once. The same read re-checks the permission rules
+for the same reason, so the deny rule guarding the App private key is verified
+per review rather than per boot.
+
+The file keeps its own copy of the stanza because it is what you read to learn
+what the reviewer may do, and what a hand-run `claude --settings
+review-settings.json` uses. Vinegar refuses to run when the two disagree: the
+three keys above must match, and the stanza may carry nothing else. A
+`filesystem.allowWrite` added to unblock a hand-run would leave that hand-run
+genuinely unconfined, and a `network` rule added to tighten things would be
+dropped from what the daemon sends — either way the file would describe
+something Vinegar does not do, so it is refused rather than ignored.
 
 **The checkout is denied writes as well, and Vinegar adds that rule itself.**
 The sandbox leaves the workspace writable, and the workspace is the checkout.
@@ -460,6 +466,20 @@ names a command git runs, and `git reset --hard`, `git clean -qfd` and
 that checkout on its next poll, outside the sandbox, as the daemon user. It
 survives `reset --hard` and `clean -qfd` too, so one line written into
 `.git/config` would buy the next poll.
+
+**The sandbox also closes the network, and that costs the `gh` commands.**
+Measured: with the sandbox on, `gh pr view` fails with `Post
+"https://api.github.com/graphql": Forbidden`. Allowing the domain does not
+bring it back either — the sandbox terminates TLS, and `gh` then fails to
+verify the certificate. So every `gh` entry in the allow list is inert while
+the sandbox is on, and the reviewer is told so in its brief rather than left
+to spend turns discovering it. It used to be told to fall back to `gh pr
+diff`; it now gets the diff from the checkout Vinegar prepares, which is where
+it came from in every review anyway.
+
+Closing the network is a gain in its own right, and a bigger one than the
+`gh` commands were worth: an injected review cannot send anything anywhere,
+whatever command it finds to run.
 
 `CHECKOUT_DIR` moves with `VINEGAR_HOME` so that one machine can run isolated
 instances, so no fixed string in the settings file is right for every install.

@@ -892,40 +892,70 @@ check("a sandbox that is not an object is refused with a sentence",
       "sandbox.enabled" in _said, _said)
 
 
-def _built_with(sandbox):
-    """The settings reviewer_settings() sends when the file holds this."""
+def _settings_file(sandbox, permissions=None, raw=None):
+    """Write a settings file and point SETTINGS_PATH at it."""
     path = os.path.join(_home, "built-settings.json")
     with open(path, "w") as handle:
-        json.dump({"permissions": {"allow": ["Read"], "deny": []},
-                   "sandbox": sandbox} if sandbox is not _absent
-                  else {"permissions": {"allow": ["Read"], "deny": []}},
-                  handle)
+        if raw is not None:
+            handle.write(raw)
+        else:
+            doc = {"permissions": permissions if permissions is not None
+                   else {"allow": [vinegar.REPORT_TOOL],
+                         "deny": [vinegar.DENY_HOME]}}
+            if sandbox is not _absent:
+                doc["sandbox"] = sandbox
+            json.dump(doc, handle)
     vinegar.SETTINGS_PATH = path
+    return path
+
+
+def _built_with(sandbox, permissions=None, raw=None):
+    """The settings reviewer_settings() sends when the file holds this."""
+    _settings_file(sandbox, permissions, raw)
     try:
         return json.loads(vinegar.reviewer_settings())
     finally:
         # In a finally like _with_sandbox above, because reviewer_settings()
-        # can raise: without it one failure leaves this global pointing at a
+        # can exit: without it one failure leaves this global pointing at a
         # temp file for the remaining two thousand checks.
         vinegar.SETTINGS_PATH = _sp_real
 
 
+def _sending(sandbox, permissions=None, raw=None):
+    """What reviewer_settings() says when it refuses to send anything."""
+    _settings_file(sandbox, permissions, raw)
+    try:
+        vinegar.reviewer_settings()
+        return "sent"
+    except SystemExit as err:
+        return str(err)
+    finally:
+        vinegar.SETTINGS_PATH = _sp_real
+
+
 _absent = object()
-# What is sent is built here, not inherited. check_paths() reads the file
-# once at startup; this runs again for every review, so a file edited to
-# chase a denial — or replaced by `git pull` — would otherwise launch the
-# next review unconfined with nothing refusing and nothing logged.
+# A file that has lost the sandbox stops the review rather than being
+# quietly corrected. check_paths() reads it once at startup; this runs
+# again for every review, so a file edited to chase a denial — or replaced
+# by `git pull` — would otherwise launch the next review with nothing
+# refusing and nothing logged.
 for _label, _stanza in (("carries no sandbox", _absent),
                         ("has a null sandbox", None),
-                        ("disables the sandbox", {"enabled": False}),
-                        ("nulls the filesystem",
-                         {"enabled": True, "filesystem": None}),
+                        ("disables the sandbox", {"enabled": False})):
+    _said = _sending(_stanza)
+    check("a review is refused when the file %s" % _label,
+          "sandbox.enabled" in _said, _said)
+# Inside a stanza that passes, the deny list is still built rather than
+# read, so these shapes cannot reach the review path. Each of them used to
+# raise out of it — setdefault hands back an existing null rather than
+# replacing it — and a raise there is charged as a failed attempt, so three
+# polls later every open pull request carried a give-up comment.
+for _label, _stanza in (("nulls the filesystem", dict(_good, filesystem=None)),
                         ("nulls the deny list",
-                         {"enabled": True, "filesystem": {
-                             "denyWrite": None}}),
+                         dict(_good, filesystem={"denyWrite": None})),
                         ("makes the deny list a string",
-                         {"enabled": True, "filesystem": {
-                             "denyWrite": "~/.vinegar-checkouts"}})):
+                         dict(_good, filesystem={
+                             "denyWrite": "~/.vinegar-checkouts"}))):
     _sent = _built_with(_stanza)["sandbox"]
     check("a settings file that %s still sends an enabled sandbox" % _label,
           _sent.get("enabled") is True, json.dumps(_sent))
@@ -937,11 +967,57 @@ for _label, _stanza in (("carries no sandbox", _absent),
 # along beside three keys that still read true, true, false.
 _sent = _built_with({"enabled": True, "failIfUnavailable": True,
                      "allowUnsandboxedCommands": False,
-                     "filesystem": {"allowWrite": ["/"]},
-                     "network": {"allowedDomains": ["*"]}})["sandbox"]
+                     "filesystem": {"allowWrite": ["/"]}})["sandbox"]
 check("a widening key left in the file is not passed on",
-      "allowWrite" not in _sent["filesystem"] and "network" not in _sent,
-      json.dumps(_sent))
+      "allowWrite" not in _sent["filesystem"], json.dumps(_sent))
+
+# The read side is re-checked on the same schedule the write side is
+# rebuilt on. Validating once at startup and forwarding blindly per review
+# left the deny rule guarding the App private key as whatever the file
+# said on the next poll — the failure this function exists to end, on the
+# half of the file it was not applied to.
+_said = _sending(_good, permissions={"allow": [vinegar.REPORT_TOOL],
+                                     "deny": []})
+check("a review is refused when the file has dropped the key deny rule",
+      "must deny" in _said, _said)
+_said = _sending(_good, permissions={"allow": [], "deny": [vinegar.DENY_HOME]})
+check("a review is refused when the file no longer allows the report tool",
+      "does not allow" in _said, _said)
+# A list collapsed to the string it held is truthy, so `or []` kept it and
+# the membership test became a substring test that passes: the key deny
+# rule reads as present while Claude Code has a malformed value.
+_said = _sending(_good, permissions={"allow": [vinegar.REPORT_TOOL],
+                                     "deny": vinegar.DENY_HOME})
+check("a deny list collapsed to a string is not read as containing itself",
+      "must deny" in _said, _said)
+_said = _sending(_good, permissions={"allow": vinegar.REPORT_TOOL,
+                                     "deny": [vinegar.DENY_HOME]})
+check("an allow list collapsed to a string is refused the same way",
+      "does not allow" in _said, _said)
+# `permissions` itself, for the same reason and with the same treatment. It
+# is guarded inside the try either way, so the difference is which sentence
+# the operator gets: the one naming the missing rule, or a parse error that
+# describes a file which parsed perfectly well.
+_said = _sending(_good, permissions=vinegar.REPORT_TOOL)
+check("a permissions block that is not an object names the missing rule",
+      "does not allow" in _said, _said)
+# Malformed JSON must be a sentence, not an exception out of review(). Left
+# to raise, handle_pr recorded FAILED with the attempt already charged, and
+# three polls later every open pull request carried a give-up comment and
+# was abandoned for good over a trailing comma.
+_said = _sending(None, raw='{"permissions": {"allow": ["X"],}}')
+check("a settings file saved mid-edit is refused with a sentence",
+      "cannot be read" in _said, _said)
+_said = _sending(None, raw='["not", "an", "object"]')
+check("a settings file that is not an object is refused with a sentence",
+      "cannot be read" in _said, _said)
+# A key Vinegar does not send would change what a hand-run does and
+# nothing else, so the file would describe something the program does not
+# do. Measured: `network` is one of those — allowing domains routes the
+# reviewer through a TLS-terminating proxy that `gh` will not trust.
+_said = _sending(dict(_good, network={"allowedDomains": []}))
+check("a sandbox key Vinegar does not send is refused",
+      "does not send" in _said, _said)
 
 # The path the kernel judges the write by, not the one that was typed.
 # Measured against the real binary: a sandbox given only the symlink path
@@ -1259,9 +1335,18 @@ check("brief tells the reviewer not to fall back to main",
 check("brief names the reporting tool, not a competing format",
       "ReportFindings" in brief and "```json" not in brief, brief)
 check("brief gives a fallback for a base ref that does not resolve",
-      "gh pr diff 12" in brief, brief)
+      "HEAD~1...HEAD" in brief, brief)
 check("brief does not promise the base ref is definitely there",
       "already fetched" not in brief, brief)
+# The old fallback was `gh pr diff`, and under the sandbox it cannot run:
+# measured, `gh` gets "Forbidden" with the network closed and a TLS trust
+# failure when domains are allowed, because the proxy terminates TLS. A
+# reviewer told to reach for it spends turns discovering that and then has
+# no scope at all.
+check("brief does not send the reviewer to a command with no network",
+      "gh pr diff" not in brief, brief)
+check("brief says the network is closed rather than leaving it to be found",
+      "no network" in brief, brief)
 
 # --- handle_pr: the guard that bounds every crash --------------------------
 reset_stubs()
