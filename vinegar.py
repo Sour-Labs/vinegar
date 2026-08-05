@@ -185,11 +185,33 @@ def log(message):
 def run(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
     # `input` and `stdin` cannot both be passed, so the default stays DEVNULL
     # and only a caller with something to send opts out of it.
+    #
+    # utf-8 and "replace" rather than the locale and "strict", in both
+    # directions. git prints a Latin-1 file's diff as the raw bytes it holds,
+    # and a strict decode raised UnicodeDecodeError out of diff_lines into
+    # announce(), which swallowed the finished review it was carrying. And
+    # under the C locale a launchd job can run in, a strict *encode* of the
+    # posting payload dies on the first non-ASCII character a finding quotes.
+    # A replacement character in a quoted line survives both; an exception
+    # here costs the whole review.
     return subprocess.run(cmd, cwd=cwd, timeout=timeout, text=True, env=env,
+                          encoding="utf-8", errors="replace",
                           input=stdin_text,
                           stdin=None if stdin_text is not None
                           else subprocess.DEVNULL,
                           capture_output=True)
+
+
+def both_streams(result, cap):
+    """Both halves of what a command said, stderr first, cut to a log line.
+
+    `gh api` puts its one-line summary on stderr and GitHub's own body on
+    stdout, and the body is the half that names which comment was refused
+    and why. Two callers log this, and as two inlined copies a fix to either
+    had to be made twice or the same failure read differently in one log.
+    """
+    return " ".join(part.strip() for part in (result.stderr, result.stdout)
+                    if part and part.strip())[:cap]
 
 
 def b64url(raw):
@@ -556,9 +578,15 @@ def save_transcript(repo, pr, text, findings=None, note=None):
     elif findings is not None:
         body += "\n\n## Findings\n\n%s\n" % (
             "None reported before it stopped." if note else "None.")
-    with open(path, "w") as handle:
+    # Whole or not at all, the way save_state already writes. finish() reads
+    # this file's existence as "the attempts left words worth keeping", and
+    # a crash mid-write must not leave a truncated file wearing that
+    # meaning.
+    tmp = path + ".tmp"
+    with open(tmp, "w") as handle:
         handle.write("# %s#%d %s\n\n%s\n\n---\n\n%s\n" % (
             repo, pr["number"], pr["headRefOid"][:7], pr["url"], body))
+    os.replace(tmp, path)
     return path
 
 
@@ -628,6 +656,25 @@ def clamp(label, body):
     return body[:MAX_BODY] + "\n\n(cut to fit GitHub's comment limit)"
 
 
+def stream_lines(text):
+    """The stream one line at a time, without a second copy of the whole.
+
+    Exactly `split("\\n")`, lazily. A --verbose stream echoes every tool
+    result, so a long review's stdout is already the largest thing the
+    daemon holds, and split() doubled it at the worst moment. splitlines()
+    is not the same contract: it also breaks on characters the stream's
+    newline-delimited JSON never uses as boundaries.
+    """
+    start = 0
+    while True:
+        end = text.find("\n", start)
+        if end < 0:
+            yield text[start:]
+            return
+        yield text[start:end]
+        start = end + 1
+
+
 def read_stream(stdout, label="review"):
     """The reviewer's findings, and the result event that ends its stream.
 
@@ -652,7 +699,7 @@ def read_stream(stdout, label="review"):
     correction of the first.
     """
     result, findings, spoken = None, None, ""
-    for line in stdout.split("\n"):
+    for line in stream_lines(stdout):
         line = line.strip()
         if not line.startswith("{"):
             continue
@@ -842,15 +889,29 @@ def repo_path(name, root):
     in the diff and neither matches the key git prints for it. The absolute
     branch is normalised by relpath already.
     """
-    if not isinstance(name, str) or not name.strip():
+    # A NUL byte is refused before anything stats the path, because what it
+    # does otherwise depends on the Python. On 3.9 realpath swallows the
+    # lstat ValueError inside islink() and hands the byte back, riding it
+    # into a comment body; on 3.10+ the same ValueError escapes realpath
+    # and would surface inside announce(), which discards the whole review.
+    # The swallow was measured on 3.9.6; the raise is 3.10's _joinrealpath
+    # catching only OSError. Neither byte belongs in a routing decision.
+    if not isinstance(name, str) or not name.strip() or "\x00" in name:
         return None
     name = name.strip()
     # realpath both sides, as check_paths() already does for its own check.
     # A checkout directory reached through a symlink resolves one way for the
     # reviewer's tools and another for this comparison, and every absolute
     # path it reports would then look like it sits outside the checkout.
-    name = (os.path.relpath(os.path.realpath(name), os.path.realpath(root))
-            if os.path.isabs(name) else os.path.normpath(name))
+    #
+    # Wrapped because the docstring promises None for anything that does not
+    # resolve, and realpath and relpath keep finding new ways to raise: one
+    # poisoned `file` must not cost the run's other findings their posting.
+    try:
+        name = (os.path.relpath(os.path.realpath(name), os.path.realpath(root))
+                if os.path.isabs(name) else os.path.normpath(name))
+    except (OSError, ValueError):
+        return None
     # The component, not the two characters. `..config.py` is an ordinary
     # file name and rejecting it would send a perfectly anchorable finding to
     # the general comment.
@@ -910,8 +971,13 @@ def describe(finding):
     summary = str(finding.get("summary") or "").strip() or "(no summary)"
     scenario = str(finding.get("failure_scenario") or "").strip()
     category = str(finding.get("category") or "").strip()
+    # The verdict rides with the category when the effort level ran a verify
+    # pass. CONFIRMED and PLAUSIBLE read very differently, and posting them
+    # identically claims a certainty the reviewer did not.
+    verdict = str(finding.get("verdict") or "").strip()
     body = "%s\n\nFailure: %s" % (summary, scenario) if scenario else summary
-    return "%s\n\n(%s)" % (body, category) if category else body
+    tags = ", ".join(part for part in (category, verdict) if part)
+    return "%s\n\n(%s)" % (body, tags) if tags else body
 
 
 def split_findings(findings, covered, root, label):
@@ -932,7 +998,8 @@ def split_findings(findings, covered, root, label):
 
 
 def review_body(label, pr, config, inline, general, raw=None,
-                heading="These could not be anchored in the diff:", note=None):
+                heading="These could not be anchored in the diff:", note=None,
+                verb="reviewed"):
     """The review's top-level comment.
 
     Always present, and not only because the endpoint requires one for a
@@ -947,8 +1014,11 @@ def review_body(label, pr, config, inline, general, raw=None,
     diff_lines and the base branch instead of to the error submit_review
     logged.
     """
-    lines = ["%s reviewed `%s` at %s effort" % (
-        BODY_MARK, pr["headRefOid"][:7], config["effort"])]
+    # `verb` because the give-up posts through here too, and its first line
+    # used to claim a review happened when none ever ran. The marker itself
+    # stays fixed: already_posted() matches it as a prefix.
+    lines = ["%s %s `%s` at %s effort" % (
+        BODY_MARK, verb, pr["headRefOid"][:7], config["effort"])]
 
     # A run that was killed or that errored still reports whatever it had
     # got to, and without this that is indistinguishable from a finished
@@ -1026,14 +1096,8 @@ def submit_review(label, repo, pr, payload, env):
         return None
     if result.returncode == 0:
         return True
-    # Both streams. `gh api` puts a one-line summary on stderr and GitHub's
-    # own body on stdout, and the body is the half that names which comment
-    # was refused and why. Logging stderr alone left the retry's comment
-    # telling the reader to consult an error that does not say.
     log("%s: posting the review failed: %s" % (
-        label,
-        " ".join(part.strip() for part in (result.stderr, result.stdout)
-                 if part and part.strip())[:600]))
+        label, both_streams(result, 600)))
     return False
 
 
@@ -1131,18 +1195,14 @@ def already_posted(label, repo, pr, env):
         return False
     if result.returncode != 0:
         log("%s: the landed-review read failed (%s), so the resend goes "
-            "ahead unchecked" % (
-                label,
-                " ".join(part.strip() for part in (result.stderr,
-                                                   result.stdout)
-                         if part and part.strip())[:200]))
+            "ahead unchecked" % (label, both_streams(result, 200)))
         return False
     return any(line.startswith(BODY_MARK)
                for line in result.stdout.splitlines())
 
 
 def post_review(label, repo, pr, path, text, findings, config, env,
-                note=None):
+                note=None, verb="reviewed"):
     """Turn what the reviewer reported into one review on the pull request."""
     if not config["comment"]:
         # Before the routing, not after. Working out which findings could be
@@ -1170,7 +1230,7 @@ def post_review(label, repo, pr, path, text, findings, config, env,
     payload = {"event": "COMMENT",
                "commit_id": pr["headRefOid"],
                "body": review_body(label, pr, config, inline, general, raw,
-                                   note=note)}
+                                   note=note, verb=verb)}
     if inline:
         payload["comments"] = inline
 
@@ -1212,7 +1272,7 @@ def post_review(label, repo, pr, path, text, findings, config, env,
         log("%s: retrying with every finding in the review comment" % label)
         payload.pop("comments")
         payload["body"] = review_body(
-            label, pr, config, [], findings, note=note,
+            label, pr, config, [], findings, note=note, verb=verb,
             heading="GitHub refused the inline comments, so all of it is "
                     "here:")
     else:
@@ -1246,7 +1306,7 @@ def keep(label, repo, pr, text, why):
 
 
 def finish(label, repo, pr, path, text, findings, config, env, tokens,
-           note=None):
+           note=None, verb="reviewed"):
     """Record the review on disk and post it, whatever ended the run.
 
     Both callers do exactly this and used to do it separately, which is how
@@ -1269,14 +1329,25 @@ def finish(label, repo, pr, path, text, findings, config, env, tokens,
     # An ending with nothing to say must not replace one that said
     # something. The give-up after MAX_ATTEMPTS arrives here with no text
     # and no findings, seconds after keep() saved what the third attempt
-    # said, and the write would truncate that file: same repository, same
-    # number, same sha, so transcript_path() names the file keep() just
-    # wrote. The note it carries goes to the pull request either way; the
-    # reviewer's words exist nowhere else.
+    # said, and a plain write would truncate that file: same repository,
+    # same number, same sha, so transcript_path() names the file keep()
+    # just wrote. The words stay and the note goes beneath them, because on
+    # a dry run this file is the only place the giving-up can be recorded
+    # at all. Skipping the write entirely kept the words but left the
+    # ending nowhere but a log nobody is watching.
     if (not text.strip() and findings is None
             and os.path.exists(transcript_path(repo, pr))):
-        log("%s: the transcript already holds what the attempts said, "
-            "leaving it" % label)
+        if note:
+            try:
+                with open(transcript_path(repo, pr), "a") as handle:
+                    handle.write("\n\n---\n\n%s\n" % note)
+                log("%s: the ending is appended to the transcript the "
+                    "attempts left" % label)
+            except Exception as err:
+                log("%s: the transcript is not saved: %s" % (label, err))
+        else:
+            log("%s: the transcript already holds what the attempts said, "
+                "leaving it" % label)
     else:
         try:
             log("%s: transcript at %s" % (
@@ -1284,7 +1355,19 @@ def finish(label, repo, pr, path, text, findings, config, env, tokens,
         except Exception as err:
             log("%s: the transcript is not saved: %s" % (label, err))
     post_review(label, repo, pr, path, text, findings, config,
-                posting_env(label, config, repo, tokens, env), note)
+                posting_env(label, config, repo, tokens, env), note, verb)
+
+
+def partial_note(cause):
+    """The note every partial ending shares, phrased the one way.
+
+    Three endings post findings they know are incomplete: killed, stream
+    stopped early, failed. review_body and the tests key off the shared
+    clause, and as three hand-written copies one edit could quietly have
+    the same class of ending described three different ways.
+    """
+    return ("This review %s, so these are the findings it had reported by "
+            "then and not a finished round." % cause)
 
 
 def review(path, repo, pr, config, env, tokens):
@@ -1372,9 +1455,8 @@ def review(path, repo, pr, config, env, tokens):
         if findings is not None:
             log("%s: it had already reported %d finding(s), posting those"
                 % (label, len(findings)))
-            note = ("This review was killed after %ds, so these are the "
-                    "findings it had reported by then and not a finished "
-                    "round." % config["review_timeout"])
+            note = partial_note(
+                "was killed after %ds" % config["review_timeout"])
         else:
             note = ("This review was killed after %ds. Read that as the "
                     "review not finishing, not as the change being clean."
@@ -1397,9 +1479,7 @@ def review(path, repo, pr, config, env, tokens):
             return FAILED
         log("%s: it had reported %d finding(s) first, posting those"
             % (label, len(findings)))
-        deliver(spoken, findings,
-                "This review stopped before it finished, so these are the "
-                "findings it had reported by then and not a finished round.")
+        deliver(spoken, findings, partial_note("stopped before it finished"))
         return DONE
 
     # A non-empty list is worth acting on. An empty one proves nothing.
@@ -1471,8 +1551,7 @@ def review(path, repo, pr, config, env, tokens):
             return FAILED
         log("%s: it failed with %d finding(s) already reported, so those are "
             "posted" % (label, len(findings)))
-        note = ("This review failed before it finished, so these are the "
-                "findings it had reported by then and not a finished round.")
+        note = partial_note("failed before it finished")
 
     cost = output.get("total_cost_usd")
     # bool first: it is an int, and True would print as 1.00 USD.
@@ -1529,6 +1608,13 @@ def handle_pr(repo, pr, config, state, tokens):
     # case this protects is a rate-limit window: without it, every pull request
     # opened during the window is written off as reviewed and never looked at
     # again once the limit resets.
+    #
+    # FAILED is the only outcome that can be carrying a spent budget: the
+    # skip branch below preserves `attempts` but runs after this return, so
+    # an exhausted entry keeps saying FAILED and keeps meeting this check.
+    # The laundering went the other way, a skip landing while attempts were
+    # still below the cap and dropping them; keeping them through the skip
+    # is what closed it.
     if done.get("outcome") == FAILED and done.get("sha") == head:
         if done.get("attempts", 0) >= MAX_ATTEMPTS:
             return
@@ -1540,7 +1626,12 @@ def handle_pr(repo, pr, config, state, tokens):
         if (done.get("outcome") != "skipped" or done.get("sha") != head
                 or done.get("reason") != reason):
             log("%s: skipped, %s" % (key, reason))
-            state[key] = {"outcome": "skipped", "sha": head, "reason": reason}
+            # The attempts burned at this head ride along. Dropping them
+            # here is what let a draft toggle launder the retry budget.
+            entry = {"outcome": "skipped", "sha": head, "reason": reason}
+            if done.get("sha") == head and done.get("attempts"):
+                entry["attempts"] = done["attempts"]
+            state[key] = entry
             save_state(state)
         return
 
@@ -1621,7 +1712,8 @@ def handle_pr(repo, pr, config, state, tokens):
             note="Vinegar tried to review this %d times and each attempt "
                  "failed before it could report anything. Read that as the "
                  "review not running, not as the change being clean." % (
-                     attempts,)))
+                     attempts,),
+            verb="gave up on"))
 
 
 def find_pr(repo, number, env):

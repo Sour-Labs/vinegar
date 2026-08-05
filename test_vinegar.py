@@ -119,6 +119,7 @@ fake_run.rc = 0
 fake_run.diff_rc = 0
 fake_run.look_rc = 0
 fake_run.look_out = ""
+GENUINE_RUN = vinegar.run
 vinegar.run = fake_run
 vinegar.log = lambda message: None
 
@@ -441,6 +442,20 @@ check("the retry does not blame anchoring for GitHub's refusal",
       and "could not be anchored" not in posted[1][1]["body"],
       posted[1][1]["body"])
 fake_run.rc = 0
+
+try:
+    _nul = vinegar.repo_path("/checkouts/o__r/a\x00b.py", ROOT)
+except ValueError:
+    _nul = "raised"
+check("a NUL byte in a finding's path is refused, not raised",
+      _nul is None, repr(_nul))
+
+check("a verdict rides with the category when one arrives",
+      "(correctness, CONFIRMED)" in vinegar.describe(
+          {"summary": "s", "category": "correctness",
+           "verdict": "CONFIRMED"}))
+check("no category and no verdict adds no empty parenthesis",
+      "(" not in vinegar.describe({"summary": "s"}))
 
 del posted[:]
 vinegar.post_review(L, "o/r", PR, ROOT, text, FINDINGS[:4],
@@ -818,6 +833,24 @@ check("an attempt is on disk before the review starts",
 check("the real outcome replaces the marker when the review finishes",
       _hp_state[L]["outcome"] == vinegar.DONE, _hp_state)
 
+# A skip must not hand back the retry budget the attempts already burned.
+_sk_state = {L: {"outcome": vinegar.FAILED, "sha": PR["headRefOid"],
+                 "attempts": 2}}
+vinegar.review = lambda *a, **k: vinegar.FAILED
+vinegar.handle_pr("o/r", dict(PR_LIVE, isDraft=True), CONFIG, _sk_state, {})
+check("a skip keeps the attempts burned at this head",
+      _sk_state[L]["outcome"] == "skipped"
+      and _sk_state[L].get("attempts") == 2, _sk_state)
+vinegar.handle_pr("o/r", PR_LIVE, CONFIG, _sk_state, {})
+check("a skip that lifts resumes the budget rather than restarting it",
+      _sk_state[L].get("attempts") == 3, _sk_state)
+vinegar.handle_pr("o/r", dict(PR_LIVE, isDraft=True), CONFIG, _sk_state, {})
+_sk_ran = []
+vinegar.review = lambda *a, **k: _sk_ran.append(1) or vinegar.DONE
+vinegar.handle_pr("o/r", PR_LIVE, CONFIG, _sk_state, {})
+check("a lifted skip cannot re-run a review whose budget is spent",
+      not _sk_ran, (_sk_state, _sk_ran))
+
 vinegar.review, vinegar.save_state = _real_review, _real_save_state
 vinegar.checkout, vinegar.github_env = _real_checkout, _real_github_env
 
@@ -847,6 +880,18 @@ check("the landed-review question reads full pages",
       any("per_page=100" in a for a in looked[0]), looked[0])
 check("the landed-review jq carries the escape, not a raw newline",
       all("\n" not in a for a in looked[0]), looked[0])
+
+# What `gh api --jq` prints when it works: one raw first line per review,
+# oldest first, a blank for a review with no body. The suite stubs run, so
+# the jq half runs only in production; the Python half is pinned here.
+fake_run.look_out = ("Looks good to me overall.\n\n%s reviewed `a1b2c3d` at "
+                     "high effort\n" % vinegar.BODY_MARK)
+check("vinegar's line is found among humans' and blanks",
+      vinegar.already_posted(L, "o/r", PR, None) is True)
+fake_run.look_out = "LGTM\n\nQuoting: %s reviewed `a1b2c3d` ...\n" % (
+    vinegar.BODY_MARK)
+check("vinegar's marker quoted mid-line is not vinegar's review",
+      vinegar.already_posted(L, "o/r", PR, None) is False)
 
 # The anchored retry is the common path and was the unguarded one.
 claude_run.stream = stream(call(FINDINGS[:1]), result_event())
@@ -979,6 +1024,10 @@ check("giving up is announced on the pull request, not only in the log",
       len(posted) == 1 and "not as the change being clean"
       in posted[0][1]["body"],
       posted[0][1]["body"][:160] if posted else "nothing posted")
+check("the give-up does not claim a review happened",
+      posted and "gave up on `a1b2c3d`" in posted[0][1]["body"]
+      and " reviewed `" not in posted[0][1]["body"],
+      posted[0][1]["body"][:120] if posted else "nothing posted")
 vinegar.review = _real_review2
 vinegar.checkout, vinegar.github_env = _real_checkout, _real_github_env
 vinegar.save_state = _real_save_state
@@ -992,6 +1041,12 @@ atexit.register(shutil.rmtree, _tx_home, True)
 _tx_real = vinegar.REVIEW_DIR
 vinegar.REVIEW_DIR = _tx_home
 vinegar.save_transcript = GENUINE_SAVE_TRANSCRIPT
+
+_first = vinegar.save_transcript("o/r", PR, "Reviewed it.", FINDINGS[:2])
+check("the transcript lands whole under its final name",
+      os.path.exists(_first)
+      and not [f for f in os.listdir(_tx_home) if f.endswith(".tmp")],
+      os.listdir(_tx_home))
 
 written = vinegar.save_transcript("o/r", PR, "Reviewed it.", FINDINGS[:2])
 body = open(written).read()
@@ -1026,6 +1081,10 @@ vinegar.finish(L, "o/r", PR_GAVE, ROOT, "", None,
 body = open(vinegar.transcript_path("o/r", PR_GAVE)).read()
 check("the give-up leaves the words the attempts saved",
       "Twenty minutes of analysis." in body, body[:200])
+check("the give-up itself is recorded beneath them",
+      "tried to review this 3 times" in body
+      and body.find("Twenty minutes") < body.find("tried to review"),
+      body[:300])
 
 PR_QUIET = dict(PR, headRefOid="deadbeefcafe")
 vinegar.finish(L, "o/r", PR_QUIET, ROOT, "", None,
@@ -1035,6 +1094,10 @@ _quiet = vinegar.transcript_path("o/r", PR_QUIET)
 check("a give-up with no words still leaves a trace",
       os.path.exists(_quiet)
       and "tried to review this 3 times" in open(_quiet).read(), _quiet)
+
+check("the transcript write leaves nothing temporary behind",
+      not [f for f in os.listdir(_tx_home) if f.endswith(".tmp")],
+      os.listdir(_tx_home))
 
 vinegar.REVIEW_DIR = _tx_real
 
@@ -1048,6 +1111,17 @@ check("the killed-run marker reaches the transcript, not just the comment",
       _tx_calls and _tx_calls[-1][4] and "killed after" in _tx_calls[-1][4],
       _tx_calls[-1][4] if _tx_calls else "never called")
 vinegar.run = fake_run
+
+# The reviewer's diff is whatever bytes the repository holds. A Latin-1
+# source file used to raise UnicodeDecodeError out of run() itself, and the
+# exception surfaced inside announce(), which swallowed the finished review
+# it was carrying.
+try:
+    _bytes_out = GENUINE_RUN(["/bin/sh", "-c", "printf 'caf\\351\\n'"]).stdout
+except UnicodeDecodeError:
+    _bytes_out = "raised"
+check("bytes that are not UTF-8 are read, not raised",
+      _bytes_out == "caf�\n", repr(_bytes_out))
 
 # --- the --pr guard, through the real entry point -------------------------
 # A mistyped target must be refused before anything is minted or asked of
