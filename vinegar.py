@@ -119,6 +119,14 @@ PR_FIELDS = ("number,title,headRefOid,baseRefName,isDraft,author,additions,"
 # usable token now, when the only work remaining is one or two API calls.
 POST_GRACE = 300
 
+# Seconds a fetch may take. Generous because it is the network and a
+# first fetch after a long gap legitimately runs for minutes, which is
+# the same reason the clone is exempted entirely; the point is only that
+# it cannot hang for ever. A failed checkout is retried on every poll and
+# never counted against MAX_ATTEMPTS, so a cap tight enough to bite would
+# mean a pull request that is never reviewed and never given up on.
+FETCH_TIMEOUT = 600
+
 # Seconds `git diff` may take before the poll loop gives up on it. Local
 # work, so generous is already absurd; the point is that a checkout on a
 # filesystem that stops answering cannot hold the one poll thread for ever.
@@ -439,7 +447,8 @@ def check_paths():
 
 
 def state_entry(head, outcome, attempts=0, reason=None, announced=False,
-                tries=0, post_tries=0, unposted=False, waivers=0):
+                tries=0, post_tries=0, unposted=False, waivers=0,
+                announce_waivers=0):
     """One pull request's record, built the one way.
 
     Four sites used to spell this out as a fresh literal, each deciding for
@@ -480,6 +489,11 @@ def state_entry(head, outcome, attempts=0, reason=None, announced=False,
         # rate-limited sends are forgiven, and any rebuild that dropped
         # it handed those waivers back.
         entry["post_waivers"] = waivers
+    if announce_waivers:
+        # The same rule for the give-up's own waivers. It lived outside
+        # this helper and was re-added by hand at one site, which is the
+        # exception every other counter here exists to remove.
+        entry["announce_waivers"] = announce_waivers
     return entry
 
 
@@ -695,6 +709,14 @@ def checkout(repo, pr, env):
              ["git", "clean", "-qfd"],
              ["git", "checkout", "--quiet", "--detach", pr["headRefOid"]])
     for step in steps:
+        # The head fetch gets the network budget, the rest get the local
+        # one. It is the same work the clone above is exempted for — a
+        # first fetch after the daemon has been down, on a slow link, is
+        # minutes — and unlike the local steps its failure is fatal to
+        # checkout(), which is deliberately never counted against
+        # MAX_ATTEMPTS: a 120-second cap turned a slow repository into a
+        # pull request that was never reviewed and never given up on.
+        bound = FETCH_TIMEOUT if step[:2] == ["git", "fetch"] else DIFF_TIMEOUT
         # Bounded, unlike the clone above it. The exemption beside
         # LIST_TIMEOUT is for a first clone over a slow link; reset, clean
         # and detach are local work, and on a filesystem that stops
@@ -705,10 +727,10 @@ def checkout(repo, pr, env):
         # reached through the call site beside it. The fetch shares the
         # budget because it is one ref from one remote, not a clone.
         try:
-            result = run(step, cwd=path, env=env, timeout=DIFF_TIMEOUT)
+            result = run(step, cwd=path, env=env, timeout=bound)
         except subprocess.TimeoutExpired:
             raise RuntimeError("%s did not finish within %ds" % (
-                " ".join(step), DIFF_TIMEOUT))
+                " ".join(step), bound))
         if result.returncode != 0:
             raise RuntimeError("%s failed: %s" % (" ".join(step),
                                                   result.stderr.strip()))
@@ -747,10 +769,10 @@ def checkout(repo, pr, env):
     try:
         result = run(["git", "fetch", "--quiet", "--force", "origin",
                       "%s:%s" % (base, base)], cwd=path, env=env,
-                     timeout=DIFF_TIMEOUT)
+                     timeout=FETCH_TIMEOUT)
     except subprocess.TimeoutExpired:
         log("%s#%d: base %s not refreshed after %ds, the diff may include "
-            "merged work" % (repo, pr["number"], base, DIFF_TIMEOUT))
+            "merged work" % (repo, pr["number"], base, FETCH_TIMEOUT))
         return path
     if result.returncode != 0:
         log("%s#%d: base %s not refreshed, the diff may include merged work: %s"
@@ -1547,9 +1569,15 @@ def post_review(label, repo, pr, path, text, findings, config, env,
                 note=None, verb="reviewed", resent=False):
     """Turn what the reviewer reported into one review on the pull request.
 
-    Answers whether the pull request carries the review now. The give-up
-    marks itself announced on that answer, so "posted nothing and said so"
-    must not read the same as "posted".
+    Answers POSTED when the pull request carries the review, THROTTLED
+    when a limit refused it and it should be tried again unchanged, and
+    False when it did not land for any other reason.
+
+    Named rather than true-or-false because there are three answers and
+    they need three different things done about them. Smuggling the third
+    through a two-state contract meant a caller testing truthiness read
+    "rate limited, try again later" as "posted", and deleted the saved
+    review it had just promised to resend.
     """
     # Before the routing, both of these. Working out which findings could
     # be anchored means a full `git diff` over the pull request and up to
@@ -1570,7 +1598,7 @@ def post_review(label, repo, pr, path, text, findings, config, env,
         # every poll for ever.
         log("%s: dry run, %d finding(s) not posted" % (
             label, len(findings) if findings else 0))
-        return True
+        return POSTED
 
     # Asked again after each send, deliberately. Every one of these three
     # reads is separated from the next by a submit_review that may have
@@ -1578,7 +1606,7 @@ def post_review(label, repo, pr, path, text, findings, config, env,
     # produces the duplicate the read exists to prevent.
     if resent and already_posted(label, repo, pr, env, verb):
         log("%s: the review is already on the pull request" % label)
-        return True
+        return POSTED
 
     if findings is None:
         log("%s: %s, posting its text as the review" % (
@@ -1619,9 +1647,9 @@ def post_review(label, repo, pr, path, text, findings, config, env,
             # tells whoever is debugging that anchoring worked.
             log("%s: posted %d inline comment(s) and the review comment" % (
                 label, len(payload.get("comments", ()))))
-            return True
-        return settled == UNSURE and already_posted(
-            label, repo, pr, env, verb)
+            return POSTED
+        return POSTED if settled == UNSURE and already_posted(
+            label, repo, pr, env, verb) else False
 
     settled = submit_review(label, repo, pr, payload, env)
     if settled == POSTED:
@@ -1639,7 +1667,7 @@ def post_review(label, repo, pr, path, text, findings, config, env,
         # is worse than one review, silence is worse than both.
         if already_posted(label, repo, pr, env, verb):
             log("%s: the review is already on the pull request" % label)
-            return True
+            return POSTED
         log("%s: the post may not have landed and nothing is up, so it is "
             "sent again" % label)
         settled = submit_review(label, repo, pr, payload, env)
@@ -1816,8 +1844,15 @@ def finish(label, repo, pr, path, text, findings, config, env, tokens,
     # extra send, and already_posted answers that.
     marker = unposted_path(repo, pr)
     if config["comment"] and not preserve and wrote:
-        save_or_log(label, lambda: write_atomic(
-            marker, "%s\n" % pr["headRefOid"]))
+        # Its own guard, not save_or_log's. That one's message says the
+        # transcript was not saved, which here is false and misleading:
+        # the transcript is safely on disk and what failed is the note
+        # saying it still needs sending.
+        try:
+            write_atomic(marker, "%s\n" % pr["headRefOid"])
+        except OSError as err:
+            log("%s: the review is saved but cannot be marked for sending "
+                "again: %s" % (label, err))
 
     posted = post_review(label, repo, pr, path, text, findings, config,
                          posting_env(label, config, repo, tokens, env), note,
@@ -1829,11 +1864,15 @@ def finish(label, repo, pr, path, text, findings, config, env, tokens,
     # silence the README forbids, reached by the one path that had no
     # retry of its own. The give-up has its own bounded retry and is
     # never marked.
-    # `not preserve` here as well as above. The give-up writes no marker,
-    # so forgetting one on its way out could only ever delete somebody
-    # else's — a saved review that is still waiting to be sent, gone with
-    # nothing left pointing at it.
-    if posted and not preserve:
+    # `== POSTED`, not truthiness. THROTTLED is a string and every string
+    # is true, so a rate-limited post — which had just logged that the
+    # review is safe and will be sent again — deleted the marker that was
+    # the only thing able to send it.
+    #
+    # `not preserve` as well, because the give-up writes no marker, so
+    # forgetting one on its way out could only ever delete somebody
+    # else's.
+    if posted == POSTED and not preserve:
         forget(marker)
     return posted
 
@@ -1906,7 +1945,11 @@ def read_mark(path):
     """
     try:
         with open(path, encoding="utf-8", errors="replace") as handle:
-            return handle.read().strip()
+            # An empty file answers None too. Zero bytes — a truncated
+            # write, a filesystem fault, an operator clearing it — is no
+            # more "written for another commit" than a permission error
+            # is, and that is the answer that deletes the saved review.
+            return handle.read().strip() or None
     except OSError:
         return None
 
@@ -2119,7 +2162,7 @@ def review(path, repo, pr, config, env, tokens, resent=False):
         # next ending to honour that nothing checked.
         if announce(label, lambda: finish(
                 label, repo, pr, path, text, findings, config, env, tokens,
-                note, resent=resent)):
+                note, resent=resent)) == POSTED:
             return
         if config["comment"]:
             # Promised only when it is true. finish() writes the marker
@@ -2418,15 +2461,11 @@ def spend_announce(key, config, state, head, attempts, tries, said):
             "stays in this log only" % (key, tries))
     was = state.get(key, {})
     entry = state_entry(head, FAILED, attempts,
-                        announced=bool(said) or spent, tries=tries,
+                        announced=said == POSTED or spent, tries=tries,
                         post_tries=was.get("post_tries", 0),
                         unposted=was.get("unposted", False),
-                        waivers=was.get("post_waivers", 0))
-    # Carried like every other counter. Dropped here, the waivers reset
-    # on each counted attempt, so a permanent throttle alternated between
-    # waiving three and charging one and never reached the cap at all.
-    if was.get("announce_waivers"):
-        entry["announce_waivers"] = was["announce_waivers"]
+                        waivers=was.get("post_waivers", 0),
+                        announce_waivers=was.get("announce_waivers", 0))
     state[key] = entry
     save_state(state)
 
@@ -2447,7 +2486,8 @@ def record_once(state, key, done, head, outcome, reason):
     state[key] = state_entry(head, outcome, kept.get("attempts", 0), reason,
                              post_tries=kept.get("post_tries", 0),
                              unposted=kept.get("unposted", False),
-                             waivers=kept.get("post_waivers", 0))
+                             waivers=kept.get("post_waivers", 0),
+                             announce_waivers=kept.get("announce_waivers", 0))
     save_state(state)
 
 
@@ -2571,8 +2611,15 @@ def handle_pr(repo, pr, config, state, tokens):
                 # an argument expression it ran before the function meant
                 # to govern it had a say, which a reader has to know
                 # Python's evaluation order to see.
+                # `tries` here counts every announcement attempt made,
+                # waived ones included, because it only decides whether
+                # this is the first time we are saying it. Taking the
+                # charged count instead reprinted the whole "leaving it
+                # alone" paragraph on every rate-limited poll, which in a
+                # shared log reads as four pull requests being abandoned.
                 said = give_up(key, repo, pr, config, done["attempts"],
-                               tokens, env=post_env, tries=tries,
+                               tokens, env=post_env,
+                               tries=tries + done.get("announce_waivers", 0),
                                resent=True)
                 spend_announce(key, config, state, head, done["attempts"],
                                tries, said)
@@ -2654,7 +2701,8 @@ def handle_pr(repo, pr, config, state, tokens):
     state[key] = state_entry(head, FAILED, attempts,
                              post_tries=kept.get("post_tries", 0),
                              unposted=kept.get("unposted", False),
-                             waivers=kept.get("post_waivers", 0))
+                             waivers=kept.get("post_waivers", 0),
+                             announce_waivers=kept.get("announce_waivers", 0))
     save_state(state)
 
     try:
@@ -2684,7 +2732,8 @@ def handle_pr(repo, pr, config, state, tokens):
                              post_tries=kept.get("post_tries", 0),
                              unposted=os.path.exists(
                                  unposted_path(repo, pr)),
-                             waivers=kept.get("post_waivers", 0))
+                             waivers=kept.get("post_waivers", 0),
+                             announce_waivers=kept.get("announce_waivers", 0))
     save_state(state)
 
     if outcome == FAILED and attempts >= MAX_ATTEMPTS:
@@ -2693,7 +2742,7 @@ def handle_pr(repo, pr, config, state, tokens):
         # regardless, a failed announcement was never retried at all.
         tries = done.get("announce_tries", 0)
         said = give_up(key, repo, pr, config, attempts, tokens, path, env,
-                       tries)
+                       tries + done.get("announce_waivers", 0))
         spend_announce(key, config, state, head, attempts, tries, said)
 
 

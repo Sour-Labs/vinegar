@@ -1247,7 +1247,8 @@ check("the live daemon still announces after a dry run looked",
 
 check("a dry run's give-up counts as said, not as a silence",
       vinegar.post_review(L, "o/r", PR, ROOT, "", None,
-                          dict(CONFIG, comment=False), None) is True)
+                          dict(CONFIG, comment=False), None)
+      == vinegar.POSTED)
 
 # A checkout that keeps failing is retried, deliberately, but it must not
 # say so once a minute for ever: the failures here are mostly transient and
@@ -1830,7 +1831,7 @@ fake_run.look_out = "%s gave up on `a1b2c3d` at high effort\n" % (
 del _rs_posts[:]
 _said = vinegar.give_up(L, "o/r", PR, CONFIG, 3, {}, tries=1)
 check("a give-up already up is not announced a second time",
-      _said is True and not _rs_posts, (_said, len(_rs_posts)))
+      _said == vinegar.POSTED and not _rs_posts, (_said, len(_rs_posts)))
 del _rs_posts[:]
 _said = vinegar.give_up(L, "o/r", PR, CONFIG, 3, {}, tries=0)
 check("the first announcement does not pay for that read",
@@ -1982,6 +1983,30 @@ del posted[:]
 vinegar.review(ROOT, "o/r", PR_LOST, CONFIG, None, {})
 check("a review GitHub refused is marked for another attempt",
       os.path.exists(_lost_marker), _lost_marker)
+
+# A rate-limited first post promises the review will be sent again, so it
+# must leave the one thing able to send it. THROTTLED is a string and
+# every string is true, so testing truthiness deleted the marker.
+PR_TL = dict(PR_LIVE, headRefOid="7407407407aa")
+_tl_marker = vinegar.unposted_path("o/r", PR_TL)
+fake_run.rc = 1
+fake_run.post_err = "gh: API rate limit exceeded (HTTP 403)"
+vinegar.run = claude_run
+claude_run.stream = stream(call(FINDINGS[:1]), result_event())
+vinegar.review(ROOT, "o/r", PR_TL, CONFIG, None, {})
+vinegar.run = fake_run
+check("a rate-limited first post keeps the review for later",
+      os.path.exists(_tl_marker), _tl_marker)
+vinegar.forget(_tl_marker)
+fake_run.rc, fake_run.post_err = 1, "HTTP 403 Resource not accessible"
+
+# An empty marker is not a marker for another commit either, and that
+# answer is the one that deletes the saved review.
+_empty = os.path.join(_tx_home, "empty.md.unposted")
+with open(_empty, "w") as h:
+    h.write("   \n")
+check("an empty marker is not read as another commit",
+      vinegar.read_mark(_empty) is None, vinegar.read_mark(_empty))
 check("the entry says a saved review is waiting behind it",
       vinegar.state_entry("x", vinegar.DONE, 1, unposted=True)["unposted"]
       is True)
