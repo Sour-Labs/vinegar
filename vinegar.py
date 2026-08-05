@@ -439,7 +439,7 @@ def check_paths():
 
 
 def state_entry(head, outcome, attempts=0, reason=None, announced=False,
-                tries=0):
+                tries=0, post_tries=0, unposted=False):
     """One pull request's record, built the one way.
 
     Four sites used to spell this out as a fresh literal, each deciding for
@@ -463,6 +463,18 @@ def state_entry(head, outcome, attempts=0, reason=None, announced=False,
         entry["announced"] = True
     if tries:
         entry["announce_tries"] = tries
+    if post_tries:
+        # Carried like the others. Every site that rebuilt an entry
+        # through this helper dropped it, so a repost budget already spent
+        # was handed back whenever anything else rewrote the entry, and
+        # "three sends and stop" became three sends per rewrite.
+        entry["post_tries"] = post_tries
+    if unposted:
+        # Whether a saved review is waiting behind this entry. Without it
+        # the only way to find out was to list the reviews directory,
+        # which the poll did for every pull request that had ever been
+        # pushed past, for ever.
+        entry["unposted"] = True
     return entry
 
 
@@ -1156,6 +1168,30 @@ def describe(finding):
     return "%s\n\n(%s)" % (body, tags) if tags else body
 
 
+def pr_key(repo, pr):
+    """How one pull request is named in the state file and the log."""
+    return "%s#%s" % (repo, pr["number"])
+
+
+def relative_findings(findings, root):
+    """The findings with every `file` made repo-relative where it resolves.
+
+    Done once, above everything that renders them. Reviewers report
+    absolute paths into the checkout — repo_path exists for that — and
+    normalising only where a finding is anchored left three other routes
+    to the pull request carrying the daemon's own directory layout: the
+    anchorless retry, the transcript, and the repost that sends that
+    transcript.
+    """
+    if not findings:
+        return findings
+    out = []
+    for finding in findings:
+        name = repo_path(finding.get("file"), root)
+        out.append(dict(finding, file=name) if name else finding)
+    return out
+
+
 def split_findings(findings, covered, root, label):
     """Route each finding to an inline comment or to the general comment."""
     inline, general = [], []
@@ -1676,6 +1712,11 @@ def finish(label, repo, pr, path, text, findings, config, env, tokens,
     # a dry run this file is the only place the giving-up can be recorded
     # at all. Skipping the write entirely kept the words but left the
     # ending nowhere but a log nobody is watching.
+    # Before the transcript is written, so every route to the pull
+    # request — this file, the comment, the anchorless retry, and the
+    # repost that sends this file later — carries the same paths.
+    findings = relative_findings(findings, path)
+
     # `preserve` is passed by the give-up, not inferred from the ending
     # being empty. Inferring it caught a different case that looks the
     # same from here: a review that ran to completion and reported
@@ -1950,7 +1991,7 @@ def review(path, repo, pr, config, env, tokens, resent=False):
     # and the reviewer goes back to printing text.
     env = dict(env or os.environ, CLAUDE_CODE_REPORT_FINDINGS="1")
 
-    label = "%s#%d" % (repo, pr["number"])
+    label = pr_key(repo, pr)
 
     def deliver(text, findings, note=None):
         """Record and post one ending, whichever ending it turned out to be.
@@ -1967,10 +2008,14 @@ def review(path, repo, pr, config, env, tokens, resent=False):
         false, and the findings exist only on disk. Saying which findings
         and where is what makes that recoverable by hand.
         """
+        # No answer to give back: every caller follows this with `return
+        # DONE`, because the subscription is spent whatever the posting
+        # said. Returning a boolean nobody read left a contract for the
+        # next ending to honour that nothing checked.
         if announce(label, lambda: finish(
                 label, repo, pr, path, text, findings, config, env, tokens,
                 note, resent=resent)):
-            return True
+            return
         if config["comment"]:
             # Promised only when it is true. finish() writes the marker
             # only if the transcript was written, so on the path where
@@ -1987,7 +2032,6 @@ def review(path, repo, pr, config, env, tokens, resent=False):
                     "saved to send later. To review it again, stop "
                     "Vinegar, delete this pull request's entry from %s, "
                     "and start it again" % (label, STATE_PATH))
-        return False
 
     log("%s: reviewing at %s effort%s" % (
         label, config["effort"], "" if config["comment"] else ", dry run"))
@@ -2252,7 +2296,11 @@ def spend_announce(key, config, state, head, attempts, tries, said):
         log("%s: the give-up could not be posted in %d attempts, so it "
             "stays in this log only" % (key, tries))
     state[key] = state_entry(head, FAILED, attempts,
-                             announced=said or spent, tries=tries)
+                             announced=said or spent, tries=tries,
+                             post_tries=state.get(key, {}).get(
+                                 "post_tries", 0),
+                             unposted=state.get(key, {}).get("unposted",
+                                                             False))
     save_state(state)
 
 
@@ -2269,12 +2317,14 @@ def record_once(state, key, done, head, outcome, reason):
         return
     log("%s: %s" % (key, reason))
     kept = done if done.get("sha") == head else {}
-    state[key] = state_entry(head, outcome, kept.get("attempts", 0), reason)
+    state[key] = state_entry(head, outcome, kept.get("attempts", 0), reason,
+                             post_tries=kept.get("post_tries", 0),
+                             unposted=kept.get("unposted", False))
     save_state(state)
 
 
 def handle_pr(repo, pr, config, state, tokens):
-    key = "%s#%d" % (repo, pr["number"])
+    key = pr_key(repo, pr)
     head = pr["headRefOid"]
     done = state.get(key) or {}
 
@@ -2282,10 +2332,15 @@ def handle_pr(repo, pr, config, state, tokens):
     # finished work waiting on one API call, so it is retried before
     # anything else decides this pull request is done.
     if config["comment"]:
-        # The scan behind the stat is only meaningful when this pull
-        # request has been reviewed at some other head.
+        # The scan behind the stat runs only when the entry says a saved
+        # review is actually waiting at some other head. Gating on "the
+        # head has moved" alone meant every pull request that was ever
+        # reviewed and then pushed to listed the whole reviews directory
+        # once a minute for the life of the daemon, looking for a prefix
+        # that was never going to be there.
         marker, saved_sha = unposted_for(
-            repo, pr, scan=bool(done.get("sha")) and done.get("sha") != head)
+            repo, pr,
+            scan=bool(done.get("unposted")) and done.get("sha") != head)
         if marker and saved_sha is None:
             # Unreadable, which is not the same as belonging to another
             # commit. Believing the entry rather than deleting a paid-for
@@ -2308,7 +2363,16 @@ def handle_pr(repo, pr, config, state, tokens):
         # entry — the same window `resent=attempts > 1` exists for one
         # branch below, and requiring DONE here deleted the finished
         # review it was written to protect.
-        if marker and done.get("sha") != saved_sha:
+        #
+        # An entry with no sha at all is the deleted-entry case, and it
+        # has to be caught before the comparison: with an unreadable
+        # marker `saved_sha` becomes that same missing sha, None equals
+        # None, and the stale transcript was posted to the pull request
+        # the operator had just cleared in order to have it reviewed
+        # afresh — followed by the real review, which is the pair of
+        # reviews the whole rule exists to prevent.
+        if marker and (done.get("sha") is None
+                       or done.get("sha") != saved_sha):
             log("%s: an unposted review is left over from a run that is no "
                 "longer recorded, so it is forgotten" % key)
             forget(marker)
@@ -2473,7 +2537,11 @@ def handle_pr(repo, pr, config, state, tokens):
         log("%s: the review did not complete: %s" % (key, err))
         outcome = FAILED
 
-    state[key] = state_entry(head, outcome, attempts)
+    # Recorded with whether a saved review is waiting behind it, so the
+    # next poll can find that out without listing a directory.
+    state[key] = state_entry(head, outcome, attempts,
+                             unposted=os.path.exists(
+                                 unposted_path(repo, pr)))
     save_state(state)
 
     if outcome == FAILED and attempts >= MAX_ATTEMPTS:
@@ -2667,8 +2735,15 @@ def main():
             # a second `--pr` run knows nothing, and without the check it
             # posts a complete second review with duplicate inline
             # comments.
-            review(checkout(repo, pr, env), repo, pr, config, env, tokens,
-                   resent=True)
+            # Deliberately not `resent`. A person running this has asked
+            # for a review and expects to see one: the reason the comment
+            # below gives for re-running by hand — trying another
+            # `--model` — is a case that asking first makes impossible,
+            # because Vinegar's own line is already up at that commit and
+            # the second review would be paid for and then thrown away.
+            # An unwanted duplicate is visible and harmless; a discarded
+            # review is neither.
+            review(checkout(repo, pr, env), repo, pr, config, env, tokens)
             # A manual run writes no state, which is right: it is not the
             # daemon's record of what has been reviewed. But a refused
             # post leaves a marker the daemon only honours when an entry
@@ -2677,10 +2752,15 @@ def main():
             # it. On a pull request the daemon skips — a draft, a fork,
             # one over max_changed_lines — nothing would ever replace the
             # review it threw away.
-            if unposted_for(repo, pr)[0]:
+            # This run's own head only. The scan would find a marker left
+            # at some *other* head by the daemon and record a DONE entry
+            # for this one, which claims a review was saved when none was
+            # and moves the entry's sha away from the marker that needed
+            # it — orphaning that saved review for good.
+            if unposted_for(repo, pr, scan=False)[0]:
                 state = load_state()
-                state["%s#%d" % (repo, pr["number"])] = state_entry(
-                    pr["headRefOid"], DONE, 1)
+                state[pr_key(repo, pr)] = state_entry(
+                    pr["headRefOid"], DONE, 1, unposted=True)
                 save_state(state)
                 log("%s: the review is saved to be posted on a later poll"
                     % args.pr)

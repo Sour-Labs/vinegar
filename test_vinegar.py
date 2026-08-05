@@ -1829,8 +1829,13 @@ except SystemExit as err:
 finally:
     (vinegar.review, vinegar.find_pr, vinegar.checkout,
      vinegar.github_env, sys.argv) = _pr_real
-check("a --pr run asks before posting over an earlier review",
-      _pr_kw.get("resent") is True, _pr_kw)
+# Deliberately not `resent`: a person running --pr has asked for a review
+# and expects to see one. Asking first makes the stated reason for a
+# second run — trying another model — impossible, because the first run's
+# own line is up at that commit and the second review would be paid for
+# and discarded.
+check("a --pr run posts what it reviewed rather than deferring",
+      _pr_kw.get("resent") in (None, False), _pr_kw)
 
 # A manual run writes no state, which is right. But a refused post leaves
 # a marker the daemon only honours when an entry stands behind it, so
@@ -1917,6 +1922,58 @@ del posted[:]
 vinegar.review(ROOT, "o/r", PR_LOST, CONFIG, None, {})
 check("a review GitHub refused is marked for another attempt",
       os.path.exists(_lost_marker), _lost_marker)
+check("the entry says a saved review is waiting behind it",
+      vinegar.state_entry("x", vinegar.DONE, 1, unposted=True)["unposted"]
+      is True)
+
+# And handle_pr records it, which is what lets the next poll find the
+# saved review without listing the whole reviews directory.
+PR_FLAG = dict(PR_LIVE, headRefOid="f1a9f1a9f1a9")
+_flag_marker = vinegar.unposted_path("o/r", PR_FLAG)
+_flag_real = (vinegar.review, vinegar.checkout, vinegar.save_state)
+
+
+def _review_that_leaves_a_marker(*a, **k):
+    with open(_flag_marker, "w") as handle:
+        handle.write("%s\n" % PR_FLAG["headRefOid"])
+    return vinegar.DONE
+
+
+vinegar.review = _review_that_leaves_a_marker
+vinegar.checkout = lambda repo, pr, env: ROOT
+vinegar.save_state = lambda st: None
+_flag_state = {}
+vinegar.handle_pr("o/r", PR_FLAG, CONFIG, _flag_state, {})
+(vinegar.review, vinegar.checkout, vinegar.save_state) = _flag_real
+check("handle_pr records that a saved review is waiting",
+      _flag_state[vinegar.pr_key("o/r", PR_FLAG)].get("unposted") is True,
+      _flag_state)
+vinegar.forget(_flag_marker)
+
+# Every route to the pull request carries the same paths: the anchorless
+# retry and the transcript the repost later sends, not only the inline
+# one. A reviewer's absolute path used to reach both verbatim.
+PR_ABS = dict(PR_LIVE, headRefOid="abcabcabc001")
+_abs_finding = [{"file": os.path.join(ROOT, "vinegar.py"), "line": 9000,
+                 "summary": "outside the diff"}]
+fake_run.rc, fake_run.post_err = 1, "HTTP 502 Bad Gateway"
+fake_run.look_out = ""
+vinegar.run = fake_run
+del posted[:]
+vinegar.finish(L, "o/r", PR_ABS, ROOT, "words", _abs_finding, CONFIG, None,
+               {})
+_abs_bodies = " ".join(p[1]["body"] for p in posted)
+_abs_transcript = open(vinegar.transcript_path("o/r", PR_ABS)).read()
+check("no route to the pull request carries the daemon's own paths",
+      posted and ROOT not in _abs_bodies and ROOT not in _abs_transcript
+      and "vinegar.py:9000" in _abs_bodies,
+      (ROOT in _abs_bodies, ROOT in _abs_transcript))
+vinegar.forget(vinegar.unposted_path("o/r", PR_ABS))
+fake_run.rc, fake_run.post_err = 1, "HTTP 403 Resource not accessible"
+# This block's ambiguous post consulted the landed-review read; the
+# checks below count those calls for themselves.
+del looked[:]
+del posted[:]
 
 _lost_state = {_lost_key: {"outcome": vinegar.DONE,
                            "sha": PR_LOST["headRefOid"], "attempts": 1}}
@@ -2016,6 +2073,28 @@ del posted[:]
 vinegar.handle_pr("o/r", PR_LOST, CONFIG, _spent_state, {})
 check("a spent post budget is not retried even if the mark remains",
       not posted, (len(posted), _spent_state))
+
+# And the budget survives whatever else rewrites the entry. Every site
+# that rebuilt one through state_entry dropped post_tries, so a spent
+# repost budget was handed back and "three sends and stop" became three
+# per rewrite.
+_launder = {_lost_key: {"outcome": vinegar.FAILED,
+                        "sha": PR_LOST["headRefOid"],
+                        "attempts": vinegar.MAX_ATTEMPTS,
+                        "post_tries": vinegar.MAX_ATTEMPTS}}
+vinegar.handle_pr("o/r", PR_LOST, CONFIG, _launder, {})
+check("the repost budget is not handed back by the give-up",
+      _launder[_lost_key].get("post_tries") == vinegar.MAX_ATTEMPTS,
+      _launder)
+PR_SKIP = dict(PR_LOST, number=77, isDraft=True)
+_skip_key = vinegar.pr_key("o/r", PR_SKIP)
+_launder_skip = {_skip_key: {"outcome": vinegar.FAILED,
+                             "sha": PR_SKIP["headRefOid"], "attempts": 1,
+                             "post_tries": 2}}
+vinegar.handle_pr("o/r", PR_SKIP, CONFIG, _launder_skip, {})
+check("the repost budget is not handed back by a skip",
+      _launder_skip[_skip_key].get("outcome") == "skipped"
+      and _launder_skip[_skip_key].get("post_tries") == 2, _launder_skip)
 vinegar.forget(_lost_marker)
 
 # A marker whose state entry is gone is left over from a review nobody
@@ -2075,6 +2154,29 @@ check("an unreadable marker keeps the review rather than dropping it",
       (len(posted), _bad_state))
 vinegar.forget(_lost_marker)
 
+# An entry the operator deleted, with a marker that cannot be read: the
+# missing sha and the unreadable one were both None, so the comparison
+# said "same commit" and the stale transcript went to the pull request
+# the operator had just cleared in order to have it reviewed afresh.
+vinegar.save_transcript("o/r", PR_LOST, "Stale findings.", [])
+with open(_lost_marker, "w") as h:
+    h.write("%s\n" % PR_LOST["headRefOid"])
+_gone = vinegar.read_mark
+_gone_review, _gone_checkout = vinegar.review, vinegar.checkout
+vinegar.read_mark = lambda path: None
+vinegar.checkout = lambda repo, pr, env: ROOT
+vinegar.review = lambda *a, **k: vinegar.DONE
+_gone_state = {}
+del posted[:]
+vinegar.handle_pr("o/r", PR_LOST, CONFIG, _gone_state, {})
+vinegar.read_mark = _gone
+vinegar.review, vinegar.checkout = _gone_review, _gone_checkout
+check("a marker with no entry at all is forgotten, not posted",
+      not os.path.exists(_lost_marker)
+      and not [p for p in posted
+               if "posted from the transcript" in p[1]["body"]],
+      (len(posted), _gone_state))
+
 # The mint failure inside repost() must clear the marker when the budget
 # runs out, or it survives to restart the cycle later. Reachable only with
 # a github_env that can fail, which the stub above cannot.
@@ -2131,7 +2233,8 @@ with open(_moved_marker, "w") as h:
     h.write("%s\n" % PR_LOST["headRefOid"])
 PR_MOVED = dict(PR_LOST, headRefOid="9999999999ff")
 _moved_state = {_lost_key: {"outcome": vinegar.DONE,
-                            "sha": PR_LOST["headRefOid"], "attempts": 1}}
+                            "sha": PR_LOST["headRefOid"], "attempts": 1,
+                            "unposted": True}}
 del posted[:]
 vinegar.handle_pr("o/r", PR_MOVED, CONFIG, _moved_state, {})
 check("a saved review survives the head moving on",
