@@ -97,6 +97,19 @@ python3 vinegar.py                       # poll forever
 Vinegar keeps its own state under `~/.vinegar`: `config.json`, `state.json`
 (the head commit it last handled per pull request), and `reviews/`.
 
+There are tests, and they need nothing installed:
+
+```sh
+python3 test_vinegar.py
+```
+
+They cover the part between the reviewer finishing and the review appearing:
+reading findings out of the stream, working out which can be anchored in the
+diff, and deciding what to post. Nothing in them touches the network, GitHub,
+git or Claude. That is deliberate rather than tidy: a review costs real money
+and several minutes, so the behaviour that can be checked for free is checked
+for free, and every case in there is one a live review got wrong once.
+
 Clones live outside that directory, in `~/.vinegar-checkouts/`, one per repo,
 which only Vinegar touches. They are deliberately not under `~/.vinegar`: the
 reviewer is denied every read there so that a diff cannot talk it into reading
