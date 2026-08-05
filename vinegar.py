@@ -559,12 +559,20 @@ def load_state():
             # ever, with nothing rewriting it. A bad entry is dropped
             # rather than taking the file with it: the pull request is
             # reviewed once more and the entry heals itself.
+            # The fields too, not only the entry. `attempts` is compared
+            # with >= and indexed directly, so an entry hand-edited to
+            # `"attempts": "3"` raises TypeError for that pull request on
+            # every poll, for ever, with nothing rewriting it to heal. A
+            # counter that is not a whole number is not a counter.
             bad = [key for key, done in state.items()
-                   if not isinstance(done, dict)]
+                   if not isinstance(done, dict)
+                   or any(not isinstance(done[field], int)
+                          or isinstance(done[field], bool)
+                          for field in ("attempts", "announce_tries")
+                          if field in done)]
             for key in bad:
-                log("%s: its entry in %s is %s, not an object, so it is "
-                    "forgotten and will be reviewed again" % (
-                        key, STATE_PATH, type(state[key]).__name__))
+                log("%s: its entry in %s cannot be read, so it is forgotten "
+                    "and will be reviewed again" % (key, STATE_PATH))
                 del state[key]
             return state
         why = "it holds %s, not an object" % type(state).__name__
@@ -1434,7 +1442,7 @@ def already_posted(label, repo, pr, env, verb="reviewed"):
 
 
 def post_review(label, repo, pr, path, text, findings, config, env,
-                note=None, verb="reviewed"):
+                note=None, verb="reviewed", resent=False):
     """Turn what the reviewer reported into one review on the pull request.
 
     Answers whether the pull request carries the review now. The give-up
@@ -1497,6 +1505,16 @@ def post_review(label, repo, pr, path, text, findings, config, env,
             return True
         return settled == UNSURE and already_posted(
             label, repo, pr, env, verb)
+
+    # A send that is already a retry from an earlier poll asks first. The
+    # checks below only fire when *this* send is ambiguous, which covers a
+    # retry inside one call and misses the one across calls: the give-up
+    # whose post landed while Vinegar could not tell, recorded unannounced,
+    # comes back a minute later and says it again. Every duplicate this
+    # code has produced came through that door.
+    if resent and already_posted(label, repo, pr, env, verb):
+        log("%s: the review is already on the pull request" % label)
+        return True
 
     settled = submit_review(label, repo, pr, payload, env)
     if settled == POSTED:
@@ -1585,7 +1603,7 @@ def keep(label, repo, pr, text, why):
 
 
 def finish(label, repo, pr, path, text, findings, config, env, tokens,
-           note=None, verb="reviewed", preserve=False):
+           note=None, verb="reviewed", preserve=False, resent=False):
     """Record the review on disk and post it, whatever ended the run.
 
     Answers post_review()'s answer: whether the pull request carries it.
@@ -1625,35 +1643,33 @@ def finish(label, repo, pr, path, text, findings, config, env, tokens,
     # disagreed about what happened, which is the asymmetry this function
     # exists to remove.
     path_kept = transcript_path(repo, pr)
-    if preserve and os.path.exists(path_kept):
-        if note:
-            try:
-                # Rewritten whole through a rename, like save_transcript,
-                # not appended in place. This branch trusts the existence
-                # of the file to mean the attempts left words worth
-                # keeping, and an append that dies half-way would hand the
-                # next reader a file that passes that test and ends
-                # mid-note.
-                with open(path_kept, encoding="utf-8",
-                          errors="replace") as handle:
-                    whole = handle.read()
-                # Once, however many times the announcement is retried.
-                # record_give_up() calls this up to MAX_ATTEMPTS times
-                # while the posting keeps failing, and each call used to
-                # append another identical ending to the file that is a
-                # dry run's only artifact.
-                if note in whole:
-                    log("%s: the transcript already records this ending" %
-                        label)
-                else:
-                    write_atomic(path_kept, whole + "\n\n---\n\n%s\n" % note)
-                    log("%s: the ending is appended to the transcript the "
-                        "attempts left" % label)
-            except Exception as err:
-                log("%s: the transcript is not saved: %s" % (label, err))
-        else:
-            log("%s: the transcript already holds what the attempts said, "
-                "leaving it" % label)
+    # `note` is in the condition rather than nested inside it: the only
+    # caller that preserves is the give-up, and it always brings a note
+    # saying why, so a preserve-without-note branch was three lines no
+    # test could reach and a reader still had to account for.
+    if preserve and note and os.path.exists(path_kept):
+        try:
+            # Rewritten whole through a rename, like save_transcript, not
+            # appended in place. This branch trusts the existence of the
+            # file to mean the attempts left words worth keeping, and an
+            # append that dies half-way would hand the next reader a file
+            # that passes that test and ends mid-note.
+            with open(path_kept, encoding="utf-8",
+                      errors="replace") as handle:
+                whole = handle.read()
+            # Once, however many times the announcement is retried. The
+            # give-up is attempted on up to MAX_ATTEMPTS polls while the
+            # posting keeps failing, and each attempt used to append
+            # another identical ending to the file that is a dry run's
+            # only artifact.
+            if note in whole:
+                log("%s: the transcript already records this ending" % label)
+            else:
+                write_atomic(path_kept, whole + "\n\n---\n\n%s\n" % note)
+                log("%s: the ending is appended to the transcript the "
+                    "attempts left" % label)
+        except Exception as err:
+            log("%s: the transcript is not saved: %s" % (label, err))
     else:
         try:
             log("%s: transcript at %s" % (
@@ -1662,7 +1678,7 @@ def finish(label, repo, pr, path, text, findings, config, env, tokens,
             log("%s: the transcript is not saved: %s" % (label, err))
     return post_review(label, repo, pr, path, text, findings, config,
                        posting_env(label, config, repo, tokens, env), note,
-                       verb)
+                       verb, resent)
 
 
 def partial_note(cause):
@@ -1952,7 +1968,7 @@ def give_up(key, repo, pr, config, attempts, tokens, path=None, env=None,
              "failed before it could report anything. Read that as the "
              "review not running, not as the change being clean." % (
                  attempts,),
-        verb="gave up on", preserve=True))
+        verb="gave up on", preserve=True, resent=bool(tries)))
 
 
 def spend_announce(key, config, state, head, attempts, tries, said):
@@ -2106,7 +2122,20 @@ def handle_pr(repo, pr, config, state, tokens):
     except Exception as err:
         # A checkout spends no subscription budget, so leave this pull request
         # unrecorded and try it again on the next poll.
-        log("%s: checkout failed: %s" % (key, err))
+        #
+        # Deliberately not bounded by MAX_ATTEMPTS. The failures here are
+        # mostly transient (a network blip during clone, a lock held by
+        # another git), retrying costs nothing but disk, and three polls is
+        # three minutes: bounding it would abandon a pull request over a
+        # brief outage, which is worse than retrying a broken one. What
+        # was worth fixing is the noise, so the same failure is said once
+        # rather than once a minute for ever.
+        said = "checkout failed: %s" % err
+        if (done.get("outcome") != "checkout" or done.get("sha") != head
+                or done.get("reason") != said):
+            log("%s: %s" % (key, said))
+            state[key] = state_entry(head, "checkout", reason=said)
+            save_state(state)
         return
 
     attempts = done.get("attempts", 0) + 1 if done.get("sha") == head else 1
@@ -2266,6 +2295,24 @@ def main():
     config = load_config(args.config)
     if args.dry_run:
         config["comment"] = False
+
+    # A run that posts nothing keeps its own bookkeeping. The poll path
+    # records an outcome for every pull request it reviews, and written to
+    # the shared file that outcome tells the live daemon the pull request
+    # is done: it returns at the DONE check, `review_on_push` is false, and
+    # a pull request nobody ever posted a review for is never looked at
+    # again. spend_announce() guards the same hazard for one field; this is
+    # the field that closes the whole pull request off.
+    #
+    # A separate file rather than no file, because a dry run is also run as
+    # a daemon (`comment: false` is a configuration, not only a flag), and
+    # remembering nothing would review every open pull request again on
+    # every poll at full cost.
+    if not config["comment"]:
+        global STATE_PATH
+        STATE_PATH = STATE_PATH + ".dry"
+        log("posting nothing, so what has been reviewed is remembered in %s"
+            % STATE_PATH)
 
     # Both paths take the lock. A manual --pr run shares the daemon's checkout
     # for that repo, so without it the manual run would reset and re-check-out

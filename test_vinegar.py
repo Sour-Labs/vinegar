@@ -1128,6 +1128,30 @@ check("a dry run's give-up counts as said, not as a silence",
       vinegar.post_review(L, "o/r", PR, ROOT, "", None,
                           dict(CONFIG, comment=False), None) is True)
 
+# A checkout that keeps failing is retried, deliberately, but it must not
+# say so once a minute for ever: the failures here are mostly transient and
+# retrying costs no subscription, so the noise is what was worth fixing.
+_ck_state = {}
+_ck_log = []
+vinegar.review = lambda *a, **k: vinegar.DONE
+vinegar.save_state = lambda st: None
+vinegar.github_env = lambda *a, **k: None
+
+
+def broken_checkout(repo, pr, env):
+    raise RuntimeError("could not clone")
+
+
+vinegar.checkout = broken_checkout
+vinegar.log = lambda m: _ck_log.append(m)
+for _ in range(4):
+    vinegar.handle_pr("o/r", PR_LIVE, CONFIG, _ck_state, {})
+vinegar.log = lambda message: None
+check("a failing checkout is reported once, not once a poll",
+      len([m for m in _ck_log if "could not clone" in m]) == 1, _ck_log)
+check("a failing checkout is still retried rather than abandoned",
+      _ck_state[L]["outcome"] == "checkout", _ck_state)
+
 vinegar.review, vinegar.save_state = _real_review, _real_save_state
 vinegar.checkout, vinegar.github_env = _real_checkout, _real_github_env
 
@@ -1196,6 +1220,19 @@ with open(vinegar.STATE_PATH, "w") as h:
 _mixed = vinegar.load_state()
 check("an entry that is not an object is dropped, not kept to crash",
       _mixed == {"o/r#13": {"outcome": "reviewed"}}, _mixed)
+
+# A counter that is not a whole number is not a counter: `attempts` is
+# compared with >= on every poll, and the hand-edit this file's own log
+# recommends is exactly where a string one comes from.
+with open(vinegar.STATE_PATH, "w") as h:
+    h.write('{"o/r#12": {"outcome": "failed", "sha": "a", "attempts": "3"},'
+            ' "o/r#13": {"outcome": "failed", "sha": "a", '
+            '"announce_tries": true},'
+            ' "o/r#14": {"outcome": "failed", "sha": "a", "attempts": 2}}')
+_typed = vinegar.load_state()
+check("an attempts that is not a number is dropped",
+      "o/r#12" not in _typed and "o/r#13" not in _typed
+      and _typed.get("o/r#14", {}).get("attempts") == 2, _typed)
 check("dropping a bad entry does not quarantine the good ones",
       not _quarantined(), _quarantined())
 os.remove(vinegar.STATE_PATH)
@@ -1585,6 +1622,35 @@ _gu_body = open(vinegar.transcript_path("o/r", PR_GU)).read()
 check("give_up asks for the attempts' words to be kept",
       "What attempt three said." in _gu_body
       and "tried to review this 3 times" in _gu_body, _gu_body[:200])
+
+# A give-up retried on a later poll asks whether the earlier attempt
+# landed after all. Without that, a post that succeeded while Vinegar
+# could not tell is said again on the next poll, and again on the one
+# after: the duplicate already_posted() exists to prevent, arriving
+# through the one path that retries across polls rather than within a call.
+_rs_posts = []
+
+
+def watch_posts(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
+    if cmd[:2] == ["gh", "api"] and "-X" not in cmd:
+        _rs_posts.append(cmd)
+    return fake_run(cmd, cwd, timeout, env, stdin_text)
+
+
+vinegar.run = watch_posts
+fake_run.rc, fake_run.post_err = 0, "HTTP 422"
+fake_run.look_out = "%s gave up on `a1b2c3d` at high effort\n" % (
+    vinegar.BODY_MARK)
+del _rs_posts[:]
+_said = vinegar.give_up(L, "o/r", PR, CONFIG, 3, {}, tries=1)
+check("a give-up already up is not announced a second time",
+      _said is True and not _rs_posts, (_said, len(_rs_posts)))
+del _rs_posts[:]
+_said = vinegar.give_up(L, "o/r", PR, CONFIG, 3, {}, tries=0)
+check("the first announcement does not pay for that read",
+      len(_rs_posts) == 1, len(_rs_posts))
+fake_run.look_out = ""
+vinegar.run = fake_run
 check("the give-up itself is recorded beneath them",
       "tried to review this 3 times" in body
       and body.find("Twenty minutes") < body.find("tried to review"),
@@ -1594,7 +1660,7 @@ check("the give-up itself is recorded beneath them",
 # append the same ending again to the file a dry run is judged by.
 vinegar.finish(L, "o/r", PR_GAVE, ROOT, "", None,
                dict(CONFIG, comment=False), None, {},
-               note="Vinegar tried to review this 3 times.")
+               note="Vinegar tried to review this 3 times.", preserve=True)
 body = open(vinegar.transcript_path("o/r", PR_GAVE)).read()
 check("a retried give-up does not stack endings in the transcript",
       body.count("tried to review this 3 times") == 1,
@@ -1693,6 +1759,25 @@ for target in ("nonsense", "o/r#2x", "o/r#²", "o/r#١٢"):
                and "cannot read" not in (proc.stdout + proc.stderr))
     check("--pr %r is refused before anything is asked of GitHub" % target,
           refused, (proc.returncode, (proc.stdout + proc.stderr)[:120]))
+
+# A run that posts nothing must not tell the live daemon those pull
+# requests are done. Through the real entry point, because the choice is
+# made in main() and the whole point is which file gets written.
+# `--pr nonsense` so the run exits on the target guard, which sits just
+# after the choice this pins and before anything is asked of GitHub.
+def _entry(*flags):
+    return subprocess.run(
+        [sys.executable, os.path.join(here_dir, "vinegar.py"),
+         "--pr", "nonsense"] + list(flags),
+        capture_output=True, text=True,
+        env=dict(os.environ, VINEGAR_HOME=os.environ["VINEGAR_HOME"]))
+
+
+_dry_out = _entry("--dry-run").stdout
+check("a dry run keeps its bookkeeping out of the live state file",
+      "state.json.dry" in _dry_out, _dry_out[-200:])
+check("a live run still uses the live state file",
+      "state.json.dry" not in _entry().stdout, _entry().stdout[-200:])
 
 print()
 print("FAILED: %s" % ", ".join(fails) if fails else "all checks passed")
