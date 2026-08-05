@@ -136,6 +136,17 @@ that passed against the very regression they were named for, and each was
 found only by running the mutation. One entry is expected to survive and one
 to abort, both explained in the file.
 
+**Run it in a scratch worktree if a daemon executes the checkout**, because a
+broken `vinegar.py` is on disk for a few seconds per entry and a `KeepAlive`
+restart landing in one of those windows starts the daemon on it. A process
+already running is unaffected; Python reads the source once at import.
+
+```sh
+git worktree add /tmp/vinegar-mutate HEAD
+cd /tmp/vinegar-mutate && python3 mutate.py
+cd - && git worktree remove /tmp/vinegar-mutate
+```
+
 Clones live outside that directory, in `~/.vinegar-checkouts/`, one per repo,
 which only Vinegar touches. They are deliberately not under `~/.vinegar`: the
 reviewer is denied every read there so that a diff cannot talk it into reading

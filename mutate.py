@@ -26,6 +26,19 @@ vinegar.py, the exact text that implements it, and what to replace that text
 with to break it. Running it edits vinegar.py in place and puts it back; the
 restore is verified, and the run stops rather than leaving a mutation behind.
 
+**Run this in a scratch worktree, not in a checkout a daemon executes.** A
+broken vinegar.py is on disk for the few seconds each entry takes, thirty
+times a run, and anything that *starts* the program inside one of those
+windows gets the broken copy rather than the restored one. Under the launchd
+setup the README describes, a KeepAlive restart landing in one of those
+windows brings the daemon back with, say, `acquire_lock`'s flock removed or
+`MAX_ATTEMPTS` at 99. A running process is unaffected, because Python reads
+the source once at import, so this is a hazard only for restarts.
+
+    git worktree add /tmp/vinegar-mutate HEAD
+    cd /tmp/vinegar-mutate && python3 mutate.py
+    cd - && git worktree remove /tmp/vinegar-mutate
+
 Add an entry whenever you add a check. Four checks shipped once that passed
 against the very regression they were named for, and each was found only by
 running the mutation.
