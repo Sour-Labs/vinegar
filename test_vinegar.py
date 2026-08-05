@@ -40,6 +40,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 here_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, here_dir)
@@ -74,6 +75,8 @@ diff --git a/doc.md b/doc.md
 @@ -1,0 +2,2 @@
 +++ b/spoofed.py
 +@@ -1 +9999 @@
+@@ -10,0 +20,1 @@
++after the forgery
 diff --git a/my file.py b/my file.py
 --- a/my file.py	
 +++ b/my file.py	
@@ -97,13 +100,15 @@ diff --git a/README.md b/README.md
 posted = []
 looked = []
 last_git_diff = [[], None]
+last_post_timeout = [None]
 
 
 def fake_run(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
     if cmd[0] == "git" and "diff" in cmd:
         last_git_diff[0], last_git_diff[1] = cmd, timeout
         return subprocess.CompletedProcess(
-            cmd, fake_run.diff_rc, "" if fake_run.diff_rc else DIFF, "boom")
+            cmd, fake_run.diff_rc,
+            fake_run.diff_out if fake_run.diff_rc else DIFF, "boom")
     if cmd[:2] == ["gh", "api"] and "-X" in cmd:
         # The read that asks whether a review already landed.
         looked.append(cmd)
@@ -111,6 +116,7 @@ def fake_run(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
             cmd, fake_run.look_rc, fake_run.look_out, "")
     if cmd[:2] == ["gh", "api"]:
         posted.append((cmd, json.loads(stdin_text)))
+        last_post_timeout[0] = timeout
         return subprocess.CompletedProcess(cmd, fake_run.rc, "",
                                            fake_run.post_err)
     raise AssertionError("unexpected command %r" % cmd)
@@ -118,6 +124,7 @@ def fake_run(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
 
 fake_run.rc = 0
 fake_run.diff_rc = 0
+fake_run.diff_out = ""
 fake_run.look_rc = 0
 fake_run.look_out = ""
 fake_run.post_err = "HTTP 422"
@@ -126,6 +133,8 @@ vinegar.run = fake_run
 vinegar.log = lambda message: None
 
 fails = []
+ran = []
+reached_the_end = []
 
 
 GENUINE = {name: getattr(vinegar, name) for name in (
@@ -152,6 +161,7 @@ def reset_stubs():
     vinegar.log = lambda message: None
     fake_run.rc = 0
     fake_run.diff_rc = 0
+    fake_run.diff_out = ""
     fake_run.look_rc = 0
     fake_run.look_out = ""
     fake_run.post_err = "HTTP 422"
@@ -161,8 +171,30 @@ def reset_stubs():
 
 def check(name, condition, detail=""):
     print("%-52s %s" % (name, "ok" if condition else "FAIL " + str(detail)))
+    ran.append(name)
     if not condition:
         fails.append(name)
+
+
+@atexit.register
+def say_if_it_stopped_early():
+    """Say so when the run ended somewhere other than its own ending.
+
+    Most of the work here happens between the checks, at module level, so
+    anything that raises ends the script where it stands and every check
+    below that line is skipped rather than run. That exits 1 with a
+    traceback, which reads like a failing check to anyone scanning, and it
+    is how a broken guard gets recorded as a caught one: breaking clamp()
+    left 11 of 344 checks running and the other 333 unreported, and the
+    exit code alone said the suite had noticed.
+
+    Registered after the one that removes the temporary home, so it prints
+    before that runs. atexit calls handlers in reverse.
+    """
+    if not reached_the_end:
+        print("\nABORTED after %d checks. The run stopped where the "
+              "traceback points. Every check below that line was skipped, "
+              "not passed." % len(ran))
 
 
 # --- read_stream ----------------------------------------------------------
@@ -251,6 +283,27 @@ check("a findings array quoted in prose is no longer readable at all",
 check("one unreadable line does not cost the rest of the stream",
       vinegar.read_stream("not json\n" + stream(call(REAL), DONE_EVENT))[1]
       == REAL)
+# A line that starts with `{` and then stops making sense, which is what a
+# stream cut mid-write actually leaves. "not json" above never reaches
+# json.loads at all: it fails the startswith and is skipped by the line
+# before the try, so the except that catches a half-written event was
+# unexercised and could be deleted with the suite still green.
+#
+# Wrapped, because what deleting that except does is raise, and an unwrapped
+# condition here would end the run instead of failing one check. In the
+# daemon the same raise escapes review() and leaves handle_pr no state, so
+# the pull request is re-reviewed at full cost on every poll after it.
+_half = '{"type":"assist\n' + stream(call(REAL), DONE_EVENT)
+try:
+    _half_read = vinegar.read_stream(_half)
+except Exception as err:
+    _half_read = err
+check("a half-written event does not cost the rest of the stream",
+      not isinstance(_half_read, Exception) and _half_read[1] == REAL,
+      _half_read)
+check("a half-written event does not cost the result that follows it",
+      not isinstance(_half_read, Exception) and _half_read[0] is not None,
+      _half_read)
 check("no result event at all is reported as no result",
       vinegar.read_stream(stream(call(REAL)))[0] is None)
 check("a subagent's result event is not the review's ending",
@@ -276,6 +329,11 @@ reset_stubs()
 covered = vinegar.diff_lines(ROOT, "release-2", None, "o/r#12")
 check("added lines are covered", covered.get("vinegar.py") == {11, 12, 13, 43},
       covered.get("vinegar.py"))
+# Redundant with the check below it, and knowingly so: a deletion's hunk is
+# always `+0,0`, so the empty-hunk gate already blocks the write whatever
+# `name` holds. Deleting the /dev/null branch in diff_lines leaves this green.
+# Kept because it states the intent at the point the reader looks for it,
+# and no fixture git can actually produce would make it bite.
 check("deleted file contributes nothing", "gone.py" not in covered, covered)
 check("deletion-only hunk contributes nothing", "README.md" not in covered,
       covered)
@@ -283,18 +341,32 @@ check("a path with a space is keyed without git's trailing tab",
       covered.get("my file.py") == {2}, list(covered))
 check("a carriage return cannot forge a hunk header",
       covered.get("crlf.py") == {2}, covered.get("crlf.py"))
+# The hunk after the forged `+++` is what does the work here. Asserting only
+# that spoofed.py is absent passes with the `heading` gate deleted: nothing
+# follows the forgery to be misfiled, so both readings agree. The second hunk
+# has somewhere to go wrong, and lands on doc.md only while the gate holds.
 check("an added line that looks like a file header is content",
-      "spoofed.py" not in covered and covered.get("doc.md") == {2, 3}, covered)
+      "spoofed.py" not in covered and covered.get("doc.md") == {2, 3, 20},
+      covered)
 check("git diff is asked for the prefixes the parser expects",
       "--src-prefix=a/" in last_git_diff[0]
       and "--dst-prefix=b/" in last_git_diff[0], last_git_diff[0])
 check("the diff carries the context GitHub accepts comments on",
       "--unified=3" in last_git_diff[0], last_git_diff[0])
 
+# With stdout, not without it. An empty stdout returns {} from parsing
+# nothing whether the return code is consulted or not, so the gate this check
+# is named for was never the reason it passed. git writes what it managed
+# before it failed, and a partial diff is the dangerous case: half the hunks
+# look like the whole truth, and every finding below the cut would be routed
+# to the general comment while the ones above it anchor with confidence.
 fake_run.diff_rc = 1
+fake_run.diff_out = DIFF.split("diff --git a/doc.md")[0]
 check("a failed diff anchors nothing rather than guessing",
-      vinegar.diff_lines(ROOT, "release-2", None, "o/r#12") == {})
+      vinegar.diff_lines(ROOT, "release-2", None, "o/r#12") == {},
+      vinegar.diff_lines(ROOT, "release-2", None, "o/r#12"))
 fake_run.diff_rc = 0
+fake_run.diff_out = ""
 check("the diff is bounded so it cannot wedge the poll loop",
       last_git_diff[1] is not None and last_git_diff[1] <= 600,
       last_git_diff[1])
@@ -356,6 +428,70 @@ _link = os.path.join(SCRATCH, "link")
 os.mkdir(_real)
 os.symlink(_real, _link)
 
+# --- checkout ------------------------------------------------------------
+# Everything here is about one property: checkout() raising is not counted
+# against MAX_ATTEMPTS, so a failure that persists logs a line per poll for
+# ever with the pull request never reviewed and never given up on. That is
+# the quietest way Vinegar can stop working, which is why the guards against
+# it are worth checking rather than assuming.
+reset_stubs()
+_co_root = os.path.join(SCRATCH, "checkouts")
+_co_dir = vinegar.CHECKOUT_DIR
+vinegar.CHECKOUT_DIR = _co_root
+_co_path = os.path.join(_co_root, "o__r")
+_co_ran = []
+
+
+def co_run(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
+    _co_ran.append((cmd, timeout))
+    if cmd[:3] == ["gh", "repo", "clone"]:
+        os.makedirs(os.path.join(cmd[4], ".git"), exist_ok=True)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+    if cmd[:2] == ["git", "rev-parse"]:
+        return subprocess.CompletedProcess(cmd, co_run.usable, "", "not a repo")
+    return subprocess.CompletedProcess(cmd, 0, "", "")
+
+
+co_run.usable = 0
+vinegar.run = co_run
+
+# A SIGKILL during a fetch leaves .git/index.lock behind, and every later
+# `git reset` fails with "Unable to create index.lock: File exists". Nothing
+# clears it on its own, so without this the repository is finished.
+os.makedirs(os.path.join(_co_path, ".git"))
+_co_stale = os.path.join(_co_path, ".git", "index.lock")
+open(_co_stale, "w").close()
+del _co_ran[:]
+check("checkout returns the path it prepared",
+      vinegar.checkout("o/r", PR, None) == _co_path, _co_path)
+check("a lock left by a killed run is cleared, not inherited",
+      not os.path.exists(_co_stale), _co_stale)
+# The head fetch reaches the network and the local steps do not. One bound
+# for both is wrong in whichever direction it is set: the network budget on
+# a local step parks the poll thread on a filesystem that stops answering,
+# and the local budget on the fetch turned a slow repository into a pull
+# request that was never reviewed and never given up on.
+_co_fetch = [t for c, t in _co_ran if c[:2] == ["git", "fetch"]]
+_co_local = [t for c, t in _co_ran if c[:2] == ["git", "reset"]]
+check("the head fetch is given the network budget",
+      _co_fetch and _co_fetch[0] == vinegar.FETCH_TIMEOUT, _co_fetch)
+check("the local steps are bounded as well, and more tightly",
+      _co_local and _co_local[0] == vinegar.DIFF_TIMEOUT, _co_local)
+check("the credential helper is written on every pass, not only at clone",
+      any(c[:3] == ["git", "config", "--local"] for c, _t in _co_ran),
+      [c[:3] for c, _t in _co_ran])
+# A clone killed part-way leaves a .git git itself refuses to open. Skipping
+# the clone because .git exists uses that repository for ever.
+co_run.usable = 1
+del _co_ran[:]
+vinegar.checkout("o/r", PR, None)
+check("a checkout git cannot open is cloned again rather than reused",
+      any(c[:3] == ["gh", "repo", "clone"] for c, _t in _co_ran),
+      [c[:3] for c, _t in _co_ran])
+co_run.usable = 0
+vinegar.CHECKOUT_DIR = _co_dir
+vinegar.run = fake_run
+
 # --- split_findings ------------------------------------------------------
 reset_stubs()
 FINDINGS = [
@@ -391,6 +527,19 @@ check("a leading .. in a file name is not a path escape",
       vinegar.repo_path("..config.py", ROOT) == "..config.py")
 check("a path outside the checkout is still refused",
       vinegar.repo_path("/etc/passwd", ROOT) is None)
+# Wrapped, because the failure this guards against is a raise: `file` comes
+# from the reviewer's tool call and the schema is not enforced on its way in,
+# so a number or an object reaches here intact. Without the isinstance the
+# .strip() below it raises inside announce(), which loses every finding in
+# the review, not just the one with the bad `file`.
+try:
+    _odd_file = (vinegar.repo_path(12, ROOT) is None
+                 and vinegar.repo_path({"path": "a.py"}, ROOT) is None
+                 and vinegar.repo_path(None, ROOT) is None)
+except Exception as err:
+    _odd_file = "raised %r" % err
+check("a file that is not a string anchors nothing rather than raising",
+      _odd_file is True, _odd_file)
 check("a symlinked checkout root still resolves its own files",
       vinegar.repo_path(_link + "/vinegar.py", _real) == "vinegar.py"
       and vinegar.repo_path(_real + "/vinegar.py", _link) == "vinegar.py")
@@ -437,6 +586,18 @@ check("the category reaches the comment body",
       vinegar.describe({"summary": "s", "category": "correctness"}))
 check("failure scenario reaches the comment body",
       "Failure: boom" in inline[0]["body"], inline[0]["body"])
+# GitHub applies its ceiling to an inline comment too, and it applies the
+# review or none of it, so one reviewer who writes an essay about line 12
+# takes every other finding down with it. The top-level body's cap is
+# checked elsewhere; this is the one on the comments array.
+_essay = vinegar.split_findings(
+    [{"file": "vinegar.py", "line": 12, "failure_scenario": "boom",
+      "summary": "s" * (vinegar.MAX_BODY + 5000)}], covered, L)[0]
+check("an overlong inline comment is cut to what GitHub accepts",
+      len(_essay[0]["body"]) <= vinegar.MAX_BODY + 100,
+      len(_essay[0]["body"]))
+check("an inline comment that was cut says so",
+      "cut to fit" in _essay[0]["body"], _essay[0]["body"][-80:])
 
 # --- review_body ---------------------------------------------------------
 reset_stubs()
@@ -496,10 +657,19 @@ check("unparseable review body keeps the reviewer's words",
       "no json here" in posted[0][1]["body"], posted[0][1]["body"])
 
 del posted[:]
+last_post_timeout[0] = None
 vinegar.post_review(L, "o/r", PR, ROOT, "clean", [], CONFIG, None)
 check("a clean review is announced, not skipped",
       len(posted) == 1 and "No findings." in posted[0][1]["body"],
       posted[0][1]["body"] if posted else "nothing posted")
+# The timeout the call received, not the constant it should have used. The
+# earlier version of this check read POST_TIMEOUT and compared it to itself,
+# so deleting `timeout=POST_TIMEOUT` from the gh invocation left it green,
+# and the poll loop is one thread: a posting that never returns wedges every
+# repository behind it. The diff and listing checks read the call; so does
+# this one now.
+check("the posting request carries a timeout",
+      last_post_timeout[0] == vinegar.POST_TIMEOUT, last_post_timeout[0])
 
 del posted[:]
 fake_run.rc = 1
@@ -669,6 +839,7 @@ def exploding_post_review(*a, **k):
 def claude_run(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
     if cmd[0] == "claude":
         claude_run.saw, claude_run.env = cmd, env
+        claude_run.cwd, claude_run.timeout = cwd, timeout
         return subprocess.CompletedProcess(cmd, 0, claude_run.stream, "")
     return fake_run(cmd, cwd, timeout, env, stdin_text)
 
@@ -679,6 +850,7 @@ def result_event(**over):
 
 
 claude_run.saw, claude_run.env = [], {}
+claude_run.cwd, claude_run.timeout = None, None
 claude_run.stream = stream(call(FINDINGS[:4]), result_event())
 
 
@@ -759,6 +931,28 @@ vinegar.review(ROOT, "o/r", PR, CONFIG, None, {})
 check("the review asks for the stream the tool call arrives in",
       "stream-json" in claude_run.saw and "--verbose" in claude_run.saw,
       claude_run.saw)
+# The three flags that decide what the reviewer runs under. Without them it
+# picks up whatever settings the machine has: `--setting-sources ""` is what
+# stops ~/.claude and the checkout's own .claude/settings.json from loading,
+# and a checkout is attacker-controlled content on a public repository.
+# `--strict-mcp-config` is the same argument for MCP servers. None of the
+# three had a check, so all three could be dropped with the suite green.
+check("the reviewer loads no settings but the ones it is handed",
+      "--setting-sources" in claude_run.saw
+      and claude_run.saw[claude_run.saw.index("--setting-sources") + 1] == "",
+      claude_run.saw)
+check("the reviewer loads no MCP servers but the ones it is handed",
+      "--strict-mcp-config" in claude_run.saw, claude_run.saw)
+# The checkout, not wherever the daemon happens to be. Vinegar polls several
+# repositories from one process, so a lost cwd does not fail: it reviews the
+# wrong tree, and says nothing about having done so.
+check("the reviewer is run inside the checkout it is reviewing",
+      claude_run.cwd == ROOT, claude_run.cwd)
+# A review with no timeout holds the poll thread for ever, and this one is
+# the longest call Vinegar makes. The killed-run path below is what handles
+# the expiry, and it is unreachable if nothing ever expires.
+check("the review is bounded by the configured timeout",
+      claude_run.timeout == CONFIG["review_timeout"], claude_run.timeout)
 check("the reporting tool is allowed, which is what makes it reachable",
       vinegar.REPORT_TOOL in json.load(
           open(os.path.join(here_dir, "review-settings.json"))
@@ -1196,6 +1390,18 @@ check("a boolean is not a number here either",
 check("the numbers as numbers still start",
       _config_with(poll_interval=30, review_timeout=900,
                    max_changed_lines=100) == "started")
+# The effort is not validated again after this: it goes into the prompt as
+# `/code-review <effort> <number>`, so a value the slash command does not
+# know is not refused anywhere downstream. It reviews at whatever the
+# command falls back to and reports the effort the operator asked for, and
+# the two are then different for every review until someone reads a
+# transcript closely. EFFORTS is the only thing standing between the two.
+check("an effort the review command does not know refuses to start",
+      "effort must be one of" in _config_with(effort="ultra"),
+      _config_with(effort="ultra"))
+check("every effort the config allows still starts",
+      all(_config_with(effort=e) == "started" for e in vinegar.EFFORTS),
+      [e for e in vinegar.EFFORTS if _config_with(effort=e) != "started"])
 
 
 def _refuses(**over):
@@ -1429,9 +1635,64 @@ for _err, _want, _name in (
 fake_run.rc = 0
 fake_run.post_err = "HTTP 422"
 vinegar.run = fake_run
-check("the posting request carries a timeout",
+check("the posting timeout is short enough to be worth having",
       vinegar.POST_TIMEOUT and vinegar.POST_TIMEOUT <= 300,
       vinegar.POST_TIMEOUT)
+
+# --- token life ----------------------------------------------------------
+# A review runs for the best part of an hour on a token that lives an hour,
+# so the token the run started on can have seconds left by the time there is
+# a review to post. `good_for` is what stops that: the caller says how much
+# life it needs and a token with less is replaced before it is handed over.
+# Two commits are about this and neither left a check, so the whole argument
+# could be deleted with the suite green.
+reset_stubs()
+APP = {"app_id": 1, "private_key": "/dev/null"}
+_real_jwt, _real_api = vinegar.app_jwt, vinegar.github_api
+
+
+def stub_app_jwt(app_id, key_path):
+    return "jwt"
+
+
+def stub_github_api(path, jwt, payload=None):
+    if path.endswith("/installation"):
+        return {"id": 7}
+    return {"token": "fresh"}
+
+
+vinegar.app_jwt, vinegar.github_api = stub_app_jwt, stub_github_api
+# Thirty seconds of life: plenty for a caller that is about to make one
+# call, useless for one that is about to spend five minutes posting.
+_short = {"o/r": ("stale", time.time() + 30)}
+check("a token with life left is reused rather than minted again",
+      vinegar.installation_token(APP, "o/r", dict(_short)) == "stale")
+check("a token that would expire mid-post is replaced before it is handed on",
+      vinegar.installation_token(APP, "o/r", dict(_short),
+                                 good_for=300) == "fresh")
+check("an expired token is replaced whatever the caller asked for",
+      vinegar.installation_token(
+          APP, "o/r", {"o/r": ("stale", time.time() - 1)}) == "fresh")
+vinegar.app_jwt, vinegar.github_api = _real_jwt, _real_api
+
+_asked = []
+_real_env = vinegar.github_env
+
+
+def recording_env(config, repo, cache, good_for=0):
+    _asked.append(good_for)
+    return None
+
+
+vinegar.github_env = recording_env
+vinegar.posting_env(L, dict(CONFIG, github_app=APP), "o/r", {}, None)
+check("the posting mints a token with time to finish posting",
+      _asked == [vinegar.POST_GRACE], _asked)
+# The grace has to be worth asking for. Left at nothing, the argument is
+# threaded through three call sites and changes no decision anywhere.
+check("the posting grace is long enough to cover a slow post",
+      vinegar.POST_GRACE >= vinegar.POST_TIMEOUT, vinegar.POST_GRACE)
+vinegar.github_env = _real_env
 
 # --- reviewer_brief ------------------------------------------------------
 brief = vinegar.reviewer_brief(PR)
@@ -1472,6 +1733,52 @@ _real_checkout, _real_github_env = vinegar.checkout, vinegar.github_env
 vinegar.save_state = lambda st: _hp_saved.append(dict(st))
 PR_LIVE = dict(PR, isDraft=False, isCrossRepository=False,
                author={"login": "kevin"}, additions=1, deletions=0)
+
+
+def _skipped(pr_over=None, config_over=None):
+    """What skip_reason says about PR_LIVE with these changes made to it."""
+    return vinegar.skip_reason(dict(PR_LIVE, **(pr_over or {})),
+                               dict(CONFIG, **(config_over or {})))
+
+
+# handle_pr below reaches skip_reason, but only ever with a draft, so the
+# draft gate was the only one of these that could fail. Each of the others
+# is a way to spend a review the operator said not to spend: a fork's head
+# is attacker-controlled content, `authors` is the allow list that bounds
+# who can cost money, and the size cap is what stops one 40000-line branch
+# costing more than a day of ordinary reviews. None of that is recoverable
+# after the fact, because the money is spent by the time anyone looks.
+check("a draft is skipped while drafts are skipped",
+      _skipped({"isDraft": True}) == "draft", _skipped({"isDraft": True}))
+check("a draft is reviewed once drafts are not skipped",
+      _skipped({"isDraft": True}, {"skip_drafts": False}) is None,
+      _skipped({"isDraft": True}, {"skip_drafts": False}))
+check("a pull request from a fork is skipped while forks are skipped",
+      "fork" in (_skipped({"isCrossRepository": True}) or ""),
+      _skipped({"isCrossRepository": True}))
+check("a bot's pull request is skipped while bots are skipped",
+      "bot" in (_skipped({"author": {"login": "dependabot",
+                                     "is_bot": True}}) or ""),
+      _skipped({"author": {"login": "dependabot", "is_bot": True}}))
+check("an author outside the authors list is skipped",
+      "authors list" in (_skipped(None, {"authors": ["someone"]}) or ""),
+      _skipped(None, {"authors": ["someone"]}))
+check("an author inside the authors list is reviewed",
+      _skipped(None, {"authors": ["kevin"]}) is None,
+      _skipped(None, {"authors": ["kevin"]}))
+# additions plus deletions, not either alone: a branch that rewrites a file
+# in place is 20000 changed lines and 0 net, and reading one side only lets
+# it through the cap it is exactly the shape of.
+check("a branch over the changed-lines cap is skipped",
+      "over the" in (_skipped({"additions": 2000, "deletions": 2000}) or ""),
+      _skipped({"additions": 2000, "deletions": 2000}))
+check("a branch under the changed-lines cap is reviewed",
+      _skipped({"additions": 2000, "deletions": 999}) is None,
+      _skipped({"additions": 2000, "deletions": 999}))
+# A deleted account leaves no author object at all, and reading .get on it
+# is what turns "skip this one" into a traceback on every poll.
+check("a pull request whose author is gone is still judged, not raised",
+      _skipped({"author": None}) is None, _skipped({"author": None}))
 
 
 def blowing_up_review(*a, **k):
@@ -2666,10 +2973,23 @@ _lost_state = {_lost_key: {"outcome": vinegar.DONE,
 fake_run.rc = 0
 vinegar.run = fake_run
 del posted[:]
+del _asked[:]
+# Put back whatever this section was using, not the genuine function: the
+# blocks around here install their own and restoring the wrong one changes
+# what the checks below exercise without failing anything.
+_env_here = vinegar.github_env
+vinegar.github_env = recording_env
 vinegar.handle_pr("o/r", PR_LOST, CONFIG, _lost_state, {})
+vinegar.github_env = _env_here
 check("the saved review is posted on a later poll, without re-reviewing",
       len(posted) == 1
       and "posted from the transcript" in posted[0][1]["body"], len(posted))
+# The repost is the path where the token is oldest: the review it is sending
+# ran to completion, was refused, and has been sitting on disk since. Minting
+# without asking for life here hands the post a token that may have minutes
+# left of an hour that started before the review did.
+check("the repost mints a token with time to finish posting",
+      _asked == [vinegar.POST_GRACE], _asked)
 # Asked every time, including the first. Skipping it there assumed
 # post_review had established that nothing landed, which holds only when
 # its own landed-review read succeeded — and that read answers "no" when
@@ -3146,6 +3466,81 @@ check("a live run still uses the live state file",
 check("a dry run writes its transcripts somewhere else as well",
       "reviews.dry" in _dry_out, _dry_out[-200:])
 
+# --- poll_once -----------------------------------------------------------
+# Both guards here are about the daemon surviving one bad thing. Under
+# launchd an escaping exception restarts the process every 30 seconds and
+# polls nothing in between, so a single unreviewable pull request would stop
+# every repository rather than itself.
+reset_stubs()
+_polled = []
+_real_listing, _real_handling = vinegar.open_prs, vinegar.handle_pr
+vinegar.github_env = lambda *a, **k: None
+
+
+def refusing_listing(repo, env):
+    if repo == "o/down":
+        raise RuntimeError("GitHub said 502")
+    return [dict(PR, number=1), dict(PR, number=2)]
+
+
+def one_bad_pr(repo, pr, config, state, tokens):
+    _polled.append((repo, pr["number"]))
+    if pr["number"] == 1:
+        raise ValueError("this pull request cannot be handled")
+
+
+vinegar.open_prs, vinegar.handle_pr = refusing_listing, one_bad_pr
+# Wrapped, because both guards fail by letting the exception out, and an
+# unwrapped call here would end the run rather than fail these checks. In
+# the daemon it ends the process instead, which is the whole point.
+try:
+    vinegar.poll_once(dict(CONFIG, repos=["o/down", "o/r"]), {}, {})
+    _poll_escaped = None
+except Exception as err:
+    _poll_escaped = err
+check("nothing one repository does escapes the poll", _poll_escaped is None,
+      _poll_escaped)
+check("a repository whose listing fails does not stop the ones after it",
+      ("o/r", 1) in _polled, _polled)
+check("one pull request that raises does not stop the ones after it",
+      ("o/r", 2) in _polled, _polled)
+vinegar.open_prs, vinegar.handle_pr = _real_listing, _real_handling
+reset_stubs()
+
+# --- acquire_lock --------------------------------------------------------
+# Two Vinegars sharing a checkout is what this stops: the second one runs
+# `git reset --hard` under the first one's review, which then reports
+# findings about a commit nobody asked about. The kernel's flock decides,
+# not the pid written in the file, so this has to be a real second lock
+# attempt. A second flock from this process contends with the first, because
+# the lock belongs to the open file description and each os.open makes a new
+# one; that was measured here rather than assumed.
+reset_stubs()
+vinegar.acquire_lock()
+check("the lock file records the pid holding it",
+      vinegar.locked_by() == os.getpid(), vinegar.locked_by())
+try:
+    vinegar.acquire_lock()
+    _second = "started"
+except SystemExit as err:
+    _second = str(err)
+check("a second Vinegar is refused while the first holds the lock",
+      "already running" in _second, _second)
+vinegar.release_lock()
+try:
+    vinegar.acquire_lock()
+    _after = "started"
+except SystemExit as err:
+    _after = str(err)
+check("the lock is free again once it is released", _after == "started",
+      _after)
+vinegar.release_lock()
+# The file outlives the process deliberately, so its mere presence must not
+# be read as "a Vinegar is running": every start after a clean shutdown
+# would fail, and the daemon KeepAlive-restarts into the same message.
+check("a lock file left behind does not by itself refuse a start",
+      os.path.exists(vinegar.LOCK_PATH), vinegar.LOCK_PATH)
+
 # A settings file whose allow list is present-and-null must produce the
 # sentence that says what to add, not a traceback every 30 seconds.
 _null_settings = os.path.join(_home, "null-allow.json")
@@ -3164,6 +3559,7 @@ vinegar.SETTINGS_PATH = _sp
 check("an allow list that is null is refused with a sentence, not a stack",
       "does not allow" in _null_said, _null_said)
 
+reached_the_end.append(True)
 print()
 print("FAILED: %s" % ", ".join(fails) if fails else "all checks passed")
 sys.exit(1 if fails else 0)
