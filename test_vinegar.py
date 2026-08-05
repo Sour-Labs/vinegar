@@ -128,8 +128,13 @@ vinegar.log = lambda message: None
 fails = []
 
 
+GENUINE = {name: getattr(vinegar, name) for name in (
+    "run", "log", "save_transcript", "github_env", "review", "checkout",
+    "save_state", "post_review", "find_pr")}
+
+
 def reset_stubs():
-    """Put every stub back the way a section should find it.
+    """Put the stubs back the way a section should find it.
 
     The stubs are module globals and attributes on fake_run, so without
     this each block inherits whatever the one above it happened to leave:
@@ -137,10 +142,14 @@ def reset_stubs():
     refusal path that still passes, and reordering two blocks changes what
     a third one exercises without failing anything. Sections call this
     first so they say what they need rather than inheriting it.
+
+    REVIEW_DIR is deliberately not one of them: the transcript sections
+    point it at a temporary directory on purpose and manage it themselves,
+    and resetting it here would undo that rather than protect it.
     """
-    vinegar.run = fake_run
+    for name, genuine in GENUINE.items():
+        setattr(vinegar, name, genuine)
     vinegar.log = lambda message: None
-    vinegar.save_transcript = GENUINE_SAVE_TRANSCRIPT
     fake_run.rc = 0
     fake_run.diff_rc = 0
     fake_run.look_rc = 0
@@ -399,6 +408,16 @@ check("absolute path is made repo-relative",
 check("inline comments anchor on the head side",
       all(c["side"] == "RIGHT" for c in inline), inline)
 check("out-of-diff findings go general", len(general) == 4, general)
+# A finding the reviewer reported with an absolute path, too far outside
+# the diff to anchor, used to be rendered into the public comment with
+# the daemon's own checkout directory in it.
+_abs_general = vinegar.split_findings(
+    [{"file": os.path.join(ROOT, "src/app.py"), "line": 9000,
+      "summary": "far outside the diff"}], covered, ROOT, L)[1]
+check("an unanchored finding does not carry the daemon's own paths",
+      _abs_general[0]["file"] == "src/app.py"
+      and ROOT not in vinegar.finding_bullet(_abs_general[0]),
+      _abs_general[0]["file"])
 check("the category reaches the comment body",
       "(correctness)" in vinegar.describe(
           {"summary": "s", "category": "correctness"}),
@@ -1883,8 +1902,8 @@ check("the transcript write leaves nothing temporary behind",
       not [f for f in os.listdir(_tx_home) if f.endswith(".tmp")],
       os.listdir(_tx_home))
 
-# A review GitHub refused is finished work waiting on one API call. It is
 reset_stubs()
+# A review GitHub refused is finished work waiting on one API call. It is
 # marked, and a later poll sends it from the transcript rather than
 # re-running a review the subscription already paid for.
 PR_LOST = dict(PR_LIVE, headRefOid="1051051051aa")
@@ -2011,6 +2030,50 @@ vinegar.handle_pr("o/r", PR_LOST, CONFIG, _orphan_state, {})
 check("a marker with no entry behind it is forgotten, not posted",
       not [p for p in posted if "posted from the transcript" in p[1]["body"]]
       and not os.path.exists(_lost_marker), (len(posted), _lost_marker))
+
+# The marker is written inside review(), before handle_pr records how the
+# review ended, so a process killed in that window leaves it beside a
+# FAILED entry. Requiring DONE here deleted the finished review that the
+# marker exists to protect.
+vinegar.save_transcript("o/r", PR_LOST, "Findings from the killed run.", [])
+with open(_lost_marker, "w") as h:
+    h.write("%s\n" % PR_LOST["headRefOid"])
+_killed_state = {_lost_key: {"outcome": vinegar.FAILED,
+                             "sha": PR_LOST["headRefOid"], "attempts": 1}}
+del posted[:]
+vinegar.handle_pr("o/r", PR_LOST, CONFIG, _killed_state, {})
+check("a marker left by a killed run is sent, not deleted",
+      len(posted) == 1
+      and "Findings from the killed run." in posted[0][1]["body"],
+      (len(posted), _killed_state))
+
+# Answering "" for a marker that cannot be opened made it identical to a
+# marker for another commit, and the caller's answer to that is to delete
+# the saved review. A directory in its place rather than chmod 0, because
+# root ignores the mode bits.
+_unopenable = os.path.join(_tx_home, "cannot-open.md.unposted")
+os.makedirs(_unopenable, exist_ok=True)
+check("a marker that cannot be opened is not read as a commit",
+      vinegar.read_mark(_unopenable) is None,
+      vinegar.read_mark(_unopenable))
+
+# An unreadable marker is not a marker for another commit, and answering
+# the same way for both threw a paid-for review away.
+vinegar.save_transcript("o/r", PR_LOST, "Findings behind a bad marker.", [])
+with open(_lost_marker, "w") as h:
+    h.write("%s\n" % PR_LOST["headRefOid"])
+_unreadable = vinegar.read_mark
+vinegar.read_mark = lambda path: None
+_bad_state = {_lost_key: {"outcome": vinegar.DONE,
+                          "sha": PR_LOST["headRefOid"], "attempts": 1}}
+del posted[:]
+vinegar.handle_pr("o/r", PR_LOST, CONFIG, _bad_state, {})
+vinegar.read_mark = _unreadable
+check("an unreadable marker keeps the review rather than dropping it",
+      len(posted) == 1
+      and "Findings behind a bad marker." in posted[0][1]["body"],
+      (len(posted), _bad_state))
+vinegar.forget(_lost_marker)
 
 # The mint failure inside repost() must clear the marker when the budget
 # runs out, or it survives to restart the cycle later. Reachable only with
@@ -2160,10 +2223,14 @@ def _entry(*flags):
 
 
 _dry_out = _entry("--dry-run").stdout
+_live_out = _entry().stdout
 check("a dry run keeps its bookkeeping out of the live state file",
       "state.json.dry" in _dry_out, _dry_out[-200:])
+# Bound once: `detail` is evaluated whether or not the check fails, so
+# calling _entry() there launched a second interpreter every run to build
+# a message a passing check throws away.
 check("a live run still uses the live state file",
-      "state.json.dry" not in _entry().stdout, _entry().stdout[-200:])
+      "state.json.dry" not in _live_out, _live_out[-200:])
 # The transcripts too: they are named from repo, number and sha, so a
 # rehearsal of a pull request the daemon already reviewed would write over
 # that review's only copy — the one the log tells the operator to send.

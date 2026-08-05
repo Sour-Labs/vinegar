@@ -1169,7 +1169,13 @@ def split_findings(findings, covered, root, label):
             inline.append({"path": name, "line": line, "side": "RIGHT",
                            "body": clamp(label, describe(finding))})
         else:
-            general.append(finding)
+            # Carried with the path made relative where it resolved.
+            # Reviewers do report absolute paths — repo_path exists for
+            # that — and a finding that could not be anchored was
+            # rendered verbatim into the review comment, putting the
+            # daemon's own checkout directory on a public pull request
+            # and giving the reader a path that means nothing to them.
+            general.append(dict(finding, file=name) if name else finding)
     return inline, general
 
 
@@ -1753,7 +1759,7 @@ def forget(path):
         pass
 
 
-def unposted_for(repo, pr):
+def unposted_for(repo, pr, scan=True):
     """Any saved review of this pull request that never reached it.
 
     Found by pull request rather than by commit, because the head can move
@@ -1776,6 +1782,13 @@ def unposted_for(repo, pr):
     here = unposted_path(repo, pr)
     if os.path.exists(here):
         return here, read_mark(here)
+    if not scan:
+        # The scan answers only one question — where did the marker go
+        # when the head moved — and the caller knows when that can have
+        # happened. Running it regardless meant listing a directory that
+        # only grows, once per open pull request per poll, to learn what
+        # the stat above had already answered.
+        return None, None
 
     prefix = "%s__%d__" % (repo.replace("/", "__"), pr["number"])
     try:
@@ -1791,12 +1804,19 @@ def unposted_for(repo, pr):
 
 
 def read_mark(path):
-    """The commit a marker was written for, or "" if it cannot be read."""
+    """The commit a marker was written for, or None if it cannot be read.
+
+    None rather than "": an unreadable marker and one written for another
+    commit are the same string to a caller comparing against a sha, and
+    the caller's answer to "another commit" is to throw the saved review
+    away. A `~/.vinegar/reviews` left root-owned by one `sudo` run would
+    have deleted a finished review that way.
+    """
     try:
         with open(path, encoding="utf-8", errors="replace") as handle:
             return handle.read().strip()
     except OSError:
-        return ""
+        return None
 
 
 def repost(key, repo, pr, config, state, tokens, done, marker, sha):
@@ -2236,6 +2256,23 @@ def spend_announce(key, config, state, head, attempts, tries, said):
     save_state(state)
 
 
+def record_once(state, key, done, head, outcome, reason):
+    """Record a decision that repeats, and say it only when it changes.
+
+    A skip and a failed checkout are both decided again on every poll and
+    both have to keep the attempts already burned at this head. Written
+    out twice, the preservation was fixed in one of them and only later
+    in the other, which is the drift these helpers exist to end.
+    """
+    if (done.get("outcome") == outcome and done.get("sha") == head
+            and done.get("reason") == reason):
+        return
+    log("%s: %s" % (key, reason))
+    kept = done if done.get("sha") == head else {}
+    state[key] = state_entry(head, outcome, kept.get("attempts", 0), reason)
+    save_state(state)
+
+
 def handle_pr(repo, pr, config, state, tokens):
     key = "%s#%d" % (repo, pr["number"])
     head = pr["headRefOid"]
@@ -2245,15 +2282,33 @@ def handle_pr(repo, pr, config, state, tokens):
     # finished work waiting on one API call, so it is retried before
     # anything else decides this pull request is done.
     if config["comment"]:
-        marker, saved_sha = unposted_for(repo, pr)
+        # The scan behind the stat is only meaningful when this pull
+        # request has been reviewed at some other head.
+        marker, saved_sha = unposted_for(
+            repo, pr, scan=bool(done.get("sha")) and done.get("sha") != head)
+        if marker and saved_sha is None:
+            # Unreadable, which is not the same as belonging to another
+            # commit. Believing the entry rather than deleting a paid-for
+            # review is the safe way to be wrong: the repost reads the
+            # transcript next, and gives up on its own budget if that
+            # cannot be read either.
+            log("%s: the unposted marker cannot be read, so the entry's own "
+                "commit is used" % key)
+            saved_sha = done.get("sha")
         # Tied to the entry that produced it. Without that, the repair the
         # log recommends — delete the entry and let it be reviewed again —
         # made the next poll post the *old* transcript instead, and the
         # poll after that review and post again: two reviews, which is
         # what the operator was trying to avoid. A marker with no entry
         # behind it is left over from a review that has been forgotten.
-        if marker and (done.get("outcome") != DONE
-                       or done.get("sha") != saved_sha):
+        #
+        # The sha decides it, not the outcome. The marker is written
+        # inside review(), before handle_pr records how the review ended,
+        # so a process killed in that window leaves it beside a FAILED
+        # entry — the same window `resent=attempts > 1` exists for one
+        # branch below, and requiring DONE here deleted the finished
+        # review it was written to protect.
+        if marker and done.get("sha") != saved_sha:
             log("%s: an unposted review is left over from a run that is no "
                 "longer recorded, so it is forgotten" % key)
             forget(marker)
@@ -2329,17 +2384,10 @@ def handle_pr(repo, pr, config, state, tokens):
 
     reason = skip_reason(pr, config)
     if reason:
-        # Deciding again is free. Saying so every minute is noise, so this
-        # logs only when the decision is new or its reason changed.
-        if (done.get("outcome") != "skipped" or done.get("sha") != head
-                or done.get("reason") != reason):
-            log("%s: skipped, %s" % (key, reason))
-            # The attempts burned at this head ride along. Dropping them
-            # is what let a draft toggle launder the retry budget.
-            kept = done if done.get("sha") == head else {}
-            state[key] = state_entry(head, "skipped",
-                                     kept.get("attempts", 0), reason)
-            save_state(state)
+        # Deciding again is free. Saying so every minute is noise, and the
+        # attempts burned at this head have to ride along: dropping them
+        # is what let a draft toggle launder the retry budget.
+        record_once(state, key, done, head, "skipped", "skipped, %s" % reason)
         return
 
     # Credentials are minted here, once a review is actually going to happen,
@@ -2382,27 +2430,13 @@ def handle_pr(repo, pr, config, state, tokens):
         # brief outage, which is worse than retrying a broken one. What
         # was worth fixing is the noise, so the same failure is said once
         # rather than once a minute for ever.
-        said = "checkout failed: %s" % err
-        if (done.get("outcome") != "checkout" or done.get("sha") != head
-                or done.get("reason") != said):
-            log("%s: %s" % (key, said))
-            # Everything already true of this head rides along, exactly as
-            # it does through a skip. Writing a bare entry here handed the
-            # retry budget back: a flapping clone alternated failure and
-            # success for ever, re-reviewing at full cost on every other
-            # poll while MAX_ATTEMPTS was never reached. Recording nothing
-            # at all, which is what this branch used to do, preserved the
-            # entry by accident; this preserves it on purpose.
-            # The attempts only. `announced` and `announce_tries` cannot
-            # be set on an entry that reaches here: they are written only
-            # at attempts >= MAX_ATTEMPTS, and that entry returns at the
-            # budget guard above. Carrying them would be two arguments no
-            # test can reach, which is the reasoning state_entry's own
-            # docstring gives for leaving them out of the skip branch.
-            kept = done if done.get("sha") == head else {}
-            state[key] = state_entry(head, "checkout",
-                                     kept.get("attempts", 0), said)
-            save_state(state)
+        # Recorded the same way a skip is, and for the same reasons: said
+        # once rather than once a minute, and keeping the attempts burned
+        # at this head. Writing a bare entry handed the retry budget back,
+        # so a flapping clone re-reviewed at full cost on every other poll
+        # while MAX_ATTEMPTS was never reached.
+        record_once(state, key, done, head, "checkout",
+                    "checkout failed: %s" % err)
         return
 
     attempts = done.get("attempts", 0) + 1 if done.get("sha") == head else 1
