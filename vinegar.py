@@ -110,6 +110,11 @@ PR_FIELDS = ("number,title,headRefOid,baseRefName,isDraft,author,additions,"
 # usable token now, when the only work remaining is one or two API calls.
 POST_GRACE = 300
 
+# Seconds `git diff` may take before the poll loop gives up on it. Local
+# work, so generous is already absurd; the point is that a checkout on a
+# filesystem that stops answering cannot hold the one poll thread for ever.
+DIFF_TIMEOUT = 120
+
 # Seconds a single posting request may take. Generous for one API call, and
 # the point is only that it ends: the poll loop is one thread and an
 # unanswered socket would otherwise hold it for as long as TCP allows.
@@ -366,7 +371,7 @@ def save_state(state):
 def open_prs(repo, env):
     result = run(["gh", "pr", "list", "-R", repo, "--state", "open",
                   "--limit", "50", "--json", PR_FIELDS], env=env)
-    if result.returncode != 0:
+    if result is None or result.returncode != 0:
         log("%s: gh pr list failed: %s" % (repo, result.stderr.strip()))
         return []
     return json.loads(result.stdout)
@@ -525,7 +530,9 @@ def reviewer_brief(pr):
         "This checkout is detached at the head commit of pull request #%d, so "
         "it has no upstream branch and `@{upstream}` does not resolve. The "
         "pull request targets `%s`, which should be fetched into this clone: "
-        "`git diff %s...HEAD` is the review scope. If that ref does not "
+        "`git diff refs/heads/%s...HEAD` is the review scope, spelled that "
+        "way because a tag of the same name would otherwise win. If that ref "
+        "does not "
         "resolve, fall back to `gh pr diff %d` and say in your summary that "
         "you did. Do not substitute a branch of your own choosing, and do not "
         "assume `main`.\n\n"
@@ -561,6 +568,11 @@ def read_stream(stdout):
     sentence to be mistaken for the answer. Seven rounds of review found bugs
     in the code that did all that, and this replaces it.
 
+    Also returns what the reviewer said in prose, which is what a killed run
+    leaves behind: there is no result event to read the summary out of, and
+    the transcript should hold the reviewer's words rather than a slice of
+    raw stream.
+
     Returns findings as None when no call was made, which is different from
     an empty list. None means the reviewer said nothing Vinegar can act on
     and its own words get posted instead; an empty list means it looked and
@@ -569,11 +581,20 @@ def read_stream(stdout):
     The last call wins. The contract asks for one, and a second would be a
     correction of the first.
     """
-    result, findings = None, None
+    result, findings, spoken = None, None, []
     for line in stdout.split("\n"):
         line = line.strip()
         if not line.startswith("{"):
             continue
+        # Only the two kinds of line that carry an answer are worth decoding.
+        # With --verbose the stream also echoes every tool result, whole file
+        # contents included, and parsing those to discard them is most of the
+        # work for none of the information.
+        if REPORT_TOOL not in line and '"type":"result"' not in line.replace(
+                '"type": "result"', '"type":"result"'):
+            if '"type":"assistant"' not in line.replace(
+                    '"type": "assistant"', '"type":"assistant"'):
+                continue
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
@@ -604,7 +625,16 @@ def read_stream(stdout):
                 if isinstance(reported, list) and all(
                         isinstance(item, dict) for item in reported):
                     findings = reported
-    return result, findings
+                else:
+                    # A later call is a correction of an earlier one, so
+                    # keeping the earlier list means posting findings the
+                    # reviewer has superseded. Nothing can be done about that
+                    # here, but it must not happen quietly.
+                    log("a %s call was not shaped like findings and was "
+                        "ignored" % REPORT_TOOL)
+            elif isinstance(block, dict) and block.get("type") == "text":
+                spoken.append(str(block.get("text") or ""))
+    return result, findings, "\n\n".join(part for part in spoken if part)
 
 
 def diff_lines(path, base, env, label):
@@ -650,16 +680,31 @@ def diff_lines(path, base, env, label):
     # numbers. Wrong lines, confidently placed, are worse than no lines. An
     # external driver does not print a unified diff at all, which is the
     # harmless half of the same setting.
-    result = run(["git", "-c", "core.quotepath=false", "-c", "color.ui=false",
-                  "diff", "--unified=3", "--no-color",
-                  "--no-textconv", "--no-ext-diff",
-                  "--src-prefix=a/", "--dst-prefix=b/",
-                  "%s...HEAD" % base], cwd=path, env=env)
+    # refs/heads/, because a bare name lets git resolve refs/tags first. A
+    # repository with a release branch `v2` and a tag `v2` would diff against
+    # the frozen tag, git would say only `warning: refname is ambiguous` on
+    # stderr and exit 0, and every anchor would be computed against the wrong
+    # range. checkout() creates the branch under refs/heads, so this names it.
+    #
+    # Timed out, because submit_review's docstring says every call out of
+    # this process is, and the poll loop is one thread. A checkout on a
+    # filesystem that stops answering would otherwise wedge it silently.
+    try:
+        result = run(["git", "-c", "core.quotepath=false", "-c",
+                      "color.ui=false", "diff", "--unified=3", "--no-color",
+                      "--no-textconv", "--no-ext-diff",
+                      "--src-prefix=a/", "--dst-prefix=b/",
+                      "refs/heads/%s...HEAD" % base], cwd=path,
+                     env=env, timeout=DIFF_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        result = None
     if result.returncode != 0:
         # Every finding is about to be routed to the general comment. Say why
         # here, because the comment itself can only report the effect.
-        log("%s: cannot diff %s...HEAD, no finding can be anchored: %s"
-            % (label, base, result.stderr.strip()[:200]))
+        log("%s: cannot diff refs/heads/%s...HEAD, no finding can be "
+            "anchored: %s" % (label, base,
+                              "timed out" if result is None
+                              else result.stderr.strip()[:200]))
         return {}
 
     # split("\n"), not splitlines(), which also breaks on a lone CR. An
@@ -753,13 +798,21 @@ def finding_bullet(finding):
 
 
 def describe(finding):
-    """A finding as prose, without the file and line that anchor it."""
+    """A finding as prose, without the file and line that anchor it.
+
+    The category comes through because it is most of what the tool call
+    carries that text never did, and it is the difference between a finding
+    that can break the change and one that is taste. The README promises it,
+    and until now nothing rendered it anywhere.
+    """
     # `or ""` rather than a get default, because these keys arrive present
     # and null often enough, and a default only covers a key that is absent.
     # str(None) is "None", which reads as a finding that says None.
     summary = str(finding.get("summary") or "").strip() or "(no summary)"
     scenario = str(finding.get("failure_scenario") or "").strip()
-    return "%s\n\nFailure: %s" % (summary, scenario) if scenario else summary
+    category = str(finding.get("category") or "").strip()
+    body = "%s\n\nFailure: %s" % (summary, scenario) if scenario else summary
+    return "%s\n\n(%s)" % (body, category) if category else body
 
 
 def split_findings(findings, covered, root, label):
@@ -915,7 +968,7 @@ def announce(label, post):
         log("%s: the review is not posted: %s" % (label, err))
 
 
-def post_timeout(label, pr, repo, seconds, env):
+def post_timeout(label, repo, pr, seconds, env):
     """Say on the pull request that the review was killed.
 
     A timeout returns no text at all, so there is nothing for post_review() to
@@ -1018,8 +1071,17 @@ def finish(label, repo, pr, path, text, findings, config, env, tokens,
     handle_pr() with no state to record and the pull request re-reviewed at
     full cost on every poll from then on.
     """
-    log("%s: transcript at %s" % (
-        label, save_transcript(repo, pr, text, findings)))
+    # The transcript is written in its own right, because it must not be
+    # able to take the posting down with it. It is the cheap local copy; the
+    # review on the pull request is the entire output of the run. Putting the
+    # write first and unguarded meant a `~/.vinegar/reviews` left root-owned
+    # by one `sudo` run silenced every review from then on, while the outcome
+    # was still recorded reviewed.
+    try:
+        log("%s: transcript at %s" % (
+            label, save_transcript(repo, pr, text, findings)))
+    except Exception as err:
+        log("%s: the transcript is not saved: %s" % (label, err))
     post_review(repo, pr, path, text, findings, config,
                 posting_env(label, config, repo, tokens, env), note)
 
@@ -1082,31 +1144,48 @@ def review(path, repo, pr, config, env, tokens):
         salvaged = expired.stdout or ""
         if isinstance(salvaged, bytes):
             salvaged = salvaged.decode(errors="replace")
-        _, findings = read_stream(salvaged)
+        _, findings, spoken = read_stream(salvaged)
 
-        if findings:
+        # `is not None`, not truthiness. A reviewer that reported an empty
+        # list looked and found nothing, and read_stream draws that
+        # distinction deliberately. Collapsing the two told the pull request
+        # the review "returned nothing", which is a different claim and a
+        # false one, and skipped the transcript as well.
+        if findings is not None:
             log("%s: it had already reported %d finding(s), posting those"
                 % (label, len(findings)))
             announce(label, lambda: finish(
-                label, repo, pr, path, salvaged[-4000:], findings, config,
+                label, repo, pr, path, spoken, findings, config,
                 env, tokens,
                 note="This review was killed after %ds, so these are the "
                      "findings it had reported by then and not a finished "
                      "round." % config["review_timeout"]))
         elif config["comment"]:
             announce(label, lambda: post_timeout(
-                label, pr, repo, config["review_timeout"],
+                label, repo, pr, config["review_timeout"],
                 posting_env(label, config, repo, tokens, env)))
         return DONE
     took = round(time.monotonic() - started)
 
-    output, findings = read_stream(result.stdout)
+    output, findings, spoken = read_stream(result.stdout)
     if output is None:
-        # No terminal result event, so the process did not finish a review.
+        # No terminal event, so the process died rather than finished: killed
+        # for memory, a segfault, a truncated pipe. If it had already reported
+        # its findings that is still a review, and throwing it away would lose
+        # it and then charge for it twice more, since FAILED is retried.
         detail = (result.stderr or result.stdout).strip()
         log("%s: claude printed no result after %ds: %s" % (
             label, took, detail[:400]))
-        return FAILED
+        if findings is None:
+            return FAILED
+        log("%s: it had reported %d finding(s) first, posting those"
+            % (label, len(findings)))
+        announce(label, lambda: finish(
+            label, repo, pr, path, spoken, findings, config, env, tokens,
+            note="This review stopped before it finished, so these are the "
+                 "findings it had reported by then and not a finished "
+                 "round."))
+        return DONE
 
     # A non-empty list is worth acting on. An empty one proves nothing.
     #

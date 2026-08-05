@@ -86,12 +86,12 @@ diff --git a/README.md b/README.md
 """
 
 posted = []
-last_git_diff = [[]]
+last_git_diff = [[], None]
 
 
 def fake_run(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
     if cmd[0] == "git" and "diff" in cmd:
-        last_git_diff[0] = cmd
+        last_git_diff[0], last_git_diff[1] = cmd, timeout
         return subprocess.CompletedProcess(
             cmd, fake_run.diff_rc, "" if fake_run.diff_rc else DIFF, "boom")
     if cmd[:2] == ["gh", "api"]:
@@ -129,7 +129,7 @@ DONE_EVENT = {"type": "result", "subtype": "success", "is_error": False,
               "result": "Reviewed it.", "total_cost_usd": 1.5}
 REAL = [{"file": "a.py", "line": 2, "summary": "s", "failure_scenario": "f"}]
 
-result, found = vinegar.read_stream(stream(call(REAL), DONE_EVENT))
+result, found, _said = vinegar.read_stream(stream(call(REAL), DONE_EVENT))
 check("findings come back from the tool call", found == REAL, found)
 check("the result event comes back with them",
       result and result["total_cost_usd"] == 1.5, result)
@@ -162,6 +162,11 @@ check("one unreadable line does not cost the rest of the stream",
       == REAL)
 check("no result event at all is reported as no result",
       vinegar.read_stream(stream(call(REAL)))[0] is None)
+check("the reviewer's own words come back for the transcript",
+      "Reviewed it." in vinegar.read_stream(stream(
+          {"type": "assistant", "message": {"content": [
+              {"type": "text", "text": "Reviewed it."}]}},
+          DONE_EVENT))[2])
 
 # --- diff_lines ----------------------------------------------------------
 covered = vinegar.diff_lines(ROOT, "release-2", None, "o/r#12")
@@ -235,6 +240,12 @@ check("git diff is pinned against textconv and external drivers",
 check("git diff is pinned against colour escapes",
       "color.ui=false" in last_git_diff[0]
       and "--no-color" in last_git_diff[0], last_git_diff[0])
+check("the base is named unambiguously, so a tag cannot win",
+      any(a.startswith("refs/heads/release-2...") for a in last_git_diff[0]),
+      last_git_diff[0])
+check("the diff is bounded so it cannot wedge the poll loop",
+      last_git_diff[1] is not None and last_git_diff[1] <= 600,
+      last_git_diff[1])
 
 inline, general = vinegar.split_findings(FINDINGS, covered, ROOT, L)
 check("in-diff findings become inline comments", len(inline) == 2, inline)
@@ -243,6 +254,10 @@ check("absolute path is made repo-relative",
 check("inline comments anchor on the head side",
       all(c["side"] == "RIGHT" for c in inline), inline)
 check("out-of-diff findings go general", len(general) == 4, general)
+check("the category reaches the comment body",
+      "(correctness)" in vinegar.describe(
+          {"summary": "s", "category": "correctness"}),
+      vinegar.describe({"summary": "s", "category": "correctness"}))
 check("failure scenario reaches the comment body",
       "Failure: boom" in inline[0]["body"], inline[0]["body"])
 
@@ -332,7 +347,7 @@ check("an oversize body is cut rather than refused",
       len(posted[0][1]["body"]) if posted else "nothing posted")
 
 del posted[:]
-vinegar.post_timeout(L, PR, "o/r", 1800, None)
+vinegar.post_timeout(L, "o/r", PR, 1800, None)
 check("a killed review still says so on the pull request",
       len(posted) == 1 and "killed after 1800s" in posted[0][1]["body"],
       posted[0][1]["body"] if posted else "nothing posted")
@@ -342,7 +357,7 @@ check("a killed review does not read as clean",
 
 fake_run.rc = 1
 del posted[:]
-vinegar.post_timeout(L, PR, "o/r", 1800, None)
+vinegar.post_timeout(L, "o/r", PR, 1800, None)
 check("the timeout notice is retried when refused",
       len(posted) == 2, len(posted))
 fake_run.rc = 0
@@ -432,8 +447,10 @@ def exploding_save(*a, **k):
 
 
 vinegar.save_transcript = exploding_save
-check("a transcript that cannot be written is still recorded as done",
-      vinegar.review(ROOT, "o/r", PR, CONFIG, None, {}) == vinegar.DONE)
+del posted[:]
+check("a transcript that cannot be written still posts the review",
+      vinegar.review(ROOT, "o/r", PR, CONFIG, None, {}) == vinegar.DONE
+      and len(posted) == 1, (len(posted),))
 vinegar.save_transcript = _real_save
 
 vinegar.github_env = lambda *a, **k: None
@@ -486,6 +503,19 @@ check("the reporting tool is not withheld any more",
 check("the environment asks for the tool contract",
       (claude_run.env or {}).get("CLAUDE_CODE_REPORT_FINDINGS") == "1",
       sorted(claude_run.env or {})[:5])
+# A stream that stops before its result event, with findings already in it.
+claude_run.stream = stream(call(FINDINGS[:4]))
+del posted[:]
+check("findings survive a stream that never reached its result event",
+      vinegar.review(ROOT, "o/r", PR, CONFIG, None, {}) == vinegar.DONE
+      and len(posted) == 1
+      and "not a finished round" in posted[0][1]["body"], (len(posted),))
+
+claude_run.stream = stream(result_event())
+del posted[:]
+check("a truncated stream with nothing reported is retried",
+      vinegar.review(ROOT, "o/r", PR, CONFIG, None, {}) == vinegar.DONE)
+
 # Killed mid-summary, after the findings were already reported.
 def timing_out(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
     if cmd[0] == "claude":
@@ -507,6 +537,24 @@ check("a salvaged review says it was not a finished round",
 check("a salvaged review is not announced as having produced nothing",
       posted and "It reported nothing" not in posted[0][1]["body"],
       posted[0][1]["body"][:160] if posted else "nothing posted")
+
+
+# Killed after reporting a genuinely clean review.
+def timing_out_clean(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
+    if cmd[0] == "claude":
+        raise subprocess.TimeoutExpired(
+            cmd, timeout or 0, output=stream(call([])).encode())
+    return fake_run(cmd, cwd, timeout, env, stdin_text)
+
+
+vinegar.run = timing_out_clean
+del posted[:]
+check("a kill after a clean report is not called 'returned nothing'",
+      vinegar.review(ROOT, "o/r", PR, CONFIG, None, {}) == vinegar.DONE
+      and len(posted) == 1
+      and "returned nothing" not in posted[0][1]["body"]
+      and "reported nothing before it stopped" in posted[0][1]["body"],
+      posted[0][1]["body"][:200] if posted else "nothing posted")
 
 
 def timing_out_early(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
@@ -573,7 +621,7 @@ check("the posting request carries a timeout",
 # --- reviewer_brief ------------------------------------------------------
 brief = vinegar.reviewer_brief(PR)
 check("brief names the pull request's real base",
-      "git diff release-2...HEAD" in brief, brief)
+      "git diff refs/heads/release-2...HEAD" in brief, brief)
 check("brief tells the reviewer not to fall back to main",
       "do not assume `main`" in brief, brief)
 check("brief names the reporting tool, not a competing format",

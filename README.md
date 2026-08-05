@@ -552,6 +552,7 @@ there were, including when there were none:
 >
 > - `vinegar.py:812`: The caller this relies on drops the error.
 >   Failure: a failed fetch returns None and the loop treats it as empty.
+>   (correctness)
 
 A finding lands inline only when its line is part of the diff. Reviews at high
 effort read whole files, so some findings land on code the PR did not touch, and
