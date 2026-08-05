@@ -88,5 +88,18 @@
       "Bash(claude:*)"
     ],
     "ask": []
+  },
+  "sandbox": {
+    "enabled": true,
+    "failIfUnavailable": true,
+    "allowUnsandboxedCommands": false,
+    "filesystem": {
+      "denyWrite": [
+        "~/.vinegar-checkouts"
+      ]
+    },
+    "network": {
+      "allowedDomains": []
+    }
   }
 }

@@ -49,6 +49,78 @@ DENIED_COMPONENT = ".vinegar"
 # about what this glob covers, and neither of them notices if it is gone.
 DENY_HOME = "Read(//**/.vinegar/**)"
 
+# The read denials the security argument actually rests on, pinned so that
+# editing the file cannot quietly drop one. Only DENY_HOME used to be
+# checked, out of 47 rules, so deleting `Read(//**/.ssh/**)` while widening
+# the list left every check passing: the reviewer of an attacker-authored
+# branch could then read `~/.ssh/id_ed25519` and quote it into a finding
+# Vinegar publishes on a public pull request.
+#
+# These and not the rest of the file. The allow list is meant to be tuned,
+# and the write denials are backed by the sandbox now; what cannot be
+# recovered from is a credential read, because the finding carrying it is
+# already public by the time anyone notices.
+DENY_ALWAYS = (
+    DENY_HOME,
+    "Read(//**/.claude/**)",
+    "Read(//**/.ssh/**)",
+    "Read(//**/.aws/**)",
+    "Read(//**/.gnupg/**)",
+    "Read(//**/.config/gh/**)",
+    "Read(//**/.netrc)",
+    "Read(//**/.env)",
+)
+
+# And the one key that would make all of them moot. `bypassPermissions`
+# ignores the allow and deny lists entirely, so a single word here undoes
+# every rule above without touching one of them. Absent is the same as
+# "default"; anything else is refused.
+PERMISSION_MODE = "default"
+
+# What the sandbox stanza in review-settings.json must say, and why each
+# part of it carries weight. The allow list names subcommands and cannot
+# see the flags that follow them, so `git show -s --format=%B
+# --output=<path> HEAD` writes a commit message byte for byte to any file
+# the daemon user can write, while matching `Bash(git show:*)` exactly
+# like the reads a review is for. That is not theoretical: run against
+# this settings file it created the file, and Claude Code's own command
+# analyser did not stop it, though it does stop `sort -o` — which is how
+# the flag went unnoticed while a narrower one did not.
+#
+# Denying `git show` would not close it either. `git diff` takes the same
+# flag and is the command every review gets its diff from, and `git
+# blame`, `sort -o` and `uniq in out` all write files too. A rule that
+# cannot see flags cannot be the boundary; the sandbox can.
+SANDBOX_RULES = (
+    ("enabled", True,
+     "nothing else confines what the reviewer writes"),
+    ("failIfUnavailable", True,
+     "a sandbox that cannot start would otherwise be skipped and the "
+     "review would run unconfined, saying nothing about it"),
+    ("allowUnsandboxedCommands", False,
+     "a command that may ask to run outside the sandbox is a command "
+     "the sandbox does not cover"),
+)
+
+# The network rule, pinned rather than assumed. Measured: with the sandbox
+# on and no network key at all, `gh pr view` fails with "Forbidden", which
+# is why the reviewer is told it has no network — but that came from a
+# default nothing here stated. A release that changed the default would
+# reopen the network silently, while the brief went on promising it was
+# closed and an injected review could send a diff or a credential
+# anywhere. Saying it costs nothing and cannot drift.
+SANDBOX_NETWORK = {"allowedDomains": []}
+
+# Every key the file's own sandbox stanza may carry, at both levels.
+# reviewer_settings() sends these and nothing else, so a key outside this
+# set changes what a hand-run does while leaving the daemon untouched —
+# which makes the file describe something Vinegar does not do.
+# `filesystem` needs its own set: checking only the top level accepted a
+# `filesystem.allowWrite` that hands a hand-run the whole disk.
+SANDBOX_KEYS = frozenset(
+    [name for name, _, _ in SANDBOX_RULES] + ["filesystem", "network"])
+SANDBOX_FS_KEYS = frozenset(["denyWrite"])
+
 # abspath, not just expanduser, so a trailing slash or a relative path cannot
 # make either of these look like it sits somewhere it does not.
 HOME = os.path.abspath(
@@ -462,45 +534,214 @@ def check_paths():
             "still covered)." % (HOME, DENIED_COMPONENT, DENIED_COMPONENT,
                                  DENIED_COMPONENT))
 
+    # And everything the settings file has to say, checked here so it is
+    # said at startup rather than first discovered on a pull request. The
+    # same call runs again for every review, which is where it matters:
+    # this function runs once, and the file can be edited afterwards.
+    load_settings()
+
+
+def load_settings():
+    """Read review-settings.json, or say in one sentence why it cannot be.
+
+    Both callers use this, and that is the point: check_paths() runs once
+    at startup while reviewer_settings() runs for every review, and when
+    the two read the same file with different care they drift. The first
+    version of this change validated at startup and forwarded blindly per
+    review, so an operator editing the file to chase a denial — the case
+    the docstring below already argues about — could widen `allow`, drop
+    `Read(//**/.vinegar/**)`, and have the next review of an
+    attacker-authored branch run with it, refused and logged by nothing.
+
+    Every exit here is a sentence rather than a raised exception, and
+    that matters more per review than at startup. Left to raise, a
+    trailing comma saved mid-edit came out of review() as an ordinary
+    failure: handle_pr records FAILED, the attempt is already charged,
+    and three polls later every open pull request has a give-up comment
+    and is abandoned for good over a typo. Exiting instead puts the
+    daemon back in launchd's hands, which restarts it into this same
+    check and prints the same sentence until the file is fixed.
+    """
+    try:
+        with open(SETTINGS_PATH, encoding="utf-8") as handle:
+            settings = json.load(handle)
+        permissions = settings.get("permissions")
+        permissions = permissions if isinstance(permissions, dict) else {}
+        # isinstance, not `or []`. `or []` covers null and covers nothing
+        # else: a hand-edited `"deny": "Read(//**/.vinegar/**)"` — the list
+        # collapsed to the string it held — is truthy, survives, and turns
+        # the membership test below into a substring test that passes
+        # while Claude Code has a malformed rule and the App private key
+        # is no longer denied. `allow` collapses the same way.
+        allowed = permissions.get("allow")
+        allowed = allowed if isinstance(allowed, list) else []
+        denied = permissions.get("deny")
+        denied = denied if isinstance(denied, list) else []
+        sandbox = settings.get("sandbox")
+        sandbox = sandbox if isinstance(sandbox, dict) else {}
+    except Exception as err:
+        sys.exit("%s cannot be read (%s), and the reviewer runs under it."
+                 % (SETTINGS_PATH, err))
+
     # The reporting contract has a third copy: REPORT_TOOL names the tool
     # review() asks for and read_stream() listens for, and the allow list in
     # review-settings.json is what makes calling it possible. That list is a
     # literal in a file this code cannot derive from the constant. If they
     # disagree, every review comes back as unanchored prose with findings
     # nobody sees, quietly, which is the same shape of silent failure the
-    # path checks above exist to refuse at startup.
-    try:
-        with open(SETTINGS_PATH, encoding="utf-8") as handle:
-            # `or []` rather than a get default: the default only covers an
-            # absent key, and a hand-edited `"allow": null` would otherwise
-            # raise TypeError out of the check below, giving a traceback
-            # every 30 seconds under launchd in place of the one sentence
-            # that says what to add.
-            permissions = json.load(handle).get("permissions", {})
-            allowed = permissions.get("allow") or []
-            denied = permissions.get("deny") or []
-    except Exception as err:
-        sys.exit("%s cannot be read (%s), and the reviewer runs under it."
-                 % (SETTINGS_PATH, err))
+    # path checks exist to refuse.
     if REPORT_TOOL not in allowed:
         sys.exit(
             "review-settings.json does not allow %s. The reviewer would be "
             "told to report through a tool it cannot call, and every review "
             "would come back as prose with no findings. Add %s to "
             "permissions.allow." % (REPORT_TOOL, REPORT_TOOL))
-    # And the rule the two path checks above spend thirty lines reasoning
+    # And the rule check_paths' two path checks spend thirty lines reasoning
     # about. They confirm HOME sits where the glob covers; nothing
     # confirmed the glob was still there. Dropped or mistyped while
     # widening the deny list, every path check still passes, the daemon
     # starts, and a review can read the App private key — the one
-    # credential not scoped to a single repository, and the thing this
-    # whole function exists to keep unreadable.
-    if DENY_HOME not in denied:
+    # credential not scoped to a single repository.
+    for rule in DENY_ALWAYS:
+        if rule not in denied:
+            sys.exit(
+                "review-settings.json must deny %s. The credential reads in "
+                "DENY_ALWAYS are what keep a review from quoting a private "
+                "key into a finding this program then publishes, and %s is "
+                "missing. Add it to permissions.deny."
+                % (rule, rule))
+    # And the word that would make every rule above decorative.
+    mode = permissions.get("defaultMode", PERMISSION_MODE)
+    if mode != PERMISSION_MODE:
         sys.exit(
-            "review-settings.json must deny %s. That rule is what stops a "
-            "review reading the App private key under %s, and both path "
-            "checks above assume it is there. Add it to permissions.deny."
-            % (DENY_HOME, HOME))
+            "review-settings.json sets permissions.defaultMode to %r. Only "
+            "%r is allowed here: the alternatives ignore the allow and deny "
+            "lists, so one word would undo every rule in this file without "
+            "touching one of them." % (mode, PERMISSION_MODE))
+
+    # Reads are governed above. Writes are governed by nothing there, and
+    # the allow list cannot govern them: a prefix rule matches `git show`
+    # and cannot see the `--output=<path>` that follows it.
+    #
+    # Compared by identity, for two different reasons. Not truthiness,
+    # because `"false"` is a non-empty string and would read as enabled.
+    # And not `!=` either, because `1 == True` and `0 == False` in Python,
+    # so `!=` accepts `"enabled": 1` and `"allowUnsandboxedCommands": 0` —
+    # a number where a flag belongs, in a file edited by hand.
+    for name, wanted, why in SANDBOX_RULES:
+        if sandbox.get(name) is not wanted:
+            sys.exit(
+                "review-settings.json must set sandbox.%s to %s, because %s. "
+                "Without the sandbox the reviewer can write any file the "
+                "daemon user can, including this program, through "
+                "`git show --output=`, which the allow list matches as an "
+                "ordinary read." % (name, str(wanted).lower(), why))
+
+    # And nothing in that stanza beyond what reviewer_settings() sends.
+    # The daemon's own reviews are safe either way, since it builds the
+    # stanza rather than inheriting it — but the README tells operators
+    # this file is what a hand-run `claude --settings review-settings.json`
+    # uses and what to read to learn what the reviewer may do. An
+    # `allowWrite` added to unblock a hand-run leaves that hand-run
+    # genuinely unconfined against an attacker-authored branch, and a
+    # `network` rule added to tighten it is silently dropped, so the file
+    # would describe something the program does not do. Refusing keeps the
+    # two readings of this file the same one.
+    filesystem = sandbox.get("filesystem")
+    filesystem = filesystem if isinstance(filesystem, dict) else {}
+    extra = (sorted(set(sandbox) - SANDBOX_KEYS)
+             + ["filesystem." + name
+                for name in sorted(set(filesystem) - SANDBOX_FS_KEYS)])
+    if extra:
+        sys.exit(
+            "review-settings.json sets sandbox.%s, which Vinegar does not "
+            "send: it builds that stanza itself for every review, so the "
+            "key would change what a hand-run does and nothing else. "
+            "Remove it, or change reviewer_settings() if the daemon should "
+            "carry it too." % ", sandbox.".join(extra))
+    # The network rule is pinned like the flags, not merely permitted. The
+    # brief tells the reviewer it has no network and the README counts that
+    # as the larger half of the win, and until now both rested on a default
+    # nothing stated.
+    if sandbox.get("network", SANDBOX_NETWORK) != SANDBOX_NETWORK:
+        sys.exit(
+            "review-settings.json must set sandbox.network to %s or leave "
+            "it out. The reviewer is told it has no network and an allowed "
+            "domain would make that false — while also failing, since the "
+            "sandbox terminates TLS and `gh` will not trust it."
+            % json.dumps(SANDBOX_NETWORK))
+    return settings
+
+
+def reviewer_settings(workspace):
+    """The settings the reviewer runs under: the file, plus this checkout.
+
+    `workspace` is the directory the review runs in, which review() has
+    and this cannot derive: it is CHECKOUT_DIR/<owner>__<repo>, and any
+    part of that may be a symlink pointing somewhere neither this
+    function nor CHECKOUT_DIR would name.
+
+    Passed to `claude --settings` as JSON rather than as a path, because
+    the one rule that cannot live in the file is the one that matters
+    most here. The sandbox leaves the workspace writable, the workspace
+    is the checkout, and `.git/config` sits inside it: `core.fsmonitor`
+    there names a command git runs, and the commands Vinegar runs in that
+    checkout on its next poll — reset, clean, checkout — would run it
+    outside the sandbox as the daemon user. Measured: all three execute
+    it, and it survives both `reset --hard` and `clean -qfd`, so one line
+    written into `.git/config` buys the next poll.
+
+    CHECKOUT_DIR is derived from VINEGAR_HOME so that one machine can run
+    isolated instances, which means no fixed string in review-settings.json
+    is right for all of them. Deriving it here cannot drift.
+
+    The whole stanza is built here rather than taken from the file, so
+    what runs cannot be weakened by editing that file while the daemon
+    polls. The file keeps its own copy because it is what a person reads
+    to learn what the reviewer may do, and what a hand-run
+    `claude --settings review-settings.json` uses; check_paths() refuses
+    to start when the two disagree, so the file cannot quietly describe a
+    weaker sandbox than the one in force.
+
+    Nothing legitimate is lost. Every read-only git command a review runs
+    — diff, log, show, blame, status, ls-files, rev-parse — works with the
+    checkout read-only.
+    """
+    # Through load_settings(), so the permissions half of this file is
+    # re-checked on the same schedule the sandbox half is rebuilt on.
+    # Copying `permissions` straight through would have left the read-side
+    # confinement — the deny rule guarding the App private key included —
+    # as whatever the file said on the next poll, which is the failure this
+    # function was written to end for writes.
+    settings = load_settings()
+    # Built from SANDBOX_RULES, not inherited from the file. check_paths()
+    # reads that file once, at startup, and this runs again for every
+    # review: an operator who edits it to chase a denial, or a `git pull`
+    # of this directory, would otherwise launch the next review with the
+    # stanza weakened and nothing would refuse or say so — the failure
+    # that looks exactly like a successful review. Overwriting also drops
+    # any key that is not checked, since an `allowWrite` left in the file
+    # would widen what three validated keys still describe as closed, and
+    # means a hand-edited `"sandbox": null` cannot raise out of here into
+    # a give-up comment about a local typo.
+    # The workspace as well as the directory holding it, and the resolved
+    # form of each. The kernel judges a write by the path it resolves to,
+    # and denying only the parent missed the case that matters: the
+    # reviewer's workspace is CHECKOUT_DIR/<owner>__<repo>, so moving one
+    # large clone with `ln -s /Volumes/big/o__r ~/.vinegar-checkouts/o__r`
+    # put the workspace outside every denied entry while the parent still
+    # looked covered. An entry that matches nothing costs nothing, and
+    # guessing which form the sandbox canonicalises does not.
+    denied = []
+    for path in (CHECKOUT_DIR, workspace):
+        for form in (path, os.path.realpath(path)):
+            if form not in denied:
+                denied.append(form)
+    settings["sandbox"] = dict(
+        ((name, wanted) for name, wanted, _ in SANDBOX_RULES),
+        filesystem={"denyWrite": denied},
+        network=dict(SANDBOX_NETWORK))
+    return json.dumps(settings)
 
 
 def waive(key, what, waived):
@@ -1003,16 +1244,19 @@ def reviewer_brief(pr):
         "pull request targets `%s`, which should be fetched into this clone: "
         "`git diff refs/heads/%s...HEAD` is the review scope, spelled that "
         "way because a tag of the same name would otherwise win. If that ref "
-        "does not "
-        "resolve, fall back to `gh pr diff %d` and say in your summary that "
-        "you did. Do not substitute a branch of your own choosing, and do not "
+        "does not resolve, use `refs/remotes/origin/%s...HEAD`, which this "
+        "clone carries even when the branch itself was not fetched, and say "
+        "in your summary that you used it. If neither resolves, say you "
+        "could not establish the scope rather than guessing at one. You have "
+        "no network: `gh` cannot reach GitHub from here, so do not reach for "
+        "it. Do not substitute a branch of your own choosing, and do not "
         "assume `main`.\n\n"
         "Post nothing to GitHub yourself. Report every finding through the "
         "%s tool, including when you found none, and give `file` relative to "
         "the repository root. Vinegar reads that call and posts the whole "
         "review from it, so a finding you leave out of it is a finding "
         "nobody sees."
-        % (pr["number"], base, base, pr["number"], REPORT_TOOL))
+        % (pr["number"], base, base, base, REPORT_TOOL))
 
 
 def clamp(label, body):
@@ -2284,7 +2528,7 @@ def review(path, repo, pr, config, env, tokens, resent=False):
     cmd = ["claude", "-p", prompt,
            "--append-system-prompt", reviewer_brief(pr),
            "--output-format", "stream-json", "--verbose",
-           "--settings", SETTINGS_PATH,
+           "--settings", reviewer_settings(path),
            "--setting-sources", "",
            "--strict-mcp-config"]
     if config["model"]:
@@ -2293,7 +2537,31 @@ def review(path, repo, pr, config, env, tokens, resent=False):
     # The env var is what makes the choice deterministic. Without it the
     # decision falls through to a server-side flag that is off by default,
     # and the reviewer goes back to printing text.
-    env = dict(env or os.environ, CLAUDE_CODE_REPORT_FINDINGS="1")
+    #
+    # Without the token, and this is the whole of a credential leak rather
+    # than tidiness. The environment handed in here is the one checkout()
+    # used, so it carries the App installation token, and enabling the
+    # sandbox stopped the allow list gating Bash at all: measured, `env`
+    # is refused without the sandbox and runs with it, with nothing in
+    # `permission_denials`. So the reviewer could print the token, and a
+    # reviewer reading an attacker-authored branch publishes what it is
+    # told to — finding text goes to the pull request verbatim. Measured
+    # end to end with a fake token: `env | grep GH_TOKEN` printed the
+    # value and the model quoted it back.
+    #
+    # Nothing is lost by removing it. The reviewer has no network, so
+    # `gh` cannot reach GitHub whatever credential it holds, and the git
+    # it does run is read-only inside a checkout that is already on disk.
+    # GITHUB_TOKEN goes too: `gh` reads either, and either would be an
+    # operator's own credential rather than one scoped to this repository.
+    #
+    # The caller's `env` is left alone, because posting_env() falls back
+    # to it when minting a fresh token fails, and that fallback is what
+    # gets a finished review onto the pull request during a GitHub blip.
+    env = env or os.environ
+    reviewing = dict(env, CLAUDE_CODE_REPORT_FINDINGS="1")
+    for carried in ("GH_TOKEN", "GITHUB_TOKEN"):
+        reviewing.pop(carried, None)
 
     label = pr_key(repo, pr)
 
@@ -2342,7 +2610,8 @@ def review(path, repo, pr, config, env, tokens, resent=False):
 
     started = time.monotonic()
     try:
-        result = run(cmd, cwd=path, timeout=config["review_timeout"], env=env)
+        result = run(cmd, cwd=path, timeout=config["review_timeout"],
+                     env=reviewing)
     except subprocess.TimeoutExpired as expired:
         # A timeout burned the budget it burned. Retrying would burn it again.
         log("%s: killed after %ds" % (label, config["review_timeout"]))

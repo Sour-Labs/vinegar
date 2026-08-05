@@ -763,6 +763,32 @@ check("the reporting tool is allowed, which is what makes it reachable",
       vinegar.REPORT_TOOL in json.load(
           open(os.path.join(here_dir, "review-settings.json"))
       )["permissions"]["allow"])
+
+# The reviewer runs under settings passed as JSON, not as a path, because
+# the checkout deny is derived. A regression to `--settings SETTINGS_PATH`
+# leaves the sandbox enabled and the workspace — where .git/config is —
+# writable, which is the whole of the hole.
+_settings_arg = (claude_run.saw[claude_run.saw.index("--settings") + 1]
+                 if "--settings" in claude_run.saw else "")
+try:
+    _sent = json.loads(_settings_arg)
+except ValueError:
+    _sent = {}
+check("the reviewer is given settings as JSON, not the file path",
+      isinstance(_sent, dict) and _sent != {},
+      _settings_arg[:120])
+check("the reviewer's sandbox is enabled in what is actually sent",
+      _sent.get("sandbox", {}).get("enabled") is True,
+      json.dumps(_sent.get("sandbox")))
+# The one rule no file can carry: CHECKOUT_DIR moves with VINEGAR_HOME.
+check("the reviewer cannot write the checkout it is reviewing",
+      vinegar.CHECKOUT_DIR in
+      _sent.get("sandbox", {}).get("filesystem", {}).get("denyWrite", []),
+      json.dumps(_sent.get("sandbox", {}).get("filesystem")))
+# Denying the checkout must not cost the reviewer its own permissions.
+check("the settings sent still carry the permission rules",
+      vinegar.REPORT_TOOL in _sent.get("permissions", {}).get("allow", []),
+      json.dumps(_sent.get("permissions", {}).get("allow"))[:120])
 # check_paths() is the startup guard for that agreement, so first prove it
 # passes as configured, or the refusal below would prove nothing.
 try:
@@ -787,16 +813,331 @@ check("a reporting tool the settings do not allow refuses to start",
 # the glob covers; nothing confirmed the glob was still there, so dropping
 # it while widening the deny list left every check passing and the App
 # private key readable.
-_dh = vinegar.DENY_HOME
-vinegar.DENY_HOME = "Read(//**/.not-in-the-file/**)"
+_dh = vinegar.DENY_ALWAYS
+vinegar.DENY_ALWAYS = ("Read(//**/.not-in-the-file/**)",)
 try:
     vinegar.check_paths()
     _denied = "started"
 except SystemExit as err:
     _denied = str(err)
-vinegar.DENY_HOME = _dh
+vinegar.DENY_ALWAYS = _dh
 check("a missing private-key deny rule refuses to start",
       "must deny" in _denied, _denied)
+# Every credential read in that tuple, not just the first. Only the App
+# key's rule used to be checked, out of 47 in the file, so deleting the
+# ssh or gh-config rule while editing left every check passing and a
+# review able to quote `~/.ssh/id_ed25519` into a published finding.
+_settings_real = vinegar.SETTINGS_PATH
+for _rule in ("Read(//**/.ssh/**)", "Read(//**/.config/gh/**)",
+              "Read(//**/.aws/**)", "Read(//**/.netrc)"):
+    _short = json.load(open(_settings_real))
+    _short["permissions"]["deny"] = [r for r in
+                                     _short["permissions"]["deny"]
+                                     if r != _rule]
+    _p = os.path.join(_home, "short-deny.json")
+    with open(_p, "w") as h:
+        json.dump(_short, h)
+    vinegar.SETTINGS_PATH = _p
+    try:
+        vinegar.load_settings()
+        _denied = "started"
+    except SystemExit as err:
+        _denied = str(err)
+    finally:
+        vinegar.SETTINGS_PATH = _settings_real
+    check("dropping %s refuses to start" % _rule,
+          "must deny" in _denied and _rule in _denied, _denied)
+# And the one word that would make all of them decorative.
+_bypass = json.load(open(_settings_real))
+_bypass["permissions"]["defaultMode"] = "bypassPermissions"
+_p = os.path.join(_home, "bypass.json")
+with open(_p, "w") as h:
+    json.dump(_bypass, h)
+vinegar.SETTINGS_PATH = _p
+try:
+    vinegar.load_settings()
+    _denied = "started"
+except SystemExit as err:
+    _denied = str(err)
+finally:
+    vinegar.SETTINGS_PATH = _settings_real
+check("a permission mode that ignores the lists refuses to start",
+      "defaultMode" in _denied, _denied)
+
+# The sandbox stanza, which is what stops `git show --output=` writing any
+# file the daemon user can write. The allow list cannot: it matches the
+# start of a command and never sees the flag. Each key is checked
+# separately because each fails differently and silently.
+_sp_real = vinegar.SETTINGS_PATH
+# The directory a review actually runs in, which is one level below
+# CHECKOUT_DIR and is what reviewer_settings() has to be told about.
+_workspace = os.path.join(vinegar.CHECKOUT_DIR, "o__r")
+
+
+def _with_sandbox(sandbox):
+    """What check_paths says when the settings carry this sandbox stanza."""
+    path = os.path.join(_home, "sandbox-settings.json")
+    real = json.load(open(_sp_real))
+    real["sandbox"] = sandbox
+    with open(path, "w") as handle:
+        json.dump(real, handle)
+    vinegar.SETTINGS_PATH = path
+    try:
+        vinegar.check_paths()
+        return "started"
+    except SystemExit as err:
+        return str(err)
+    finally:
+        vinegar.SETTINGS_PATH = _sp_real
+
+
+_good = {"enabled": True, "failIfUnavailable": True,
+         "allowUnsandboxedCommands": False}
+# Bound once each: `check` evaluates its detail argument whether or not the
+# condition fails, so calling the helper there ran check_paths() a second
+# time and reported a different execution than the one asserted on.
+_said = _with_sandbox(_good)
+check("the sandbox stanza as shipped starts cleanly",
+      _said == "started", _said)
+_said = _with_sandbox({})
+check("no sandbox at all refuses to start", "sandbox.enabled" in _said, _said)
+_said = _with_sandbox(dict(_good, enabled=False))
+check("a disabled sandbox refuses to start",
+      "sandbox.enabled" in _said, _said)
+# `"true"` is a non-empty string, so reading these flags for truth rather
+# than for value would take a hand-edited quote as an enabled sandbox. It
+# is the same slip load_config refuses in config.json, in the file
+# operators edit far more often.
+_said = _with_sandbox(dict(_good, enabled="true"))
+check("a quoted true is not an enabled sandbox",
+      "sandbox.enabled" in _said, _said)
+# And `1 == True` in Python, so comparing with `==` accepts a number where
+# a flag belongs. `is` is what makes these three keys mean what they say.
+_said = _with_sandbox(dict(_good, enabled=1))
+check("a sandbox enabled with 1 rather than true refuses to start",
+      "sandbox.enabled" in _said, _said)
+_said = _with_sandbox(dict(_good, allowUnsandboxedCommands=0))
+check("unsandboxed commands allowed as 0 rather than false refuses",
+      "allowUnsandboxedCommands" in _said, _said)
+# Without this, a sandbox that cannot start is skipped and the review runs
+# unconfined, which is the failure that looks exactly like success.
+_said = _with_sandbox(dict(_good, failIfUnavailable=False))
+check("a sandbox allowed to be unavailable refuses to start",
+      "failIfUnavailable" in _said, _said)
+_said = _with_sandbox(dict(_good, allowUnsandboxedCommands=True))
+check("letting commands run unsandboxed refuses to start",
+      "allowUnsandboxedCommands" in _said, _said)
+# A stanza that is not an object at all must produce that same sentence.
+# Truthy and unguarded, it reached a .get outside the try that guards the
+# read, so launchd restarted into a traceback every 30 seconds.
+_said = _with_sandbox("true")
+check("a sandbox that is not an object is refused with a sentence",
+      "sandbox.enabled" in _said, _said)
+
+
+def _settings_file(sandbox, permissions=None, raw=None):
+    """Write a settings file and point SETTINGS_PATH at it."""
+    path = os.path.join(_home, "built-settings.json")
+    with open(path, "w") as handle:
+        if raw is not None:
+            handle.write(raw)
+        else:
+            doc = {"permissions": permissions if permissions is not None
+                   else {"allow": [vinegar.REPORT_TOOL],
+                         "deny": list(vinegar.DENY_ALWAYS)}}
+            if sandbox is not _absent:
+                doc["sandbox"] = sandbox
+            json.dump(doc, handle)
+    vinegar.SETTINGS_PATH = path
+    return path
+
+
+def _built_with(sandbox, permissions=None, raw=None):
+    """The settings reviewer_settings() sends when the file holds this."""
+    _settings_file(sandbox, permissions, raw)
+    try:
+        return json.loads(vinegar.reviewer_settings(_workspace))
+    finally:
+        # In a finally like _with_sandbox above, because reviewer_settings()
+        # can exit: without it one failure leaves this global pointing at a
+        # temp file for the remaining two thousand checks.
+        vinegar.SETTINGS_PATH = _sp_real
+
+
+def _sending(sandbox, permissions=None, raw=None):
+    """What reviewer_settings() says when it refuses to send anything."""
+    _settings_file(sandbox, permissions, raw)
+    try:
+        vinegar.reviewer_settings(_workspace)
+        return "sent"
+    except SystemExit as err:
+        return str(err)
+    finally:
+        vinegar.SETTINGS_PATH = _sp_real
+
+
+_absent = object()
+# A file that has lost the sandbox stops the review rather than being
+# quietly corrected. check_paths() reads it once at startup; this runs
+# again for every review, so a file edited to chase a denial — or replaced
+# by `git pull` — would otherwise launch the next review with nothing
+# refusing and nothing logged.
+for _label, _stanza in (("carries no sandbox", _absent),
+                        ("has a null sandbox", None),
+                        ("disables the sandbox", {"enabled": False})):
+    _said = _sending(_stanza)
+    check("a review is refused when the file %s" % _label,
+          "sandbox.enabled" in _said, _said)
+# Inside a stanza that passes, the deny list is still built rather than
+# read, so these shapes cannot reach the review path. Each of them used to
+# raise out of it — setdefault hands back an existing null rather than
+# replacing it — and a raise there is charged as a failed attempt, so three
+# polls later every open pull request carried a give-up comment.
+for _label, _stanza in (("nulls the filesystem", dict(_good, filesystem=None)),
+                        ("nulls the deny list",
+                         dict(_good, filesystem={"denyWrite": None})),
+                        ("makes the deny list a string",
+                         dict(_good, filesystem={
+                             "denyWrite": "~/.vinegar-checkouts"}))):
+    _sent = _built_with(_stanza)["sandbox"]
+    check("a settings file that %s still sends an enabled sandbox" % _label,
+          _sent.get("enabled") is True, json.dumps(_sent))
+    check("a settings file that %s still denies the checkout" % _label,
+          vinegar.CHECKOUT_DIR in _sent["filesystem"]["denyWrite"],
+          json.dumps(_sent["filesystem"]))
+# Every key that can turn confinement off is set here, so one left in the
+# file cannot ride along beside three keys that still read true, true,
+# false. Checking only the top level accepted a `filesystem.allowWrite`,
+# which hands a hand-run the whole disk while the daemon looks fine — and
+# the README said such a key was refused, so the file was the one telling
+# the truth about a promise the code did not keep.
+_said = _sending(dict(_good, filesystem={"allowWrite": ["/"]}))
+check("a widening key nested under filesystem is refused",
+      "sandbox.filesystem.allowWrite" in _said, _said)
+_said = _sending(dict(_good, filesystem={"denyWrite": [], "denyRead": ["/"]}))
+check("any other filesystem key is refused too",
+      "sandbox.filesystem.denyRead" in _said, _said)
+# The network rule is pinned rather than assumed. Measured: with no
+# network key the reviewer already has none — `gh` gets Forbidden — but
+# that was a default nothing stated, and a release that changed it would
+# reopen the network while the brief still promised it was closed.
+_sent = _built_with(_good)["sandbox"]
+check("the settings sent pin the network closed",
+      _sent.get("network") == {"allowedDomains": []},
+      json.dumps(_sent.get("network")))
+_said = _sending(dict(_good, network={"allowedDomains": ["api.github.com"]}))
+check("a file that opens a domain is refused",
+      "sandbox.network" in _said, _said)
+
+# The read side is re-checked on the same schedule the write side is
+# rebuilt on. Validating once at startup and forwarding blindly per review
+# left the deny rule guarding the App private key as whatever the file
+# said on the next poll — the failure this function exists to end, on the
+# half of the file it was not applied to.
+_said = _sending(_good, permissions={"allow": [vinegar.REPORT_TOOL],
+                                     "deny": []})
+check("a review is refused when the file has dropped the key deny rule",
+      "must deny" in _said, _said)
+_said = _sending(_good, permissions={"allow": [], "deny": [vinegar.DENY_HOME]})
+check("a review is refused when the file no longer allows the report tool",
+      "does not allow" in _said, _said)
+# A list collapsed to the string it held is truthy, so `or []` kept it and
+# the membership test became a substring test that passes: the key deny
+# rule reads as present while Claude Code has a malformed value.
+_said = _sending(_good, permissions={"allow": [vinegar.REPORT_TOOL],
+                                     "deny": vinegar.DENY_HOME})
+check("a deny list collapsed to a string is not read as containing itself",
+      "must deny" in _said, _said)
+_said = _sending(_good, permissions={"allow": vinegar.REPORT_TOOL,
+                                     "deny": [vinegar.DENY_HOME]})
+check("an allow list collapsed to a string is refused the same way",
+      "does not allow" in _said, _said)
+# `permissions` itself, for the same reason and with the same treatment. It
+# is guarded inside the try either way, so the difference is which sentence
+# the operator gets: the one naming the missing rule, or a parse error that
+# describes a file which parsed perfectly well.
+_said = _sending(_good, permissions=vinegar.REPORT_TOOL)
+check("a permissions block that is not an object names the missing rule",
+      "does not allow" in _said, _said)
+# Malformed JSON must be a sentence, not an exception out of review(). Left
+# to raise, handle_pr recorded FAILED with the attempt already charged, and
+# three polls later every open pull request carried a give-up comment and
+# was abandoned for good over a trailing comma.
+_said = _sending(None, raw='{"permissions": {"allow": ["X"],}}')
+check("a settings file saved mid-edit is refused with a sentence",
+      "cannot be read" in _said, _said)
+_said = _sending(None, raw='["not", "an", "object"]')
+check("a settings file that is not an object is refused with a sentence",
+      "cannot be read" in _said, _said)
+# A key Vinegar does not send would change what a hand-run does and
+# nothing else, so the file would describe something the program does not
+# do. Measured: `network` is one of those — allowing domains routes the
+# reviewer through a TLS-terminating proxy that `gh` will not trust.
+_said = _sending(dict(_good, credentials={"files": []}))
+check("a sandbox key Vinegar does not send is refused",
+      "does not send" in _said, _said)
+
+# The path the kernel judges the write by, not the one that was typed.
+# Measured against the real binary: a sandbox given only the symlink path
+# let `git show --output=` create the file inside it.
+_link_root = os.path.join(_home, "linked-checkouts")
+os.makedirs(os.path.join(_home, "real-checkouts"), exist_ok=True)
+if not os.path.islink(_link_root):
+    os.symlink(os.path.join(_home, "real-checkouts"), _link_root)
+_cd = vinegar.CHECKOUT_DIR
+vinegar.CHECKOUT_DIR = _link_root
+try:
+    _linked = json.loads(vinegar.reviewer_settings(_link_root))["sandbox"][
+        "filesystem"]["denyWrite"]
+finally:
+    vinegar.CHECKOUT_DIR = _cd
+# realpath on the expectation too: the temp root this suite runs under is
+# itself reached through a symlink on macOS (/var/folders -> /private/...),
+# so the literal join would differ from what the kernel resolves to for a
+# reason that has nothing to do with what is being checked.
+check("a symlinked checkout is denied by the path it resolves to",
+      os.path.realpath(os.path.join(_home, "real-checkouts")) in _linked,
+      _linked)
+
+# And the workspace itself, which is one level below CHECKOUT_DIR and is
+# where the review actually runs. Denying only the parent missed the
+# shortcut that moves one large clone to another disk: the workspace then
+# resolves outside every denied entry, the sandbox's workspace grant
+# applies, and `.git/config` is writable again — which buys the next poll,
+# since Vinegar runs reset, clean and checkout there unsandboxed.
+_real_repo = os.path.join(_home, "elsewhere", "o__r")
+os.makedirs(_real_repo, exist_ok=True)
+_linked_repo = os.path.join(vinegar.CHECKOUT_DIR, "linked__repo")
+os.makedirs(vinegar.CHECKOUT_DIR, exist_ok=True)
+if not os.path.islink(_linked_repo):
+    os.symlink(_real_repo, _linked_repo)
+_sent = json.loads(vinegar.reviewer_settings(_linked_repo))["sandbox"]
+check("the workspace itself is denied, not only the directory above it",
+      _linked_repo in _sent["filesystem"]["denyWrite"],
+      json.dumps(_sent["filesystem"]))
+check("a symlinked workspace is denied by the path it resolves to",
+      os.path.realpath(_real_repo) in _sent["filesystem"]["denyWrite"],
+      json.dumps(_sent["filesystem"]))
+
+# What these checks cannot reach, said plainly rather than left implied.
+# They prove what Vinegar sends. Whether `sandbox.filesystem.denyWrite`
+# actually beats the sandbox's own workspace-writable grant is a fact
+# about Claude Code, and the only honest way to learn it is to run one —
+# which costs money and needs a login, so it stays out of the suite.
+#
+# Measured by hand on Claude Code 2.1.221, macOS 26.6, and worth
+# repeating whenever that version moves. From a git repository inside a
+# directory the emitted denyWrite names:
+#
+#   claude -p 'Run exactly: git show -s --format=%B --output=./x.txt HEAD' \
+#     --settings "$(python3 -c 'import vinegar, os;
+#         print(vinegar.reviewer_settings(os.getcwd()))')" \
+#     --setting-sources "" --strict-mcp-config --model claude-haiku-4-5
+#
+# Then: `git log` exits 0, the write exits 128 with "Operation not
+# permitted", and no file appears — inside the checkout or in $HOME.
+# Use a repository whose commit messages are innocuous, or the model
+# refuses the command on its own and measures nothing.
 
 # And the key has to be somewhere that rule reaches. check_paths argues
 # the key is safe because HOME carries the denied component; the key's
@@ -889,6 +1230,34 @@ check("the paths as configured are still accepted",
 check("the environment asks for the tool contract",
       (claude_run.env or {}).get("CLAUDE_CODE_REPORT_FINDINGS") == "1",
       sorted(claude_run.env or {})[:5])
+
+# The reviewer is given no GitHub credential, and this is a leak rather
+# than tidiness. The environment handed to review() is the one checkout()
+# used, so it carries the App installation token, and enabling the sandbox
+# stopped the allow list gating Bash: measured, `env` is refused without
+# the sandbox and runs with it. A reviewer reading an attacker-authored
+# branch could print the token, and finding text reaches the pull request
+# verbatim.
+_tokened = {"GH_TOKEN": "ghs_installation_token",
+            "GITHUB_TOKEN": "ghp_operator_token", "PATH": "/usr/bin"}
+del posted[:]
+# Passed by reference deliberately: handing over a copy would make the
+# untouched-caller check below unable to fail, which is what it did first.
+vinegar.review(ROOT, "o/r", PR, CONFIG, _tokened, {})
+check("the reviewer is not given the installation token",
+      "GH_TOKEN" not in (claude_run.env or {}), sorted(claude_run.env or {}))
+check("nor an operator's own GitHub token",
+      "GITHUB_TOKEN" not in (claude_run.env or {}),
+      sorted(claude_run.env or {}))
+check("the rest of the environment still reaches the reviewer",
+      (claude_run.env or {}).get("PATH") == "/usr/bin"
+      and (claude_run.env or {}).get("CLAUDE_CODE_REPORT_FINDINGS") == "1",
+      sorted(claude_run.env or {}))
+# And the caller's own copy is untouched, because posting_env() falls back
+# to it when minting a fresh token fails — the path that gets a finished
+# review posted during a GitHub blip.
+check("removing it from the reviewer does not disarm the posting fallback",
+      _tokened.get("GH_TOKEN") == "ghs_installation_token", _tokened)
 # A stream that stops before its result event, with findings already in it.
 claude_run.stream = stream(call(FINDINGS[:4]))
 del posted[:]
@@ -1072,10 +1441,24 @@ check("brief tells the reviewer not to fall back to main",
       "do not assume `main`" in brief, brief)
 check("brief names the reporting tool, not a competing format",
       "ReportFindings" in brief and "```json" not in brief, brief)
+# The remote-tracking ref, which `gh repo clone` leaves behind whether or
+# not the base fetch later succeeded. Sending the reviewer to `HEAD~1`
+# instead was wrong on any pull request with more than one commit: it
+# would report that it could not establish the scope while the right ref
+# sat in the clone, and a full review budget bought nothing.
 check("brief gives a fallback for a base ref that does not resolve",
-      "gh pr diff 12" in brief, brief)
+      "refs/remotes/origin/release-2...HEAD" in brief, brief)
 check("brief does not promise the base ref is definitely there",
       "already fetched" not in brief, brief)
+# The old fallback was `gh pr diff`, and under the sandbox it cannot run:
+# measured, `gh` gets "Forbidden" with the network closed and a TLS trust
+# failure when domains are allowed, because the proxy terminates TLS. A
+# reviewer told to reach for it spends turns discovering that and then has
+# no scope at all.
+check("brief does not send the reviewer to a command with no network",
+      "gh pr diff" not in brief, brief)
+check("brief says the network is closed rather than leaving it to be found",
+      "no network" in brief, brief)
 
 # --- handle_pr: the guard that bounds every crash --------------------------
 reset_stubs()
