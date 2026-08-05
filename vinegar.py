@@ -371,6 +371,22 @@ def load_config(path):
         key = os.path.expanduser(app["private_key"])
         if not os.path.isfile(key):
             sys.exit("%s: no private key at %s" % (path, key))
+        # And it has to sit where the sandbox denies reads. check_paths()
+        # argues at length that the key is safe because HOME carries the
+        # denied component and review-settings.json denies reads there —
+        # an argument about a path this setting is free to point
+        # somewhere else entirely. `~/keys/vinegar.pem` is a natural
+        # choice, passes every other check, and is readable by any
+        # review, which then quotes it into a finding posted on a public
+        # pull request.
+        if not any(part.lower() == DENIED_COMPONENT
+                   for part in os.path.realpath(key).split(os.sep)):
+            sys.exit(
+                "%s: the private key at %s is somewhere a review can read. "
+                "It must sit under a `%s` directory, which is the only "
+                "path review-settings.json denies. Move it, or point "
+                "private_key at a copy that lives there." % (
+                    path, key, DENIED_COMPONENT))
     return config
 
 
@@ -665,7 +681,7 @@ def load_state():
                           or isinstance(done[field], bool)
                           for field in ("attempts", "announce_tries",
                                         "post_tries", "post_waivers",
-                                        "announce_waivers")
+                                        "announce_waivers", "seen")
                           if field in done)
                    # The flags too, and for the same reason: this file is
                    # hand-edited on the log's own advice, and a bare
@@ -2556,13 +2572,26 @@ def record_once(state, key, done, head, outcome, reason):
     out twice, the preservation was fixed in one of them and only later
     in the other, which is the drift these helpers exist to end.
     """
-    if (done.get("outcome") == outcome and done.get("sha") == head
-            and done.get("reason") == reason):
-        return
-    log("%s: %s" % (key, reason))
+    same = (done.get("outcome") == outcome and done.get("sha") == head
+            and done.get("reason") == reason)
+    seen = done.get("seen", 0) + 1 if same else 1
+    if same:
+        # Said again as it becomes a wedge rather than a blip. Silencing
+        # the repeat entirely was right for noise and wrong for this:
+        # a checkout that fails permanently is exempt from MAX_ATTEMPTS
+        # on purpose, so nothing else ever mentions the pull request
+        # again, and one line from weeks ago is indistinguishable from
+        # having judged it. Tenfold intervals keep that rare.
+        if seen not in (10, 100, 1000) and seen % 10000:
+            state[key] = dict(done, seen=seen)
+            return
+        log("%s: still true after %d polls: %s" % (key, seen, reason))
+    else:
+        log("%s: %s" % (key, reason))
     kept = done if done.get("sha") == head else {}
     state[key] = state_entry(head, outcome, kept.get("attempts", 0), reason,
                              **carry_forward(kept))
+    state[key]["seen"] = seen
     save_state(state)
 
 
@@ -2780,7 +2809,7 @@ def handle_pr(repo, pr, config, state, tokens):
     # review unpostable the moment it was written.
     kept = done if done.get("sha") == head else {}
     state[key] = state_entry(head, FAILED, attempts,
-                             **carry_forward(kept))
+                             **dict(carry_forward(kept), post_tries=0))
     save_state(state)
 
     try:
@@ -2806,8 +2835,12 @@ def handle_pr(repo, pr, config, state, tokens):
 
     # Recorded with whether a saved review is waiting behind it, so the
     # next poll can find that out without listing a directory.
+    # post_tries reset: this review writes its own transcript over any
+    # saved one, so the budget that governed the old copy is void. Kept,
+    # it met the new marker already spent and nothing would repost or
+    # forget it.
     state[key] = state_entry(head, outcome, attempts,
-                             **dict(carry_forward(kept),
+                             **dict(carry_forward(kept), post_tries=0,
                                     unposted=os.path.exists(
                                         unposted_path(repo, pr))))
     save_state(state)
@@ -3020,7 +3053,7 @@ def main():
                 # One sentence, like the daemon gives for the same
                 # failure, rather than a traceback through the lock.
                 sys.exit("%s: checkout failed: %s" % (args.pr, err))
-            review(where, repo, pr, config, env, tokens)
+            outcome = review(where, repo, pr, config, env, tokens)
 
             # Recorded, always. A manual run is still a review of that
             # commit, and leaving no trace meant the daemon reviewed the
@@ -3036,9 +3069,21 @@ def main():
             state = load_state()
             was = state.get(pr_key(repo, pr), {})
             kept = was if was.get("sha") == pr["headRefOid"] else {}
+            # The outcome the review actually reached, not DONE. Writing
+            # DONE for a run that never got that far — a rate-limit
+            # window, a logged-out CLI — closed the pull request off for
+            # good: the daemon returns at the DONE check and, with
+            # review_on_push false, never looks again. FAILED is what
+            # MAX_ATTEMPTS is for.
+            #
+            # And a fresh review voids any earlier saved one's budget,
+            # because this run writes its own transcript over it. Carried
+            # forward, a spent post_tries met the new marker at 3 of 3,
+            # so neither the repost branch nor the forget branch fired
+            # and the review sat on disk for ever.
             state[pr_key(repo, pr)] = state_entry(
-                pr["headRefOid"], DONE, kept.get("attempts", 0) + 1,
-                **dict(carry_forward(kept),
+                pr["headRefOid"], outcome, kept.get("attempts", 0) + 1,
+                **dict(carry_forward(kept), post_tries=0,
                        unposted=bool(unposted_for(repo, pr, scan=False)[0])))
             save_state(state)
             if state[pr_key(repo, pr)].get("unposted"):

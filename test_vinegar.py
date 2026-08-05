@@ -798,6 +798,37 @@ vinegar.DENY_HOME = _dh
 check("a missing private-key deny rule refuses to start",
       "must deny" in _denied, _denied)
 
+# And the key has to be somewhere that rule reaches. check_paths argues
+# the key is safe because HOME carries the denied component; the key's
+# own location is a separate setting, free to point anywhere.
+_loose_key = os.path.join(_home, "loose-key.pem")
+with open(_loose_key, "w") as h:
+    h.write("not really a key\n")
+os.makedirs(os.environ["VINEGAR_HOME"], exist_ok=True)
+_covered_key = os.path.join(os.environ["VINEGAR_HOME"], "covered-key.pem")
+with open(_covered_key, "w") as h:
+    h.write("not really a key\n")
+
+
+def _config_with_key(where):
+    path = os.path.join(_home, "app-config.json")
+    with open(path, "w") as handle:
+        json.dump({"repos": ["o/r"],
+                   "github_app": {"app_id": 1, "private_key": where}}, handle)
+    try:
+        vinegar.load_config(path)
+        return "started"
+    except SystemExit as err:
+        return str(err)
+
+
+check("a private key a review could read refuses to start",
+      "review can read" in _config_with_key(_loose_key),
+      _config_with_key(_loose_key))
+check("a private key under the denied component is accepted",
+      _config_with_key(_covered_key) == "started",
+      _config_with_key(_covered_key))
+
 
 def _refuses(**over):
     """Whether check_paths exits with these module paths in place."""
@@ -1292,6 +1323,16 @@ for _ in range(4):
 vinegar.log = lambda message: None
 check("a failing checkout is reported once, not once a poll",
       len([m for m in _ck_log if "could not clone" in m]) == 1, _ck_log)
+# But not silent for ever. A checkout that fails permanently is exempt
+# from MAX_ATTEMPTS on purpose, so nothing else ever mentions the pull
+# request again and one line from weeks ago reads as a verdict.
+del _ck_log[:]
+vinegar.log = lambda m: _ck_log.append(m)
+for _ in range(12):
+    vinegar.handle_pr("o/r", PR_LIVE, CONFIG, _ck_state, {})
+vinegar.log = lambda message: None
+check("a checkout that stays broken is mentioned again",
+      any("still true after 10 polls" in m for m in _ck_log), _ck_log[:2])
 check("a failing checkout is still retried rather than abandoned",
       _ck_state[L]["outcome"] == "checkout", _ck_state)
 # The mirror of "a skip keeps the attempts burned at this head". A bare
@@ -2006,6 +2047,25 @@ check("a manual run that posted is recorded, so the daemon does not repeat it",
       _ok_state.get(L, {}).get("outcome") == vinegar.DONE
       and _ok_state.get(L, {}).get("unposted") is None, _ok_state)
 
+# And a manual review that never ran is recorded as failed, not done.
+# Written as DONE, the daemon returns at the DONE check for ever and the
+# pull request is closed off with no comment and no retry.
+vinegar.review = lambda *a, **k: vinegar.FAILED
+vinegar.find_pr = lambda repo, number, env: PR_LIVE
+vinegar.checkout = lambda repo, pr, env: ROOT
+vinegar.github_env = lambda *a, **k: None
+sys.argv = ["vinegar.py", "--pr", "o/r#12"]
+try:
+    vinegar.main()
+except SystemExit:
+    pass
+finally:
+    (vinegar.review, vinegar.find_pr, vinegar.checkout,
+     vinegar.github_env, sys.argv) = _pr_real
+check("a manual review that failed is recorded as failed, so it is retried",
+      vinegar.load_state().get(L, {}).get("outcome") == vinegar.FAILED,
+      vinegar.load_state().get(L))
+
 # Announcing is retried while it fails to land, and each retry used to
 # append the same ending again to the file a dry run is judged by.
 vinegar.finish(L, "o/r", PR_GAVE, ROOT, "", None,
@@ -2294,8 +2354,16 @@ vinegar.checkout = lambda repo, pr, env: ROOT
 vinegar.save_state = lambda st: _rerun_saved.append(dict(st[_rerun_key]))
 vinegar.handle_pr("o/r", PR_RERUN, CONFIG, _rerun, {})
 (vinegar.review, vinegar.checkout, vinegar.save_state) = _rerun_real
-check("the repost budget is not handed back by a fresh review",
-      _rerun[_rerun_key].get("post_tries") == 2, _rerun)
+# A fresh review voids the budget rather than inheriting it: this run
+# writes its own transcript over any saved one, so the count that
+# governed the old copy no longer applies. Carried forward, a spent
+# budget met the new marker already at its cap, and neither the repost
+# branch nor the forget branch would touch it again.
+check("a fresh review starts the repost budget over",
+      _rerun[_rerun_key].get("post_tries") is None, _rerun)
+check("the marker written before a review starts it over too",
+      _rerun_saved and _rerun_saved[0].get("post_tries") is None,
+      _rerun_saved[:1])
 
 # But it does not follow the pull request to the next head. A budget
 # spent on one head's saved review made every later head's review
@@ -2313,12 +2381,6 @@ check("a spent repost budget does not follow the head",
       _moved_budget[_rerun_key].get("sha") == PR_RERUN["headRefOid"]
       and _moved_budget[_rerun_key].get("post_tries", 0) == 0,
       _moved_budget)
-# The marker written before the review runs carries it too. Only that
-# entry survives a process killed mid-review, and it is the entry the
-# next poll reads.
-check("the marker written before a review carries the repost budget",
-      _rerun_saved and _rerun_saved[0].get("post_tries") == 2,
-      _rerun_saved[:1])
 
 check("the repost budget is not handed back by a skip",
       _launder_skip[_skip_key].get("outcome") == "skipped"
@@ -2556,7 +2618,10 @@ vinegar.review(ROOT, "o/r", PR, CONFIG, None, {})
 check("the killed-run marker reaches the transcript, not just the comment",
       _tx_calls and _tx_calls[-1][4] and "killed after" in _tx_calls[-1][4],
       _tx_calls[-1][4] if _tx_calls else "never called")
-vinegar.run = fake_run
+# Both stubs put back, not just the runner. Leaving the recorder in place
+# costs nothing today and would silently make the next check that writes
+# a transcript exercise the stub instead of the writer.
+reset_stubs()
 
 # The reviewer's diff is whatever bytes the repository holds. A Latin-1
 # source file used to raise UnicodeDecodeError out of run() itself, and the
