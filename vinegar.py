@@ -1471,10 +1471,12 @@ def post_review(label, repo, pr, path, text, findings, config, env,
     # be anchored means a full `git diff` over the pull request and up to
     # 60KB of assembled markdown, and neither of these endings looks at
     # any of it.
-    if resent and already_posted(label, repo, pr, env, verb):
-        log("%s: the review is already on the pull request" % label)
-        return True
-
+    #
+    # The dry run first. A dry run mints no token, so posting_env() hands
+    # this an env of None, and asking GitHub anything with it is a live
+    # call under whatever ambient credentials exist: on an App-only
+    # deployment that is a 401 and a logged warning about a resend that a
+    # dry run was never going to make.
     if not config["comment"]:
         # A dry run discards the answer to print two counts.
         #
@@ -1484,6 +1486,10 @@ def post_review(label, repo, pr, path, text, findings, config, env,
         # every poll for ever.
         log("%s: dry run, %d finding(s) not posted" % (
             label, len(findings) if findings else 0))
+        return True
+
+    if resent and already_posted(label, repo, pr, env, verb):
+        log("%s: the review is already on the pull request" % label)
         return True
 
     if findings is None:
@@ -1723,7 +1729,11 @@ def finish(label, repo, pr, path, text, findings, config, env, tokens,
                 # Marking on its existence pointed the repost at a partial
                 # narration headed "It is not a review", and published it
                 # as one.
-                write_atomic(marker, "%s\n" % label)
+                #
+                # The whole commit goes inside it. The name carries seven
+                # characters and the reviews endpoint wants forty, and by
+                # the time this is read the head may have moved on.
+                write_atomic(marker, "%s\n" % pr["headRefOid"])
         except OSError as err:
             log("%s: cannot record whether the review was posted: %s" % (
                 label, err))
@@ -1743,7 +1753,39 @@ def forget(path):
         pass
 
 
-def repost(key, repo, pr, config, state, tokens, done):
+def unposted_for(repo, pr):
+    """Any saved review of this pull request that never reached it.
+
+    Found by pull request rather than by commit, because the head can move
+    between the refusal and the retry. Keyed on the current head, the
+    marker written for the previous one could never be found again: with
+    `review_on_push` false that pull request is never reviewed a second
+    time either, so the refused review was the only one there would ever
+    be, and it was silently abandoned with its file left behind.
+
+    Returns the marker path and the full commit it was written for, which
+    the marker carries because the transcript's name holds only seven
+    characters of it and the reviews endpoint wants all forty.
+    """
+    prefix = "%s__%d__" % (repo.replace("/", "__"), pr["number"])
+    try:
+        names = sorted(os.listdir(REVIEW_DIR))
+    except OSError:
+        return None, None
+    for name in names:
+        if not (name.startswith(prefix) and name.endswith(".md.unposted")):
+            continue
+        path = os.path.join(REVIEW_DIR, name)
+        try:
+            with open(path, encoding="utf-8", errors="replace") as handle:
+                sha = handle.read().strip()
+        except OSError:
+            sha = ""
+        return path, sha
+    return None, None
+
+
+def repost(key, repo, pr, config, state, tokens, done, marker, sha):
     """Send a review that GitHub refused, again, from the transcript.
 
     The review itself is not re-run: the subscription is spent and the
@@ -1758,60 +1800,65 @@ def repost(key, repo, pr, config, state, tokens, done):
     spent the marker is removed and the review stays where the log says
     it is.
     """
-    marker = unposted_path(repo, pr)
-    tries = done.get("post_tries", 0)
-    try:
-        env = github_env(config, repo, tokens, good_for=POST_GRACE)
-    except Exception as err:
-        log("%s: cannot mint a token to post the saved review: %s" % (
-            key, err))
-        env = None
-        if config.get("github_app"):
-            tries += 1
-            # Cleared here too when the budget runs out. Returning early
-            # without it left the marker on disk for ever, and a later
-            # deletion of the state entry then restarted the whole retry
-            # cycle against a transcript nothing was going to accept.
-            if tries >= MAX_ATTEMPTS:
-                log("%s: the saved review could not be posted in %d "
-                    "attempts. It stays in %s" % (
-                        key, tries, transcript_path(repo, pr)))
-                forget(marker)
-            state[key] = dict(done, post_tries=tries)
-            save_state(state)
-            return
-    try:
-        with open(transcript_path(repo, pr), encoding="utf-8",
-                  errors="replace") as handle:
-            body = handle.read()
-    except OSError as err:
-        log("%s: the saved review cannot be read (%s), so it is given up "
-            "on" % (key, err))
-        forget(marker)
-        state[key] = dict(done, post_tries=MAX_ATTEMPTS)
-        save_state(state)
-        return
-
-    log("%s: posting the review that was refused earlier (attempt %d of %d)"
-        % (key, tries + 1, MAX_ATTEMPTS))
-    body = clamp(key, "%s\n\nThis review was refused when it was written "
-                      "and is posted from the transcript, so its findings "
-                      "are not anchored in the diff.\n\n---\n\n%s" % (
-                          review_heading(pr, config), body))
-    landed = already_posted(key, repo, pr, env) or submit_review(
-        key, repo, pr, {"event": "COMMENT", "commit_id": pr["headRefOid"],
-                        "body": body}, env) == POSTED
-
-    tries += 1
-    if landed:
-        log("%s: the saved review is on the pull request" % key)
-    elif tries >= MAX_ATTEMPTS:
-        log("%s: the saved review could not be posted in %d attempts. It "
-            "stays in %s" % (key, tries, transcript_path(repo, pr)))
-    if landed or tries >= MAX_ATTEMPTS:
-        forget(marker)
+    # The attempt is spent before it is made, and every way out of this
+    # function goes through the same ending. Charging it afterwards meant
+    # anything that raised — `gh` missing from PATH, a fork that cannot
+    # allocate — escaped to poll_once() with the counter unmoved and the
+    # marker in place, and the budget that is supposed to bound this
+    # never advanced: a token mint, a file read and a log line a minute,
+    # per pull request, for ever. review() has announce() for the same
+    # reason.
+    tries = done.get("post_tries", 0) + 1
     state[key] = dict(done, post_tries=tries)
     save_state(state)
+
+    at = dict(pr, headRefOid=sha or pr["headRefOid"])
+    saved = transcript_path(repo, at)
+    landed, give_up_on_it = False, tries >= MAX_ATTEMPTS
+
+    # The read is guarded on its own, and narrowly. Wrapping the sending
+    # in the same `except OSError` swallowed a missing `gh` and a fork
+    # that cannot allocate as "the saved review cannot be read", which
+    # names the wrong cause and abandons on the first try something that
+    # deserves the other two.
+    body = None
+    try:
+        with open(saved, encoding="utf-8", errors="replace") as handle:
+            body = handle.read()
+    except OSError as err:
+        # The transcript is what there was to send. Without it there is
+        # nothing to retry and no point counting to three about it.
+        log("%s: the saved review cannot be read (%s), so it is given up "
+            "on" % (key, err))
+        give_up_on_it = True
+
+    if body is not None:
+        try:
+            env = github_env(config, repo, tokens, good_for=POST_GRACE)
+            log("%s: posting the review that was refused earlier (attempt "
+                "%d of %d)" % (key, tries, MAX_ATTEMPTS))
+            body = clamp(key, "%s\n\nThis review was refused when it was "
+                              "written and is posted from the transcript, "
+                              "so its findings are not anchored in the "
+                              "diff.\n\n---\n\n%s" % (
+                                  review_heading(at, config), body))
+            landed = already_posted(key, repo, at, env) or submit_review(
+                key, repo, at,
+                {"event": "COMMENT", "commit_id": at["headRefOid"],
+                 "body": body}, env) == POSTED
+        except Exception as err:
+            log("%s: the saved review could not be sent: %s" % (key, err))
+
+    if landed:
+        log("%s: the saved review is on the pull request" % key)
+    elif give_up_on_it:
+        log("%s: the saved review could not be posted in %d attempts. It "
+            "stays in %s" % (key, tries, saved))
+    if landed or give_up_on_it:
+        forget(marker)
+        if give_up_on_it:
+            state[key] = dict(done, post_tries=MAX_ATTEMPTS)
+            save_state(state)
 
 
 def partial_note(cause):
@@ -1885,11 +1932,21 @@ def review(path, repo, pr, config, env, tokens, resent=False):
                 note, resent=resent)):
             return True
         if config["comment"]:
-            log("%s: nothing reached the pull request. The review is in "
-                "%s and posting it again is already scheduled; to review "
-                "from scratch instead, stop Vinegar, delete this pull "
-                "request's entry from %s, and start it again" % (
-                    label, transcript_path(repo, pr), STATE_PATH))
+            # Promised only when it is true. finish() writes the marker
+            # only if the transcript was written, so on the path where
+            # that failed too — a `~/.vinegar/reviews` left root-owned by
+            # one `sudo` run — this said a retry was scheduled and named a
+            # file that does not exist, while the outcome was recorded
+            # DONE and the pull request closed off for good.
+            if os.path.exists(unposted_path(repo, pr)):
+                log("%s: nothing reached the pull request. The review is "
+                    "in %s and posting it again is scheduled" % (
+                        label, transcript_path(repo, pr)))
+            else:
+                log("%s: nothing reached the pull request and nothing was "
+                    "saved to send later. To review it again, stop "
+                    "Vinegar, delete this pull request's entry from %s, "
+                    "and start it again" % (label, STATE_PATH))
         return False
 
     log("%s: reviewing at %s effort%s" % (
@@ -2036,8 +2093,13 @@ def review(path, repo, pr, config, env, tokens, resent=False):
         log("%s: it failed with %d finding(s) already reported, so those are "
             "posted" % (label, len(findings)))
         note = partial_note("failed before it finished")
-
-    log("%s: reviewed in %ds%s" % (label, took, priced))
+    else:
+        # Only when it did not fail. Moving the price above the error
+        # handling so a failed run reports it left this line printing a
+        # second time under the same run: the same cost counted twice by
+        # anyone totalling the log, and a completed review counted by
+        # anyone grepping for one.
+        log("%s: reviewed in %ds%s" % (label, took, priced))
 
     # After the transcript is on disk, so a review whose findings cannot be
     # posted is still a review someone can read. The outcome stays DONE
@@ -2162,19 +2224,22 @@ def handle_pr(repo, pr, config, state, tokens):
     # A review that was written but never reached the pull request is
     # finished work waiting on one API call, so it is retried before
     # anything else decides this pull request is done.
-    if config["comment"] and os.path.exists(unposted_path(repo, pr)):
+    if config["comment"]:
+        marker, saved_sha = unposted_for(repo, pr)
         # Tied to the entry that produced it. Without that, the repair the
         # log recommends — delete the entry and let it be reviewed again —
         # made the next poll post the *old* transcript instead, and the
         # poll after that review and post again: two reviews, which is
         # what the operator was trying to avoid. A marker with no entry
         # behind it is left over from a review that has been forgotten.
-        if done.get("sha") != head or done.get("outcome") != DONE:
+        if marker and (done.get("outcome") != DONE
+                       or done.get("sha") != saved_sha):
             log("%s: an unposted review is left over from a run that is no "
                 "longer recorded, so it is forgotten" % key)
-            forget(unposted_path(repo, pr))
-        elif done.get("post_tries", 0) < MAX_ATTEMPTS:
-            repost(key, repo, pr, config, state, tokens, done)
+            forget(marker)
+        elif marker and done.get("post_tries", 0) < MAX_ATTEMPTS:
+            repost(key, repo, pr, config, state, tokens, done, marker,
+                   saved_sha)
             return
 
     # Only a finished review closes a pull request off. A skip is decided
@@ -2308,11 +2373,15 @@ def handle_pr(repo, pr, config, state, tokens):
             # poll while MAX_ATTEMPTS was never reached. Recording nothing
             # at all, which is what this branch used to do, preserved the
             # entry by accident; this preserves it on purpose.
+            # The attempts only. `announced` and `announce_tries` cannot
+            # be set on an entry that reaches here: they are written only
+            # at attempts >= MAX_ATTEMPTS, and that entry returns at the
+            # budget guard above. Carrying them would be two arguments no
+            # test can reach, which is the reasoning state_entry's own
+            # docstring gives for leaving them out of the skip branch.
             kept = done if done.get("sha") == head else {}
             state[key] = state_entry(head, "checkout",
-                                     kept.get("attempts", 0), said,
-                                     kept.get("announced", False),
-                                     kept.get("announce_tries", 0))
+                                     kept.get("attempts", 0), said)
             save_state(state)
         return
 

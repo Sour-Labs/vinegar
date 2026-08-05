@@ -128,6 +128,28 @@ vinegar.log = lambda message: None
 fails = []
 
 
+def reset_stubs():
+    """Put every stub back the way a section should find it.
+
+    The stubs are module globals and attributes on fake_run, so without
+    this each block inherits whatever the one above it happened to leave:
+    an `rc` of 1 turns a later check about a clean post into a test of the
+    refusal path that still passes, and reordering two blocks changes what
+    a third one exercises without failing anything. Sections call this
+    first so they say what they need rather than inheriting it.
+    """
+    vinegar.run = fake_run
+    vinegar.log = lambda message: None
+    vinegar.save_transcript = GENUINE_SAVE_TRANSCRIPT
+    fake_run.rc = 0
+    fake_run.diff_rc = 0
+    fake_run.look_rc = 0
+    fake_run.look_out = ""
+    fake_run.post_err = "HTTP 422"
+    del posted[:]
+    del looked[:]
+
+
 def check(name, condition, detail=""):
     print("%-52s %s" % (name, "ok" if condition else "FAIL " + str(detail)))
     if not condition:
@@ -241,6 +263,7 @@ check("the reviewer's own words come back for the transcript",
           DONE_EVENT))[2])
 
 # --- diff_lines ----------------------------------------------------------
+reset_stubs()
 covered = vinegar.diff_lines(ROOT, "release-2", None, "o/r#12")
 check("added lines are covered", covered.get("vinegar.py") == {11, 12, 13, 43},
       covered.get("vinegar.py"))
@@ -325,6 +348,7 @@ os.mkdir(_real)
 os.symlink(_real, _link)
 
 # --- split_findings ------------------------------------------------------
+reset_stubs()
 FINDINGS = [
     {"file": "vinegar.py", "line": 12, "summary": "in diff",
      "failure_scenario": "boom"},
@@ -383,6 +407,7 @@ check("failure scenario reaches the comment body",
       "Failure: boom" in inline[0]["body"], inline[0]["body"])
 
 # --- review_body ---------------------------------------------------------
+reset_stubs()
 empty = vinegar.review_body(L, PR, CONFIG, [], [])
 check("nothing found still says so", "No findings." in empty, empty)
 check("body names the reviewed sha", "a1b2c3d" in empty, empty)
@@ -408,6 +433,7 @@ check("unreadable output is quoted verbatim",
       and "did not return its findings" in raw, raw)
 
 # --- post_review ---------------------------------------------------------
+reset_stubs()
 text = "Summary of the review."
 
 del posted[:]
@@ -943,6 +969,7 @@ check("brief does not promise the base ref is definitely there",
       "already fetched" not in brief, brief)
 
 # --- handle_pr: the guard that bounds every crash --------------------------
+reset_stubs()
 # An exception anywhere in review() used to leave no state at all, so the
 # pull request was checked out and reviewed again at full cost every poll,
 # for ever, with MAX_ATTEMPTS never reaching it.
@@ -1266,6 +1293,7 @@ check("dropping a bad entry does not quarantine the good ones",
 os.remove(vinegar.STATE_PATH)
 
 # --- a resend must not duplicate a review that already landed --------------
+reset_stubs()
 # A 5xx is ambiguous the way a timeout is; a 4xx created nothing and is
 # retried without the read. The stub answers 502 for the ambiguous half.
 claude_run.stream = stream(call([]), result_event())
@@ -1559,6 +1587,19 @@ check("a failed review is retried and its cost still reported",
       vinegar.review(ROOT, "o/r", PR, CONFIG, None, {}) == vinegar.FAILED
       and any("2.50 USD" in m for m in logged),
       [m for m in logged if "failed" in m])
+
+# A run that failed with findings already reported must not also announce
+# itself as completed: the cost would be counted twice by anyone totalling
+# the log, and the run counted as a finished review by anyone grepping.
+claude_run.stream = stream(call(FINDINGS[:2]),
+                           result_event(is_error=True, total_cost_usd=1.5,
+                                        subtype="error_max_turns"))
+del logged[:]
+vinegar.review(ROOT, "o/r", PR, CONFIG, None, {})
+check("a failed run is not also logged as a completed one",
+      len([m for m in logged if "USD equivalent" in m]) == 1
+      and not any("reviewed in" in m for m in logged),
+      [m for m in logged if "USD equivalent" in m or "reviewed in" in m])
 vinegar.log = lambda message: None
 vinegar.run = fake_run
 
@@ -1708,6 +1749,14 @@ vinegar.post_review(L, "o/r", PR, ROOT, "x", FINDINGS[:2], CONFIG, None,
                     resent=True)
 check("a review already up costs no diff to discover",
       not last_git_diff[0], last_git_diff[0])
+# But a dry run asks GitHub nothing at all. It mints no token, so the
+# read would go out under whatever ambient credentials exist and warn
+# about a resend a dry run was never going to make.
+del looked[:]
+vinegar.post_review(L, "o/r", PR, ROOT, "x", [], dict(CONFIG, comment=False),
+                    None, resent=True)
+check("a dry run makes no live call to see if a review is up",
+      not looked, looked)
 del _rs_posts[:]
 vinegar.post_review(L, "o/r", PR, ROOT, "x", [], CONFIG, None)
 check("the daemon's own first post does not ask",
@@ -1839,6 +1888,19 @@ check("a transcript that could not be written is not marked for reposting",
       not os.path.exists(_nw_marker)
       and "not a review" in open(
           vinegar.transcript_path("o/r", PR_NOWRITE)).read(), _nw_marker)
+# And the operator is not told a retry is scheduled when none is. The
+# message named a file that was never written, while the outcome was
+# recorded done and the pull request closed off for good.
+_nw_log = []
+vinegar.log = lambda m: _nw_log.append(m)
+vinegar.save_transcript = exploding_save
+vinegar.review(ROOT, "o/r", PR_NOWRITE, CONFIG, None, {})
+vinegar.save_transcript = _nw_save
+vinegar.log = lambda message: None
+check("a review with nothing saved does not promise a retry",
+      any("nothing was saved to send later" in m for m in _nw_log)
+      and not any("posting it again is scheduled" in m for m in _nw_log),
+      [m for m in _nw_log if "nothing reached" in m])
 fake_run.rc = 0
 vinegar.run = fake_run
 
@@ -1864,7 +1926,7 @@ check("a review that can never post stops being retried",
 # fail, and a mark left behind with the budget spent must not restart the
 # retries.
 with open(_lost_marker, "w") as h:
-    h.write("left behind\n")
+    h.write("%s\n" % PR_LOST["headRefOid"])
 _spent_state = {_lost_key: {"outcome": vinegar.DONE,
                             "sha": PR_LOST["headRefOid"], "attempts": 1,
                             "post_tries": vinegar.MAX_ATTEMPTS}}
@@ -1872,7 +1934,7 @@ del posted[:]
 vinegar.handle_pr("o/r", PR_LOST, CONFIG, _spent_state, {})
 check("a spent post budget is not retried even if the mark remains",
       not posted, (len(posted), _spent_state))
-os.remove(_lost_marker)
+vinegar.forget(_lost_marker)
 
 # A marker whose state entry is gone is left over from a review nobody
 # remembers. Reposting it defeats the repair the log recommends: the
@@ -1891,7 +1953,7 @@ check("a marker with no entry behind it is forgotten, not posted",
 # runs out, or it survives to restart the cycle later. Reachable only with
 # a github_env that can fail, which the stub above cannot.
 with open(_lost_marker, "w") as h:
-    h.write("left\n")
+    h.write("%s\n" % PR_LOST["headRefOid"])
 _mint_state = {_lost_key: {"outcome": vinegar.DONE,
                            "sha": PR_LOST["headRefOid"], "attempts": 1,
                            "post_tries": vinegar.MAX_ATTEMPTS - 1}}
@@ -1911,6 +1973,46 @@ check("a token that never mints does not leave the mark behind",
       not os.path.exists(_lost_marker)
       and _mint_state[_lost_key]["post_tries"] == vinegar.MAX_ATTEMPTS,
       (os.path.exists(_lost_marker), _mint_state))
+
+# Anything that raises must still spend the attempt. Charging it after
+# the send meant a missing `gh`, or a fork that cannot allocate, escaped
+# with the counter unmoved and the marker in place: a mint, a file read
+# and a log line a minute, per pull request, for ever.
+with open(_lost_marker, "w") as h:
+    h.write("%s\n" % PR_LOST["headRefOid"])
+_raise_state = {_lost_key: {"outcome": vinegar.DONE,
+                            "sha": PR_LOST["headRefOid"], "attempts": 1}}
+
+
+def _no_gh(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
+    raise FileNotFoundError("[Errno 2] No such file or directory: 'gh'")
+
+
+vinegar.run = _no_gh
+for _ in range(4):
+    vinegar.handle_pr("o/r", PR_LOST, CONFIG, _raise_state, {})
+vinegar.run = fake_run
+check("a repost that raises still spends its attempt and stops",
+      _raise_state[_lost_key].get("post_tries") == vinegar.MAX_ATTEMPTS
+      and not os.path.exists(_lost_marker), _raise_state)
+
+# The head can move between the refusal and the retry. Keyed on the
+# current head the marker was never found again, and with review_on_push
+# false that review was the only one there would ever be.
+_moved_marker = vinegar.unposted_path("o/r", PR_LOST)
+vinegar.save_transcript("o/r", PR_LOST, "Findings at the old head.", [])
+with open(_moved_marker, "w") as h:
+    h.write("%s\n" % PR_LOST["headRefOid"])
+PR_MOVED = dict(PR_LOST, headRefOid="9999999999ff")
+_moved_state = {_lost_key: {"outcome": vinegar.DONE,
+                            "sha": PR_LOST["headRefOid"], "attempts": 1}}
+del posted[:]
+vinegar.handle_pr("o/r", PR_MOVED, CONFIG, _moved_state, {})
+check("a saved review survives the head moving on",
+      len(posted) == 1
+      and posted[0][1]["commit_id"] == PR_LOST["headRefOid"]
+      and "Findings at the old head." in posted[0][1]["body"],
+      posted[0][1]["commit_id"] if posted else "nothing posted")
 fake_run.rc, fake_run.post_err = 0, "HTTP 422"
 
 vinegar.REVIEW_DIR = _tx_real
