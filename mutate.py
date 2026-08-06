@@ -432,6 +432,77 @@ MUTATIONS = [
      "    chooser = config[\"severity_model\"]\n"
      "    if False:"),
 
+    # --- the checks-list indicator -------------------------------------
+    # A check that can fail is a merge gate, and the README promises
+    # Vinegar is not one. Both halves: the constant and its use.
+    ("check-conclusion-never-fails",
+     'CHECK_CONCLUSION = "neutral"', 'CHECK_CONCLUSION = "failure"'),
+    ("check-conclusion-is-used",
+     '"status": "completed", "conclusion": CHECK_CONCLUSION,',
+     '"status": "completed", "conclusion": "success",'),
+    # Only an App can own a check run, so without one this is a 403 per
+    # review about a permission the operator cannot grant.
+    ("check-needs-an-app",
+     '    if not config["comment"] or not config.get("github_app"):\n'
+     "        return None",
+     "    if False:\n        return None"),
+    # An indicator an earlier attempt left running is reused rather than
+    # joined by a second one that also never finishes.
+    ("check-reuses-a-running-one",
+     "    if mine:\n"
+     '        log("%s: reusing the check run an earlier attempt left running"\n'
+     "            % label)\n"
+     '        return {"repo": repo, "id": mine[0].get("id"), "env": env,\n'
+     '                "closed": False}',
+     "    if False:\n        pass"),
+    ("check-ignores-another-apps",
+     '    mine = [was for was in (open_already or {}).get("check_runs") or []\n'
+     '            if (was.get("app") or {}).get("id")\n'
+     '            == config["github_app"].get("app_id")]',
+     '    mine = list((open_already or {}).get("check_runs") or [])'),
+    # A handle with no id would PATCH `check-runs/None` on every ending.
+    ("check-handle-needs-an-id",
+     '    return {"repo": repo, "id": made["id"], "env": env, "closed": False} \\\n'
+     "        if made and made.get(\"id\") else None",
+     '    return {"repo": repo, "id": (made or {}).get("id"), "env": env,\n'
+     '            "closed": False}'),
+    ("check-closes-once",
+     '    if not check or check["closed"]:\n        return\n'
+     '    check["closed"] = True',
+     "    if not check:\n        return"),
+    # GitHub refuses a title over 255 characters, and refuses the whole
+    # update with it, leaving the indicator running.
+    ("check-title-fits",
+     '"output": {"title": title[:255], "summary": summary or title}},',
+     '"output": {"title": title, "summary": summary or title}},'),
+    # An empty details_url is not a URL and GitHub judges the whole
+    # request on it, so the create fails and no indicator appears at all.
+    ("check-omits-an-empty-url",
+     '    if pr.get("url"):\n        asked["details_url"] = pr["url"]',
+     '    asked["details_url"] = pr.get("url") or ""'),
+    # The title is the whole of what the checks list communicates.
+    ("check-title-counts-findings",
+     '        tally = severity_tally(findings)\n'
+     '        title = "%d finding%s%s" % (\n'
+     '            len(findings), "" if len(findings) == 1 else "s",\n'
+     '            " (%s)" % tally if tally else "")',
+     '        title = "Reviewed"'),
+    ("check-title-not-clean-when-unreadable",
+     '        title = "Nothing Vinegar could read"',
+     '        title = "No findings"'),
+    ("check-title-says-a-partial-run",
+     "    if note:\n"
+     '        title = "%s, and the review did not finish" % title',
+     "    if False:\n        pass"),
+    ("check-closed-in-finish",
+     "    close_check(label, check, title,",
+     "    (lambda *a, **k: None)(label, check, title,"),
+    # Left open, the pull request lists a Vinegar check that spins for
+    # ever and the next attempt reuses it rather than clearing it.
+    ("check-closed-when-the-review-fails",
+     '    close_check(key, check, "The review failed %d times and was given up on"',
+     '    (lambda *a, **k: None)(key, check, "The review failed %d times and was given up on"'),
+
     # --- constants -----------------------------------------------------
     ("max-attempts", "MAX_ATTEMPTS = 3", "MAX_ATTEMPTS = 99"),
     ("severity-timeout-value",

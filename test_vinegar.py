@@ -100,6 +100,7 @@ diff --git a/README.md b/README.md
 
 posted = []
 looked = []
+checked = []
 last_git_diff = [[], None]
 last_post_timeout = [None]
 
@@ -145,6 +146,19 @@ def fake_run(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
         return subprocess.CompletedProcess(
             cmd, fake_run.diff_rc,
             fake_run.diff_out if fake_run.diff_rc else DIFF, "boom")
+    # Before the posting branch, and not folded into it. A check-run call
+    # is `gh api ... --method ...` exactly like a review posting, so
+    # without its own branch every indicator landed in `posted` and the
+    # counts three sections assert on would climb by two per review.
+    if cmd[:2] == ["gh", "api"] and "/check-runs" in cmd[2]:
+        how = cmd[cmd.index("--method") + 1] if "--method" in cmd else "GET"
+        checked.append((how, cmd[2],
+                        json.loads(stdin_text) if stdin_text else None))
+        return subprocess.CompletedProcess(
+            cmd, fake_run.check_rc,
+            {"GET": json.dumps(fake_run.check_open),
+             "POST": json.dumps(fake_run.check_made)}.get(how, "{}"),
+            fake_run.check_err)
     if cmd[:2] == ["gh", "api"] and "-X" in cmd:
         # The read that asks whether a review already landed.
         looked.append(cmd)
@@ -159,6 +173,10 @@ def fake_run(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
 
 
 fake_run.rc = 0
+fake_run.check_rc = 0
+fake_run.check_err = ""
+fake_run.check_open = {"check_runs": []}
+fake_run.check_made = {"id": 4242}
 fake_run.diff_rc = 0
 fake_run.diff_out = ""
 fake_run.look_rc = 0
@@ -201,8 +219,13 @@ def reset_stubs():
     fake_run.look_rc = 0
     fake_run.look_out = ""
     fake_run.post_err = "HTTP 422"
+    fake_run.check_rc = 0
+    fake_run.check_err = ""
+    fake_run.check_open = {"check_runs": []}
+    fake_run.check_made = {"id": 4242}
     del posted[:]
     del looked[:]
+    del checked[:]
 
 
 def check(name, condition, detail=""):
@@ -1099,6 +1122,109 @@ _kept = vinegar.review_body(L, PR, CONFIG, [], sorted(
 check("a comment too big to fit drops notes before blockers",
       "the one that matters" in _kept and "did not fit" in _kept, _kept[-300:])
 
+reset_stubs()
+
+# --- the checks-list indicator -------------------------------------------
+reset_stubs()
+vinegar.run = fake_run
+CHK_CONFIG = dict(CONFIG, github_app={"app_id": 77, "private_key": "/k.pem"})
+CHK_ENV = {"GH_TOKEN": "x"}
+
+
+def _opened(config=None, **stub):
+    for name, value in stub.items():
+        setattr(fake_run, name, value)
+    del checked[:]
+    got = vinegar.open_check(L, "o/r", PR, config or CHK_CONFIG, CHK_ENV)
+    return got
+
+
+# Only an App can own a check run, so on the ambient `gh` login this would
+# be a 403 per review telling the operator to fix what they cannot.
+check("no GitHub App means no indicator and no call",
+      _opened(CONFIG) is None and not checked, checked)
+check("a dry run shows nothing, because it posts nothing",
+      _opened(dict(CHK_CONFIG, comment=False)) is None and not checked,
+      checked)
+
+_made = _opened()
+_post = [asked for how, _, asked in checked if how == "POST"]
+check("the review opens an indicator on the head commit",
+      len(_post) == 1 and _post[0]["head_sha"] == PR["headRefOid"],
+      _post)
+check("the indicator says it is running, not queued or done",
+      _post[0]["status"] == "in_progress" and "started_at" in _post[0],
+      _post[0])
+check("the indicator carries one name and the effort",
+      _post[0]["name"] == vinegar.CHECK_NAME
+      and "high" in _post[0]["output"]["title"], _post[0])
+check("the handle carries the id the caller must close",
+      _made and _made["id"] == 4242, _made)
+check("the indicator links back to the pull request",
+      _post[0].get("details_url") == PR["url"], _post[0].get("details_url"))
+# GitHub judges the whole request on a malformed details_url, so an empty
+# one would refuse the create rather than merely lose the link. A pull
+# request with no `url` is the shape find_pr builds by hand.
+del checked[:]
+_bare = vinegar.open_check(L, "o/r", {name: value for name, value in PR.items()
+                                      if name != "url"}, CHK_CONFIG, CHK_ENV)
+_bare_post = [asked for how, _, asked in checked if how == "POST"][0]
+check("no url means the key is absent, not empty",
+      "details_url" not in _bare_post and _bare is not None, _bare_post)
+
+# A review is killed mid-flight often enough to matter: stopping the daemon
+# during one is a documented step, and MAX_ATTEMPTS brings the same head
+# back twice more. Three spinning indicators on one pull request is the
+# failure this avoids.
+_reuse = _opened(check_open={"check_runs": [{"id": 99, "app": {"id": 77}}]})
+check("an indicator an earlier attempt left running is reused",
+      _reuse and _reuse["id"] == 99
+      and not [h for h, _, _ in checked if h == "POST"], checked)
+check("another app's check of the same name is not adopted",
+      _opened(check_open={"check_runs": [{"id": 99, "app": {"id": 5}}]})["id"]
+      == 4242, checked)
+check("a create that fails leaves no handle to close",
+      _opened(check_open={"check_runs": []}, check_rc=1) is None, checked)
+check("a create that answers without an id leaves no handle",
+      _opened(check_rc=0, check_made={"no": "id"}) is None, checked)
+_opened(check_made={"id": 4242})
+
+# Closing. The conclusion is the whole safety argument: a check that can
+# fail is a merge gate, and the README promises Vinegar is not one.
+del checked[:]
+_handle = {"repo": "o/r", "id": 4242, "env": CHK_ENV, "closed": False}
+vinegar.close_check(L, _handle, "7 findings (1 blocker, 6 advisory)")
+_patch = [asked for how, _, asked in checked if how == "PATCH"]
+check("closing completes the indicator",
+      len(_patch) == 1 and _patch[0]["status"] == "completed"
+      and "completed_at" in _patch[0], _patch)
+check("a finished review never fails the check",
+      _patch[0]["conclusion"] == "neutral", _patch[0]["conclusion"])
+check("the tally is what the checks list shows",
+      _patch[0]["output"]["title"] == "7 findings (1 blocker, 6 advisory)",
+      _patch[0]["output"])
+del checked[:]
+vinegar.close_check(L, _handle, "again")
+check("closing twice sends one request", not checked, checked)
+check("no handle is not an error", vinegar.close_check(L, None, "x") is None)
+# GitHub refuses a title over 255 characters and refuses the whole update
+# with it, which would leave the indicator running for ever.
+_long = {"repo": "o/r", "id": 1, "env": CHK_ENV, "closed": False}
+del checked[:]
+vinegar.close_check(L, _long, "t" * 400)
+check("an overlong title cannot leave the indicator spinning",
+      len([a for h, _, a in checked if h == "PATCH"][0]["output"]["title"])
+      <= 255, len(_patch))
+# The one failure an operator can act on, so it names the remedy.
+del checked[:]
+fake_run.check_rc = 1
+fake_run.check_err = "gh: HTTP 403 Resource not accessible"
+_said = []
+_real_log, vinegar.log = vinegar.log, lambda m: _said.append(m)
+vinegar.open_check(L, "o/r", PR, CHK_CONFIG, CHK_ENV)
+vinegar.log = _real_log
+check("a missing permission says which permission",
+      any("checks: write" in m and "installation" in m for m in _said), _said)
 reset_stubs()
 
 # --- post_review ---------------------------------------------------------
@@ -2485,6 +2611,61 @@ vinegar.run, vinegar.review = fake_run, _cw_real
 check("a review that raises counts as an attempt against MAX_ATTEMPTS",
       _hp_state.get(L, {}).get("attempts") == 1, _hp_state)
 
+# handle_pr finishes the indicator on every ending that never reaches
+# finish(): the two FAILED returns, a review that raises, and the give-up.
+# Left open, the pull request lists a Vinegar check spinning for ever, and
+# the next attempt reuses it rather than clearing it.
+_ck_kept = (vinegar.review, vinegar.checkout, vinegar.github_env,
+            vinegar.save_state)
+vinegar.checkout = lambda repo, pr, env: ROOT
+vinegar.github_env = lambda *a, **k: {"GH_TOKEN": "x"}
+vinegar.save_state = lambda st: None
+
+
+def _boom(*a, **k):
+    raise RuntimeError("the review process vanished")
+
+
+def _indicator_after(what, attempts):
+    """The title handle_pr leaves on the indicator for one ending."""
+    del checked[:]
+    del posted[:]
+    vinegar.review = _boom if what == "raise" else (lambda *a, **k: what)
+    state = {L: {"outcome": vinegar.FAILED, "sha": PR_LIVE["headRefOid"],
+                 "attempts": attempts}} if attempts else {}
+    vinegar.handle_pr("o/r", PR_LIVE, CHK_CONFIG, state, {})
+    said = [asked for how, _, asked in checked if how == "PATCH"]
+    return said[0]["output"]["title"] if said else "(never closed)"
+
+
+check("a failed review leaves the indicator finished, not spinning",
+      _indicator_after(vinegar.FAILED, 0)
+      == "The review failed and will be tried again",
+      _indicator_after(vinegar.FAILED, 0))
+check("a review that raises still finishes the indicator",
+      _indicator_after("raise", 0)
+      == "The review failed and will be tried again",
+      _indicator_after("raise", 0))
+check("the last attempt says it was given up on, not retried",
+      "given up on" in _indicator_after(vinegar.FAILED,
+                                        vinegar.MAX_ATTEMPTS - 1),
+      _indicator_after(vinegar.FAILED, vinegar.MAX_ATTEMPTS - 1))
+# review() closed it already on this path, so the backstop must not
+# overwrite the tally with a generic sentence.
+check("an ending that already reported is not overwritten",
+      _indicator_after(vinegar.DONE, 0) == "The review finished",
+      _indicator_after(vinegar.DONE, 0))
+check("the indicator is opened before the review, not after",
+      [how for how, _, _ in checked][0] in ("GET", "POST"),
+      [how for how, _, _ in checked])
+# Put back exactly what this block borrowed, and nothing else. A
+# reset_stubs() here restored `checkout` and `save_state` to the genuine
+# ones, which the rest of this section is still relying on being stubbed:
+# three checks below started reporting a real `gh repo clone`.
+(vinegar.review, vinegar.checkout, vinegar.github_env,
+ vinegar.save_state) = _ck_kept
+del checked[:]
+
 # And the marker written before the review runs, which is what survives a
 # process that is killed outright rather than raising.
 _hp_state.clear()
@@ -3687,6 +3868,45 @@ check("the worse finding is listed above the smaller one",
       _tier_file.index("the bad one") < _tier_file.index("the small one"),
       _tier_file[-400:])
 vinegar.forget(vinegar.unposted_path("o/r", PR_TIER))
+
+# The indicator's title is written in finish(), because that is the only
+# place that knows both what was found and whether it reached the pull
+# request. The checks list is what people look at before the comment, so
+# what it says has to be true on its own.
+_titles = []
+
+
+def _titled(findings, note=None, sha="d0d0d0d0d0d0"):
+    handle = {"repo": "o/r", "id": 7, "env": None, "closed": False}
+    del checked[:]
+    at = dict(PR_LIVE, headRefOid=sha)
+    fake_run.rc, fake_run.post_err = 0, ""
+    vinegar.run = _run_and_tier
+    vinegar.finish(L, "o/r", at, ROOT, "words", findings, CONFIG, None, {},
+                   note, check=handle)
+    vinegar.run = fake_run
+    vinegar.forget(vinegar.unposted_path("o/r", at))
+    said = [asked for how, _, asked in checked if how == "PATCH"]
+    _titles.append(said[0]["output"]["title"] if said else "(never closed)")
+    return _titles[-1]
+
+
+check("a clean review says so in the checks list",
+      _titled([], sha="aa00aa00aa00") == "No findings", _titles[-1])
+check("the checks list carries the same tally as the comment",
+      _titled(_tier_found, sha="bb00bb00bb00")
+      == "2 findings (1 blocker, 1 note)", _titles[-1])
+# Never "no findings" for a review whose output could not be read: that is
+# the same false all-clear a green tick would be.
+check("an unreadable review is not reported as a clean one",
+      _titled(None, sha="cc00cc00cc00") == "Nothing Vinegar could read",
+      _titles[-1])
+check("a review that did not finish says so in the checks list",
+      "did not finish" in _titled(_tier_found, note="killed at 30 minutes",
+                                  sha="dd00dd00dd00"), _titles[-1])
+check("one finding is not reported as 1 findings",
+      _titled(_tier_found[:1], sha="ee00ee00ee00").startswith("1 finding ("),
+      _titles[-1])
 
 fake_run.rc, fake_run.post_err = 1, "HTTP 403 Resource not accessible"
 # This block's ambiguous post consulted the landed-review read; the

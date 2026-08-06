@@ -458,6 +458,30 @@ TRIAGE_SETTINGS = {
         network=dict(SANDBOX_NETWORK)),
 }
 
+# What the review calls itself in the pull request's list of checks. One
+# name, because GitHub keys nothing on it but a human reads the list to see
+# whether the reviewer has finished, and two spellings would read as two
+# tools.
+CHECK_NAME = "Vinegar"
+
+# How a finished review reports itself in that list, and it is never
+# `failure` or `success`.
+#
+# `failure` would make Vinegar a merge gate wherever the check is required,
+# which the README promises it is not, and reviews are submitted as COMMENT
+# for the same reason. Severity triage knows what a blocker is now, so
+# failing on one is newly possible and still wrong: the blocker rate
+# measured 45% on two of four reviews, so the gate would be closed most of
+# the time on a judgement that is only good enough to sort a list.
+#
+# `success` is the other trap. A green tick on a pull request carrying
+# twelve findings is a statement nobody made, and the tick is what people
+# read rather than the title beside it.
+#
+# `neutral` renders as a grey mark that cannot block anything, and the
+# count goes in the title where it says something true.
+CHECK_CONCLUSION = "neutral"
+
 # Characters a review comment may carry. GitHub's own ceiling is 65536 and it
 # refuses the whole review for going over, which on the path that posts the
 # reviewer's message verbatim would mean posting nothing at all. The reviewer
@@ -2388,6 +2412,131 @@ def review_body(label, pr, config, inline, general, raw=None,
     return clamp(label, "\n".join(lines))
 
 
+def check_api(label, repo, path, method, payload, env):
+    """One Checks API call. Answers what it replied, or None if it failed.
+
+    None rather than an exception, and every failure logged and swallowed,
+    because nothing here is worth a review. The check run is a progress
+    indicator: it tells a human the reviewer is working and then that it
+    stopped. A review that runs and posts with no indicator beside it is a
+    worse pull request, not a broken one.
+
+    Bounded on POST_TIMEOUT, which is the same shape of call for the same
+    reason: one request on the single poll thread, with a finished review
+    waiting behind it, and a socket that never answers is not an error
+    anyone raises.
+    """
+    cmd = ["gh", "api", "repos/%s/%s" % (repo, path), "--method", method]
+    if payload is not None:
+        cmd += ["--input", "-"]
+    try:
+        result = run(cmd, env=env, timeout=POST_TIMEOUT,
+                     stdin_text=json.dumps(payload) if payload else None)
+    except Exception as err:
+        log("%s: the checks call did not run: %s" % (label, err))
+        return None
+    if result.returncode:
+        said = both_streams(result, 300)
+        # The permission is named because this is the one failure an
+        # operator can fix and will otherwise see once per review with no
+        # idea what to do about it. `checks: write` is not granted by
+        # default, and adding it to the App is only half of it: GitHub
+        # holds the change until the installation accepts it.
+        if "HTTP 403" in said:
+            log("%s: the check run needs the App's `checks: write` "
+                "permission, which must also be accepted on the "
+                "installation: %s" % (label, said))
+        else:
+            log("%s: the checks call failed: %s" % (label, said))
+        return None
+    try:
+        return json.loads(result.stdout or "{}")
+    except json.JSONDecodeError:
+        # It answered 2xx, so whatever it created exists. Only the reply
+        # was unreadable, and the caller wants an id it will not get.
+        return {}
+
+
+def open_check(label, repo, pr, config, env):
+    """Say in the pull request's checks that a review is running.
+
+    Answers a handle to close afterwards, or None when there is nothing to
+    show and no call worth making.
+
+    Only with a GitHub App. A check run belongs to the App that created it
+    and no user token can own one, so on the ambient `gh` login this would
+    be a 403 per review telling the operator to fix something they cannot.
+    And only when Vinegar is posting at all: a dry run puts nothing on the
+    pull request, and an indicator is something on the pull request.
+    """
+    if not config["comment"] or not config.get("github_app"):
+        return None
+    sha = pr["headRefOid"]
+
+    # An indicator an earlier attempt left spinning is reused rather than
+    # joined by a second one. A review is killed mid-flight often enough
+    # to matter: stopping the daemon during one is a documented step for
+    # restarting it, the process is recorded FAILED before the review
+    # runs, and MAX_ATTEMPTS then brings the same head back twice more.
+    # Creating a run each time would leave the pull request listing three
+    # checks called Vinegar, two of them running for ever.
+    open_already = check_api(
+        label, repo,
+        "commits/%s/check-runs?check_name=%s&status=in_progress"
+        % (sha, CHECK_NAME), "GET", None, env)
+    mine = [was for was in (open_already or {}).get("check_runs") or []
+            if (was.get("app") or {}).get("id")
+            == config["github_app"].get("app_id")]
+    if mine:
+        log("%s: reusing the check run an earlier attempt left running"
+            % label)
+        return {"repo": repo, "id": mine[0].get("id"), "env": env,
+                "closed": False}
+
+    asked = {"name": CHECK_NAME, "head_sha": sha, "status": "in_progress",
+             "started_at": datetime.now(timezone.utc).strftime(
+                 "%Y-%m-%dT%H:%M:%SZ"),
+             "output": {
+                 "title": "Reviewing at %s effort" % config["effort"],
+                 "summary": "Vinegar is reviewing this commit. The findings "
+                            "arrive as one review when it finishes."}}
+    # Only when there is one. An empty `details_url` is not a URL and
+    # GitHub judges the whole request on it.
+    if pr.get("url"):
+        asked["details_url"] = pr["url"]
+    made = check_api(label, repo, "check-runs", "POST", asked, env)
+    # An id or nothing. A handle without one cannot be closed, and
+    # pretending otherwise would send a PATCH to `check-runs/None`.
+    return {"repo": repo, "id": made["id"], "env": env, "closed": False} \
+        if made and made.get("id") else None
+
+
+def close_check(label, check, title, summary=""):
+    """Finish the indicator, whatever ended the review.
+
+    Always `neutral`, never a pass or a fail: CHECK_CONCLUSION says why at
+    length. The title is the whole of what this communicates, so it says
+    what happened rather than how it feels about it.
+
+    Closed on the handle before the call, not after. finish() closes it
+    with the tally and the caller closes it again as a backstop for the
+    endings that never reach finish(), so a failed PATCH that left
+    `closed` unset would send the same request twice and log the same
+    failure twice.
+    """
+    if not check or check["closed"]:
+        return
+    check["closed"] = True
+    check_api(label, check["repo"], "check-runs/%s" % check["id"], "PATCH", {
+        "status": "completed", "conclusion": CHECK_CONCLUSION,
+        "completed_at": datetime.now(timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"),
+        # GitHub refuses a title over 255 characters and would refuse the
+        # whole update with it, leaving the indicator running.
+        "output": {"title": title[:255], "summary": summary or title}},
+        check["env"])
+
+
 def submit_review(label, repo, pr, payload, env):
     """Post one review, as one request, and say whether it landed.
 
@@ -2762,7 +2911,8 @@ def keep(label, repo, pr, text, why):
 
 
 def finish(label, repo, pr, path, text, findings, config, env, tokens,
-           note=None, verb="reviewed", preserve=False, resent=False):
+           note=None, verb="reviewed", preserve=False, resent=False,
+           check=None):
     """Record the review on disk and post it, whatever ended the run.
 
     Answers post_review()'s answer: whether the pull request carries it.
@@ -2894,6 +3044,38 @@ def finish(label, repo, pr, path, text, findings, config, env, tokens,
     # else's.
     if posted == POSTED and not preserve:
         forget(marker)
+
+    # The indicator is finished here, for the reason the two lines at the
+    # top of this function are here: every route to the pull request
+    # leaves from finish(), and this is the only one of them that knows
+    # both how many findings there were and whether they landed. Closing
+    # it in review() instead would have had to say "reviewed" without
+    # being able to say what was found.
+    #
+    # Counted off `findings`, which triage() has already tiered, so the
+    # checks list carries the same tally as the comment.
+    if findings is None:
+        # Not "no findings". The reviewer said something Vinegar could not
+        # read, and a checks list saying the change is clean would be the
+        # same false all-clear that CHECK_CONCLUSION refuses a green tick
+        # for.
+        title = "Nothing Vinegar could read"
+    elif not findings:
+        title = "No findings"
+    else:
+        tally = severity_tally(findings)
+        title = "%d finding%s%s" % (
+            len(findings), "" if len(findings) == 1 else "s",
+            " (%s)" % tally if tally else "")
+    # A partial run says so in the title rather than only in the comment.
+    # "3 findings" from a review killed at minute thirty reads as the
+    # whole answer, and the checks list is what people look at first.
+    if note:
+        title = "%s, and the review did not finish" % title
+    close_check(label, check, title,
+                "The review is on the pull request." if posted == POSTED
+                else "The review did not reach the pull request. The log "
+                     "says where it is saved.")
     return posted
 
 
@@ -3124,7 +3306,7 @@ def partial_note(cause):
             "then and not a finished round." % cause)
 
 
-def review(path, repo, pr, config, env, tokens, resent=False):
+def review(path, repo, pr, config, env, tokens, resent=False, check=None):
     prompt = "/code-review %s %d" % (config["effort"], pr["number"])
 
     # The review reads a diff that Vinegar did not write, so it runs under
@@ -3222,7 +3404,7 @@ def review(path, repo, pr, config, env, tokens, resent=False):
         # next ending to honour that nothing checked.
         if announce(label, lambda: finish(
                 label, repo, pr, path, text, findings, config, env, tokens,
-                note, resent=resent)) == POSTED:
+                note, resent=resent, check=check)) == POSTED:
             return
         if config["comment"]:
             # Promised only when it is true. finish() writes the marker
@@ -3777,6 +3959,14 @@ def handle_pr(repo, pr, config, state, tokens):
                              **dict(carry_forward(kept), post_tries=0, waivers=0))
     save_state(state)
 
+    # Opened here rather than inside review(), so that the one place that
+    # sees every ending is also the place that finishes it. review()
+    # returns FAILED on two paths and can raise out of a third, and none
+    # of those knows whether MAX_ATTEMPTS has just run out, which is the
+    # difference between "it will be tried again" and "it was given up
+    # on".
+    check = open_check(key, repo, pr, config, env)
+
     try:
         # A second attempt at a head asks before posting. The marker above
         # is written before review() runs and the real outcome only after,
@@ -3787,7 +3977,7 @@ def handle_pr(repo, pr, config, state, tokens):
         # inline comments. The give-up rediscovery already says `resent`
         # for the same crash window.
         outcome = review(path, repo, pr, config, env, tokens,
-                         resent=attempts > 1)
+                         resent=attempts > 1, check=check)
     except Exception as err:
         # The subscription is spent by the time most of these can happen, and
         # an unrecorded pull request is reviewed again on the very next poll,
@@ -3818,6 +4008,15 @@ def handle_pr(repo, pr, config, state, tokens):
         said = give_up(key, repo, pr, config, attempts, tokens, path, env,
                        tries + done.get("announce_waivers", 0))
         spend_announce(key, config, state, head, attempts, tries, said)
+
+    # Last, so the title can account for the give-up above. A no-op when
+    # finish() already closed it, which is every ending that produced a
+    # review; what is left here is the two FAILED returns, an exception
+    # out of review(), and the give-up.
+    close_check(key, check, "The review failed %d times and was given up on"
+                % attempts if outcome == FAILED and attempts >= MAX_ATTEMPTS
+                else "The review failed and will be tried again"
+                if outcome == FAILED else "The review finished")
 
 
 def find_pr(repo, number, env):
@@ -4025,11 +4224,18 @@ def main():
             # the same head a minute later at full cost and posted a
             # second complete review, because its first attempt does not
             # ask. handle_pr wraps its own call for the same reason.
+            # The same indicator as the daemon's. A hand-run review is
+            # still minutes of silence on a real pull request, which is
+            # the whole thing this shows.
+            hand = open_check(args.pr, repo, pr, config, env)
             try:
-                outcome = review(where, repo, pr, config, env, tokens)
+                outcome = review(where, repo, pr, config, env, tokens,
+                                 check=hand)
             except Exception as err:
                 log("%s: the review did not complete: %s" % (args.pr, err))
                 outcome = FAILED
+            close_check(args.pr, hand, "The review finished"
+                        if outcome != FAILED else "The review failed")
 
             # Recorded, always. A manual run is still a review of that
             # commit, and leaving no trace meant the daemon reviewed the
