@@ -522,9 +522,19 @@ def checkout_grace(config):
     return CHECKOUT_GRACE + config["review_timeout"]
 
 
+def utc_stamp():
+    """Now, in the one format this program writes times in.
+
+    Three callers want it since the checks-list indicator arrived, and
+    this file extracts a one-line rule the moment there are two:
+    priced(), both_streams() and checkout_grace() each exist because two
+    copies of one drifted or had to be fixed twice.
+    """
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def log(message):
-    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    print("%s %s" % (stamp, message), flush=True)
+    print("%s %s" % (utc_stamp(), message), flush=True)
 
 
 def run(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
@@ -2426,12 +2436,17 @@ def check_api(label, repo, path, method, payload, env):
     waiting behind it, and a socket that never answers is not an error
     anyone raises.
     """
+    # One condition for both, because they are one decision. Written as
+    # `is not None` for the flag and truthiness for the body, a caller
+    # passing `{}` told `gh` to read a request body from a stdin run()
+    # had already pointed at /dev/null, and the parse error it died of
+    # named nothing that would lead anyone back here.
+    body = json.dumps(payload) if payload is not None else None
     cmd = ["gh", "api", "repos/%s/%s" % (repo, path), "--method", method]
-    if payload is not None:
+    if body is not None:
         cmd += ["--input", "-"]
     try:
-        result = run(cmd, env=env, timeout=POST_TIMEOUT,
-                     stdin_text=json.dumps(payload) if payload else None)
+        result = run(cmd, env=env, timeout=POST_TIMEOUT, stdin_text=body)
     except Exception as err:
         log("%s: the checks call did not run: %s" % (label, err))
         return None
@@ -2493,17 +2508,21 @@ def open_check(label, repo, pr, config, env):
         label, repo,
         "commits/%s/check-runs?check_name=%s&status=in_progress"
         % (sha, CHECK_NAME), "GET", None, env)
+    # `.get("id")` as well as the app, not just membership. A reply with
+    # no id, from a truncated body or one check_api answered as `{}`,
+    # would otherwise build a handle whose every close sends
+    # `PATCH check-runs/None`. The create branch below refuses exactly
+    # that, and this branch was the one place the guard was missing.
     mine = [was for was in (open_already or {}).get("check_runs") or []
             if (was.get("app") or {}).get("id")
-            == config["github_app"].get("app_id")]
+            == config["github_app"].get("app_id") and was.get("id")]
     if mine:
         log("%s: reusing the check run an earlier attempt left running"
             % label)
         return {"repo": repo, "id": mine[0].get("id"), "closed": False}
 
     asked = {"name": CHECK_NAME, "head_sha": sha, "status": "in_progress",
-             "started_at": datetime.now(timezone.utc).strftime(
-                 "%Y-%m-%dT%H:%M:%SZ"),
+             "started_at": utc_stamp(),
              "output": {
                  "title": "Reviewing at %s effort" % config["effort"],
                  "summary": "Vinegar is reviewing this commit. The findings "
@@ -2536,23 +2555,26 @@ def close_check(label, check, title, env, summary=""):
     length. The title is the whole of what this communicates, so it says
     what happened rather than how it feels about it.
 
-    Closed on the handle before the call, not after. finish() closes it
-    with the tally and the caller closes it again as a backstop for the
-    endings that never reach finish(), so a failed PATCH that left
-    `closed` unset would send the same request twice and log the same
-    failure twice.
+    Closed on the handle only once it is really closed. finish() closes
+    it with the tally and the caller closes it again as a backstop, so
+    marking it up front made a refusal final: one 401, from a token that
+    outlived a long review, left the run in_progress on the pull request
+    for ever, and a stuck run blocks a merge anywhere Vinegar is a
+    required check, which is the outcome CHECK_CONCLUSION exists to make
+    impossible. Marked afterwards, the backstop gets its turn, holding
+    credentials of its own.
     """
     if not check or check["closed"]:
         return
-    check["closed"] = True
-    check_api(label, check["repo"], "check-runs/%s" % check["id"], "PATCH", {
-        "status": "completed", "conclusion": CHECK_CONCLUSION,
-        "completed_at": datetime.now(timezone.utc).strftime(
-            "%Y-%m-%dT%H:%M:%SZ"),
-        # GitHub refuses a title over 255 characters and would refuse the
-        # whole update with it, leaving the indicator running.
-        "output": {"title": title[:255], "summary": summary or title}},
+    settled = check_api(
+        label, check["repo"], "check-runs/%s" % check["id"], "PATCH", {
+            "status": "completed", "conclusion": CHECK_CONCLUSION,
+            "completed_at": utc_stamp(),
+            # GitHub refuses a title over 255 characters and would refuse
+            # the whole update with it, leaving the indicator running.
+            "output": {"title": title[:255], "summary": summary or title}},
         env)
+    check["closed"] = settled is not None
 
 
 def submit_review(label, repo, pr, payload, env):
@@ -3987,56 +4009,87 @@ def handle_pr(repo, pr, config, state, tokens):
     # on".
     check = open_check(key, repo, pr, config, env)
 
+    # Everything from here to the give-up sits in a try, so that the one
+    # line that finishes the indicator cannot be skipped. The end of this
+    # function is reachable only when nothing goes wrong: save_state
+    # below raises on a full disk, a failure this function already treats
+    # as real, and Ctrl-C is how the README says to stop the daemon.
+    # KeyboardInterrupt is not an Exception, so it walks past every
+    # handler here untouched. Either way the pull request was left
+    # carrying a Vinegar check that spins for ever, and a stuck run
+    # blocks a merge wherever the check is required.
+    outcome = FAILED
     try:
-        # A second attempt at a head asks before posting. The marker above
-        # is written before review() runs and the real outcome only after,
-        # so a process killed in between — launchd booting the job out, a
-        # save_state that raises on a full disk — leaves FAILED on disk
-        # for a review that did post. Without this the retry re-reviews at
-        # full cost and posts a complete second review with duplicate
-        # inline comments. The give-up rediscovery already says `resent`
-        # for the same crash window.
-        outcome = review(path, repo, pr, config, env, tokens,
-                         resent=attempts > 1, check=check)
-    except Exception as err:
-        # The subscription is spent by the time most of these can happen, and
-        # an unrecorded pull request is reviewed again on the very next poll,
-        # at full cost, for ever. announce() covers the posting; this covers
-        # everything else review() touches, including the two read_stream
-        # calls and `claude` missing from PATH entirely. Recording FAILED
-        # keeps MAX_ATTEMPTS in charge of how many times that may repeat.
-        log("%s: the review did not complete: %s" % (key, err))
-        outcome = FAILED
+        try:
+            # A second attempt at a head asks before posting. The marker
+            # above is written before review() runs and the real outcome
+            # only after, so a process killed in between — launchd
+            # booting the job out, a save_state that raises on a full
+            # disk — leaves FAILED on disk for a review that did post.
+            # Without this the retry re-reviews at full cost and posts a
+            # complete second review with duplicate inline comments. The
+            # give-up rediscovery already says `resent` for the same
+            # crash window.
+            outcome = review(path, repo, pr, config, env, tokens,
+                             resent=attempts > 1, check=check)
+        except Exception as err:
+            # The subscription is spent by the time most of these can
+            # happen, and an unrecorded pull request is reviewed again on
+            # the very next poll, at full cost, for ever. announce()
+            # covers the posting; this covers everything else review()
+            # touches, including the two read_stream calls and `claude`
+            # missing from PATH entirely. Recording FAILED keeps
+            # MAX_ATTEMPTS in charge of how many times that may repeat.
+            log("%s: the review did not complete: %s" % (key, err))
+            outcome = FAILED
 
-    # Recorded with whether a saved review is waiting behind it, so the
-    # next poll can find that out without listing a directory.
-    # post_tries reset: this review writes its own transcript over any
-    # saved one, so the budget that governed the old copy is void. Kept,
-    # it met the new marker already spent and nothing would repost or
-    # forget it.
-    state[key] = state_entry(head, outcome, attempts,
-                             **dict(carry_forward(kept), post_tries=0, waivers=0,
-                                    unposted=os.path.exists(
-                                        unposted_path(repo, pr))))
-    save_state(state)
+        # Recorded with whether a saved review is waiting behind it, so the
+        # next poll can find that out without listing a directory.
+        # post_tries reset: this review writes its own transcript over any
+        # saved one, so the budget that governed the old copy is void. Kept,
+        # it met the new marker already spent and nothing would repost or
+        # forget it.
+        state[key] = state_entry(
+            head, outcome, attempts,
+            **dict(carry_forward(kept), post_tries=0, waivers=0,
+                   unposted=os.path.exists(unposted_path(repo, pr))))
+        save_state(state)
 
-    if outcome == FAILED and attempts >= MAX_ATTEMPTS:
-        # Marked only if it was said, so the restart path knows. Without
-        # the mark a daemon restart would say it all again; with it applied
-        # regardless, a failed announcement was never retried at all.
-        tries = done.get("announce_tries", 0)
-        said = give_up(key, repo, pr, config, attempts, tokens, path, env,
-                       tries + done.get("announce_waivers", 0))
-        spend_announce(key, config, state, head, attempts, tries, said)
-
-    # Last, so the title can account for the give-up above. A no-op when
-    # finish() already closed it, which is every ending that produced a
-    # review; what is left here is the two FAILED returns, an exception
-    # out of review(), and the give-up.
-    close_check(key, check, "The review failed %d times and was given up on"
-                % attempts if outcome == FAILED and attempts >= MAX_ATTEMPTS
-                else "The review failed and will be tried again"
-                if outcome == FAILED else "The review finished", env)
+        if outcome == FAILED and attempts >= MAX_ATTEMPTS:
+            # Marked only if it was said, so the restart path knows.
+            # Without the mark a daemon restart would say it all again;
+            # with it applied regardless, a failed announcement was never
+            # retried at all.
+            tries = done.get("announce_tries", 0)
+            said = give_up(key, repo, pr, config, attempts, tokens, path,
+                           env, tries + done.get("announce_waivers", 0))
+            spend_announce(key, config, state, head, attempts, tries, said)
+    finally:
+        # Worked out on its own lines rather than inline, because as one
+        # argument it was a %-format followed by two chained conditionals
+        # and the reader had to know that `%` binds tighter than `if` to
+        # tell which string took `attempts`.
+        #
+        # Never "the review finished" for a DONE outcome. review() answers
+        # DONE whenever the subscription was spent, which includes the
+        # endings where announce() swallowed a raise and nothing reached
+        # the pull request at all. finish() closes the indicator itself on
+        # every ending that did post, so reaching here with it still open
+        # means the posting is exactly what did not happen; saying it
+        # finished would be the same false all-clear CHECK_CONCLUSION
+        # refuses a green tick for.
+        if outcome == FAILED and attempts >= MAX_ATTEMPTS:
+            ended = "The review failed %d times and was given up on" % attempts
+        elif outcome == FAILED:
+            ended = "The review failed and will be tried again"
+        else:
+            ended = "The review ran but nothing reached the pull request"
+        # Its own credentials, minted now. The ones above were asked to
+        # cover the checkout and the review, and by here a full-length
+        # review has spent all of that: closing on them was a 401 at the
+        # exact moment the indicator most needs finishing.
+        close_check(key, check, ended,
+                    posting_env(key, config, repo, tokens, env) or env)
 
 
 def find_pr(repo, number, env):
@@ -4248,14 +4301,29 @@ def main():
             # still minutes of silence on a real pull request, which is
             # the whole thing this shows.
             hand = open_check(args.pr, repo, pr, config, env)
+            outcome = FAILED
+            # In a finally for the reason handle_pr's is: the end of this
+            # block is reachable only when nothing goes wrong, and Ctrl-C
+            # during a hand-run review is not an Exception, so it walks
+            # past the handler below and out to main's own. Without this
+            # the pull request kept a Vinegar check spinning.
             try:
                 outcome = review(where, repo, pr, config, env, tokens,
                                  check=hand)
             except Exception as err:
                 log("%s: the review did not complete: %s" % (args.pr, err))
                 outcome = FAILED
-            close_check(args.pr, hand, "The review finished"
-                        if outcome != FAILED else "The review failed", env)
+            finally:
+                # Not "finished" for a review that answered DONE. finish()
+                # closes the indicator itself on every ending that posted,
+                # so an open one here means the posting is what did not
+                # happen. handle_pr says the same at more length.
+                close_check(args.pr, hand,
+                            "The review failed" if outcome == FAILED
+                            else "The review ran but nothing reached the "
+                                 "pull request",
+                            posting_env(args.pr, config, repo, tokens, env)
+                            or env)
 
             # Recorded, always. A manual run is still a review of that
             # commit, and leaving no trace meant the daemon reviewed the

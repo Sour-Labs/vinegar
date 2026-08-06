@@ -457,8 +457,9 @@ MUTATIONS = [
     ("check-ignores-another-apps",
      '    mine = [was for was in (open_already or {}).get("check_runs") or []\n'
      '            if (was.get("app") or {}).get("id")\n'
-     '            == config["github_app"].get("app_id")]',
-     '    mine = list((open_already or {}).get("check_runs") or [])'),
+     '            == config["github_app"].get("app_id") and was.get("id")]',
+     '    mine = [was for was in (open_already or {}).get("check_runs") or []\n'
+     '            if was.get("id")]'),
     # A handle with no id would PATCH `check-runs/None` on every ending.
     ("check-handle-needs-an-id",
      '    return {"repo": repo, "id": made["id"], "closed": False} \\\n'
@@ -471,8 +472,7 @@ MUTATIONS = [
      '        return {"repo": repo, "id": mine[0].get("id"), "env": env,\n'
      '                "closed": False}'),
     ("check-closes-once",
-     '    if not check or check["closed"]:\n        return\n'
-     '    check["closed"] = True',
+     '    if not check or check["closed"]:\n        return',
      "    if not check:\n        return"),
     # GitHub refuses a title over 255 characters, and refuses the whole
     # update with it, leaving the indicator running.
@@ -504,8 +504,38 @@ MUTATIONS = [
     # Left open, the pull request lists a Vinegar check that spins for
     # ever and the next attempt reuses it rather than clearing it.
     ("check-closed-when-the-review-fails",
-     '    close_check(key, check, "The review failed %d times and was given up on"',
-     '    (lambda *a, **k: None)(key, check, "The review failed %d times and was given up on"'),
+     "        close_check(key, check, ended,",
+     "        (lambda *a, **k: None)(key, check, ended,"),
+
+    # --- what the first review pass found ------------------------------
+    ("check-close-retryable-after-a-refusal",
+     '    check["closed"] = settled is not None',
+     '    check["closed"] = True'),
+    ("check-reuse-needs-an-id",
+     '            == config["github_app"].get("app_id") and was.get("id")]',
+     '            == config["github_app"].get("app_id")]'),
+    ("check-body-matches-the-flag",
+     "    body = json.dumps(payload) if payload is not None else None",
+     "    body = json.dumps(payload) if payload else None"),
+    ("check-closed-even-if-recording-raises",
+     "    finally:\n"
+     "        # Worked out on its own lines rather than inline, because as one",
+     "    except BaseException:\n"
+     "        raise\n"
+     "    else:\n"
+     "        # Worked out on its own lines rather than inline, because as one"),
+    ("check-done-that-posted-nothing-is-not-finished",
+     '            ended = "The review ran but nothing reached the pull request"',
+     '            ended = "The review finished"'),
+    ("check-closed-on-fresh-credentials",
+     "        close_check(key, check, ended,\n"
+     "                    posting_env(key, config, repo, tokens, env) or env)",
+     "        close_check(key, check, ended, env)"),
+    # Not the extraction, which changes no behaviour and so nothing can
+    # catch: the format itself, which GitHub rejects the update over.
+    ("utc-stamp-format",
+     '    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")',
+     '    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")'),
 
     # --- constants -----------------------------------------------------
     ("max-attempts", "MAX_ATTEMPTS = 3", "MAX_ATTEMPTS = 99"),

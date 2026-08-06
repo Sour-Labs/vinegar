@@ -101,6 +101,7 @@ diff --git a/README.md b/README.md
 posted = []
 looked = []
 checked = []
+check_envs = []
 last_git_diff = [[], None]
 last_post_timeout = [None]
 
@@ -154,6 +155,7 @@ def fake_run(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
         how = cmd[cmd.index("--method") + 1] if "--method" in cmd else "GET"
         checked.append((how, cmd[2],
                         json.loads(stdin_text) if stdin_text else None))
+        check_envs.append((env or {}).get("GH_TOKEN"))
         return subprocess.CompletedProcess(
             cmd, fake_run.check_rc,
             {"GET": json.dumps(fake_run.check_open),
@@ -226,6 +228,7 @@ def reset_stubs():
     del posted[:]
     del looked[:]
     del checked[:]
+    del check_envs[:]
 
 
 def check(name, condition, detail=""):
@@ -1166,11 +1169,16 @@ def _has_secret(handle):
         "token" in str(name).lower() or "token" in str(value).lower()
         or isinstance(value, dict) and _has_secret(value)
         for name, value in (handle or {}).items())
+check("the indicator's start time is the shape GitHub accepts",
+      re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$",
+               _post[0]["started_at"]), _post[0]["started_at"])
 check("the indicator links back to the pull request",
       _post[0].get("details_url") == PR["url"], _post[0].get("details_url"))
 # GitHub judges the whole request on a malformed details_url, so an empty
-# one would refuse the create rather than merely lose the link. A pull
-# request with no `url` is the shape find_pr builds by hand.
+# one would refuse the create rather than merely lose the link. No caller
+# reaches this: PR_FIELDS asks for `url` and both open_prs and find_pr
+# pass that list to `gh`. It is checked as the defence it is, against a
+# hand-built dict and a future field list, rather than a live path.
 del checked[:]
 _bare = vinegar.open_check(L, "o/r", {name: value for name, value in PR.items()
                                       if name != "url"}, CHK_CONFIG, CHK_ENV)
@@ -1210,6 +1218,9 @@ _patch = [asked for how, _, asked in checked if how == "PATCH"]
 check("closing completes the indicator",
       len(_patch) == 1 and _patch[0]["status"] == "completed"
       and "completed_at" in _patch[0], _patch)
+check("the indicator's end time is the same shape",
+      re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$",
+               _patch[0]["completed_at"]), _patch[0]["completed_at"])
 check("a finished review never fails the check",
       _patch[0]["conclusion"] == "neutral", _patch[0]["conclusion"])
 check("the tally is what the checks list shows",
@@ -1220,14 +1231,43 @@ vinegar.close_check(L, _handle, "again", CHK_ENV)
 check("closing twice sends one request", not checked, checked)
 check("no handle is not an error",
       vinegar.close_check(L, None, "x", CHK_ENV) is None)
+# A refused close must be retryable. Marked closed up front, one 401 from
+# a token that outlived a long review left the run in_progress for ever,
+# and a stuck run blocks a merge wherever the check is required.
+_stuck = {"repo": "o/r", "id": 8, "closed": False}
+fake_run.check_rc = 1
+del checked[:]
+vinegar.close_check(L, _stuck, "first try", CHK_ENV)
+check("a refused close leaves the indicator open for the backstop",
+      _stuck["closed"] is False, _stuck)
+fake_run.check_rc = 0
+vinegar.close_check(L, _stuck, "second try", CHK_ENV)
+check("and the backstop's attempt actually goes out",
+      [a["output"]["title"] for h, _, a in checked if h == "PATCH"]
+      == ["first try", "second try"],
+      [a["output"]["title"] for h, _, a in checked if h == "PATCH"])
+check("a close that lands marks the handle closed", _stuck["closed"] is True,
+      _stuck)
+# The reuse branch needs the id guard the create branch has, or every
+# close on the handle sends `PATCH check-runs/None`.
+check("a reusable run with no id is not adopted",
+      _opened(check_open={"check_runs": [{"app": {"id": 77}}]})["id"] == 4242,
+      checked)
+# `--input -` and the body it promises are one decision. Split across two
+# conditions, a payload of `{}` told `gh` to read a body from a stdin
+# run() had already pointed at /dev/null.
+del checked[:]
+vinegar.check_api(L, "o/r", "check-runs/1", "PATCH", {}, CHK_ENV)
+check("an empty payload is still sent as a body",
+      checked and checked[-1][2] == {}, checked)
 # GitHub refuses a title over 255 characters and refuses the whole update
 # with it, which would leave the indicator running for ever.
 _long = {"repo": "o/r", "id": 1, "closed": False}
 del checked[:]
 vinegar.close_check(L, _long, "t" * 400, CHK_ENV)
+_cut = len([a for h, _, a in checked if h == "PATCH"][0]["output"]["title"])
 check("an overlong title cannot leave the indicator spinning",
-      len([a for h, _, a in checked if h == "PATCH"][0]["output"]["title"])
-      <= 255, len(_patch))
+      _cut <= 255, _cut)
 # The one failure an operator can act on, so it names the remedy.
 del checked[:]
 fake_run.check_rc = 1
@@ -2635,42 +2675,113 @@ vinegar.github_env = lambda *a, **k: {"GH_TOKEN": "x"}
 vinegar.save_state = lambda st: None
 
 
-def _boom(*a, **k):
-    raise RuntimeError("the review process vanished")
+def _indicator_after(what, attempts, closes=None):
+    """Every title handle_pr leaves on the indicator for one ending.
 
+    A list, not the first one, because two of these checks are about how
+    many closes happened rather than what the last one said.
 
-def _indicator_after(what, attempts):
-    """The title handle_pr leaves on the indicator for one ending."""
+    The review stub can close the indicator itself, which is what finish()
+    does on every ending that posted. Without that, "the backstop does not
+    overwrite the tally" asserted against a check nothing had closed, and
+    held identically with close_check's `closed` guard deleted.
+
+    It also drops a marker into `checked`, so the order of open and review
+    is observable. Asserting that the first call is a GET proved nothing:
+    open_check issues one first wherever it is called from.
+    """
     del checked[:]
     del posted[:]
-    vinegar.review = _boom if what == "raise" else (lambda *a, **k: what)
+
+    def review_stub(path, repo, pr, config, env, tokens, resent=False,
+                    check=None):
+        checked.append(("REVIEW", "", None))
+        if closes:
+            vinegar.close_check(L, check, closes, CHK_ENV)
+        if what == "raise":
+            raise RuntimeError("the review process vanished")
+        return what
+
+    vinegar.review = review_stub
     state = {L: {"outcome": vinegar.FAILED, "sha": PR_LIVE["headRefOid"],
                  "attempts": attempts}} if attempts else {}
     vinegar.handle_pr("o/r", PR_LIVE, CHK_CONFIG, state, {})
-    said = [asked for how, _, asked in checked if how == "PATCH"]
-    return said[0]["output"]["title"] if said else "(never closed)"
+    return [asked["output"]["title"] for how, _, asked in checked
+            if how == "PATCH"]
 
 
+# Bound once and passed to both arguments. check() evaluates its `detail`
+# eagerly, so calling the helper again there ran a second whole handle_pr:
+# another give-up posting, another transcript, and a failure reported with
+# evidence from a run other than the one asserted on.
+_failed = _indicator_after(vinegar.FAILED, 0)
 check("a failed review leaves the indicator finished, not spinning",
-      _indicator_after(vinegar.FAILED, 0)
-      == "The review failed and will be tried again",
-      _indicator_after(vinegar.FAILED, 0))
+      _failed == ["The review failed and will be tried again"], _failed)
+_raised = _indicator_after("raise", 0)
 check("a review that raises still finishes the indicator",
-      _indicator_after("raise", 0)
-      == "The review failed and will be tried again",
-      _indicator_after("raise", 0))
+      _raised == ["The review failed and will be tried again"], _raised)
+_gave_up = _indicator_after(vinegar.FAILED, vinegar.MAX_ATTEMPTS - 1)
 check("the last attempt says it was given up on, not retried",
-      "given up on" in _indicator_after(vinegar.FAILED,
-                                        vinegar.MAX_ATTEMPTS - 1),
-      _indicator_after(vinegar.FAILED, vinegar.MAX_ATTEMPTS - 1))
-# review() closed it already on this path, so the backstop must not
-# overwrite the tally with a generic sentence.
-check("an ending that already reported is not overwritten",
-      _indicator_after(vinegar.DONE, 0) == "The review finished",
-      _indicator_after(vinegar.DONE, 0))
-check("the indicator is opened before the review, not after",
-      [how for how, _, _ in checked][0] in ("GET", "POST"),
-      [how for how, _, _ in checked])
+      _gave_up and "given up on" in _gave_up[0], _gave_up)
+# review() answers DONE whenever the subscription was spent, including the
+# endings where announce() swallowed a raise and nothing was posted. If
+# the indicator is still open here, the posting is exactly what did not
+# happen, so the backstop must not call that finished.
+_spent = _indicator_after(vinegar.DONE, 0)
+check("a DONE that posted nothing is not called a finished review",
+      _spent == ["The review ran but nothing reached the pull request"],
+      _spent)
+# And the case that proves the `closed` guard: finish() got there first.
+_already = _indicator_after(vinegar.DONE, 0, closes="9 findings (1 blocker)")
+check("a tally already reported is not overwritten by the backstop",
+      _already == ["9 findings (1 blocker)"], _already)
+_order = [how for how, _, _ in checked]
+check("the indicator is opened before the review runs",
+      "REVIEW" in _order and _order.index("REVIEW") > 0
+      and _order[0] in ("GET", "POST"), _order)
+
+# The end of handle_pr is reachable only when nothing goes wrong, which is
+# why the close is in a finally. save_state on a full disk is the failure
+# this file already treats as real.
+_saves = [0]
+
+
+def _second_save_raises(state):
+    _saves[0] += 1
+    if _saves[0] > 1:
+        raise OSError("no space left on device")
+
+
+_save_kept = vinegar.save_state
+vinegar.save_state = _second_save_raises
+# The OSError is meant to escape: poll_once is what catches it, and
+# handle_pr recording nothing is the point of the entry written earlier.
+# What must have happened on the way out is the close, so the titles are
+# read off `checked` rather than from a return that never comes.
+try:
+    _indicator_after(vinegar.FAILED, 0)
+except OSError:
+    pass
+vinegar.save_state = _save_kept
+_disk = [asked["output"]["title"] for how, _, asked in checked
+         if how == "PATCH"]
+check("recording that fails still finishes the indicator",
+      _disk == ["The review failed and will be tried again"], _disk)
+
+# The credentials above were asked to cover the checkout and the review,
+# so on a full-length review they can be spent by the time this runs.
+# Closing on them was a 401 exactly when the indicator most needs closing.
+def _env_for(config, repo, tokens, good_for=0):
+    return {"GH_TOKEN": "post" if good_for == vinegar.POST_GRACE else "stale"}
+
+
+_env_kept = vinegar.github_env
+vinegar.github_env = _env_for
+_fresh = _indicator_after(vinegar.FAILED, 0)
+vinegar.github_env = _env_kept
+check("the indicator is closed on freshly minted credentials",
+      check_envs and check_envs[-1] == "post", check_envs)
+
 # Put back exactly what this block borrowed, and nothing else. A
 # reset_stubs() here restored `checkout` and `save_state` to the genuine
 # ones, which the rest of this section is still relying on being stubbed:
