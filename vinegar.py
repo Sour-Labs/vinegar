@@ -3130,8 +3130,22 @@ def review(path, repo, pr, config, env, tokens, resent=False):
     # The review reads a diff that Vinegar did not write, so it runs under
     # vinegar's own settings file and loads none of the user, project, or
     # local settings.json an interactive session would, and no MCP server.
-    # This does not cover a CLAUDE.md in the checkout, which is still read as
-    # project instructions. See "What the reviewer is allowed to do".
+    #
+    # `--setting-sources ""` covers the checkout's memory files too, and
+    # this comment said the opposite until it was measured. On Claude Code
+    # 2.1.221 a `CLAUDE.md` in the working directory is not applied with
+    # the flag and is applied without it, holding everything else equal:
+    # same directory, same settings, same model, six runs, `AGENTS.md` and
+    # a real git repository included. So the head commit cannot instruct
+    # the reviewer through a memory file.
+    #
+    # Treat that as true of this version rather than for ever. It is the
+    # behaviour of a flag in a tool Vinegar does not own, nothing here can
+    # detect it changing, and the offline suite cannot reach it because it
+    # stubs the CLI. The README has the probe that re-checks it in a
+    # minute; run that rather than inheriting this paragraph, and read its
+    # warning about the control first, because the weak version of the
+    # probe passes whether or not the flag does anything.
     #
     # Three settings that only work together, and the reviewer's findings
     # arrive nowhere if any one of them is dropped.
