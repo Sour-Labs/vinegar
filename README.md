@@ -197,9 +197,11 @@ Every key in `config.example.json`:
 | `severity_model` | `"haiku"` | Model that tiers the findings before they are posted. Null posts them in the order the reviewer reported them. See below. |
 | `github_app` | `null` | Post as a GitHub App instead of as you. See below. |
 
-The last five are budget and safety controls, not optimizations. Automated
-reviews spend the same subscription limits as your interactive Claude Code
-work.
+`max_changed_lines`, the three `skip_` keys and `authors` are budget and
+safety controls, not optimizations. Automated reviews spend the same
+subscription limits as your interactive Claude Code work. `severity_model` is
+the one row that adds spend rather than bounding it, and "Severity" below says
+how much.
 
 **`model` and `effort` together decide how good the review is.**
 `/code-review` picks its prompt from a table keyed by both. Opus 5 at `high`

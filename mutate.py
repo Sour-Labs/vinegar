@@ -301,14 +301,13 @@ MUTATIONS = [
      "        if 0 <= index < count and index not in seen:",
      "        if 0 <= index < count:"),
     ("severity-answer-anchored-at-line-start",
-     r'        match = re.match(r"\s*\[?(\d+)\]?[\s:.)-]+(%s)\b" % "|".join(TIERS),',
-     r'        match = re.search(r"\s*\[?(\d+)\]?[\s:.)-]+(%s)\b" % "|".join(TIERS),'),
+     "        match = TIER_LINE.match(line)",
+     "        match = TIER_LINE.search(line)"),
     ("severity-answer-known-tiers-only",
-     r'        match = re.match(r"\s*\[?(\d+)\]?[\s:.)-]+(%s)\b" % "|".join(TIERS),',
-     r'        match = re.match(r"\s*\[?(\d+)\]?[\s:.)-]+([a-z]+)\b" % (),'),
+     r'TIER_LINE = re.compile(r"\s*\[?(\d+)\]?[\s:.)-]+(%s)\b" % "|".join(TIERS),',
+     r'TIER_LINE = re.compile(r"\s*\[?(\d+)\]?[\s:.)-]+([a-z]+)\b" % (),'),
     ("severity-answer-any-case",
-     "                         line, re.IGNORECASE)",
-     "                         line)"),
+     "                       re.IGNORECASE)", "                       0)"),
 
     # Turning it off, and the two shapes of nothing to do.
     ("severity-off-switch",
@@ -320,9 +319,25 @@ MUTATIONS = [
     # is paid for by this point and an ordering step must not cost it.
     ("severity-failure-is-not-fatal",
      "    except Exception as err:\n"
-     '        log("%s: the severity pass did not run, so findings are posted in "',
+     "        # The exception's own text is not logged, and that is the point of",
      "    except json.JSONDecodeError as err:\n"
-     '        log("%s: the severity pass did not run, so findings are posted in "'),
+     "        # The exception's own text is not logged, and that is the point of"),
+    # The disclosure guard: TimeoutExpired stringifies the whole command,
+    # and this one carries every finding's text plus the settings JSON.
+    ("severity-timeout-does-not-log-the-prompt",
+     "        if isinstance(err, subprocess.TimeoutExpired):\n"
+     '            why = "it ran longer than %ds" % SEVERITY_TIMEOUT\n'
+     "        elif isinstance(err, OSError):\n"
+     "            why = str(err)\n"
+     "        else:\n"
+     "            why = type(err).__name__",
+     "        why = str(err)"),
+
+    # The tier is triage()'s to set, so one arriving on a finding is
+    # discarded before anything renders or counts it.
+    ("severity-smuggled-tier-discarded",
+     '    if findings and any("tier" in finding for finding in findings):',
+     "    if False:"),
     ("severity-error-answer-ignored",
      '        if event.get("is_error"):\n'
      '            log("%s: the severity pass failed, so findings are posted in "\n'
@@ -348,10 +363,30 @@ MUTATIONS = [
      '                 "Grep", "Task", "WebFetch", "WebSearch", "Workflow"],',
      '        "deny": [],'),
     ("severity-sandboxed",
-     '    "sandbox": dict(((name, wanted) for name, wanted, _ in SANDBOX_RULES),\n'
-     "                    network=dict(SANDBOX_NETWORK)),",
-     '    "sandbox": {"enabled": False, "failIfUnavailable": False,\n'
-     '                "network": {"allowedDomains": ["*"]}},'),
+     '    "sandbox": dict(\n'
+     "        ((name, wanted) for name, wanted, _ in SANDBOX_RULES),",
+     '    "sandbox": dict(\n'
+     '        (("enabled", False), ("failIfUnavailable", False)),'),
+    # Measured: with the sandbox on and no `filesystem` stanza, a
+    # permitted Write reached `$HOME`. These are the paths that cannot be
+    # recovered from.
+    ("severity-denies-writes-to-home-and-checkouts",
+     '        filesystem={"denyWrite": sorted(\n'
+     "            {form for path in (HOME, CHECKOUT_DIR)\n"
+     "             for form in (path, os.path.realpath(path))})},",
+     '        filesystem={"denyWrite": []},'),
+
+    # One definition of where a finding points, and it collapses rather
+    # than trims: a newline in `file` forged an extra numbered block in
+    # the severity prompt.
+    ("severity-where-is-collapsed",
+     '    where = " ".join(str(finding.get("file") or "").split()) or "(no file)"',
+     '    where = str(finding.get("file") or "").strip() or "(no file)"'),
+    ("severity-every-field-collapsed",
+     "    def flat(finding, name):\n"
+     '        return " ".join(str(finding.get(name) or "").split())',
+     "    def flat(finding, name):\n"
+     '        return str(finding.get(name) or "").strip()'),
     ("severity-no-bypass-mode",
      '        "defaultMode": PERMISSION_MODE,',
      '        "defaultMode": "bypassPermissions",'),
