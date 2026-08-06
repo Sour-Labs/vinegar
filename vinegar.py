@@ -207,6 +207,24 @@ CHECKOUT_GRACE = 1500
 # number, named here because two things are measured against it.
 TOKEN_LIFE = 3600
 
+# The longest one review may be allowed to hold the poll thread. A ceiling
+# on `review_timeout`, not a timeout itself.
+#
+# It exists because the token-life check above used to refuse rather than
+# say, and that refusal was incidentally load_config's only upper bound on
+# `review_timeout`. Downgrading it to a warning removed the bound, leaving
+# `isinstance(value, int)` and `value > 0`. An operator answering repeated
+# "killed after 1800s" lines with an extra zero would then start a daemon
+# that parks on one review for five hours: nothing else listed, nothing
+# else reviewed, and the watchdog calling it healthy throughout, because it
+# reads the pid and a quiet log is what a quiet week looks like too.
+#
+# Refused rather than said, unlike the check above, and the difference is
+# the point: a daemon that parks is running wrongly, not expensively. Two
+# hours is roughly nine times the slowest review measured here, so a value
+# past it is a typo rather than an intent.
+MAX_REVIEW_TIMEOUT = 7200
+
 # Enough life for `gh pr list`, which is one call. This is not zero because the
 # cache serves a token right up to its recorded expiry, and that expiry is
 # optimistic: it is computed from the local clock after the mint response
@@ -511,20 +529,50 @@ def load_config(path):
         if value <= 0:
             sys.exit("%s: %s must be greater than zero" % (path, name))
 
-    # Refused rather than warned about, because the failure is silence. The
-    # token cache serves a token only while `now + good_for < expires`, so
-    # once the checkout and review together ask for a token's whole life no
-    # cached token can satisfy it and every call mints a new one. Nothing
-    # breaks and nothing is logged; it once ran at roughly 1440 tokens a day
-    # per open pull request before anyone noticed. Raising CHECKOUT_GRACE to
-    # 1500 moved this within reach of an ordinary edit: `review_timeout`
-    # above 2100 now crosses it, where the old 600 left room to 3000.
-    if checkout_grace(config) >= TOKEN_LIFE:
-        sys.exit("%s: review_timeout must be under %d, because the checkout "
-                 "reserves %d seconds on top of it and a GitHub token only "
-                 "lives %d. Above that every call mints a new token."
-                 % (path, TOKEN_LIFE - CHECKOUT_GRACE, CHECKOUT_GRACE,
-                    TOKEN_LIFE))
+    if config["review_timeout"] > MAX_REVIEW_TIMEOUT:
+        sys.exit("%s: review_timeout must be at most %d seconds. One review "
+                 "holds the only poll thread for as long as it runs, so "
+                 "nothing else is listed or reviewed meanwhile, and the "
+                 "watchdog reads a parked daemon as a healthy one."
+                 % (path, MAX_REVIEW_TIMEOUT))
+
+    # Said, not refused. The cache serves a token only while
+    # `now + good_for < expires`, so once the checkout and the review
+    # together ask for a token's whole life no cached token can satisfy it:
+    # every review mints a fresh one and then runs past the hour that token
+    # lives.
+    #
+    # What that costs is a mint per review and a dead fallback, not a broken
+    # review. Since the reviewer is handed no GitHub credential and has no
+    # network, nothing it does needs the token, and the posting mints its
+    # own. What is left holding it is posting_env()'s fallback, used only
+    # when that fresh mint fails, and past the cap it would be expired.
+    # Every other refusal in this function stops a daemon that would run
+    # *wrongly*; taking one down over a token bill is the worse trade, and
+    # it was a refusal for one day whose first catch was the deploy of the
+    # change that added it.
+    #
+    # Only with an App. Without one github_env() returns None before
+    # installation_token() is reached, so nothing mints and there is nothing
+    # to say; the shipped config.example.json has no App, so the warning
+    # would otherwise greet the documented starting configuration with a
+    # cost it cannot incur.
+    #
+    # `>=`, because the cache condition is a strict `<`: asking for exactly
+    # a token's life already fails it. The message says "at least" to match.
+    #
+    # No rate is quoted. The mint happens once per review that actually
+    # runs, not once per poll — handle_pr reaches it only past the DONE,
+    # give-up and skip returns — so a per-day figure derived from
+    # `poll_interval` overstates it by about three orders of magnitude.
+    if config.get("github_app") and checkout_grace(config) >= TOKEN_LIFE:
+        log("%s: review_timeout is %d, and with the %ds the checkout "
+            "reserves that asks for at least the %ds a GitHub token lives. "
+            "No cached token can satisfy it, so every review mints a fresh "
+            "one and then runs on a token that can expire before it "
+            "finishes. Set it under %d to use the cache."
+            % (path, config["review_timeout"], CHECKOUT_GRACE, TOKEN_LIFE,
+               TOKEN_LIFE - CHECKOUT_GRACE))
 
     # A misconfigured App is caught here rather than at the first review, which
     # is minutes later and on a real pull request.
