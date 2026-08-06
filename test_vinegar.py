@@ -1472,18 +1472,39 @@ check("an effort the review command does not know refuses to start",
 check("every effort the config allows still starts",
       all(_config_with(effort=e) == "started" for e in vinegar.EFFORTS),
       [e for e in vinegar.EFFORTS if _config_with(effort=e) != "started"])
-# Refused at startup rather than discovered on the token bill. Past this the
+# Said at startup rather than discovered on the token bill. Past this the
 # checkout and review together ask for a whole token's life, no cached token
-# can satisfy that, and every call mints a new one with nothing logged.
-# Raising CHECKOUT_GRACE to 1500 brought the boundary within reach of an
-# ordinary edit to a documented setting.
-_over = vinegar.TOKEN_LIFE - vinegar.CHECKOUT_GRACE
-check("a review_timeout that would mint a token per call refuses to start",
-      "every call mints" in _config_with(review_timeout=_over),
-      _config_with(review_timeout=_over))
+# can satisfy that, and every call mints a new one. Said and not refused,
+# because it is waste rather than breakage: a daemon that will not start is
+# worse than one that mints too often, and refusing took the deploy of its
+# own change down for exactly that reason.
+_cap = vinegar.TOKEN_LIFE - vinegar.CHECKOUT_GRACE
+# Not the cap itself. Tested at exactly the boundary, the message echoes the
+# configured value and the remedy it prints are the same number, so a check
+# for "it names the fix" passes on the echo with the remedy deleted. Half a
+# thousand clear of it, the two are distinguishable.
+_over = _cap + 500
+_said = []
+_log_before = vinegar.log
+vinegar.log = lambda message: _said.append(message)
+_over_start = _config_with(review_timeout=_over)
+_over_said = list(_said)
+del _said[:]
+_under_start = _config_with(review_timeout=_cap - 1)
+_under_said = list(_said)
+vinegar.log = _log_before
+check("a review_timeout over the cap still starts, rather than refusing",
+      _over_start == "started", _over_start)
+check("a review_timeout over the cap says so at startup",
+      any("every call mints a new one" in m for m in _over_said), _over_said)
+# The number to set, not just the complaint. A warning that does not say
+# what to change costs the reader the arithmetic this check exists to do.
+check("the warning names the value that would fix it",
+      any(str(_cap) in m for m in _over_said), _over_said)
 check("the largest review_timeout inside the cap still starts",
-      _config_with(review_timeout=_over - 1) == "started",
-      _config_with(review_timeout=_over - 1))
+      _under_start == "started", _under_start)
+check("a review_timeout inside the cap says nothing",
+      not _under_said, _under_said)
 
 
 def _refuses(**over):

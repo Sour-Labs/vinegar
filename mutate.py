@@ -223,9 +223,20 @@ MUTATIONS = [
      '                           "%ds" % (key_path, DIFF_TIMEOUT))',
      "    except subprocess.TimeoutExpired:\n"
      "        raise"),
-    ("grace-cap-guard",
+    ("token-cap-silent",
      "    if checkout_grace(config) >= TOKEN_LIFE:",
      "    if False:"),
+    ("token-cap-cries-wolf",
+     "    if checkout_grace(config) >= TOKEN_LIFE:",
+     "    if True:"),
+    ("token-cap-no-remedy",
+     "                            TOKEN_LIFE - CHECKOUT_GRACE))",
+     "                            0))"),
+    # It must stay a warning. A refusal here took down the deploy of the
+    # change that introduced it, which is the whole subject of issue #15.
+    ("token-cap-refuses",
+     '        log("%s: review_timeout is %d, and with the %ds the checkout "',
+     '        sys.exit("%s: review_timeout is %d, and with the %ds the checkout "'),
     ("checkout-cwd",
      "            result = run(step, cwd=path, env=env, timeout=bound)",
      "            result = run(step, env=env, timeout=bound)"),

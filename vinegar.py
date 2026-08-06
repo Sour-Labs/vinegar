@@ -511,20 +511,33 @@ def load_config(path):
         if value <= 0:
             sys.exit("%s: %s must be greater than zero" % (path, name))
 
-    # Refused rather than warned about, because the failure is silence. The
-    # token cache serves a token only while `now + good_for < expires`, so
-    # once the checkout and review together ask for a token's whole life no
-    # cached token can satisfy it and every call mints a new one. Nothing
-    # breaks and nothing is logged; it once ran at roughly 1440 tokens a day
-    # per open pull request before anyone noticed. Raising CHECKOUT_GRACE to
-    # 1500 moved this within reach of an ordinary edit: `review_timeout`
-    # above 2100 now crosses it, where the old 600 left room to 3000.
+    # Said, not refused. The token cache serves a token only while
+    # `now + good_for < expires`, so once the checkout and the review
+    # together ask for a token's whole life no cached token can satisfy it
+    # and every call mints a new one. That is waste, not breakage: reviews
+    # still run and findings still post. Every other refusal in this
+    # function stops a daemon that would run *wrongly*; this one would stop
+    # a daemon that runs *expensively*, and taking the daemon down to fix a
+    # token bill is the worse trade.
+    #
+    # It was a refusal for one day, and the first thing it caught was the
+    # deploy of the change that added it: the live config was over the line,
+    # so the restart would have looped every 30 seconds under launchd's
+    # KeepAlive and paged, rather than reviewing anything.
+    #
+    # Once, at startup, next to the banner an operator reads. Saying it on
+    # every wasted mint would be more visible and is exactly wrong: that is
+    # a line a minute, which is the volume being complained about. The rate
+    # is computed rather than quoted, because it is `poll_interval` that
+    # decides it.
     if checkout_grace(config) >= TOKEN_LIFE:
-        sys.exit("%s: review_timeout must be under %d, because the checkout "
-                 "reserves %d seconds on top of it and a GitHub token only "
-                 "lives %d. Above that every call mints a new token."
-                 % (path, TOKEN_LIFE - CHECKOUT_GRACE, CHECKOUT_GRACE,
-                    TOKEN_LIFE))
+        log("%s: review_timeout is %d, and with the %ds the checkout "
+            "reserves that asks for more than the %ds a GitHub token lives. "
+            "No cached token can satisfy it, so every call mints a new one: "
+            "roughly %d a day per open pull request. Set it under %d to use "
+            "the cache." % (path, config["review_timeout"], CHECKOUT_GRACE,
+                            TOKEN_LIFE, 86400 // config["poll_interval"],
+                            TOKEN_LIFE - CHECKOUT_GRACE))
 
     # A misconfigured App is caught here rather than at the first review, which
     # is minutes later and on a real pull request.
