@@ -11,5 +11,6 @@
   "skip_forks": true,
   "authors": [],
   "review_timeout": 1800,
+  "severity_model": "haiku",
   "github_app": null
 }

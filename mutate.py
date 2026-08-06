@@ -155,12 +155,16 @@ MUTATIONS = [
     ("claude-settings",
      '           "--settings", reviewer_settings(path),',
      "           "),
+    # Both of these carry the line above them, because the severity pass
+    # sends the same two flags and the bare text now matches twice.
     ("setting-sources",
+     '           "--settings", reviewer_settings(path),\n'
      '           "--setting-sources", "",',
-     "           "),
+     '           "--settings", reviewer_settings(path),'),
     ("strict-mcp-config",
+     '           "--setting-sources", "",\n'
      '           "--strict-mcp-config"]',
-     "           ]"),
+     '           "--setting-sources", ""]'),
     ("review-timeout",
      '        result = run(cmd, cwd=path, timeout=config["review_timeout"],\n'
      "                     env=reviewing)",
@@ -283,8 +287,120 @@ MUTATIONS = [
      "    if os.path.exists(LOCK_PATH):\n"
      '        sys.exit("vinegar is already running as pid %s" % locked_by())'),
 
+    # --- the severity pass ---------------------------------------------
+    # read_tiers is the whole output surface of a call that reads text
+    # quoted out of the branch under review, so what it refuses is as much
+    # of the guard as what it accepts.
+    ("severity-answer-covers-every-finding",
+     "    return [seen[i] for i in range(count)] if len(seen) == count else None",
+     "    return [seen[i] for i in sorted(seen)]"),
+    ("severity-answer-index-in-range",
+     "        if 0 <= index < count and index not in seen:",
+     "        if index not in seen:"),
+    ("severity-answer-first-wins",
+     "        if 0 <= index < count and index not in seen:",
+     "        if 0 <= index < count:"),
+    ("severity-answer-anchored-at-line-start",
+     r'        match = re.match(r"\s*\[?(\d+)\]?[\s:.)-]+(%s)\b" % "|".join(TIERS),',
+     r'        match = re.search(r"\s*\[?(\d+)\]?[\s:.)-]+(%s)\b" % "|".join(TIERS),'),
+    ("severity-answer-known-tiers-only",
+     r'        match = re.match(r"\s*\[?(\d+)\]?[\s:.)-]+(%s)\b" % "|".join(TIERS),',
+     r'        match = re.match(r"\s*\[?(\d+)\]?[\s:.)-]+([a-z]+)\b" % (),'),
+    ("severity-answer-any-case",
+     "                         line, re.IGNORECASE)",
+     "                         line)"),
+
+    # Turning it off, and the two shapes of nothing to do.
+    ("severity-off-switch",
+     "    if not chooser or not findings:", "    if not findings:"),
+    ("severity-nothing-to-tier",
+     "    if not chooser or not findings:", "    if not chooser:"),
+
+    # Every failure has to land on the findings as they arrived. The review
+    # is paid for by this point and an ordering step must not cost it.
+    ("severity-failure-is-not-fatal",
+     "    except Exception as err:\n"
+     '        log("%s: the severity pass did not run, so findings are posted in "',
+     "    except json.JSONDecodeError as err:\n"
+     '        log("%s: the severity pass did not run, so findings are posted in "'),
+    ("severity-error-answer-ignored",
+     '        if event.get("is_error"):\n'
+     '            log("%s: the severity pass failed, so findings are posted in "\n'
+     '                "the order they were reported: %s" % (label, said[:200]))\n'
+     "            return findings",
+     "        pass"),
+
+    # A subprocess on the single poll thread, between a finished review and
+    # the posting of it.
+    ("severity-timeout-arg",
+     "                     timeout=SEVERITY_TIMEOUT, env=env)",
+     "                     env=env)"),
+
+    # What the call runs under. The findings quote a branch Vinegar does
+    # not trust, so the model reading them gets no tools and no credential.
+    ("severity-token-stripped",
+     "    env = dict(os.environ)\n"
+     '    for carried in ("GH_TOKEN", "GITHUB_TOKEN"):\n'
+     "        env.pop(carried, None)",
+     "    env = dict(os.environ)"),
+    ("severity-tools-denied",
+     '        "deny": ["Bash", "Read", "Write", "Edit", "NotebookEdit", "Glob",\n'
+     '                 "Grep", "Task", "WebFetch", "WebSearch", "Workflow"],',
+     '        "deny": [],'),
+    ("severity-sandboxed",
+     '    "sandbox": dict(((name, wanted) for name, wanted, _ in SANDBOX_RULES),\n'
+     "                    network=dict(SANDBOX_NETWORK)),",
+     '    "sandbox": {"enabled": False, "failIfUnavailable": False,\n'
+     '                "network": {"allowedDomains": ["*"]}},'),
+    ("severity-no-bypass-mode",
+     '        "defaultMode": PERMISSION_MODE,',
+     '        "defaultMode": "bypassPermissions",'),
+
+    # What the tiers are for: an order, and a label on each comment.
+    ("severity-sorts-most-serious-first",
+     '    return sorted(tiered, key=lambda finding: TIERS.index(finding["tier"]))',
+     "    return tiered"),
+    ("severity-copies-rather-than-writes",
+     "    tiered = [dict(finding, tier=tier)\n"
+     "              for finding, tier in zip(findings, tiers)]",
+     "    tiered = findings\n"
+     "    for finding, tier in zip(findings, tiers):\n"
+     '        finding["tier"] = tier'),
+    ("severity-label-opens-the-comment",
+     '        summary = "**%s** · %s" % (tier, summary)',
+     "        pass"),
+    ("severity-tally-counts",
+     '    return ", ".join("%d %s" % (count, tier)\n'
+     "                     for tier, count in counted if count)",
+     '    return ""'),
+    ("severity-tally-drops-empty-tiers",
+     '    return ", ".join("%d %s" % (count, tier)\n'
+     "                     for tier, count in counted if count)",
+     '    return ", ".join("%d %s" % (count, tier)\n'
+     "                     for tier, count in counted)"),
+    ("severity-tally-reaches-the-comment",
+     '            " (%s)" % tally if tally else "", len(inline))]',
+     '            "", len(inline))]'),
+    ("severity-tally-passed-to-the-body",
+     "                                   note=note, verb=verb,\n"
+     "                                   tally=severity_tally(findings))}",
+     "                                   note=note, verb=verb)}"),
+
+    # In finish(), so that all four routes to the pull request agree.
+    ("severity-runs-in-finish",
+     "    findings = triage(label, findings, config)",
+     "    pass"),
+    ("severity-model-validated",
+     "    chooser = config[\"severity_model\"]\n"
+     "    if chooser is not None and not (isinstance(chooser, str)\n"
+     "                                    and chooser.strip()):",
+     "    chooser = config[\"severity_model\"]\n"
+     "    if False:"),
+
     # --- constants -----------------------------------------------------
     ("max-attempts", "MAX_ATTEMPTS = 3", "MAX_ATTEMPTS = 99"),
+    ("severity-timeout-value",
+     "SEVERITY_TIMEOUT = 300", "SEVERITY_TIMEOUT = 0"),
     # The value, not just the argument. Removing `timeout=` leaves the
     # constant intact, so the check that the clone gets longer than the
     # fetch was covered by neither of the two entries above it.
