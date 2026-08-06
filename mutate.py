@@ -452,8 +452,7 @@ MUTATIONS = [
      "    if mine:\n"
      '        log("%s: reusing the check run an earlier attempt left running"\n'
      "            % label)\n"
-     '        return {"repo": repo, "id": mine[0].get("id"), "env": env,\n'
-     '                "closed": False}',
+     '        return {"repo": repo, "id": mine[0].get("id"), "closed": False}',
      "    if False:\n        pass"),
     ("check-ignores-another-apps",
      '    mine = [was for was in (open_already or {}).get("check_runs") or []\n'
@@ -462,10 +461,15 @@ MUTATIONS = [
      '    mine = list((open_already or {}).get("check_runs") or [])'),
     # A handle with no id would PATCH `check-runs/None` on every ending.
     ("check-handle-needs-an-id",
-     '    return {"repo": repo, "id": made["id"], "env": env, "closed": False} \\\n'
+     '    return {"repo": repo, "id": made["id"], "closed": False} \\\n'
      "        if made and made.get(\"id\") else None",
-     '    return {"repo": repo, "id": (made or {}).get("id"), "env": env,\n'
+     '    return {"repo": repo, "id": (made or {}).get("id"),\n'
      '            "closed": False}'),
+    # A handle holding a token is one log line from publishing it.
+    ("check-handle-holds-no-credential",
+     '        return {"repo": repo, "id": mine[0].get("id"), "closed": False}',
+     '        return {"repo": repo, "id": mine[0].get("id"), "env": env,\n'
+     '                "closed": False}'),
     ("check-closes-once",
      '    if not check or check["closed"]:\n        return\n'
      '    check["closed"] = True',

@@ -1160,6 +1160,12 @@ check("the indicator carries one name and the effort",
       and "high" in _post[0]["output"]["title"], _post[0])
 check("the handle carries the id the caller must close",
       _made and _made["id"] == 4242, _made)
+def _has_secret(handle):
+    """Whether a handle carries anything credential-shaped, at any depth."""
+    return any(
+        "token" in str(name).lower() or "token" in str(value).lower()
+        or isinstance(value, dict) and _has_secret(value)
+        for name, value in (handle or {}).items())
 check("the indicator links back to the pull request",
       _post[0].get("details_url") == PR["url"], _post[0].get("details_url"))
 # GitHub judges the whole request on a malformed details_url, so an empty
@@ -1180,6 +1186,12 @@ _reuse = _opened(check_open={"check_runs": [{"id": 99, "app": {"id": 77}}]})
 check("an indicator an earlier attempt left running is reused",
       _reuse and _reuse["id"] == 99
       and not [h for h, _, _ in checked if h == "POST"], checked)
+# Both handles, because they are built on separate lines and only one of
+# them was covered when this was first written: a mutation that put the
+# token back on the reused one survived.
+check("no handle carries a credential, however it was made",
+      not _has_secret(_made) and not _has_secret(_reuse),
+      (sorted(_made or {}), sorted(_reuse or {})))
 check("another app's check of the same name is not adopted",
       _opened(check_open={"check_runs": [{"id": 99, "app": {"id": 5}}]})["id"]
       == 4242, checked)
@@ -1192,8 +1204,8 @@ _opened(check_made={"id": 4242})
 # Closing. The conclusion is the whole safety argument: a check that can
 # fail is a merge gate, and the README promises Vinegar is not one.
 del checked[:]
-_handle = {"repo": "o/r", "id": 4242, "env": CHK_ENV, "closed": False}
-vinegar.close_check(L, _handle, "7 findings (1 blocker, 6 advisory)")
+_handle = {"repo": "o/r", "id": 4242, "closed": False}
+vinegar.close_check(L, _handle, "7 findings (1 blocker, 6 advisory)", CHK_ENV)
 _patch = [asked for how, _, asked in checked if how == "PATCH"]
 check("closing completes the indicator",
       len(_patch) == 1 and _patch[0]["status"] == "completed"
@@ -1204,14 +1216,15 @@ check("the tally is what the checks list shows",
       _patch[0]["output"]["title"] == "7 findings (1 blocker, 6 advisory)",
       _patch[0]["output"])
 del checked[:]
-vinegar.close_check(L, _handle, "again")
+vinegar.close_check(L, _handle, "again", CHK_ENV)
 check("closing twice sends one request", not checked, checked)
-check("no handle is not an error", vinegar.close_check(L, None, "x") is None)
+check("no handle is not an error",
+      vinegar.close_check(L, None, "x", CHK_ENV) is None)
 # GitHub refuses a title over 255 characters and refuses the whole update
 # with it, which would leave the indicator running for ever.
-_long = {"repo": "o/r", "id": 1, "env": CHK_ENV, "closed": False}
+_long = {"repo": "o/r", "id": 1, "closed": False}
 del checked[:]
-vinegar.close_check(L, _long, "t" * 400)
+vinegar.close_check(L, _long, "t" * 400, CHK_ENV)
 check("an overlong title cannot leave the indicator spinning",
       len([a for h, _, a in checked if h == "PATCH"][0]["output"]["title"])
       <= 255, len(_patch))
@@ -3877,7 +3890,7 @@ _titles = []
 
 
 def _titled(findings, note=None, sha="d0d0d0d0d0d0"):
-    handle = {"repo": "o/r", "id": 7, "env": None, "closed": False}
+    handle = {"repo": "o/r", "id": 7, "closed": False}
     del checked[:]
     at = dict(PR_LIVE, headRefOid=sha)
     fake_run.rc, fake_run.post_err = 0, ""

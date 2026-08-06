@@ -2480,6 +2480,15 @@ def open_check(label, repo, pr, config, env):
     # runs, and MAX_ATTEMPTS then brings the same head back twice more.
     # Creating a run each time would leave the pull request listing three
     # checks called Vinegar, two of them running for ever.
+    #
+    # Only a running one, and that is a limit of the API rather than a
+    # choice. A completed check run cannot be moved back to in_progress:
+    # measured, the PATCH answers 200 and changes nothing at all, which
+    # is the worst way for it to refuse. So an attempt that ended and is
+    # then retried does add a second entry, and a pull request whose
+    # review fails twice before succeeding lists three. That is honest
+    # history rather than a defect, and trying to collapse it is the
+    # thing that silently does not work.
     open_already = check_api(
         label, repo,
         "commits/%s/check-runs?check_name=%s&status=in_progress"
@@ -2490,8 +2499,7 @@ def open_check(label, repo, pr, config, env):
     if mine:
         log("%s: reusing the check run an earlier attempt left running"
             % label)
-        return {"repo": repo, "id": mine[0].get("id"), "env": env,
-                "closed": False}
+        return {"repo": repo, "id": mine[0].get("id"), "closed": False}
 
     asked = {"name": CHECK_NAME, "head_sha": sha, "status": "in_progress",
              "started_at": datetime.now(timezone.utc).strftime(
@@ -2507,12 +2515,22 @@ def open_check(label, repo, pr, config, env):
     made = check_api(label, repo, "check-runs", "POST", asked, env)
     # An id or nothing. A handle without one cannot be closed, and
     # pretending otherwise would send a PATCH to `check-runs/None`.
-    return {"repo": repo, "id": made["id"], "env": env, "closed": False} \
+    return {"repo": repo, "id": made["id"], "closed": False} \
         if made and made.get("id") else None
 
 
-def close_check(label, check, title, summary=""):
+def close_check(label, check, title, env, summary=""):
     """Finish the indicator, whatever ended the review.
+
+    The credentials come in here rather than riding along on the handle,
+    for two reasons that both bit. A handle holding a token is one debug
+    log line away from publishing it, and this program prints finding text
+    to public pull requests for a living; printing one handle during
+    development put a live installation token in a terminal, and it had to
+    be revoked. And the token the review started on can be older than a
+    long review: the caller closest to the ending knows which credentials
+    are current, and finish() hands over the fresh ones it just minted to
+    post with.
 
     Always `neutral`, never a pass or a fail: CHECK_CONCLUSION says why at
     length. The title is the whole of what this communicates, so it says
@@ -2534,7 +2552,7 @@ def close_check(label, check, title, summary=""):
         # GitHub refuses a title over 255 characters and would refuse the
         # whole update with it, leaving the indicator running.
         "output": {"title": title[:255], "summary": summary or title}},
-        check["env"])
+        env)
 
 
 def submit_review(label, repo, pr, payload, env):
@@ -3024,9 +3042,11 @@ def finish(label, repo, pr, path, text, findings, config, env, tokens,
             log("%s: the review is saved but cannot be marked for sending "
                 "again: %s" % (label, err))
 
+    # Hoisted, because the indicator is finished on these too. They are
+    # freshly minted where the review's own may be an hour old by now.
+    sending = posting_env(label, config, repo, tokens, env)
     posted = post_review(label, repo, pr, path, text, findings, config,
-                         posting_env(label, config, repo, tokens, env), note,
-                         verb, resent)
+                         sending, note, verb, resent)
     # Cleared once it is on the pull request. What is left behind says a
     # review is saved and waiting, which is what handle_pr acts on: the
     # outcome is recorded DONE either way, `review_on_push` is false, and
@@ -3072,7 +3092,7 @@ def finish(label, repo, pr, path, text, findings, config, env, tokens,
     # whole answer, and the checks list is what people look at first.
     if note:
         title = "%s, and the review did not finish" % title
-    close_check(label, check, title,
+    close_check(label, check, title, sending or env,
                 "The review is on the pull request." if posted == POSTED
                 else "The review did not reach the pull request. The log "
                      "says where it is saved.")
@@ -4016,7 +4036,7 @@ def handle_pr(repo, pr, config, state, tokens):
     close_check(key, check, "The review failed %d times and was given up on"
                 % attempts if outcome == FAILED and attempts >= MAX_ATTEMPTS
                 else "The review failed and will be tried again"
-                if outcome == FAILED else "The review finished")
+                if outcome == FAILED else "The review finished", env)
 
 
 def find_pr(repo, number, env):
@@ -4235,7 +4255,7 @@ def main():
                 log("%s: the review did not complete: %s" % (args.pr, err))
                 outcome = FAILED
             close_check(args.pr, hand, "The review finished"
-                        if outcome != FAILED else "The review failed")
+                        if outcome != FAILED else "The review failed", env)
 
             # Recorded, always. A manual run is still a review of that
             # commit, and leaving no trace meant the daemon reviewed the
