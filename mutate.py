@@ -224,19 +224,33 @@ MUTATIONS = [
      "    except subprocess.TimeoutExpired:\n"
      "        raise"),
     ("token-cap-silent",
-     "    if checkout_grace(config) >= TOKEN_LIFE:",
+     '    if config.get("github_app") and checkout_grace(config) >= TOKEN_LIFE:',
      "    if False:"),
     ("token-cap-cries-wolf",
-     "    if checkout_grace(config) >= TOKEN_LIFE:",
+     '    if config.get("github_app") and checkout_grace(config) >= TOKEN_LIFE:',
      "    if True:"),
+    # The boundary itself. A sum of exactly a token's life already fails the
+    # cache's strict `<`, so `>` would start that one config in silence.
+    ("token-cap-boundary",
+     '    if config.get("github_app") and checkout_grace(config) >= TOKEN_LIFE:',
+     '    if config.get("github_app") and checkout_grace(config) > TOKEN_LIFE:'),
+    # Without an App nothing mints, so the warning would name a cost that
+    # cannot be incurred, on the configuration the README ships.
+    ("token-cap-no-app-guard",
+     '    if config.get("github_app") and checkout_grace(config) >= TOKEN_LIFE:',
+     "    if checkout_grace(config) >= TOKEN_LIFE:"),
     ("token-cap-no-remedy",
-     "                            TOKEN_LIFE - CHECKOUT_GRACE))",
-     "                            0))"),
+     "               TOKEN_LIFE - CHECKOUT_GRACE))",
+     "               0))"),
     # It must stay a warning. A refusal here took down the deploy of the
     # change that introduced it, which is the whole subject of issue #15.
     ("token-cap-refuses",
      '        log("%s: review_timeout is %d, and with the %ds the checkout "',
      '        sys.exit("%s: review_timeout is %d, and with the %ds the checkout "'),
+    # The ceiling the downgraded refusal used to provide by accident.
+    ("review-timeout-ceiling",
+     '    if config["review_timeout"] > MAX_REVIEW_TIMEOUT:',
+     "    if False:"),
     ("checkout-cwd",
      "            result = run(step, cwd=path, env=env, timeout=bound)",
      "            result = run(step, env=env, timeout=bound)"),

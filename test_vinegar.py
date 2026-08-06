@@ -1479,32 +1479,74 @@ check("every effort the config allows still starts",
 # worse than one that mints too often, and refusing took the deploy of its
 # own change down for exactly that reason.
 _cap = vinegar.TOKEN_LIFE - vinegar.CHECKOUT_GRACE
-# Not the cap itself. Tested at exactly the boundary, the message echoes the
-# configured value and the remedy it prints are the same number, so a check
-# for "it names the fix" passes on the echo with the remedy deleted. Half a
-# thousand clear of it, the two are distinguishable.
-_over = _cap + 500
-_said = []
-_log_before = vinegar.log
-vinegar.log = lambda message: _said.append(message)
-_over_start = _config_with(review_timeout=_over)
-_over_said = list(_said)
-del _said[:]
-_under_start = _config_with(review_timeout=_cap - 1)
-_under_said = list(_said)
-vinegar.log = _log_before
+_APP_CFG = {"app_id": 1, "private_key": _covered_key}
+
+
+def _cap_warning(app=True, **over):
+    """What load_config says for this config, and whether it started.
+
+    The patch is undone in a finally, and the sink is local. Restored with
+    a bare assignment, a load_config that raised anything but SystemExit —
+    a TypeError out of the message's own %-format, which is exactly what
+    these checks are for — would leave `log` patched for the rest of the
+    file, pointed at a name other blocks rebind to a string. The failure
+    then surfaces two thousand lines away with a traceback naming the
+    wrong function. `_refuses()` below already has this shape.
+
+    An App by default, because without one github_env() returns before
+    installation_token() and there is nothing to mint or to warn about.
+    """
+    settings = dict(over, github_app=_APP_CFG) if app else dict(over)
+    said = []
+    keep = vinegar.log
+    vinegar.log = lambda message: said.append(message)
+    try:
+        return _config_with(**settings), said
+    finally:
+        vinegar.log = keep
+
+
+# Over, exactly on, and under. The boundary is the case worth having: the
+# comparison is `>=` because the cache condition is a strict `<`, so a sum
+# of exactly a token's life already fails it. Straddling the boundary
+# without landing on it lets `>=` weaken to `>` with every check still
+# green, which is the one configuration that would then start in silence.
+_over_start, _over_said = _cap_warning(review_timeout=_cap + 500)
+_at_start, _at_said = _cap_warning(review_timeout=_cap)
+_under_start, _under_said = _cap_warning(review_timeout=_cap - 1)
+_noapp_start, _noapp_said = _cap_warning(app=False, review_timeout=_cap + 500)
 check("a review_timeout over the cap still starts, rather than refusing",
       _over_start == "started", _over_start)
 check("a review_timeout over the cap says so at startup",
-      any("every call mints a new one" in m for m in _over_said), _over_said)
-# The number to set, not just the complaint. A warning that does not say
-# what to change costs the reader the arithmetic this check exists to do.
+      any("mints a fresh one" in m for m in _over_said), _over_said)
+check("a review_timeout exactly on the cap says so as well",
+      _at_start == "started" and any("mints a fresh one" in m
+                                     for m in _at_said),
+      (_at_start, _at_said))
+# The remedy clause verbatim, not the number loose in the message. `_cap`
+# appears in the echoed setting too, and in the interpolated temp path,
+# so a bare substring match passes with the remedy deleted.
 check("the warning names the value that would fix it",
-      any(str(_cap) in m for m in _over_said), _over_said)
+      any("Set it under %d" % _cap in m for m in _over_said), _over_said)
 check("the largest review_timeout inside the cap still starts",
       _under_start == "started", _under_start)
 check("a review_timeout inside the cap says nothing",
       not _under_said, _under_said)
+# Nothing mints without an App, so the warning would name a cost that
+# cannot be incurred, on the configuration the README ships.
+check("no App configured means the cap is not worth mentioning",
+      _noapp_start == "started" and not _noapp_said,
+      (_noapp_start, _noapp_said))
+# The bound the downgraded refusal used to provide incidentally. One review
+# holds the only poll thread, so an extra zero parks the daemon for hours
+# while the watchdog reads the pid and calls it healthy.
+check("an absurd review_timeout refuses to start",
+      "at most" in _config_with(
+          review_timeout=vinegar.MAX_REVIEW_TIMEOUT + 1),
+      _config_with(review_timeout=vinegar.MAX_REVIEW_TIMEOUT + 1))
+check("the longest review_timeout allowed still starts",
+      _cap_warning(review_timeout=vinegar.MAX_REVIEW_TIMEOUT)[0] == "started",
+      _cap_warning(review_timeout=vinegar.MAX_REVIEW_TIMEOUT)[0])
 
 
 def _refuses(**over):
