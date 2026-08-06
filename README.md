@@ -6,10 +6,12 @@ A self-hosted pull-request reviewer. It runs on a machine you already own, uses
 a Claude subscription you already pay for, and posts inline review comments on
 your PRs.
 
-> **Status: the poller works. Triage does not exist yet.**
+> **Status: the poller works. The triage pass does not exist yet.**
 > `vinegar.py` polls GitHub, picks which pull requests deserve a reviewer, and
-> runs the review. The cheap triage model described below is still a design,
-> so today every pull request that passes the filters gets a full review.
+> runs the review. The cheap model that reads a diff and decides whether to
+> review it at all is still a design, so today every pull request that passes
+> the filters gets a full review. The severity pass that tiers the findings
+> afterwards is a different thing and does work; see "Severity".
 
 ## Why it exists
 
@@ -192,11 +194,14 @@ Every key in `config.example.json`:
 | `skip_forks` | `true` | Skip pull requests whose head branch lives in a fork. Read the next section before you turn this off. |
 | `authors` | `[]` | Only review these GitHub logins. Empty means anyone who passes the checks above. |
 | `review_timeout` | `1800` | Kill a review that runs longer than this many seconds. |
+| `severity_model` | `"haiku"` | Model that tiers the findings before they are posted. Null posts them in the order the reviewer reported them. See below. |
 | `github_app` | `null` | Post as a GitHub App instead of as you. See below. |
 
-The last five are budget and safety controls, not optimizations. Automated
-reviews spend the same subscription limits as your interactive Claude Code
-work.
+`max_changed_lines`, the three `skip_` keys and `authors` are budget and
+safety controls, not optimizations. Automated reviews spend the same
+subscription limits as your interactive Claude Code work. `severity_model` is
+the one row that adds spend rather than bounding it, and "Severity" below says
+how much.
 
 **`model` and `effort` together decide how good the review is.**
 `/code-review` picks its prompt from a table keyed by both. Opus 5 at `high`
@@ -705,11 +710,11 @@ there were, including when there were none:
 
 > **Vinegar** · reviewed `a1b2c3d` at high effort
 >
-> 4 findings, 3 posted inline.
+> 4 findings (1 blocker, 3 advisory), 3 posted inline.
 >
 > These could not be anchored in the diff:
 >
-> - `vinegar.py:812`: The caller this relies on drops the error.
+> - `vinegar.py:812`: **blocker** · The caller this relies on drops the error.
 >   Failure: a failed fetch returns None and the loop treats it as empty.
 >   (correctness)
 
@@ -726,6 +731,67 @@ that is the only thing it is allowed to mean.
 
 Reviews are submitted with `event: COMMENT`. Vinegar never approves and never
 requests changes, so it cannot hold up a merge. See "What this is not".
+
+## Severity
+
+A review of this repository reports nine to thirteen findings. Measured across
+65 saved transcripts, that is 448 findings, and until now every one of them was
+rendered identically and posted in whatever order the reviewer happened to
+report them. Reading all of them was the only way to find the one that mattered.
+
+Nothing already in a finding separates them. 187 of the 359 categorised
+findings say `correctness`, and the reviewer has invented 21 distinct category
+strings against the seven the tool contract anticipates, twice filing a cause
+as `altitude` while its consequence was a wrong result. `verdict` is present on
+only 33 of 359, because it appears on some `xhigh` passes and not others. So a
+fixed table from category to severity cannot work, and neither can sorting on
+the verdict.
+
+Instead, when the review finishes, one cheap model call reads the findings and
+gives each a tier:
+
+- **blocker**: something goes wrong at runtime for a user or an operator: a
+  wrong result, lost data, a security hole, a hang, a crash, or a silent
+  failure. Someone should act before this merges.
+- **advisory**: a real defect with bounded cost. It degrades quality, misleads
+  a reader, leaves a gap in tests, or wastes resources, but nothing at runtime
+  behaves wrongly because of it.
+- **note**: taste, naming, structure, or a small cleanup.
+
+The tier opens each comment and the findings are posted most serious first. The
+top-level comment counts them. Nothing is ever dropped for being minor: the
+tier changes the order and the label, never whether you see it.
+
+**The triage model never re-judges whether a finding is true.** It is given the
+findings' own words and no repository, no diff, and no tools, and it is told to
+assume each finding is true and decide only how much it would matter if it
+were. The failure scenario the reviewer wrote is the answer to exactly that
+question. This is the same rule the diff-shape triage pass above follows, for
+the same reason: small models are unreliable at finding bugs and reliable at
+classifying. It is also the right rule here on the evidence, because across 43
+rounds only three findings were ever false. Volume was the problem, not
+precision.
+
+It costs about $0.03 and 25 to 65 seconds, against a review that costs $2.80 to
+$6.40 and nine to twenty-two minutes. Set `severity_model` to `null` to turn it
+off; findings are then posted exactly as they were before this existed. Every
+way the call can fail lands there too: a timeout, a missing `claude`, an
+unparseable answer, or an answer that does not tier every finding. The review
+is finished and paid for by the time this runs, so an ordering step is never
+allowed to cost it.
+
+**What it does not do yet.** On two of the four reviews measured, about 45% of
+findings still came back `blocker`, and on one of them three `test-coverage`
+findings did, against the rule the model is given. That is good enough to order
+a comment. It is not good enough on its own to decide when to stop re-reviewing
+a pull request, so `review_on_push` is still `false` and whatever turns it on
+will need a bound that does not depend on the blocker count falling.
+
+Two things that measured worse and are recorded so they are not retried.
+Requiring the model to name the runtime harm beside each tier, which sounds
+like it should discipline the judgement, made it invent a harm for every
+finding and promote more of them, at 2.4 times the cost. A model five times the
+price matched the small one rather than beating it.
 
 ## What it costs, honestly
 

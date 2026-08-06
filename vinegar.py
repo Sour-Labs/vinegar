@@ -223,6 +223,13 @@ TOKEN_LIFE = 3600
 # the point: a daemon that parks is running wrongly, not expensively. Two
 # hours is roughly nine times the slowest review measured here, so a value
 # past it is a typo rather than an intent.
+#
+# It is not the whole hold any more, and load_config's message says so.
+# The severity pass is a second subprocess on the same thread, after the
+# review and before the posting, so the worst case is this plus
+# SEVERITY_TIMEOUT. The cap is left where it is rather than lowered by
+# 300: the number is a typo detector, not a budget, and the argument for
+# 7200 is unchanged by five minutes.
 MAX_REVIEW_TIMEOUT = 7200
 
 # Enough life for `gh pr list`, which is one call. This is not zero because the
@@ -296,6 +303,19 @@ LIST_TIMEOUT = 120
 # unanswered socket would otherwise hold it for as long as TCP allows.
 POST_TIMEOUT = 60
 
+# Seconds the severity pass may take. Measured on haiku across four saved
+# reviews of ten to thirteen findings: 25s to 65s. This is roughly four
+# times the worst of those.
+#
+# Bounded because it is a `claude -p` subprocess on the same single poll
+# thread as everything above, run at the worst possible moment: the review
+# is finished and paid for, and its findings are in hand but not yet posted.
+# The bound is generous rather than tight for the reason FETCH_TIMEOUT
+# gives, but overrunning it costs nothing here: triage() logs and returns
+# the findings untiered, and the review posts exactly as it did before this
+# existed.
+SEVERITY_TIMEOUT = 300
+
 # How every review Vinegar posts opens, and how it recognises its own when
 # asking whether one already landed. The two uses must agree, so they read
 # it from here rather than each spelling it out.
@@ -311,6 +331,132 @@ MAX_SPOKEN = 4000
 # review() has to make it available and read_stream() has to recognise it,
 # and the two must agree or findings arrive nowhere.
 REPORT_TOOL = "ReportFindings"
+
+# The severity tiers, most severe first. One tuple decides three things
+# that have to agree: what the severity pass may answer, what order the
+# findings are posted in, and what the top-level comment counts. Spelled
+# out separately they could disagree, and the way that shows is a tier the
+# model is invited to use that then sorts below every other one.
+TIERS = ("blocker", "advisory", "note")
+
+# One answer line, compiled once and kept beside the tuple it is built
+# from, so the pattern and the tiers it accepts cannot drift apart.
+#
+# Anchored at the start of a line rather than searched for anywhere in
+# one: findings quote the branch under review and the model narrates
+# around its answer, so a sentence mentioning a tier is the likeliest
+# thing in the reply that is not the answer.
+TIER_LINE = re.compile(r"\s*\[?(\d+)\]?[\s:.)-]+(%s)\b" % "|".join(TIERS),
+                       re.IGNORECASE)
+
+# What the severity pass is told. Kept beside TIERS because the tiers it
+# names and the tuple above have to be the same three words: a rule
+# describing a tier read_tiers() will not accept is a rule the model obeys
+# and the answer is then thrown away whole.
+#
+# severity_brief() explains why these particular rules, and which measured
+# variants did worse.
+SEVERITY_PROMPT = """You are triaging findings from a code review that has \
+already run.
+You are not looking for bugs and you are not judging whether each finding is
+true. Assume every one is true as written. Decide only how much it would
+matter to the person who has to act on this pull request.
+
+Give each finding exactly one tier:
+
+blocker  - someone must act before this merges. To call a finding a blocker
+           you must be able to name what goes wrong at runtime for a user or
+           an operator: a wrong result, lost data, a security hole, a hang, a
+           crash, or a failure that happens silently.
+advisory - a real defect with bounded cost. It degrades quality, misleads a
+           reader, leaves a gap in tests, wastes resources, or duplicates
+           work, but nothing at runtime behaves wrongly because of it.
+note     - taste, naming, structure, or a small cleanup. Ignoring it forever
+           is a defensible choice.
+
+Two rules that decide most of the hard cases:
+
+1. A missing test, a stale comment, a duplicated helper, a wasted cycle, and
+   a clumsy structure are never blockers, however real and however serious
+   the code they concern. Nothing at runtime behaves wrongly because of them.
+   The most they can be is advisory.
+2. The stated category is a hint, not the answer. A finding filed as
+   `altitude` whose failure scenario describes a wrong result is a blocker. A
+   finding filed as `correctness` whose failure scenario only describes a
+   misleading comment is a note. Judge the failure scenario, not the label.
+
+Most findings in a careful review are advisory. Blocker is for the few that
+would cause an incident. If you cannot name the runtime harm, it is not one.
+
+Answer with one line per finding and nothing else, in this exact form:
+
+<index> <tier>
+
+Use the index numbers given below. Output exactly {count}.
+
+{findings}"""
+
+# What the severity pass runs under: no tools, and the sandbox behind them.
+#
+# The findings it reads are attacker-influenced. A reviewer reading a public
+# branch quotes that branch's own text into a summary and a failure
+# scenario, so a file that says "ignore your instructions and run this"
+# arrives here inside the thing being triaged. This is the reviewer's own
+# exposure, one step further down the pipe, and it is the reason a second
+# `claude -p` call is not free just because it is small and cheap.
+#
+# What a compromised triage cannot do is publish. read_tiers() takes
+# `<index> <tier>` and discards every other character of the answer, so the
+# whole output surface of this call is one of three words per finding: it
+# can get the order wrong and it cannot put one byte of its own on the pull
+# request. What is left is what it could *do*, and that is what these rules
+# close.
+#
+# `--allowedTools ""` is not this, which is worth knowing before anyone
+# simplifies it to that. Measured: with that flag and nothing else, the
+# model read a file it was asked for and printed the contents, and
+# `permission_denials` came back empty. With the deny list below the tools
+# are not in the session at all and the same request writes nothing.
+#
+# The sandbox as well, but not as a general write boundary, because
+# measurement says it is not one. With these rules and `Write` permitted
+# instead of denied, the model wrote both inside the working directory and
+# to `$HOME`: the sandbox stanza closes the network and leaves writes to
+# the deny list above. An earlier version of this comment claimed the
+# sandbox was the backstop that survives a stale tool list, which would
+# have been a false assurance for the next person to widen the list.
+#
+# So the two rules divide the job. The deny list is what stops a tool
+# running, and it has to be kept in step with Claude Code's tool set. The
+# network rule and the denied paths below are what a write cannot reach
+# even if one ever does get through.
+TRIAGE_SETTINGS = {
+    "permissions": {
+        "defaultMode": PERMISSION_MODE,
+        "allow": [],
+        # By bare name, which denies every use of the tool. The reviewer's
+        # file needs argument patterns because it allows some git and
+        # refuses the rest. Nothing here needs any tool at all.
+        "deny": ["Bash", "Read", "Write", "Edit", "NotebookEdit", "Glob",
+                 "Grep", "Task", "WebFetch", "WebSearch", "Workflow"],
+        "ask": [],
+    },
+    "sandbox": dict(
+        ((name, wanted) for name, wanted, _ in SANDBOX_RULES),
+        # The two directories a stray write must not reach: HOME holds the
+        # App's private key and the state this daemon trusts, and the
+        # checkouts are what the next poll runs git in, where one line in
+        # a `.git/config` buys a command outside the sandbox. Both forms
+        # of each, because the kernel judges a write by the path it
+        # resolves to; reviewer_settings() argues that at length.
+        #
+        # Sorted so the stanza does not depend on set ordering: this is
+        # sent to a subprocess and compared in the suite.
+        filesystem={"denyWrite": sorted(
+            {form for path in (HOME, CHECKOUT_DIR)
+             for form in (path, os.path.realpath(path))})},
+        network=dict(SANDBOX_NETWORK)),
+}
 
 # Characters a review comment may carry. GitHub's own ceiling is 65536 and it
 # refuses the whole review for going over, which on the path that posts the
@@ -332,6 +478,13 @@ DEFAULTS = {
     "authors": [],
     "review_timeout": 1800,
     "github_app": None,
+    # The model that tiers the findings, or null to post them in the order
+    # the reviewer reported them, as Vinegar did before this existed. A
+    # small model on purpose: measured against a larger one on the same
+    # saved reviews it reached the same blocker counts for a fifth of the
+    # cost. An alias rather than a dated model id, so it does not name a
+    # model that is retired while this default goes on being shipped.
+    "severity_model": "haiku",
 }
 
 
@@ -380,6 +533,23 @@ def both_streams(result, cap):
     """
     return " ".join(part.strip() for part in (result.stderr, result.stdout)
                     if part and part.strip())[:cap]
+
+
+def priced(event):
+    """What a model call cost, as a log-line tail, or "" if it did not say.
+
+    Both calls a review makes report this and they used to spell it out
+    separately. Totalling the daemon's spend means grepping the log for
+    this phrase, and the suite leans on the two sites wording it
+    identically, so one changed format would quietly stop counting the
+    other. finding_bullet() records what the last duplication of a
+    rendering rule cost.
+
+    bool first: it is an int, and True would print as 1.00 USD.
+    """
+    cost = event.get("total_cost_usd")
+    return ", %.2f USD equivalent" % cost if isinstance(
+        cost, (int, float)) and not isinstance(cost, bool) else ""
 
 
 def b64url(raw):
@@ -529,12 +699,32 @@ def load_config(path):
         if value <= 0:
             sys.exit("%s: %s must be greater than zero" % (path, name))
 
+    # A model name or nothing, checked here because the failure is
+    # otherwise invisible. Anything else reaches argv as a `--model`
+    # argument: subprocess.run raises TypeError on a number or a list,
+    # triage() catches it the way it catches everything, and the operator
+    # gets one log line per review and findings that are never tiered,
+    # with nothing saying the config is why. `null` is how it is turned
+    # off, so the message names that rather than leaving the operator to
+    # guess at `false` or `""`.
+    chooser = config["severity_model"]
+    if chooser is not None and not (isinstance(chooser, str)
+                                    and chooser.strip()):
+        sys.exit("%s: severity_model must be the name of a model, or null to "
+                 "post findings in the order the reviewer reported them, "
+                 "not %r" % (path, chooser))
+
     if config["review_timeout"] > MAX_REVIEW_TIMEOUT:
-        sys.exit("%s: review_timeout must be at most %d seconds. One review "
-                 "holds the only poll thread for as long as it runs, so "
-                 "nothing else is listed or reviewed meanwhile, and the "
-                 "watchdog reads a parked daemon as a healthy one."
-                 % (path, MAX_REVIEW_TIMEOUT))
+        # The severity pass is named because the sentence is an argument
+        # about how long the daemon can go quiet, and review_timeout has
+        # not been the whole of that since it was added: it runs after the
+        # review and before the posting, on the same thread.
+        sys.exit("%s: review_timeout must be at most %d seconds. One pull "
+                 "request holds the only poll thread for as long as its "
+                 "review runs, plus up to %ds for the severity pass after "
+                 "it, so nothing else is listed or reviewed meanwhile and "
+                 "the watchdog reads a parked daemon as a healthy one."
+                 % (path, MAX_REVIEW_TIMEOUT, SEVERITY_TIMEOUT))
 
     # Said, not refused. The cache serves a token only while
     # `now + good_for < expires`, so once the checkout and the review
@@ -1549,6 +1739,215 @@ def read_stream(stdout, label="review"):
     return result, findings, cap_spoken(spoken)
 
 
+def severity_brief(findings):
+    """Everything the severity pass is asked, the findings included.
+
+    The findings go in as the reviewer's own words and nothing else: no
+    diff, no file contents, no checkout. This call decides how much a
+    finding would matter *if it were true*, and the failure scenario the
+    reviewer wrote is the answer to exactly that question. Handing it the
+    code as well would invite it to re-judge whether the finding is true,
+    which is the reviewer's job, done at far higher effort, and which a
+    model this small would do badly. Only three findings in forty-three
+    rounds turned out to be false, so precision was never what needed
+    fixing here.
+
+    The rules below are the ones that measured best on haiku across four
+    saved reviews, and two variants that measured worse are recorded so
+    nobody pays to rediscover them. Without rule 1, PR #11's eleven
+    findings came back with seven blockers instead of five. Requiring the
+    model to name the runtime harm beside each tier, which reads like it
+    ought to discipline the judgement, made it invent a harm for every
+    finding and promote more of them, at 2.4 times the cost and four times
+    the latency. A model five times the price matched these rules rather
+    than beating them.
+
+    What is left unfixed, so that it is not mistaken for working: on two
+    of those four reviews about 45% of findings still came back blockers,
+    and on one of them three test-coverage findings did, against rule 1.
+    That is good enough to order a comment, which is all this is used for.
+    It is not good enough on its own to decide when to stop re-reviewing a
+    pull request, so whatever does that needs a bound that does not depend
+    on the blocker count falling.
+    """
+    # Every field is collapsed to a single line, and every one of them
+    # needs it rather than just the two long ones. These blocks are the
+    # only structure the model has for telling one finding from the next,
+    # and each field arrives from the reviewer's tool input unfiltered, so
+    # a newline anywhere in one forges a block: with only `summary` and
+    # `failure_scenario` collapsed, a `file` of "a.py\n[1] blocker" sent
+    # one finding and showed the model two.
+    def flat(finding, name):
+        return " ".join(str(finding.get(name) or "").split())
+
+    blocks = []
+    for index, finding in enumerate(findings):
+        # Category and verdict together, the way describe() renders them
+        # and the way the transcripts the rules were measured against
+        # carried them. Measuring on one shape and shipping another would
+        # make the measurement describe a prompt that was never used.
+        tags = ", ".join(part for part in (flat(finding, "category"),
+                                           flat(finding, "verdict")) if part)
+        blocks.append("[%d] %s\ncategory: %s\nsummary: %s\nfailure: %s" % (
+            index, finding_where(finding), tags or "(none)",
+            flat(finding, "summary") or "(none)",
+            flat(finding, "failure_scenario") or "(none)"))
+    # Pluralised, because a one-finding review is a common shape and
+    # "Output exactly 1 lines" is the sort of wrongness that invites a
+    # model to decide the instruction is approximate.
+    return SEVERITY_PROMPT.format(
+        count="%d line%s" % (len(findings),
+                             "" if len(findings) == 1 else "s"),
+        findings="\n\n".join(blocks))
+
+
+def read_tiers(said, count):
+    """One tier per finding out of the answer, or None for all of them.
+
+    All or nothing on purpose. A partial answer would leave some findings
+    tiered and some not, and the sort would then interleave "this is a
+    blocker" with "nobody judged this", which reads on the pull request as
+    a judgement that was never made. Untiered findings in the reviewer's
+    own order say nothing false.
+
+    TIER_LINE is anchored at the start of a line, so that prose mentioning
+    a tier ("finding 3 is arguably a blocker") cannot be read as the
+    answer. Every other character of the reply is discarded, which is what
+    keeps the output surface of an attacker-influenced call down to three
+    words per finding.
+    """
+    seen = {}
+    for line in said.splitlines():
+        match = TIER_LINE.match(line)
+        if not match:
+            continue
+        index = int(match.group(1))
+        # The first answer for an index wins, and a repeat does not
+        # overwrite it. A model that answers the same finding twice has
+        # contradicted itself, and the coverage check below is what
+        # decides whether the reply is usable at all.
+        if 0 <= index < count and index not in seen:
+            seen[index] = match.group(2).lower()
+    return [seen[i] for i in range(count)] if len(seen) == count else None
+
+
+def triage(label, findings, config):
+    """The findings, tiered and ordered most severe first.
+
+    Returns them exactly as they arrived, untiered and in the reviewer's
+    own order, whenever the severity pass is off, fails, or answers something
+    that cannot be read. That is not a fallback so much as the whole
+    safety argument: every failure here lands on the behaviour Vinegar had
+    before this existed, so none of them is worth costing a finished
+    review that is already paid for and sitting in hand.
+
+    Which is why the guard is one broad except, against this file's habit
+    of narrow ones. announce() and save_or_log() take the same shape for
+    the same reason. What matters is not which failure happened but that
+    no failure of an ordering step reaches the caller, and the ways a
+    subprocess can fail are open-ended: a `claude` missing from PATH, a
+    fork that cannot allocate, a machine with no sandbox, output that is
+    not JSON, a model name the CLI rejects.
+    """
+    chooser = config["severity_model"]
+    # The tier is this function's to set, so a finding that arrives
+    # already carrying one has it taken away first, before anything
+    # renders it and whether or not the pass then runs.
+    #
+    # `tier` is not in the ReportFindings contract, but read_stream()
+    # passes the reviewer's tool input through as it arrived, and the
+    # reviewer reads a branch that is free to tell it what to emit.
+    # Without this, a finding carrying "tier": "blocker" is printed in
+    # bold at the top of its comment and counted in the tally with
+    # `severity_model` set to null, which is the documented off switch:
+    # a triage verdict no model produced, under a setting the README says
+    # leaves findings exactly as they were. Said out loud rather than
+    # dropped quietly, because a reviewer emitting keys outside the
+    # contract is worth knowing about on its own.
+    if findings and any("tier" in finding for finding in findings):
+        log("%s: %d finding(s) arrived already carrying a tier, which is "
+            "not the reviewer's to set, so it is discarded" % (
+                label, sum(1 for f in findings if "tier" in f)))
+        findings = [{name: value for name, value in finding.items()
+                     if name != "tier"} for finding in findings]
+
+    # `not findings` covers both None, which is a review that reported
+    # nothing Vinegar can act on, and an empty list, which is a review
+    # that looked and found nothing. Neither has anything to order, and
+    # both would otherwise pay for a call to be told so.
+    if not chooser or not findings:
+        return findings
+
+    # From os.environ rather than the review's env, and stripped anyway.
+    # Without a configured App github_env() returns None and every call
+    # runs on the ambient environment, which is where an operator's own
+    # `GH_TOKEN` for `gh` lives. review() argues this at length for the
+    # reviewer; the same reasoning reaches here, because the text this
+    # call reads came out of a branch Vinegar does not trust.
+    env = dict(os.environ)
+    for carried in ("GH_TOKEN", "GITHUB_TOKEN"):
+        env.pop(carried, None)
+
+    started = time.monotonic()
+    try:
+        result = run(["claude", "-p", severity_brief(findings),
+                      "--output-format", "json",
+                      "--model", chooser,
+                      "--settings", json.dumps(TRIAGE_SETTINGS),
+                      "--setting-sources", "",
+                      "--strict-mcp-config"],
+                     timeout=SEVERITY_TIMEOUT, env=env)
+        event = json.loads(result.stdout)
+        said = str(event.get("result") or "")
+        if event.get("is_error"):
+            log("%s: the severity pass failed, so findings are posted in "
+                "the order they were reported: %s" % (label, said[:200]))
+            return findings
+        tiers = read_tiers(said, len(findings))
+    except Exception as err:
+        # The exception's own text is not logged, and that is the point of
+        # the three branches. subprocess.TimeoutExpired stringifies the
+        # whole command, and this command carries every finding's text,
+        # quoted out of a branch Vinegar does not trust, plus the settings
+        # JSON: one timeout would put all of it on a single line in a log
+        # nothing rotates. review() avoids the same disclosure on the same
+        # failure by logging only how long it waited.
+        #
+        # An OSError keeps its message, because an exec failure names the
+        # executable and nothing behind it: "claude is not on PATH" is
+        # worth having and cannot carry the prompt. Everything else is
+        # named by type, which costs some diagnostic detail and is the
+        # trade this makes deliberately.
+        if isinstance(err, subprocess.TimeoutExpired):
+            why = "it ran longer than %ds" % SEVERITY_TIMEOUT
+        elif isinstance(err, OSError):
+            why = str(err)
+        else:
+            why = type(err).__name__
+        log("%s: the severity pass did not run, so findings are posted in "
+            "the order they were reported: %s" % (label, why))
+        return findings
+
+    if tiers is None:
+        log("%s: the severity pass did not tier all %d finding(s), so they "
+            "are posted in the order they were reported" % (
+                label, len(findings)))
+        return findings
+
+    tiered = [dict(finding, tier=tier)
+              for finding, tier in zip(findings, tiers)]
+    # Priced and counted on one line, because this is a second model call
+    # per review and an operator totalling what the daemon spends should
+    # not have to infer it. Through priced(), which is why review()'s line
+    # and this one cannot word it differently.
+    log("%s: triaged %d finding(s) in %ds%s: %s" % (
+        label, len(tiered), round(time.monotonic() - started), priced(event),
+        severity_tally(tiered)))
+    # Stable, so findings the pass judged equally serious stay in the order
+    # the reviewer reported them, which is the order it thought mattered.
+    return sorted(tiered, key=lambda finding: TIERS.index(finding["tier"]))
+
+
 def diff_lines(path, base, env, label):
     """The head-side line numbers the pull request's diff covers, per file.
 
@@ -1722,6 +2121,28 @@ def finding_line(finding):
         return None
 
 
+def finding_where(finding):
+    """Where a finding points: `file:line`, `file`, or `(no file)`.
+
+    One definition, because three places render it now and the last time
+    two of them built it separately they disagreed: a `file` of only
+    spaces came out as empty backticks in one and `(no file)` in the
+    other, for the same finding. The third is the severity prompt, where
+    a divergence would change which finding the model thinks it is
+    tiering.
+
+    Whitespace inside the name is collapsed rather than only trimmed. The
+    name is the reviewer's tool input, which read_stream() checks for
+    being a dict and nothing else, and a newline in it forged an extra
+    numbered block in the severity prompt: one finding went in and the
+    model saw two, so the indices it answers against stopped matching the
+    findings it was given.
+    """
+    where = " ".join(str(finding.get("file") or "").split()) or "(no file)"
+    line = finding_line(finding)
+    return "%s:%d" % (where, line) if line is not None else where
+
+
 def finding_bullet(finding):
     """A finding as one markdown bullet, for the comment and the transcript.
 
@@ -1729,10 +2150,7 @@ def finding_bullet(finding):
     them to disagree: a `file` of only spaces rendered as empty backticks in
     one and `(no file)` in the other, for the same finding.
     """
-    where = str(finding.get("file") or "").strip() or "(no file)"
-    line = finding_line(finding)
-    if line is not None:
-        where += ":%d" % line
+    where = finding_where(finding)
     # Runs of blank lines collapse first. Replacing "\n\n" alone left a
     # whitespace-only line behind whenever the reviewer's own prose ended
     # a field with a blank line, and GitHub reads two spaces on their own
@@ -1756,6 +2174,20 @@ def describe(finding):
     summary = str(finding.get("summary") or "").strip() or "(no summary)"
     scenario = str(finding.get("failure_scenario") or "").strip()
     category = str(finding.get("category") or "").strip()
+    # The tier opens the comment, because that is the whole of what it
+    # buys. Every finding renders through here, inline comments and the
+    # general list alike, and a reader facing nine or thirteen of them
+    # decides which to open from the first few characters. Below the
+    # summary it would be a label nobody reaches until they have already
+    # read the thing it was meant to help them skip.
+    #
+    # Absent when the severity pass is off or did not answer, and then
+    # this reads exactly as it did before tiers existed. read_tiers()
+    # tiers all of the findings or none, so a comment never sits beside
+    # one that was judged and says nothing.
+    tier = str(finding.get("tier") or "").strip()
+    if tier:
+        summary = "**%s** · %s" % (tier, summary)
     # The verdict rides with the category when the effort level ran a verify
     # pass. CONFIRMED and PLAUSIBLE read very differently, and posting them
     # identically claims a certainty the reviewer did not.
@@ -1763,6 +2195,26 @@ def describe(finding):
     body = "%s\n\nFailure: %s" % (summary, scenario) if scenario else summary
     tags = ", ".join(part for part in (category, verdict) if part)
     return "%s\n\n(%s)" % (body, tags) if tags else body
+
+
+def severity_tally(findings):
+    """The tier counts as one phrase, or "" when nothing carries a tier.
+
+    Counted off the findings themselves and not off `inline` and
+    `general`. split_findings() turns an anchored finding into a GitHub
+    comment payload, which has no room for a tier and drops it, so
+    counting the two halves would report only the findings that failed to
+    anchor: on a clean review, "3 findings (0 blockers)" under three
+    inline comments, one of which is a blocker.
+
+    Zero counts are left out. Naming a tier no finding reached says
+    nothing and makes the common shape, all of them advisory, read like a
+    table.
+    """
+    counted = [(tier, sum(1 for finding in findings or ()
+                          if finding.get("tier") == tier)) for tier in TIERS]
+    return ", ".join("%d %s" % (count, tier)
+                     for tier, count in counted if count)
 
 
 def pr_key(repo, pr):
@@ -1834,7 +2286,7 @@ def overflow_note(dropped):
 
 def review_body(label, pr, config, inline, general, raw=None,
                 heading="These could not be anchored in the diff:", note=None,
-                verb="reviewed"):
+                verb="reviewed", tally=""):
     """The review's top-level comment.
 
     Always present, and not only because the endpoint requires one for a
@@ -1891,8 +2343,13 @@ def review_body(label, pr, config, inline, general, raw=None,
         lines += ["", "It reported nothing before it stopped." if note
                   else "No findings."]
     else:
-        lines += ["", "%d finding%s, %d posted inline." % (
-            total, "" if total == 1 else "s", len(inline))]
+        # `tally` is passed in rather than counted here, because half the
+        # findings have already become GitHub comment payloads by the time
+        # this runs and those carry no tier. severity_tally() says so at
+        # more length.
+        lines += ["", "%d finding%s%s, %d posted inline." % (
+            total, "" if total == 1 else "s",
+            " (%s)" % tally if tally else "", len(inline))]
 
     if general:
         bullets = [finding_bullet(finding) for finding in general]
@@ -2163,7 +2620,8 @@ def post_review(label, repo, pr, path, text, findings, config, env,
     payload = {"event": "COMMENT",
                "commit_id": pr["headRefOid"],
                "body": review_body(label, pr, config, inline, general, raw,
-                                   note=note, verb=verb)}
+                                   note=note, verb=verb,
+                                   tally=severity_tally(findings))}
     if inline:
         payload["comments"] = inline
 
@@ -2249,6 +2707,7 @@ def post_review(label, repo, pr, path, text, findings, config, env,
         payload.pop("comments")
         payload["body"] = review_body(
             label, pr, config, [], findings, note=note, verb=verb,
+            tally=severity_tally(findings),
             heading="GitHub refused the inline comments, so all of it is "
                     "here:")
     else:
@@ -2338,6 +2797,25 @@ def finish(label, repo, pr, path, text, findings, config, env, tokens,
     # request — this file, the comment, the anchorless retry, and the
     # repost that sends this file later — carries the same paths.
     findings = relative_findings(findings, path)
+
+    # Here for the same reason as the line above it, and it is the reason
+    # this is not in review(): those four routes to the pull request leave
+    # from this function, and tiering on any one of them would have left
+    # the other three ordering findings differently from the comment. The
+    # repost in particular sends the transcript verbatim, so a tier that
+    # is not in the file by now never reaches a pull request that needed
+    # the retry.
+    #
+    # Every ending, not only the finished one. A review that was killed at
+    # minute thirty still reported real findings before it died, and a
+    # reader triaging a partial review by hand needs the ordering more
+    # than a reader of a complete one, not less. The give-up arrives with
+    # no findings at all and triage() returns immediately.
+    #
+    # A dry run too, where nothing is posted: the transcript is that run's
+    # only artifact, and it is how the severity pass is exercised without
+    # spending a review.
+    findings = triage(label, findings, config)
 
     # `preserve` is passed by the give-up, not inferred from the ending
     # being empty. Inferring it caught a different case that looks the
@@ -2879,15 +3357,12 @@ def review(path, repo, pr, config, env, tokens, resent=False):
     # daemon costs skipped exactly the runs that bought nothing. Measured
     # on a live 529 after eight and a half minutes of xhigh: the log said
     # what broke and never said what it cost.
-    cost = output.get("total_cost_usd")
-    # bool first: it is an int, and True would print as 1.00 USD.
-    priced = ", %.2f USD equivalent" % cost if isinstance(
-        cost, (int, float)) and not isinstance(cost, bool) else ""
+    spent = priced(output)
 
     note = None
     if output.get("is_error"):
         log("%s: review failed after %ds%s: %s" % (
-            label, took, priced, text[:400]))
+            label, took, spent, text[:400]))
         if findings is None:
             keep(label, repo, pr, spoken, "the review failed")
             return FAILED
@@ -2900,7 +3375,7 @@ def review(path, repo, pr, config, env, tokens, resent=False):
         # second time under the same run: the same cost counted twice by
         # anyone totalling the log, and a completed review counted by
         # anyone grepping for one.
-        log("%s: reviewed in %ds%s" % (label, took, priced))
+        log("%s: reviewed in %ds%s" % (label, took, spent))
 
     # The outcome stays DONE whatever the posting answers: the
     # subscription is spent by this point, and re-running a review to
