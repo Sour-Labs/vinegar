@@ -414,8 +414,10 @@ MUTATIONS = [
      '            "", len(inline))]'),
     ("severity-tally-passed-to-the-body",
      "                                   note=note, verb=verb,\n"
-     "                                   tally=severity_tally(findings))}",
-     "                                   note=note, verb=verb)}"),
+     "                                   tally=severity_tally(findings),\n"
+     "                                   since=since)}",
+     "                                   note=note, verb=verb,\n"
+     "                                   since=since)}"),
 
     # What a findings prompt can carry into argv. One entry per condition
     # exec imposes, plus the choice the code argues for at length: a NUL
@@ -685,6 +687,128 @@ MUTATIONS = [
     ("efforts-ultra",
      'EFFORTS = ("low", "medium", "high", "xhigh", "max")',
      'EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")'),
+
+    # --- scoping a pass to what it has not reviewed --------------------
+    # Each probe deleted on its own. Breaking both at once is the mistake
+    # the suite's own _missing() helper documents: with either one left,
+    # a test that refuses every probe stays green.
+    # Written as a whole-tuple swap rather than a line deletion. Deleting
+    # the two lines leaves `in ((list, str)):`, whose outer parens are
+    # grouping rather than a tuple, so the loop unpacks the probe itself
+    # and raises. That comes back ABORTED, which hides whether any check
+    # would have caught it.
+    ("scope-commit-probe",
+     '            (["git", "cat-file", "-e", since + "^{commit}"],\n'
+     '             "the commit its last review finished at is not in this '
+     'clone"),\n'
+     '            (["git", "merge-base", "--is-ancestor", since, '
+     'pr["headRefOid"]],\n'
+     '             "the branch was rewritten since its last review")):',
+     '            (["git", "merge-base", "--is-ancestor", since, '
+     'pr["headRefOid"]],\n'
+     '             "the branch was rewritten since its last review"),):'),
+    ("scope-ancestor-probe",
+     '            (["git", "merge-base", "--is-ancestor", since, '
+     'pr["headRefOid"]],\n'
+     '             "the branch was rewritten since its last review")):',
+     "            ):"),
+    # `-e <sha>` answers yes for a blob or a tree carrying that id.
+    ("scope-commit-peel",
+     '(["git", "cat-file", "-e", since + "^{commit}"],',
+     '(["git", "cat-file", "-e", since],'),
+    # The two ways a probe says no, each narrowing instead of widening.
+    ("scope-probe-timeout",
+     '            log("%s: %s did not finish within %ds, so the whole pull '
+     'request "\n'
+     '                "is reviewed" % (label, " ".join(probe), '
+     'DIFF_TIMEOUT))\n'
+     "            return None",
+     "            return since"),
+    ("scope-probe-refused",
+     "        if result.returncode != 0:\n"
+     '            log("%s: %s, so the whole pull request is reviewed"\n'
+     "                % (label, why))\n"
+     "            return None",
+     "        pass"),
+
+    # --- what may be recorded as reviewed ------------------------------
+    ("state-entry-sha-shape",
+     "    if reviewed_sha and FULL_SHA.match(reviewed_sha):",
+     "    if reviewed_sha:"),
+    ("load-state-sha-shape",
+     '                   or ("reviewed_sha" in done\n'
+     '                       and not (isinstance(done["reviewed_sha"], str)\n'
+     '                                and FULL_SHA.match('
+     'done["reviewed_sha"])))]',
+     "                   ]"),
+    # Unanchored, `re.match` takes a good sha with anything after it.
+    ("full-sha-anchored",
+     'FULL_SHA = re.compile(r"\\A[0-9a-f]{40}\\Z")',
+     'FULL_SHA = re.compile(r"[0-9a-f]{40}")'),
+
+    # --- carrying it past the head it was written at -------------------
+    ("carry-pr-record-once",
+     "                             **dict(carry_forward(kept), "
+     "**carry_pr(done)))",
+     "                             **carry_forward(kept))"),
+    ("carry-pr-pre-review",
+     "                             **dict(carry_forward(kept), post_tries=0,\n"
+     "                                    waivers=0, **carry_pr(done)))",
+     "                             **dict(carry_forward(kept), post_tries=0,\n"
+     "                                    waivers=0))"),
+
+    # --- the three conditions that let a pass narrow the next one ------
+    ("reviewed-sha-unposted",
+     "                       head if outcome == DONE and not unposted\n"
+     '                       and config["comment"] '
+     'else done.get("reviewed_sha"))))',
+     "                       head if outcome == DONE\n"
+     '                       and config["comment"] '
+     'else done.get("reviewed_sha"))))'),
+    ("reviewed-sha-outcome",
+     "                       head if outcome == DONE and not unposted\n",
+     "                       head if not unposted\n"),
+    ("reviewed-sha-dry-run",
+     '                       and config["comment"] '
+     'else done.get("reviewed_sha"))))',
+     '                       else done.get("reviewed_sha"))))'),
+
+    # --- telling the reviewer, and telling the pull request ------------
+    ("brief-since",
+     '           "--append-system-prompt", reviewer_brief(pr, since),',
+     '           "--append-system-prompt", reviewer_brief(pr),'),
+    ("handle-pr-since",
+     "                             resent=attempts > 1, check=check, "
+     "since=since)",
+     "                             resent=attempts > 1, check=check)"),
+    ("brief-scope-name",
+     '           "the pull request\'s full diff" if since '
+     'else "the review scope",',
+     '           "the review scope",'),
+    ("brief-may-read-anything",
+     '        "`git diff %s..HEAD` is the review scope. Read anything in '
+     'the "',
+     '        "`git diff %s..HEAD` is the review scope. Consider the "'),
+    ("body-says-what-it-read",
+     '    if since:\n'
+     '        lines += ["", "This pass reviewed only what was added since '
+     '`%s`, "\n'
+     '                      "which is where the last review of this pull '
+     'request "\n'
+     '                      "finished. Earlier findings are already on the '
+     'pull "\n'
+     '                      "request as their own comments." % since[:7]]',
+     "    pass"),
+
+    # The trap the whole change turns on. GitHub takes an inline comment
+    # only on a line in the pull request's diff, and the reviews endpoint
+    # applies the review whole or not at all, so narrowing the anchors
+    # along with the reading scope loses every finding to one bad anchor.
+    ("anchors-from-the-base",
+     '            findings, diff_lines(path, pr["baseRefName"], env, label), '
+     "label)",
+     "            findings, diff_lines(path, since or pr[\"baseRefName\"], "
+     "env, label), label)"),
 ]
 
 

@@ -188,7 +188,7 @@ Every key in `config.example.json`:
 | `comment` | `true` | Post findings on the pull request. False runs the review and writes only to `~/.vinegar/reviews.dry/`, remembering what it did in `state.json.dry`. |
 | `model` | `null` | Model for the review. Null uses your Claude Code default. Read the note below before setting it. |
 | `fallback_model` | `null` | Model to run the review again on when `model` cannot be routed. Null means no fallback. See below. |
-| `review_on_push` | `false` | Review again when the head commit changes. |
+| `review_on_push` | `false` | Review again when the head commit changes. A second review reads only what was added since the last one that posted. See "The review". |
 | `max_changed_lines` | `3000` | Skip pull requests larger than this. |
 | `skip_drafts` | `true` | Skip drafts. |
 | `skip_bots` | `true` | Skip pull requests opened by bots. |
@@ -806,6 +806,49 @@ that is the only thing it is allowed to mean.
 
 Reviews are submitted with `event: COMMENT`. Vinegar never approves and never
 requests changes, so it cannot hold up a merge. See "What this is not".
+
+### A second review reads only what is new
+
+With `review_on_push` on, a pull request can be reviewed more than once, and the
+second pass does not read the first pass's work again. Vinegar records the
+commit whose findings actually reached the pull request, and the next pass is
+told to report only on `git diff <that commit>..HEAD`.
+
+The reviewer may still read anything it needs. Only what it reports on is
+narrowed. A diff read without the code around it produces confident findings
+about calls whose definitions the reviewer never saw.
+
+Three things widen a pass back to the whole pull request, and all three are
+deliberate: the commit is not in the clone, the branch was rewritten since it
+was reviewed, or nothing has been reviewed yet. Every failure here widens rather
+than narrows. Reading too much costs money and says so in the log; reading too
+little reports a change clean without having looked at it, and nothing
+downstream can tell.
+
+The comment says which happened, so "no findings" on a re-review is never
+ambiguous:
+
+> **Vinegar** · reviewed `89abcde` at high effort
+>
+> This pass reviewed only what was added since `0123456`, which is where the
+> last review of this pull request finished. Earlier findings are already on the
+> pull request as their own comments.
+
+Findings from an earlier pass are not repeated. Their comments are already on
+the pull request: GitHub keeps a comment live where the code around it did not
+change, and where it did change, that code is in the next pass's diff and gets
+read again.
+
+Two things this does **not** change. Inline comments are still anchored against
+the pull request's full diff, because that is the only thing GitHub will accept
+an anchor in, and one bad anchor loses the whole review. And `max_changed_lines`
+still counts the whole pull request, so one that grows past the cap is skipped
+even when each new push is small. That is the existing behaviour rather than a
+decision this made, and it is worth revisiting alongside whatever turns
+`review_on_push` on.
+
+A `--dry-run` never narrows anything: it posts nothing, so there is nothing an
+author has seen, and it deliberately records no starting point for later passes.
 
 ## The checks list
 

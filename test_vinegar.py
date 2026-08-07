@@ -101,6 +101,7 @@ diff --git a/README.md b/README.md
 posted = []
 looked = []
 checked = []
+scoped = []
 check_envs = []
 last_git_diff = [[], None]
 last_post_timeout = [None]
@@ -147,6 +148,14 @@ def fake_run(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
         return subprocess.CompletedProcess(
             cmd, fake_run.diff_rc,
             fake_run.diff_out if fake_run.diff_rc else DIFF, "boom")
+    # The two probes review_scope runs before it narrows a pass. Their own
+    # return code, and not a shared 0: every check about a commit that is
+    # gone or a branch that was rewritten needs to be able to refuse one of
+    # them, and answering 0 to both would put those paths out of reach
+    # while the section still reported green.
+    if cmd[:2] in (["git", "cat-file"], ["git", "merge-base"]):
+        scoped.append(cmd)
+        return subprocess.CompletedProcess(cmd, fake_run.scope_rc, "", "")
     # Before the posting branch, and not folded into it. A check-run call
     # is `gh api ... --method ...` exactly like a review posting, so
     # without its own branch every indicator landed in `posted` and the
@@ -183,6 +192,7 @@ fake_run.diff_rc = 0
 fake_run.diff_out = ""
 fake_run.look_rc = 0
 fake_run.look_out = ""
+fake_run.scope_rc = 0
 fake_run.post_err = "HTTP 422"
 GENUINE_RUN = vinegar.run
 vinegar.run = fake_run
@@ -220,6 +230,7 @@ def reset_stubs():
     fake_run.diff_out = ""
     fake_run.look_rc = 0
     fake_run.look_out = ""
+    fake_run.scope_rc = 0
     fake_run.post_err = "HTTP 422"
     fake_run.check_rc = 0
     fake_run.check_err = ""
@@ -228,6 +239,7 @@ def reset_stubs():
     del posted[:]
     del looked[:]
     del checked[:]
+    del scoped[:]
     del check_envs[:]
 
 
@@ -756,6 +768,17 @@ raw = vinegar.review_body(L, PR, CONFIG, [], [], "the reviewer rambled")
 check("unreadable output is quoted verbatim",
       raw.rstrip().endswith("the reviewer rambled")
       and "did not return its findings" in raw, raw)
+
+# "No findings" on a narrowed pass is ambiguous in the one way that
+# matters: it reads as the change being clean when it may only mean the
+# last forty lines were.
+_narrowed = vinegar.review_body(L, PR, CONFIG, [], [],
+                                since="0123456789abcdef0123456789abcdef01234567")
+check("a narrowed pass says what it actually read",
+      "only what was added since `0123456`" in _narrowed
+      and "No findings." in _narrowed, _narrowed)
+check("a full pass does not claim it was narrowed",
+      "only what was added since" not in empty, empty)
 
 # --- the severity pass ---------------------------------------------------
 reset_stubs()
@@ -3079,6 +3102,109 @@ check("brief does not send the reviewer to a command with no network",
 check("brief says the network is closed rather than leaving it to be found",
       "no network" in brief, brief)
 
+# --- review_scope --------------------------------------------------------
+# Two full commit ids, because state_entry refuses to record anything else
+# and load_state drops an entry carrying anything else. The twelve-hex
+# `PR["headRefOid"]` the rest of this file uses cannot reach these paths,
+# which is the point of both guards.
+OLD_SHA = "0123456789abcdef0123456789abcdef01234567"
+NEW_SHA = "89abcdef0123456789abcdef0123456789abcdef"
+PR_SINCE = dict(PR, headRefOid=NEW_SHA)
+REVIEWED = {"outcome": vinegar.DONE, "sha": OLD_SHA, "reviewed_sha": OLD_SHA}
+
+reset_stubs()
+check("a pull request with no earlier review is read whole",
+      vinegar.review_scope(ROOT, PR_SINCE, {}, None, L) is None
+      and not scoped, scoped)
+
+reset_stubs()
+check("an earlier review that resolves and is an ancestor narrows the pass",
+      vinegar.review_scope(ROOT, PR_SINCE, REVIEWED, None, L) == OLD_SHA,
+      scoped)
+# `-e <sha>` alone answers yes for a blob or a tree that happens to carry
+# that id, and `git diff` would then fail on a scope that had already been
+# called safe. `^{commit}` is what makes the probe ask the question it is
+# there to ask.
+check("the probe asks for a commit rather than any object with that id",
+      any("cat-file" in cmd and cmd[-1].endswith("^{commit}")
+          for cmd in scoped), scoped)
+check("the probes are bounded like every other local git call",
+      vinegar.DIFF_TIMEOUT == 120, vinegar.DIFF_TIMEOUT)
+
+# Each of the three ways an increment stops being safe widens the pass
+# rather than narrowing it. Getting any of these backwards reports a
+# change clean without having read it, and nothing downstream can tell.
+def _missing(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
+    """The commit is gone, but anything else asked about resolves.
+
+    Only `cat-file` refuses, deliberately. Refusing both probes at once
+    reads as a check of the missing-commit path and is not one: with both
+    answering 1, deleting the `cat-file` probe entirely leaves the
+    `merge-base` probe to refuse in its place and the check stays green.
+    """
+    scoped.append(cmd)
+    return subprocess.CompletedProcess(
+        cmd, 1 if cmd[:2] == ["git", "cat-file"] else 0, "", "")
+
+
+reset_stubs()
+vinegar.run = _missing
+check("a commit missing from the clone widens the pass to the whole thing",
+      vinegar.review_scope(ROOT, PR_SINCE, REVIEWED, None, L) is None,
+      scoped)
+check("the ancestor probe is not paid for once the commit is known missing",
+      len(scoped) == 1, scoped)
+
+
+def _rewritten(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
+    """The commit is here, but it is no longer on this branch."""
+    scoped.append(cmd)
+    return subprocess.CompletedProcess(
+        cmd, 1 if cmd[:2] == ["git", "merge-base"] else 0, "", "")
+
+
+reset_stubs()
+vinegar.run = _rewritten
+check("a rewritten branch widens the pass to the whole pull request",
+      vinegar.review_scope(ROOT, PR_SINCE, REVIEWED, None, L) is None,
+      scoped)
+check("the rewrite is only known after both probes ran", len(scoped) == 2,
+      scoped)
+
+
+def _hanging_probe(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
+    raise subprocess.TimeoutExpired(cmd, timeout)
+
+
+reset_stubs()
+vinegar.run = _hanging_probe
+check("a probe that hangs widens the pass rather than narrowing it",
+      vinegar.review_scope(ROOT, PR_SINCE, REVIEWED, None, L) is None)
+reset_stubs()
+
+# --- the brief a re-review gets ------------------------------------------
+again = vinegar.reviewer_brief(PR_SINCE, OLD_SHA)
+check("a re-review names the increment as the review scope",
+      "`git diff %s..HEAD` is the review scope" % OLD_SHA in again, again)
+# Two scopes named as the scope is two instructions for one decision, and
+# the reviewer settles it itself with nothing in the transcript saying
+# which way it went.
+check("a re-review stops calling the full diff the review scope",
+      "refs/heads/release-2...HEAD` is the pull request's full diff" in again
+      and again.count("is the review scope") == 1, again)
+# Narrowing what is reported must not narrow what may be read. A diff read
+# with no surrounding code produces confident findings about calls whose
+# definitions the reviewer never saw.
+check("a re-review still lets the reviewer read outside the increment",
+      "Read anything in the repository you need" in again, again)
+check("a re-review says why earlier findings are not wanted again",
+      "already reported" in again, again)
+check("a re-review has somewhere to go if the commit does not resolve",
+      "review the pull request's full diff instead" in again, again)
+check("a first review's brief is left exactly as it was measured working",
+      "refs/heads/release-2...HEAD` is the review scope" in brief
+      and "re-review" not in brief, brief)
+
 # --- handle_pr: the guard that bounds every crash --------------------------
 reset_stubs()
 # An exception anywhere in review() used to leave no state at all, so the
@@ -3211,7 +3337,7 @@ def _indicator_after(what, attempts, closes=None):
     del posted[:]
 
     def review_stub(path, repo, pr, config, env, tokens, resent=False,
-                    check=None):
+                    check=None, since=None):
         checked.append(("REVIEW", "", None))
         if closes:
             vinegar.close_check(L, check, closes, CHK_ENV)
@@ -3668,7 +3794,161 @@ check("a flag that is not a boolean is dropped",
       and _flags.get("o/r#14", {}).get("announced") is True, _flags)
 check("dropping a bad entry does not quarantine the good ones",
       not _quarantined(), _quarantined())
+
+# reviewed_sha is the one string in an entry, and it reaches a git command
+# line. "Is it a str" is the wrong question, because every injection is:
+# `"; rm -rf ~"` is a perfectly good str. Forty lowercase hex characters is
+# the whole of what a resolved commit can be.
+with open(vinegar.STATE_PATH, "w") as h:
+    h.write('{"o/r#12": {"outcome": "reviewed", "sha": "a", '
+            '"reviewed_sha": "a1b2c3d"},'
+            ' "o/r#13": {"outcome": "reviewed", "sha": "a", '
+            '"reviewed_sha": 12345},'
+            ' "o/r#14": {"outcome": "reviewed", "sha": "a", '
+            '"reviewed_sha": "%s"}}' % OLD_SHA)
+_since = vinegar.load_state()
+check("a reviewed_sha that is not a full commit id is dropped",
+      "o/r#12" not in _since and "o/r#13" not in _since
+      and _since.get("o/r#14", {}).get("reviewed_sha") == OLD_SHA, _since)
+# Anchored at both ends. A valid sha with anything after it is the half
+# that matters, and `re.match` alone takes it.
+with open(vinegar.STATE_PATH, "w") as h:
+    h.write('{"o/r#12": {"outcome": "reviewed", "sha": "a", '
+            '"reviewed_sha": "%s and then some"}}' % OLD_SHA)
+check("a commit id with anything after it is dropped too",
+      vinegar.load_state() == {}, vinegar.load_state())
+
+# --- where the last review finished --------------------------------------
+# The reader throws away the whole entry, so writing what it would reject
+# forgets a finished review and buys it again. The two checks are one
+# rule, and they have to agree.
+check("a full commit id is recorded as where the last review finished",
+      vinegar.state_entry("a", vinegar.DONE,
+                          reviewed_sha=OLD_SHA).get("reviewed_sha")
+      == OLD_SHA)
+check("a short sha is never written for the reader to reject",
+      "reviewed_sha" not in vinegar.state_entry("a", vinegar.DONE,
+                                                reviewed_sha="a1b2c3d"))
+
+# carry_forward is scoped to one head and its callers pass an entry that is
+# deliberately empty once the branch moves. reviewed_sha is read only after
+# the head has moved, so carrying it that way would clear it on exactly the
+# poll that needs it — and the failure is invisible, because a pass that
+# forgets simply reads the whole pull request as it always used to.
+check("where the last review finished outlives the head moving",
+      vinegar.carry_pr(REVIEWED).get("reviewed_sha") == OLD_SHA)
+check("the head-scoped counters do not outlive the head moving",
+      "reviewed_sha" not in vinegar.carry_forward({}))
 os.remove(vinegar.STATE_PATH)
+
+# --- a second pass reads only what is new --------------------------------
+reset_stubs()
+_ag_real = (vinegar.review, vinegar.checkout, vinegar.github_env,
+            vinegar.save_state, vinegar.run)
+PR_AGAIN = dict(PR_LIVE, headRefOid=NEW_SHA)
+AGAIN_CFG = dict(CONFIG, review_on_push=True)
+
+
+_ag_saves = []
+
+
+def _second_pass(entry, config=None, review=None):
+    """One handle_pr over a pull request that was reviewed at OLD_SHA."""
+    reset_stubs()
+    del _ag_saves[:]
+    vinegar.checkout = lambda repo, pr, env: ROOT
+    vinegar.github_env = lambda *a, **k: {"GH_TOKEN": "x"}
+    # Every save, deep-copied. handle_pr writes the entry twice, once
+    # before the review and once after, and the two are the same mutable
+    # dict object: keeping references would show the last write in both
+    # slots and the pre-review check below would be asserting on the
+    # post-review entry without saying so.
+    vinegar.save_state = lambda st: _ag_saves.append(
+        json.loads(json.dumps(st)))
+    vinegar.run = claude_run
+    claude_run.stream = stream(call(FINDINGS[:1]), result_event())
+    if review:
+        vinegar.review = review
+    state = {L: dict(entry)}
+    vinegar.handle_pr("o/r", PR_AGAIN, config or AGAIN_CFG, state, {})
+    return state.get(L, {})
+
+
+_ag_state = _second_pass(REVIEWED)
+_ag_brief = claude_run.saw[claude_run.saw.index("--append-system-prompt") + 1]
+check("a second pass tells the reviewer where the last one finished",
+      OLD_SHA in _ag_brief and "This is a re-review" in _ag_brief, _ag_brief)
+# The trap this whole change turns on. GitHub takes an inline comment only
+# on a line in the pull request's diff, and the reviews endpoint applies
+# the review whole or not at all, so narrowing the anchors along with the
+# reading scope would demote earlier-commit findings to the general comment
+# and, worse, do it silently. Narrow what is read; never what is anchored.
+check("the anchors still come from the whole pull request, not the increment",
+      "refs/heads/release-2...HEAD" in last_git_diff[0]
+      and not any(OLD_SHA in arg for arg in last_git_diff[0]),
+      last_git_diff[0])
+check("a second pass that posted moves where the next one starts",
+      _ag_state.get("reviewed_sha") == NEW_SHA, _ag_state)
+# The FAILED marker handle_pr writes before the review runs is what a
+# process killed mid-review leaves behind. If it drops where the last
+# review finished, that kill costs a whole-pull-request re-read on top of
+# the review it already lost, and nothing says why.
+check("the marker written before the review keeps where the last one finished",
+      _ag_saves and _ag_saves[0][L].get("reviewed_sha") == OLD_SHA,
+      _ag_saves[:1])
+check("the pull request is told what the pass actually read",
+      any("only what was added since" in body["body"]
+          for _cmd, body in posted), posted)
+
+
+def _could_not_post(*a, **k):
+    """A review that ran, cost the subscription, and reached nobody."""
+    os.makedirs(vinegar.REVIEW_DIR, exist_ok=True)
+    with open(vinegar.unposted_path("o/r", PR_AGAIN), "w") as handle:
+        handle.write("%s\n" % NEW_SHA)
+    return vinegar.DONE
+
+
+# DONE is not the same as posted. deliver() keeps the outcome DONE whatever
+# the posting answered, because the subscription is spent either way, so a
+# review GitHub refused arrives here looking exactly like one that landed.
+# Narrowing on it would skip past findings nobody has ever seen.
+_ag_unposted = _second_pass(REVIEWED, review=_could_not_post)
+check("a review that reached nobody does not move where the next one starts",
+      _ag_unposted.get("reviewed_sha") == OLD_SHA, _ag_unposted)
+vinegar.forget(vinegar.unposted_path("o/r", PR_AGAIN))
+
+_ag_failed = _second_pass(REVIEWED, review=lambda *a, **k: vinegar.FAILED)
+check("a failed review does not move where the next one starts",
+      _ag_failed.get("reviewed_sha") == OLD_SHA, _ag_failed)
+
+# A dry run posts nothing by definition, and post_review answers POSTED
+# there and writes no marker, so both tests above pass while the pull
+# request carries nothing. One --dry-run against the real VINEGAR_HOME
+# would otherwise tell the live daemon this commit had been shown to the
+# author.
+_ag_dry = _second_pass(REVIEWED, config=dict(AGAIN_CFG, comment=False),
+                       review=lambda *a, **k: vinegar.DONE)
+check("a dry run does not move where the next one starts",
+      _ag_dry.get("reviewed_sha") == OLD_SHA, _ag_dry)
+
+# A skip at a new head must not be what forgets a finished review. It
+# would be silent: the next pass that does run reads the whole pull
+# request, exactly as it always used to, with only the bill to show.
+_ag_skipped = _second_pass(REVIEWED, config=dict(AGAIN_CFG, authors=["nobody"]))
+check("a skip does not forget where the last review finished",
+      _ag_skipped.get("reviewed_sha") == OLD_SHA
+      and _ag_skipped.get("outcome") == "skipped", _ag_skipped)
+
+# And a pull request nothing has reviewed yet is still read whole.
+_ag_first = _second_pass({})
+check("a first pass is not narrowed by an entry that has no commit in it",
+      "This is a re-review" not in claude_run.saw[
+          claude_run.saw.index("--append-system-prompt") + 1])
+
+(vinegar.review, vinegar.checkout, vinegar.github_env, vinegar.save_state,
+ vinegar.run) = _ag_real
+reset_stubs()
 
 # --- a resend must not duplicate a review that already landed --------------
 reset_stubs()

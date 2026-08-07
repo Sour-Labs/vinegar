@@ -129,6 +129,20 @@ STATE_PATH = os.path.join(HOME, "state.json")
 LOCK_PATH = os.path.join(HOME, "vinegar.pid")
 REVIEW_DIR = os.path.join(HOME, "reviews")
 
+# What `reviewed_sha` has to look like before anything diffs from it.
+#
+# The other fields in an entry are counters and flags, and load_state()
+# type-checks them because the give-up's own log line tells operators to
+# edit this file by hand. This one is a string that reaches a git command
+# line, so a type check is not enough: `"reviewed_sha": "; rm -rf ~"` is a
+# perfectly good str. Forty lowercase hex characters is the whole of what a
+# resolved commit can be, it is what `git rev-parse` answers with, and
+# anything else means the entry is not describing a commit.
+#
+# Anchored at both ends. `re.match` alone would take a valid sha with
+# anything at all after it, which is the half of the check that matters.
+FULL_SHA = re.compile(r"\A[0-9a-f]{40}\Z")
+
 # Checkouts sit beside HOME rather than inside it, and that is load-bearing
 # rather than tidiness. The reviewer is denied every read under HOME, so a
 # checkout in there is a repository it cannot open: it falls back to fetching
@@ -1166,9 +1180,28 @@ def carry_forward(kept):
             "announce_waivers": kept.get("announce_waivers", 0)}
 
 
+def carry_pr(done):
+    """The field a rebuilt entry keeps whatever the head is doing.
+
+    Separate from carry_forward() because the two have opposite lifetimes,
+    and folding this into that one would be the bug rather than the tidy-up.
+    Everything carry_forward() holds is scoped to a single commit: three
+    sends and stop, spent at this head, void the moment the branch moves.
+    Its callers pass `kept`, which is deliberately empty when the head has
+    changed.
+
+    `reviewed_sha` is read only *after* the head has moved, because a pass
+    with no new commits has no increment to scope to and never asks. Passing
+    it through `kept` would clear it on exactly the poll that needs it, and
+    the failure would be invisible: every re-review would silently read the
+    whole pull request, which is what this used to do anyway.
+    """
+    return {"reviewed_sha": done.get("reviewed_sha")}
+
+
 def state_entry(head, outcome, attempts=0, reason=None, announced=False,
                 tries=0, post_tries=0, unposted=False, waivers=0,
-                announce_waivers=0):
+                announce_waivers=0, reviewed_sha=None):
     """One pull request's record, built the one way.
 
     Four sites used to spell this out as a fresh literal, each deciding for
@@ -1214,6 +1247,22 @@ def state_entry(head, outcome, attempts=0, reason=None, announced=False,
         # this helper and was re-added by hand at one site, which is the
         # exception every other counter here exists to remove.
         entry["announce_waivers"] = announce_waivers
+    if reviewed_sha and FULL_SHA.match(reviewed_sha):
+        # The head whose findings actually reached the pull request, which
+        # is what a later pass diffs from. Deliberately not `sha`: that one
+        # is the head this entry last *acted* at, and record_once() rewrites
+        # it for skips and failed checkouts, neither of which showed anyone
+        # anything.
+        #
+        # Checked on the way in as well as on the way out, and the two
+        # checks are not the same check. load_state() drops a bad one
+        # because an operator can hand-edit this file. This one is about
+        # never writing what that reader would reject: the reader throws
+        # away the *whole entry*, so an entry that fails its own validator
+        # is one that forgets a finished review and buys it again. Not
+        # narrowing is the cheap way to be wrong; this is the expensive
+        # one.
+        entry["reviewed_sha"] = reviewed_sha
     return entry
 
 
@@ -1336,7 +1385,16 @@ def load_state():
                    # pull request that is never told Vinegar gave up.
                    or any(not isinstance(done[field], bool)
                           for field in ("announced", "unposted")
-                          if field in done)]
+                          if field in done)
+                   # And the one string. It is interpolated into a git
+                   # command, so "is it a str" is the wrong question:
+                   # every injection is. A commit is forty hex characters
+                   # or the entry is not describing one, and an entry that
+                   # cannot say where the last review got to is exactly an
+                   # entry that should be forgotten and reviewed whole.
+                   or ("reviewed_sha" in done
+                       and not (isinstance(done["reviewed_sha"], str)
+                                and FULL_SHA.match(done["reviewed_sha"])))]
             for key in bad:
                 log("%s: its entry in %s cannot be read, so it is forgotten "
                     "and will be reviewed again" % (key, STATE_PATH))
@@ -1611,7 +1669,59 @@ def save_transcript(repo, pr, text, findings=None, note=None):
         repo, pr["number"], pr["headRefOid"][:7], pr["url"], body))
 
 
-def reviewer_brief(pr):
+def review_scope(path, pr, done, env, label):
+    """The commit a re-review diffs from, or None to read the whole thing.
+
+    Two probes, and both of them answer the same way when they fail: read
+    the whole pull request. That is the only direction a wrong answer here
+    is allowed to fail in. A pass that reads too much costs money and says
+    so in the log; a pass that reads too little reports a change clean
+    without having looked at it, and nothing downstream can tell.
+
+    The first probe is whether the commit is still here at all. checkout()
+    fetches `pull/N/head` into a clone it may have deleted and remade since
+    the last pass, and an unreachable commit can be pruned, so the sha in
+    `state.json` is a claim about this clone rather than a fact of it.
+
+    The second is whether the branch was rewritten. After a rebase or a
+    force-push the old commit is no longer an ancestor of the head, so
+    there is no "since" to speak of: `git diff old..HEAD` would describe
+    the difference between two branches rather than the work added to one.
+    `--is-ancestor` answers that in one call and costs nothing.
+
+    A moving base branch deliberately gets no probe, and that is worth
+    saying because it looks like it should. checkout() refreshes the base
+    on every pass, so the merge base really does move under a long-lived
+    pull request, but the increment is measured along the branch rather
+    than from the base: commits that leave the pull request's diff by being
+    merged into the base leave `refs/heads/<base>...HEAD` and never entered
+    `<since>..HEAD` in the first place. What the moving base does change is
+    which lines can carry an inline comment, and diff_lines() recomputes
+    that from the current full diff on every pass regardless.
+    """
+    since = done.get("reviewed_sha")
+    if not since:
+        return None
+
+    for probe, why in (
+            (["git", "cat-file", "-e", since + "^{commit}"],
+             "the commit its last review finished at is not in this clone"),
+            (["git", "merge-base", "--is-ancestor", since, pr["headRefOid"]],
+             "the branch was rewritten since its last review")):
+        try:
+            result = run(probe, cwd=path, env=env, timeout=DIFF_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            log("%s: %s did not finish within %ds, so the whole pull request "
+                "is reviewed" % (label, " ".join(probe), DIFF_TIMEOUT))
+            return None
+        if result.returncode != 0:
+            log("%s: %s, so the whole pull request is reviewed"
+                % (label, why))
+            return None
+    return since
+
+
+def reviewer_brief(pr, since=None):
     """What the reviewer cannot work out from the checkout it wakes up in.
 
     Two things, and both of them are things it otherwise guesses at.
@@ -1643,13 +1753,30 @@ def reviewer_brief(pr):
     is the right one to use and not always one that exists locally. Telling a
     reviewer to diff against a missing ref and forbidding any alternative
     leaves it with the guess this exists to prevent.
+
+    `since` narrows what is reported without narrowing what may be read, and
+    the two have to be said separately or the reviewer picks one. A diff read
+    with no surrounding code produces confident findings about calls whose
+    definitions it never saw, so the permission to read the whole branch is
+    part of the instruction rather than an aside. What it must not do is
+    report again on code this pass's diff does not touch: that was reported
+    on an earlier pass and is already on the pull request as its own comment.
+
+    The whole-pull-request wording is left exactly as it was when `since` is
+    absent. It is the arrangement that was measured working after two others
+    cost live reviews, and the first pass of every pull request still runs
+    through it.
     """
     base = pr["baseRefName"]
+    # Named as what it is in each case. Calling the base diff "the review
+    # scope" while a later paragraph names a different scope is two
+    # instructions for one decision, and the reviewer settles that itself
+    # with nothing in the transcript saying which it chose.
     return (
         "This checkout is detached at the head commit of pull request #%d, so "
         "it has no upstream branch and `@{upstream}` does not resolve. The "
         "pull request targets `%s`, which should be fetched into this clone: "
-        "`git diff refs/heads/%s...HEAD` is the review scope, spelled that "
+        "`git diff refs/heads/%s...HEAD` is %s, spelled that "
         "way because a tag of the same name would otherwise win. If that ref "
         "does not resolve, use `refs/remotes/origin/%s...HEAD`, which this "
         "clone carries even when the branch itself was not fetched, and say "
@@ -1657,13 +1784,36 @@ def reviewer_brief(pr):
         "could not establish the scope rather than guessing at one. You have "
         "no network: `gh` cannot reach GitHub from here, so do not reach for "
         "it. Do not substitute a branch of your own choosing, and do not "
-        "assume `main`.\n\n"
+        "assume `main`.%s\n\n"
         "Post nothing to GitHub yourself. Report every finding through the "
         "%s tool, including when you found none, and give `file` relative to "
         "the repository root. Vinegar reads that call and posts the whole "
         "review from it, so a finding you leave out of it is a finding "
         "nobody sees."
-        % (pr["number"], base, base, base, REPORT_TOOL))
+        % (pr["number"], base, base,
+           "the pull request's full diff" if since else "the review scope",
+           base, since_brief(since) if since else "", REPORT_TOOL))
+
+
+def since_brief(since):
+    """The paragraph that turns a full review into a re-review.
+
+    Its own function because it is the half of the brief that changes, and
+    a test that asserts on it should not have to spell out the base-branch
+    half to reach it.
+    """
+    return (
+        "\n\nThis is a re-review. An earlier pass already reviewed this pull "
+        "request up to commit `%s` and its findings are already on the pull "
+        "request, so this pass reviews only what has been added since: "
+        "`git diff %s..HEAD` is the review scope. Read anything in the "
+        "repository you need in order to judge that change, the earlier "
+        "commits on this branch and the files they touch included. Report "
+        "only on the review scope: a problem in code this pass's diff does "
+        "not touch was either already reported or deliberately left, and "
+        "raising it again is noise. If `%s` does not resolve, review the "
+        "pull request's full diff instead and say so in your summary."
+        % (since, since, since))
 
 
 def clamp(label, body):
@@ -2399,7 +2549,7 @@ def overflow_note(dropped):
 
 def review_body(label, pr, config, inline, general, raw=None,
                 heading="These could not be anchored in the diff:", note=None,
-                verb="reviewed", tally=""):
+                verb="reviewed", tally="", since=None):
     """The review's top-level comment.
 
     Always present, and not only because the endpoint requires one for a
@@ -2418,6 +2568,17 @@ def review_body(label, pr, config, inline, general, raw=None,
     # used to claim a review happened when none ever ran. The marker itself
     # stays fixed: already_posted() matches it as a prefix.
     lines = [review_heading(pr, config, verb)]
+
+    # What this pass actually read, whenever that is not the whole pull
+    # request. Without it "no findings" on a re-review is ambiguous in the
+    # one way that matters: it reads as the change being clean when it may
+    # only mean the last forty lines were. Said before the note below,
+    # because it frames everything under it, the note included.
+    if since:
+        lines += ["", "This pass reviewed only what was added since `%s`, "
+                      "which is where the last review of this pull request "
+                      "finished. Earlier findings are already on the pull "
+                      "request as their own comments." % since[:7]]
 
     # A run that was killed or that errored still reports whatever it had
     # got to, and without this that is indistinguishable from a finished
@@ -2869,7 +3030,7 @@ def already_posted(label, repo, pr, env, verb="reviewed"):
 
 
 def post_review(label, repo, pr, path, text, findings, config, env,
-                note=None, verb="reviewed", resent=False):
+                note=None, verb="reviewed", resent=False, since=None):
     """Turn what the reviewer reported into one review on the pull request.
 
     Answers POSTED when the pull request carries the review, THROTTLED
@@ -2931,7 +3092,8 @@ def post_review(label, repo, pr, path, text, findings, config, env,
                "commit_id": pr["headRefOid"],
                "body": review_body(label, pr, config, inline, general, raw,
                                    note=note, verb=verb,
-                                   tally=severity_tally(findings))}
+                                   tally=severity_tally(findings),
+                                   since=since)}
     if inline:
         payload["comments"] = inline
 
@@ -3017,7 +3179,7 @@ def post_review(label, repo, pr, path, text, findings, config, env,
         payload.pop("comments")
         payload["body"] = review_body(
             label, pr, config, [], findings, note=note, verb=verb,
-            tally=severity_tally(findings),
+            tally=severity_tally(findings), since=since,
             heading="GitHub refused the inline comments, so all of it is "
                     "here:")
     else:
@@ -3073,7 +3235,7 @@ def keep(label, repo, pr, text, why):
 
 def finish(label, repo, pr, path, text, findings, config, env, tokens,
            note=None, verb="reviewed", preserve=False, resent=False,
-           check=None):
+           check=None, since=None):
     """Record the review on disk and post it, whatever ended the run.
 
     Answers post_review()'s answer: whether the pull request carries it.
@@ -3189,7 +3351,7 @@ def finish(label, repo, pr, path, text, findings, config, env, tokens,
     # freshly minted where the review's own may be an hour old by now.
     sending = posting_env(label, config, repo, tokens, env)
     posted = post_review(label, repo, pr, path, text, findings, config,
-                         sending, note, verb, resent)
+                         sending, note, verb, resent, since=since)
     # Cleared once it is on the pull request. What is left behind says a
     # review is saved and waiting, which is what handle_pr acts on: the
     # outcome is recorded DONE either way, `review_on_push` is false, and
@@ -3513,7 +3675,8 @@ def unroutable(output, findings):
             and output.get("total_cost_usd") == 0)
 
 
-def review(path, repo, pr, config, env, tokens, resent=False, check=None):
+def review(path, repo, pr, config, env, tokens, resent=False, check=None,
+           since=None):
     prompt = "/code-review %s %d" % (config["effort"], pr["number"])
 
     # The review reads a diff that Vinegar did not write, so it runs under
@@ -3551,7 +3714,7 @@ def review(path, repo, pr, config, env, tokens, resent=False, check=None):
     # part of the final result, and this is the combination that was measured
     # working rather than the one that reads most likely.
     cmd = ["claude", "-p", prompt,
-           "--append-system-prompt", reviewer_brief(pr),
+           "--append-system-prompt", reviewer_brief(pr, since),
            "--output-format", "stream-json", "--verbose",
            "--settings", reviewer_settings(path),
            "--setting-sources", "",
@@ -3609,7 +3772,7 @@ def review(path, repo, pr, config, env, tokens, resent=False, check=None):
         # next ending to honour that nothing checked.
         if announce(label, lambda: finish(
                 label, repo, pr, path, text, findings, config, env, tokens,
-                note, resent=resent, check=check)) == POSTED:
+                note, resent=resent, check=check, since=since)) == POSTED:
             return
         if config["comment"]:
             # Promised only when it is true. finish() writes the marker
@@ -3996,7 +4159,7 @@ def spend_announce(key, config, state, head, attempts, tries, said):
     was = state.get(key, {})
     entry = state_entry(head, FAILED, attempts,
                         announced=said == POSTED or spent, tries=tries,
-                        **carry_forward(was))
+                        **dict(carry_forward(was), **carry_pr(was)))
     state[key] = entry
     save_state(state)
 
@@ -4026,8 +4189,13 @@ def record_once(state, key, done, head, outcome, reason):
     else:
         log("%s: %s" % (key, reason))
     kept = done if done.get("sha") == head else {}
+    # `kept` for the head-scoped counters, `done` for the one field that
+    # outlives the head. A skip or a failed checkout at a new commit must
+    # not be what forgets where the last real review got to: the pull
+    # request would then be read whole on the next pass that does run,
+    # silently, with only the bill to show for it.
     state[key] = state_entry(head, outcome, kept.get("attempts", 0), reason,
-                             **carry_forward(kept))
+                             **dict(carry_forward(kept), **carry_pr(done)))
     state[key]["seen"] = seen
     save_state(state)
 
@@ -4254,8 +4422,15 @@ def handle_pr(repo, pr, config, state, tokens):
     # review unpostable the moment it was written.
     kept = done if done.get("sha") == head else {}
     state[key] = state_entry(head, FAILED, attempts,
-                             **dict(carry_forward(kept), post_tries=0, waivers=0))
+                             **dict(carry_forward(kept), post_tries=0,
+                                    waivers=0, **carry_pr(done)))
     save_state(state)
+
+    # Worked out before the review, because it is what the review is told,
+    # and after the checkout, because both probes read this clone.
+    since = review_scope(path, pr, done, env, key)
+    if since:
+        log("%s: reviewing what was added since %s" % (key, since[:7]))
 
     # Opened here rather than inside review(), so that the one place that
     # sees every ending is also the place that finishes it. review()
@@ -4297,7 +4472,7 @@ def handle_pr(repo, pr, config, state, tokens):
             # give-up rediscovery already says `resent` for the same
             # crash window.
             outcome = review(path, repo, pr, config, env, tokens,
-                             resent=attempts > 1, check=check)
+                             resent=attempts > 1, check=check, since=since)
         except Exception as err:
             # The subscription is spent by the time most of these can
             # happen, and an unrecorded pull request is reviewed again on
@@ -4309,16 +4484,41 @@ def handle_pr(repo, pr, config, state, tokens):
             log("%s: the review did not complete: %s" % (key, err))
             outcome = FAILED
 
+        # Given a name because two decisions read it now, and the second
+        # one is the whole of what a later pass is allowed to skip.
+        unposted = os.path.exists(unposted_path(repo, pr))
+
         # Recorded with whether a saved review is waiting behind it, so the
         # next poll can find that out without listing a directory.
         # post_tries reset: this review writes its own transcript over any
         # saved one, so the budget that governed the old copy is void. Kept,
         # it met the new marker already spent and nothing would repost or
         # forget it.
+        #
+        # reviewed_sha is advanced only by a review whose findings reached
+        # the pull request.
+        #
+        # DONE alone is not that. deliver()'s docstring records why: the
+        # outcome stays DONE whatever the posting answered, because the
+        # subscription is spent either way, so a review GitHub refused and
+        # a review nobody has seen both arrive here as DONE. Narrowing the
+        # next pass on one of those would hide findings that were never
+        # shown once.
+        #
+        # And `config["comment"]` on top, because a dry run posts nothing
+        # by definition. post_review() answers POSTED there and writes no
+        # marker, so both tests above pass while the pull request carries
+        # nothing at all. One `--dry-run` against the real VINEGAR_HOME
+        # would otherwise tell the live daemon that everything up to this
+        # commit had been reviewed and shown to the author. The cost is
+        # that `--dry-run` cannot exercise a narrowed pass; the suite can.
         state[key] = state_entry(
             head, outcome, attempts,
             **dict(carry_forward(kept), post_tries=0, waivers=0,
-                   unposted=os.path.exists(unposted_path(repo, pr))))
+                   unposted=unposted,
+                   reviewed_sha=(
+                       head if outcome == DONE and not unposted
+                       and config["comment"] else done.get("reviewed_sha"))))
         save_state(state)
 
         if outcome == FAILED and attempts >= MAX_ATTEMPTS:
@@ -4538,6 +4738,25 @@ def main():
                 # One sentence, like the daemon gives for the same
                 # failure, rather than a traceback through the lock.
                 sys.exit("%s: checkout failed: %s" % (args.pr, err))
+
+            # Read here as well as after the review, rather than hoisting
+            # the one below. That one is deliberately re-read at the end so
+            # that a review lasting twenty minutes records against whatever
+            # the file says then; holding a copy across the review would
+            # write back a snapshot from before it and undo anything the
+            # operator changed meanwhile. This copy is used for one field
+            # and then dropped.
+            #
+            # A manual run scopes itself exactly as the daemon would, which
+            # is what makes `--pr` the way to exercise this. Under a scratch
+            # VINEGAR_HOME there is no state, so there is no `reviewed_sha`
+            # and the pull request is read whole, which is the right answer
+            # rather than a limitation.
+            since = review_scope(where, pr, load_state().get(
+                pr_key(repo, pr), {}), env, args.pr)
+            if since:
+                log("%s: reviewing what was added since %s"
+                    % (args.pr, since[:7]))
             # Wrapped, so the recording below always happens. The
             # subscription is spent by the time most of these can fire,
             # and dying here left no entry at all: the daemon reviewed
@@ -4562,7 +4781,7 @@ def main():
             try:
                 hand = open_check(args.pr, repo, pr, config, env)
                 outcome = review(where, repo, pr, config, env, tokens,
-                                 check=hand)
+                                 check=hand, since=since)
             except Exception as err:
                 log("%s: the review did not complete: %s" % (args.pr, err))
                 outcome = FAILED
@@ -4601,11 +4820,22 @@ def main():
                 # forward, a spent post_tries met the new marker at 3 of 3,
                 # so neither the repost branch nor the forget branch fired
                 # and the review sat on disk for ever.
+                # The same rule handle_pr uses, and it has to be the same
+                # rule: a hand-run review that posted is a review the author
+                # has seen, so the daemon's next pass may start from it.
+                # Getting this wrong in only one of the two places is how a
+                # manual run would quietly widen or narrow every later
+                # daemon pass on that pull request.
+                unposted = bool(unposted_for(repo, pr, scan=False)[0])
                 state[pr_key(repo, pr)] = state_entry(
                     pr["headRefOid"], outcome, kept.get("attempts", 0) + 1,
                     **dict(carry_forward(kept), post_tries=0, waivers=0,
-                           unposted=bool(
-                               unposted_for(repo, pr, scan=False)[0])))
+                           unposted=unposted,
+                           reviewed_sha=(
+                               pr["headRefOid"]
+                               if outcome == DONE and not unposted
+                               and config["comment"]
+                               else was.get("reviewed_sha"))))
                 save_state(state)
                 if state[pr_key(repo, pr)].get("unposted"):
                     log("%s: the review is saved to be posted on a later "
