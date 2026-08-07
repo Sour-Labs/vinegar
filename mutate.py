@@ -455,11 +455,9 @@ MUTATIONS = [
      '        return {"repo": repo, "id": mine[0].get("id"), "closed": False}',
      "    if False:\n        pass"),
     ("check-ignores-another-apps",
-     '    mine = [was for was in (open_already or {}).get("check_runs") or []\n'
-     '            if (was.get("app") or {}).get("id")\n'
-     '            == config["github_app"].get("app_id") and was.get("id")]',
-     '    mine = [was for was in (open_already or {}).get("check_runs") or []\n'
-     '            if was.get("id")]'),
+     '            if str((was.get("app") or {}).get("id"))\n'
+     '            == str(config["github_app"].get("app_id")) and was.get("id")]',
+     "            if was.get(\"id\")]"),
     # A handle with no id would PATCH `check-runs/None` on every ending.
     ("check-handle-needs-an-id",
      '    return {"repo": repo, "id": made["id"], "closed": False} \\\n'
@@ -504,38 +502,78 @@ MUTATIONS = [
     # Left open, the pull request lists a Vinegar check that spins for
     # ever and the next attempt reuses it rather than clearing it.
     ("check-closed-when-the-review-fails",
-     "        close_check(key, check, ended,",
-     "        (lambda *a, **k: None)(key, check, ended,"),
+     "        close_check(key, check, ended_title(outcome, attempts),",
+     "        (lambda *a, **k: None)(key, check, ended_title(outcome, attempts),"),
 
     # --- what the first review pass found ------------------------------
     ("check-close-retryable-after-a-refusal",
      '    check["closed"] = settled is not None',
      '    check["closed"] = True'),
     ("check-reuse-needs-an-id",
-     '            == config["github_app"].get("app_id") and was.get("id")]',
-     '            == config["github_app"].get("app_id")]'),
+     '            == str(config["github_app"].get("app_id")) and was.get("id")]',
+     '            == str(config["github_app"].get("app_id"))]'),
     ("check-body-matches-the-flag",
      "    body = json.dumps(payload) if payload is not None else None",
      "    body = json.dumps(payload) if payload else None"),
     ("check-closed-even-if-recording-raises",
      "    finally:\n"
-     "        # Worked out on its own lines rather than inline, because as one",
+     "        # Its own credentials, minted now. The ones above were asked to",
      "    except BaseException:\n"
      "        raise\n"
      "    else:\n"
-     "        # Worked out on its own lines rather than inline, because as one"),
+     "        # Its own credentials, minted now. The ones above were asked to"),
     ("check-done-that-posted-nothing-is-not-finished",
-     '            ended = "The review ran but nothing reached the pull request"',
-     '            ended = "The review finished"'),
+     '    return "The review ran but nothing reached the pull request"',
+     '    return "The review finished"'),
     ("check-closed-on-fresh-credentials",
-     "        close_check(key, check, ended,\n"
+     "        close_check(key, check, ended_title(outcome, attempts),\n"
      "                    posting_env(key, config, repo, tokens, env) or env)",
-     "        close_check(key, check, ended, env)"),
+     "        close_check(key, check, ended_title(outcome, attempts), env)"),
     # Not the extraction, which changes no behaviour and so nothing can
     # catch: the format itself, which GitHub rejects the update over.
     ("utc-stamp-format",
      '    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")',
      '    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")'),
+
+    # --- what the second review pass found -----------------------------
+    # A refused close must not let the backstop relabel a posted review as
+    # one that never posted.
+    ("check-retry-repeats-the-first-title",
+     '    title = check.get("said") or title\n'
+     '    summary = check.get("summary") or summary',
+     "    pass"),
+    # app_jwt signs with str(app_id), so a quoted one mints and matched
+    # nothing here.
+    ("check-app-id-compared-as-strings",
+     '            if str((was.get("app") or {}).get("id"))\n'
+     '            == str(config["github_app"].get("app_id")) and was.get("id")]',
+     '            if (was.get("app") or {}).get("id")\n'
+     '            == config["github_app"].get("app_id") and was.get("id")]'),
+    # Opening it is the one call here that parses a reply GitHub sent.
+    ("check-opened-inside-the-try",
+     "        check = open_check(key, repo, pr, config, env)\n"
+     "        try:",
+     "        try:"),
+    # The hand-run path: reachable by no check and anchored by no
+    # mutation until the second pass said so.
+    ("check-hand-run-opens-one",
+     "                hand = open_check(args.pr, repo, pr, config, env)",
+     "                hand = None"),
+    ("check-hand-run-closes-it",
+     "                close_check(args.pr, hand, ended_title(outcome),",
+     "                (lambda *a, **k: None)(args.pr, hand, ended_title(outcome),"),
+    ("check-hand-run-records-through-ctrl-c",
+     "            finally:\n"
+     "                # Not \"finished\" for a review that answered DONE. finish()",
+     "            except BaseException:\n"
+     "                raise\n"
+     "            else:\n"
+     "                # Not \"finished\" for a review that answered DONE. finish()"),
+    # The reuse lookup's query. Dropping the status filter adopts a
+    # completed run, and a completed run cannot be reopened.
+    ("check-reuse-asks-for-running-only",
+     '        "commits/%s/check-runs?check_name=%s&status=in_progress"',
+     '        "commits/%s/check-runs?check_name=%s"'),
 
     # --- constants -----------------------------------------------------
     ("max-attempts", "MAX_ATTEMPTS = 3", "MAX_ATTEMPTS = 99"),

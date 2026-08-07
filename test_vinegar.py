@@ -1190,6 +1190,17 @@ check("no url means the key is absent, not empty",
 # during one is a documented step, and MAX_ATTEMPTS brings the same head
 # back twice more. Three spinning indicators on one pull request is the
 # failure this avoids.
+# The query the reuse lookup sends, which nothing asserted while
+# `fake_run.check_open` answered the same runs whatever was asked. Drop
+# `status=in_progress` and attempt 2 adopts attempt 1's *completed* run,
+# skips the POST, and the pull request never shows a running Vinegar
+# again: a completed run cannot be returned to in_progress, and that
+# PATCH answers 200 while changing nothing.
+_asked_path = [where for how, where, _ in checked if how == "GET"][0]
+check("the reuse lookup asks only for this app's running check",
+      "status=in_progress" in _asked_path
+      and "check_name=%s" % vinegar.CHECK_NAME in _asked_path
+      and PR["headRefOid"] in _asked_path, _asked_path)
 _reuse = _opened(check_open={"check_runs": [{"id": 99, "app": {"id": 77}}]})
 check("an indicator an earlier attempt left running is reused",
       _reuse and _reuse["id"] == 99
@@ -1200,6 +1211,11 @@ check("an indicator an earlier attempt left running is reused",
 check("no handle carries a credential, however it was made",
       not _has_secret(_made) and not _has_secret(_reuse),
       (sorted(_made or {}), sorted(_reuse or {})))
+check("an app_id written as a string still matches its own run",
+      _opened(dict(CHK_CONFIG,
+                   github_app={"app_id": "77", "private_key": "/k.pem"}),
+              check_open={"check_runs": [{"id": 99, "app": {"id": 77}}]})["id"]
+      == 99, checked)
 check("another app's check of the same name is not adopted",
       _opened(check_open={"check_runs": [{"id": 99, "app": {"id": 5}}]})["id"]
       == 4242, checked)
@@ -1241,11 +1257,18 @@ vinegar.close_check(L, _stuck, "first try", CHK_ENV)
 check("a refused close leaves the indicator open for the backstop",
       _stuck["closed"] is False, _stuck)
 fake_run.check_rc = 0
-vinegar.close_check(L, _stuck, "second try", CHK_ENV)
-check("and the backstop's attempt actually goes out",
-      [a["output"]["title"] for h, _, a in checked if h == "PATCH"]
-      == ["first try", "second try"],
-      [a["output"]["title"] for h, _, a in checked if h == "PATCH"])
+# The retry repeats what the first attempt tried to say. `closed` stays
+# False on a refusal so the backstop can retry, and the backstop works
+# its own title out from "the indicator is still open", which it reads as
+# "the posting never happened". On a review that posted and then failed
+# only to *say* so, that inference is backwards: without this, the tally
+# was replaced by "nothing reached the pull request" on a pull request
+# visibly carrying the review.
+vinegar.close_check(L, _stuck, "The review ran but nothing reached the "
+                    "pull request", CHK_ENV)
+_tries = [a["output"]["title"] for h, _, a in checked if h == "PATCH"]
+check("a retry repeats the first attempt's title, not the backstop's",
+      _tries == ["first try", "first try"], _tries)
 check("a close that lands marks the handle closed", _stuck["closed"] is True,
       _stuck)
 # The reuse branch needs the id guard the create branch has, or every
@@ -3731,6 +3754,66 @@ finally:
 # and discarded.
 check("a --pr run posts what it reviewed rather than deferring",
       _pr_kw.get("resent") in (None, False), _pr_kw)
+
+
+def _hand_run(review_stub, app=True):
+    """One `--pr` run through main(), and the checks calls it made."""
+    kept = (vinegar.review, vinegar.find_pr, vinegar.checkout,
+            vinegar.github_env, sys.argv)
+    with open(os.path.join(os.environ["VINEGAR_HOME"], "config.json"),
+              "w") as handle:
+        json.dump({"repos": ["o/r"]} if not app else
+                  {"repos": ["o/r"],
+                   "github_app": {"app_id": 77,
+                                  "private_key": _covered_key}}, handle)
+    vinegar.review = review_stub
+    vinegar.find_pr = lambda repo, number, env: PR_LIVE
+    vinegar.checkout = lambda repo, pr, env: ROOT
+    vinegar.github_env = lambda *a, **k: {"GH_TOKEN": "x"}
+    sys.argv = ["vinegar.py", "--pr", "o/r#12"]
+    del checked[:]
+    try:
+        vinegar.main()
+    except SystemExit:
+        pass
+    finally:
+        (vinegar.review, vinegar.find_pr, vinegar.checkout,
+         vinegar.github_env, sys.argv) = kept
+    return [asked["output"]["title"] for how, _, asked in checked
+            if how == "PATCH"]
+
+
+# A hand run is minutes of silence on a real pull request too, and this
+# whole path was reachable by no check and anchored by no mutation: it
+# could have been deleted outright with the suite green.
+_hand_done = _hand_run(lambda *a, **k: vinegar.DONE)
+check("a hand run opens and finishes the indicator too",
+      _hand_done == ["The review ran but nothing reached the pull request"],
+      _hand_done)
+_hand_failed = _hand_run(lambda *a, **k: vinegar.FAILED)
+check("a hand run that failed says so on the indicator",
+      _hand_failed == ["The review failed"], _hand_failed)
+
+
+def _hand_interrupted(*a, **k):
+    raise KeyboardInterrupt()
+
+
+# Ctrl-C is how the README says to stop a run, and it is not an Exception.
+# It used to walk past the handler with the indicator still spinning and,
+# worse, with no state entry, so the daemon re-reviewed the same head at
+# full cost and posted a second complete review.
+try:
+    _hand_ctrl_c = _hand_run(_hand_interrupted)
+except KeyboardInterrupt:
+    _hand_ctrl_c = [asked["output"]["title"] for how, _, asked in checked
+                    if how == "PATCH"]
+check("Ctrl-C during a hand run still finishes the indicator",
+      _hand_ctrl_c == ["The review failed"], _hand_ctrl_c)
+check("Ctrl-C during a hand run still records the attempt",
+      vinegar.load_state().get(vinegar.pr_key("o/r", PR_LIVE), {}).get("sha")
+      == PR_LIVE["headRefOid"],
+      vinegar.load_state().get(vinegar.pr_key("o/r", PR_LIVE)))
 
 # A manual run writes no state, which is right. But a refused post leaves
 # a marker the daemon only honours when an entry stands behind it, so

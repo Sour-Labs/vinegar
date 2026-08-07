@@ -795,9 +795,9 @@ is what people read.
 **It needs the App's `checks: write` permission, which is not granted by
 default.** Adding it to the App is only half of it: GitHub holds the change as a
 request until the installation accepts it too, on the installation's settings
-page. Until both are done every review logs one line saying so. Without a
-configured GitHub App there is no entry at all, because no user token can own a
-check run.
+page. Until both are done, every review says so in the log, once for each
+call that was refused. Without a configured GitHub App there is no entry at
+all, because no user token can own a check run.
 
 A retried review adds a second entry rather than reusing the first. An entry a
 killed review left running *is* reused, so a daemon stopped mid-review does not
