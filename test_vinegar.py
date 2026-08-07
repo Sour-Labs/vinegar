@@ -3324,6 +3324,18 @@ check("brief does not send the reviewer to a command with no network",
       "gh pr diff" not in brief, brief)
 check("brief says the network is closed rather than leaving it to be found",
       "no network" in brief, brief)
+# The same argument as the network sentence above, one step further: a
+# reviewer discovering a denial one command at a time pays a turn for each.
+# Measured across the three rounds of PR #24, six of sixteen denied commands
+# were `sed`, `find` and `awk` doing what Read, Grep and Glob already do.
+check("brief names the tools rather than leaving the denials to be found",
+      "Read, Grep and Glob" in brief and "`python3`" in brief, brief)
+# Separate, because it is a different failure. Told only which commands are
+# denied, a reviewer plans a review around running the tests: three rounds
+# of PR #24 each reached for `python3 test_vinegar.py` and each spent a turn
+# finding out.
+check("brief says the reviewer cannot run the code it is reviewing",
+      "cannot run this repository's tests" in brief, brief)
 
 # --- review_scope --------------------------------------------------------
 # Two full commit ids, because state_entry refuses to record anything else

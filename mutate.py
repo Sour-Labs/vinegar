@@ -788,6 +788,20 @@ MUTATIONS = [
      '           "the pull request\'s full diff" if since '
      'else "the review scope",',
      '           "the review scope",'),
+    # A denial the reviewer has to discover costs it a turn each time. Six
+    # of PR #24's sixteen were sed, find and awk doing what Read, Grep and
+    # Glob already do; most of the rest were python3 running the suite.
+    ("brief-names-the-read-tools",
+     '        "it. Use Read, Grep and Glob to read this checkout: `sed`, `awk`, "\n'
+     '        "`find` and every interpreter, `python3` among them, are denied, so "\n'
+     '        "reaching for one costs a turn and returns nothing. You cannot run "',
+     '        "it. You cannot run "'),
+    # Separate, because it is a different failure: told only which commands
+    # are denied, a reviewer plans a review around running the tests.
+    ("brief-says-the-code-cannot-be-run",
+     '        "reaching for one costs a turn and returns nothing. You cannot run "\n'
+     '        "this repository\'s tests or any of its code. Do not substitute a "',
+     '        "reaching for one costs a turn and returns nothing. Do not substitute a "'),
     ("brief-may-read-anything",
      '        "`git diff %s..HEAD` is the review scope. Read anything in '
      'the "',
