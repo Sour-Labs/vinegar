@@ -1556,7 +1556,7 @@ vinegar.post_review(L, "o/r", PR, ROOT, text, FINDINGS[:4], CONFIG, None,
                     since="0123456789abcdef0123456789abcdef01234567",
                     blockers=True)
 check("the anchor-refused retry still says how the pass was scoped",
-      len(posted) == 2 and "reports only blockers" in posted[1][1]["body"]
+      len(posted) == 2 and "asked for blockers only" in posted[1][1]["body"]
       and "only what was added since" in posted[1][1]["body"],
       posted[1][1]["body"][:400] if len(posted) > 1 else posted)
 fake_run.rc = 0
@@ -3809,6 +3809,17 @@ vinegar.handle_pr("o/r", PR_LIVE, CONFIG, _gm_state, {})
 check("a token that cannot be minted counts as an attempt",
       not posted and _gm_state[L].get("announce_tries") == 1,
       (len(posted), _gm_state))
+# The give-up rebuilds the entry like every other path, so it carries the
+# rounds already spent or hands them all back. rounds_done()'s docstring
+# names this case by name: a pull request that reaches MAX_ATTEMPTS once,
+# which is three bad minutes at GitHub, would otherwise go back to
+# reporting everything it finds from then on.
+_gr_state = {L: {"outcome": vinegar.FAILED, "sha": PR["headRefOid"],
+                 "attempts": vinegar.MAX_ATTEMPTS, "rounds": 2}}
+del posted[:]
+vinegar.handle_pr("o/r", PR_LIVE, CONFIG, _gr_state, {})
+check("a give-up does not hand back the rounds already spent",
+      _gr_state[L].get("rounds") == 2, _gr_state)
 vinegar.github_env = lambda *a, **k: None
 
 # A dry run must not tell the live daemon the give-up was already said:
@@ -4301,6 +4312,16 @@ _rd_skipped = _second_pass(dict(REVIEWED, rounds=2),
                            config=dict(AGAIN_CFG, authors=["nobody"]))
 check("a skip does not hand back the rounds already spent",
       _rd_skipped.get("rounds") == 2, _rd_skipped)
+# DONE is not the same as posted. deliver() keeps the outcome DONE
+# whatever the posting answered, so a review GitHub refused arrives here
+# looking exactly like one that landed. Counting it means round three
+# telling an author that the first two "reported everything they found,
+# and those findings are on the pull request already" on a pull request
+# carrying nothing at all.
+_rd_unposted = _second_pass(dict(REVIEWED, rounds=1), review=_could_not_post)
+check("a review that reached nobody does not count a round",
+      _rd_unposted.get("rounds") == 1, _rd_unposted)
+vinegar.forget(vinegar.unposted_path("o/r", PR_AGAIN))
 
 
 def _checkout_fails(repo, pr, env):
@@ -4313,9 +4334,19 @@ check("a failed checkout does not hand back the rounds already spent",
       _rd_broken)
 # And the marker written before the review runs, which is what a process
 # killed mid-review leaves behind. Counting the round there would charge
-# for a review that never reported anything.
+# for a review that never reported anything, and dropping the carry would
+# hand back every round the pull request had already spent.
+#
+# Read off a pass that reached the marker. A failed checkout returns from
+# record_once and never gets that far, so taking the saves from the run
+# above tested record_once's copy twice and left this one covered by
+# nothing at all.
+_rd_marker = _second_pass(dict(REVIEWED, rounds=2))
 check("the marker written before the review has not counted the round yet",
-      _ag_saves and _ag_saves[0][L].get("rounds") == 2, _ag_saves[:1])
+      len(_ag_saves) > 1 and _ag_saves[0][L].get("rounds") == 2,
+      _ag_saves[:1])
+check("the marker written before the review keeps the rounds already spent",
+      _rd_marker.get("rounds") == 3, (_ag_saves[:1], _rd_marker))
 
 # What the reviewer is actually told, which is the whole feature. A filter
 # applied to the tiers afterwards would not do: the severity pass reads a
@@ -4329,6 +4360,16 @@ _bl_brief = claude_run.saw[claude_run.saw.index("--append-system-prompt") + 1]
 _bl_posted = [body["body"] for _cmd, body in posted]
 check("a later review is told to report only blockers",
       "reports only blockers" in _bl_brief, _bl_brief)
+# The transcript is told too, and read off the file the pass actually
+# wrote rather than off a direct call to save_transcript. The wire from
+# review() through finish() carried `since` under two guards and
+# `blockers` under none, so dropping it there left BLOCKERS_MARK on no
+# transcript any real review produced — and the repost that delivers a
+# refused review days later reads the mark, not the flag.
+with open(vinegar.transcript_path("o/r", PR_AGAIN)) as _h:
+    _bl_tx = _h.read()
+check("the transcript of a blockers-only review is told it was one",
+      vinegar.BLOCKERS_MARK in _bl_tx, _bl_tx[:300])
 # Narrowing what is reported must not narrow what is read. A reviewer told
 # to look only for blockers reads less carefully and finds fewer of them,
 # and that judgement is the expensive thing this program buys.
@@ -4393,14 +4434,14 @@ check("both refuse the same things as blockers whatever their severity",
 # different thing here. Without it a quiet later review reads as the change
 # being clean when it only means nothing in it breaks at runtime.
 check("the pull request is told that smaller findings were held back",
-      any("reports only blockers" in body for body in _bl_posted), _bl_posted)
+      any("asked for blockers only" in body for body in _bl_posted), _bl_posted)
 check("it names the number rather than leaving the author to guess",
       any("first 2 reviews" in body for body in _bl_posted), _bl_posted)
 _bl_body = vinegar.review_body(L, PR, CONFIG, [], [], since=OLD_SHA,
                                blockers=True)
 check("what was read is said before what was reported from it",
       _in_order(_bl_body, "only what was added since",
-                "reports only blockers"), _bl_body)
+                "asked for blockers only"), _bl_body)
 check("an ordinary review says none of it",
       "blockers" not in vinegar.review_body(L, PR, CONFIG, [], []))
 
@@ -4988,7 +5029,7 @@ check("a --pr run posts what it reviewed rather than deferring",
       _pr_kw.get("resent") in (None, False), _pr_kw)
 
 
-def _hand_scoped(entry, argv=("vinegar.py", "--pr", "o/r#12")):
+def _hand_scoped(entry, argv=("vinegar.py", "--pr", "o/r#12"), review=None):
     """What `--pr` scopes itself to, and what it records afterwards.
 
     The manual half of the narrowing was reachable by no check and anchored
@@ -5000,7 +5041,8 @@ def _hand_scoped(entry, argv=("vinegar.py", "--pr", "o/r#12")):
     kept = (vinegar.review, vinegar.find_pr, vinegar.checkout,
             vinegar.github_env, vinegar.save_transcript, sys.argv)
     seen = {}
-    vinegar.review = lambda *a, **k: seen.update(k) or (vinegar.DONE, True)
+    vinegar.review = review or (
+        lambda *a, **k: seen.update(k) or (vinegar.DONE, True))
     vinegar.find_pr = lambda repo, number, env: dict(PR_LIVE,
                                                      headRefOid=NEW_SHA)
     vinegar.checkout = lambda repo, pr, env: ROOT
@@ -5035,6 +5077,51 @@ check("--whole still records where this review got to",
 _hn_seen, _hn_state = _hand_scoped({})
 check("a hand run with nothing reviewed before it reads the whole thing",
       _hn_seen.get("since") is None, _hn_seen)
+
+# The other half of the manual path, and it shipped the same way the
+# scoping half did: the round count, the narrowing it decides and the
+# round it records were all reachable by no check. This harness only ever
+# passed entries without `rounds`, so `blockers` was False on every hand
+# run and every line computing it could have been deleted.
+_hb_seen, _hb_state = _hand_scoped(dict(REVIEWED, rounds=2))
+check("a hand run narrows to blockers on the round the daemon would",
+      _hb_seen.get("blockers") is True, _hb_seen)
+check("a hand run counts the round it just spent",
+      _hb_state.get("rounds") == 3, _hb_state)
+_he_seen, _he_state = _hand_scoped(dict(REVIEWED, rounds=1))
+check("a hand run before the cut still reports everything",
+      _he_seen.get("blockers") is False, _he_seen)
+# `--whole` is the only way out of this, and there is no second flag. An
+# operator hand-running a fourth review wants all of it: a review scoped
+# to everything that still withholds anything smaller than a blocker is
+# not the whole review its own flag promises.
+_hwb_seen, _hwb_state = _hand_scoped(
+    dict(REVIEWED, rounds=2), ("vinegar.py", "--pr", "o/r#12", "--whole"))
+check("--whole opts out of the blockers narrowing as well as the scope",
+      _hwb_seen.get("blockers") is False and _hwb_seen.get("since") is None,
+      _hwb_seen)
+check("--whole still counts the round it spent",
+      _hwb_state.get("rounds") == 3, _hwb_state)
+
+
+def _hand_could_not_post(*a, **k):
+    """A hand run that spent the subscription and reached nobody."""
+    os.makedirs(vinegar.REVIEW_DIR, exist_ok=True)
+    with open(vinegar.unposted_path("o/r", dict(PR_LIVE, headRefOid=NEW_SHA)),
+              "w") as handle:
+        handle.write("%s\n" % NEW_SHA)
+    return vinegar.DONE, False
+
+
+# The same rule as the daemon's, and it needed saying here too: a hand run
+# answers DONE whatever the posting did, so counting on the outcome alone
+# charges a round for a review the author never saw.
+_hu_seen, _hu_state = _hand_scoped(dict(REVIEWED, rounds=1),
+                                   review=_hand_could_not_post)
+check("a hand run that reached nobody does not count a round",
+      _hu_state.get("rounds") == 1, _hu_state)
+vinegar.forget(vinegar.unposted_path("o/r", dict(PR_LIVE,
+                                                 headRefOid=NEW_SHA)))
 
 # Refused rather than ignored. `--whole` is read only by the --pr branch,
 # so as a bare flag it was accepted, did nothing, and said nothing: an
@@ -5388,14 +5475,14 @@ vinegar.forget(vinegar.unposted_path("o/r", PR_TIER))
 _titles = []
 
 
-def _titled(findings, note=None, sha="d0d0d0d0d0d0"):
+def _titled(findings, note=None, sha="d0d0d0d0d0d0", blockers=False):
     handle = {"repo": "o/r", "id": 7, "closed": False}
     del checked[:]
     at = dict(PR_LIVE, headRefOid=sha)
     fake_run.rc, fake_run.post_err = 0, ""
     vinegar.run = _run_and_tier
     vinegar.finish(L, "o/r", at, ROOT, "words", findings, CONFIG, None, {},
-                   note, check=handle)
+                   note, check=handle, blockers=blockers)
     vinegar.run = fake_run
     vinegar.forget(vinegar.unposted_path("o/r", at))
     said = [asked for how, _, asked in checked if how == "PATCH"]
@@ -5419,6 +5506,22 @@ check("a review that did not finish says so in the checks list",
 check("one finding is not reported as 1 findings",
       _titled(_tier_found[:1], sha="ee00ee00ee00").startswith("1 finding ("),
       _titles[-1])
+# The narrowing has to survive into the closed title. open_check puts it in
+# the running one, this overwrites that title, and the one left behind is
+# what stands for the rest of the pull request's life: without it "No
+# findings" from a blockers-only fifth round is the same six characters as
+# "No findings" from a first review that read everything, and `gh pr
+# checks` is where an agent reads it.
+check("a blockers-only review says so in the finished check too",
+      _titled([], sha="ff00ff00ff00", blockers=True)
+      == "No findings, reporting blockers only", _titles[-1])
+check("an ordinary review's finished check claims no narrowing",
+      "blockers" not in _titled([], sha="ab00ab00ab00"), _titles[-1])
+# The note stays last, because it is the caveat that most changes how the
+# rest of the title reads.
+check("a narrowed run that was killed still says it was killed, last",
+      _titled(_tier_found, note="killed at 30 minutes", sha="ac00ac00ac00",
+              blockers=True).endswith("did not finish"), _titles[-1])
 
 fake_run.rc, fake_run.post_err = 1, "HTTP 403 Resource not accessible"
 # This block's ambiguous post consulted the landed-review read; the
@@ -5797,6 +5900,13 @@ check("an oversized saved review keeps its findings, not its narration",
       and "## Findings" in posted[0][1]["body"]
       and "the beginning was cut" in posted[0][1]["body"],
       len(posted[0][1]["body"]) if posted else "nothing posted")
+# The round the refused review never got. handle_pr deliberately does not
+# count one for a review whose findings did not land, so this send is the
+# moment the author is finally shown something, and the only one: the
+# marker is forgotten on the next line. Missed here, a pull request whose
+# posting failed twice would report everything for ever.
+check("the send that finally lands counts the round it never got",
+      _big_state[_lost_key].get("rounds") == 1, _big_state)
 check("a posted saved review stops arming the directory scan",
       _big_state[_lost_key].get("unposted") is None, _big_state)
 
@@ -5822,11 +5932,12 @@ check("an oversized narrowed review still says what it read",
       and "## Findings" in posted[0][1]["body"],
       posted[0][1]["body"][:300] if posted else "nothing posted")
 
-# Both marks, because both are written and the lift reads to the blank
-# line rather than taking one line. Matching only the scope mark kept the
-# scope line and left the blockers line in the body, where the cut then
-# took it: a review that reported one finding out of everything it saw,
-# arriving days later as a review that found one thing.
+# Both marks arrive, which is the cheap half of this and does not by
+# itself prove the lift matches either one: they are joined by a single
+# newline, so `find("\n\n")` runs past both whichever mark sat at the
+# start. The case that actually holds the lift honest is the blockers-only
+# transcript below, which has no scope line in front of it. Kept for the
+# shape both-marks-at-once produces, not as the guard.
 vinegar.save_transcript("o/r", PR_LOST, "narration " * 9000, FINDINGS[:1],
                         None, "0123456789abcdef0123456789abcdef01234567",
                         True)

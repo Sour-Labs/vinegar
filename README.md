@@ -926,23 +926,57 @@ The pull request is told, because "no findings" means a different thing here:
 > pull request as their own comments.
 >
 > The first 2 reviews of a pull request report everything they find. This is a
-> later one, so it reports only blockers: findings where something goes wrong at
-> runtime. Anything smaller it found is not listed here.
+> later one, so it was asked for blockers only: findings where something goes
+> wrong at runtime. Anything smaller it found is not listed here.
 >
 > No findings.
 
-The checks list says it too, as `Reviewing at high effort, blockers only`, since
-that is the half of this an agent polling `gh pr checks` can read. So does the
-transcript, for the same reason the narrowing statement is written there.
+That says what the pass was *asked for* rather than what came back, and the
+distinction is not pedantry. The severity pass runs afterwards and is
+independent, so it can tier a finding this review reported as `note`. Claiming
+"it reports only blockers" above a tally reading "1 finding (1 note)" would tell
+the pull request it is seeing blockers above what Vinegar itself calls the
+smallest thing there is. Saying what was asked for stays true whatever the tier
+comes back as, and leaves the disagreement visible instead of contradictory.
+
+The checks list says it too, since that is the half of this an agent polling
+`gh pr checks` can read: `Reviewing at high effort, blockers only` while it runs,
+and `No findings, reporting blockers only` once it finishes. Both matter, and the
+second one more, because the finished title is what stands for the rest of the
+pull request's life. So does the transcript, for the same reason the narrowing
+statement is written there.
 
 The count is per pull request and it survives everything: the head moving, a
-skip, a failed checkout, a review that failed and was retried. Only a review
-that ran to an ending counts a round. It lives in `state.json` as `rounds`, so
-deleting an entry starts that pull request over at round one.
+skip, a failed checkout, a give-up, a review that failed and was retried. It
+lives in `state.json` as `rounds`, so deleting an entry starts that pull request
+over at round one.
+
+**A round is a review whose findings reached the pull request**, not one that
+ran. A review whose posting GitHub refused is saved to disk and answers `DONE`
+like any other, but the author has been shown nothing, so it counts nothing; the
+round is counted later, once, if the saved review is sent successfully. Without
+that, two refused postings would have the third round telling an author that the
+first two "reported everything they found, and those findings are on the pull
+request already" on a pull request carrying nothing at all.
 
 Set `blockers_only_after` to `null` to turn this off. With `review_on_push` on
 that means a full review of every push for the life of the pull request, and
 nothing bounds what one pull request can cost.
+
+**`vinegar --pr owner/repo#N` counts rounds the same way**, so this is not inert
+while `review_on_push` is false: a third hand run of the same pull request
+reports only blockers, even though the daemon reviewed it once. `--whole` is the
+way out, and it opts out of both narrowings at once — the whole pull request is
+read, and everything found in it is reported:
+
+```sh
+python3 vinegar.py --pr owner/repo#12 --whole
+```
+
+There is deliberately no second flag. An operator reaching for `--pr` after an
+unsatisfying review wants all of it, and a review scoped to everything that still
+withholds anything smaller than a blocker is not the whole review the flag's name
+promises.
 
 **What this does not bound is spend.** A branch pushed to fifteen times buys
 fifteen reviews, and each one parks the single poll thread for nine to
