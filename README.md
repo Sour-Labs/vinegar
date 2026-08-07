@@ -217,8 +217,10 @@ is not always a public model id. `claude-opus-5[1m]` selects a routing
 variant, and nothing promises a variant keeps answering across Claude Code
 releases or account changes. When one stops, every review comes back the same
 way: a result event carrying `api_error_status` 404, about a second in, having
-spent nothing. Vinegar retries three times, gives up, and then says nothing on
-any pull request in any repository it polls until somebody reads the log.
+spent nothing. Vinegar retries three times and gives up. It says so on each
+pull request, so the failure is visible rather than silent, but no pull
+request in any repository it polls gets reviewed until somebody fixes the
+config.
 
 Set `fallback_model` to a plain model id and that failure costs one extra
 second per review instead of every review. `"claude-opus-5"` is the sensible

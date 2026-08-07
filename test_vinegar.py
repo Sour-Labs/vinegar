@@ -1530,6 +1530,10 @@ def claude_run(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
         # call has already overwritten the first by the time anything
         # reads it.
         claude_run.calls.append(cmd)
+        # The bound each attempt was given, because the two attempts share
+        # one and a fallback handed a fresh `review_timeout` would let a
+        # single pull request park the only poll thread for twice it.
+        claude_run.bounds.append(timeout)
         # Callable answers, the way the severity stub already takes them.
         # One canned stream for both attempts would have the fallback 404
         # as well, and every check below would pass with the fallback
@@ -1557,7 +1561,7 @@ def result_event(**over):
 
 claude_run.saw, claude_run.env = [], {}
 claude_run.cwd, claude_run.timeout = None, None
-claude_run.calls = []
+claude_run.calls, claude_run.bounds = [], []
 claude_run.stream = stream(call(FINDINGS[:4]), result_event())
 
 triage_run.saw, triage_run.env = [], {}
@@ -1701,6 +1705,21 @@ check("a failure that is not a routing failure never reaches the fallback",
       vinegar.review(ROOT, "o/r", PR, FALLING_BACK, None, {}) == vinegar.FAILED
       and len(claude_run.calls) == 1, len(claude_run.calls))
 
+# The same, but free. A spent subscription fails in about a second having
+# bought nothing, so the cost clause cannot be what refuses it and the 404
+# clause has to. Without this the 404 test above passes with that clause
+# deleted, and every subscription-limited review runs a second time on a
+# model drawing from the same exhausted subscription.
+claude_run.stream = _answers(
+    stream(result_event(is_error=True, total_cost_usd=0,
+                        result="Claude AI usage limit reached")),
+    stream(call(FINDINGS[:4]), result_event()))
+del posted[:]
+del claude_run.calls[:]
+check("a free failure with no 404 on it never reaches the fallback",
+      vinegar.review(ROOT, "o/r", PR, FALLING_BACK, None, {}) == vinegar.FAILED
+      and len(claude_run.calls) == 1, len(claude_run.calls))
+
 # A 404 arriving after the reviewer has reported keeps what it reported.
 # Nothing else in review() throws findings away to buy another attempt, and
 # this must not become the exception: the second run would pay a full
@@ -1735,6 +1754,105 @@ check("a fallback that cannot be routed either stops at two attempts",
       vinegar.review(ROOT, "o/r", PR, FALLING_BACK, None, {}) == vinegar.FAILED
       and len(claude_run.calls) == 2 and not posted,
       (len(claude_run.calls), posted))
+
+# The whole justification for retrying at all is that the failed attempt
+# bought nothing, and only `total_cost_usd` says so. A 404 need not arrive
+# in the first second: a model retired mid-run, or a finder subagent's, has
+# already spent the review's budget, and re-running it spends that budget
+# again for one pull request, three times over MAX_ATTEMPTS.
+claude_run.stream = _answers(
+    stream(result_event(is_error=True, api_error_status=404, result=None,
+                        total_cost_usd=2.53)),
+    stream(call(FINDINGS[:4]), result_event()))
+del posted[:]
+del claude_run.calls[:]
+check("a routing failure that already spent the budget is not retried",
+      vinegar.review(ROOT, "o/r", PR, FALLING_BACK, None, {}) == vinegar.FAILED
+      and len(claude_run.calls) == 1, len(claude_run.calls))
+
+# A 404 recorded on a run that finished is not a routing failure. It would
+# be a sub-request that failed and was retried, and throwing the finished
+# review away to pay for another is the opposite of the repair.
+claude_run.stream = _answers(
+    stream(result_event(is_error=False, result=None, api_error_status=404,
+                        total_cost_usd=0)),
+    stream(call(FINDINGS[:4]), result_event()))
+del posted[:]
+del claude_run.calls[:]
+check("a 404 on a run that did not fail is not retried on the fallback",
+      vinegar.review(ROOT, "o/r", PR, FALLING_BACK, None, {}) == vinegar.DONE
+      and len(claude_run.calls) == 1, len(claude_run.calls))
+
+# A stream that stopped before its result event has no status to read, and
+# .get() on None raises out of review() into handle_pr's catch-all: FAILED
+# is recorded and the same head is re-reviewed at full cost twice more.
+# Every other test that produces this uses CONFIG, which pins no fallback,
+# so `model == models[-1]` short-circuits before the clause is ever the one
+# deciding.
+# No result event and no tool call, so `output is None` is the clause that
+# has to decide rather than `findings is not None` reaching it first. The
+# raise is caught and named rather than allowed out: an AttributeError
+# escaping review() would abort the suite here instead of failing this
+# check, and every check below it would go unrun.
+def _reviewed(config):
+    try:
+        return vinegar.review(ROOT, "o/r", PR, config, None, {})
+    except Exception as err:
+        return "raised %s" % type(err).__name__
+
+
+claude_run.stream = _answers(
+    stream({"type": "assistant",
+            "message": {"content": [{"type": "text", "text": "reading it"}]}}),
+    stream(call(FINDINGS[:4]), result_event()))
+del posted[:]
+del claude_run.calls[:]
+check("a truncated stream with a fallback configured fails, never raises",
+      _reviewed(FALLING_BACK) == vinegar.FAILED
+      and len(claude_run.calls) == 1, len(claude_run.calls))
+
+# The two attempts share one bound. Given a fresh review_timeout each, one
+# pull request parks the only poll thread for twice it, and load_config
+# exits with a sentence telling the operator that cannot happen.
+#
+# The clock is driven rather than waited on. A stubbed reviewer returns in
+# no measurable time, so the real clock makes the first attempt cost 0
+# seconds and the second bound comes out equal to the first whether or not
+# the arithmetic exists. Charging the fake clock 120 seconds per attempt is
+# what makes the difference observable, and the suite still runs instantly.
+class _Clock:
+    """Only the two `time` names review() reaches for."""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
+_clock = _Clock()
+_real_time, vinegar.time = vinegar.time, _clock
+
+
+def _ticking(cmd):
+    _clock.now += 120
+    return stream(NOT_FOUND) if len(claude_run.calls) == 1 else stream(
+        call(FINDINGS[:4]), result_event())
+
+
+claude_run.stream = _ticking
+del posted[:]
+del claude_run.calls[:]
+del claude_run.bounds[:]
+vinegar.review(ROOT, "o/r", PR, FALLING_BACK, None, {})
+vinegar.time = _real_time
+check("the fallback inherits what is left of the one bound, not a fresh one",
+      claude_run.bounds == [FALLING_BACK["review_timeout"],
+                            FALLING_BACK["review_timeout"] - 120],
+      claude_run.bounds)
 
 # The line an operator has to see to learn a fallback happened at all: a
 # review that quietly moves to another model is a review whose findings
@@ -2297,6 +2415,38 @@ check("a pinned model with a fallback beside it starts",
 check("a fallback with no pinned model starts",
       _config_with(fallback_model="claude-opus-5") == "started",
       _config_with(fallback_model="claude-opus-5"))
+check("a blank model refuses rather than reaching argv",
+      "model must be" in _config_with(model="  "), _config_with(model="  "))
+
+
+# A name is a name whatever a hand-edit left around it. Unstripped, a
+# `"model": "claude-opus-5 "` passes every check above and then 404s every
+# review of every repository, which is the failure those checks exist to
+# prevent, and an unstripped fallback walks past the same-model refusal.
+def _loaded(**over):
+    path = os.path.join(_home, "strip-config.json")
+    with open(path, "w") as handle:
+        json.dump(dict({"repos": ["o/r"]}, **over), handle)
+    try:
+        return vinegar.load_config(path)
+    except SystemExit as err:
+        return str(err)
+
+
+check("a model with whitespace around it is stored stripped",
+      _loaded(model=" claude-opus-5 ")["model"] == "claude-opus-5",
+      _loaded(model=" claude-opus-5 ")["model"])
+check("a fallback with whitespace around it is stored stripped",
+      _loaded(fallback_model="claude-opus-5\n")["fallback_model"]
+      == "claude-opus-5",
+      _loaded(fallback_model="claude-opus-5\n")["fallback_model"])
+check("the severity model is stored stripped too",
+      _loaded(severity_model=" haiku ")["severity_model"] == "haiku",
+      _loaded(severity_model=" haiku ")["severity_model"])
+check("whitespace cannot smuggle a fallback past the same-model refusal",
+      "cannot stand in for it" in _loaded(model="claude-opus-5",
+                                          fallback_model=" claude-opus-5"),
+      _loaded(model="claude-opus-5", fallback_model=" claude-opus-5"))
 # null is the off switch the refusal above names, so it has to work.
 check("null turns the severity pass off without refusing to start",
       _config_with(severity_model=None) == "started",

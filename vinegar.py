@@ -744,34 +744,39 @@ def load_config(path):
         if value <= 0:
             sys.exit("%s: %s must be greater than zero" % (path, name))
 
-    # A model name or nothing, checked here because the failure is
-    # otherwise invisible. Anything else reaches argv as a `--model`
-    # argument: subprocess.run raises TypeError on a number or a list,
-    # triage() catches it the way it catches everything, and the operator
-    # gets one log line per review and findings that are never tiered,
-    # with nothing saying the config is why. `null` is how it is turned
-    # off, so the message names that rather than leaving the operator to
-    # guess at `false` or `""`.
-    chooser = config["severity_model"]
-    if chooser is not None and not (isinstance(chooser, str)
-                                    and chooser.strip()):
-        sys.exit("%s: severity_model must be the name of a model, or null to "
-                 "post findings in the order the reviewer reported them, "
-                 "not %r" % (path, chooser))
-
-    # The two models a review itself can run under, checked for the same
-    # reason and in the same place. Both reach argv as a `--model`
-    # argument, where a number or a list raises TypeError inside
-    # subprocess.run; that lands in handle_pr's catch-all as one
-    # "unhandled error" line per pull request per poll, with nothing in it
-    # naming the config as the cause. `model` was unchecked until
-    # `fallback_model` arrived beside it and made the gap visible.
-    for name in ("model", "fallback_model"):
+    # Every setting that names a model, in one place because they are one
+    # rule. Each reaches argv as a `--model` argument, where a number or a
+    # list raises TypeError inside subprocess.run: triage() catches that
+    # the way it catches everything and review()'s lands in handle_pr's
+    # catch-all, so the operator gets one log line per review, or one per
+    # pull request per poll, with nothing in it naming the config. `null`
+    # is how each is turned off, so every message names that rather than
+    # leaving the operator to guess at `false` or `""`.
+    #
+    # Stripped as well as checked, and stored stripped. A name is a name
+    # whatever a hand-edit leaves around it: `"model": "claude-opus-5 "`
+    # passes the check, is not something the API can route, and 404s every
+    # review of every repository, which is the failure this check exists
+    # to prevent. It also has to be stripped *before* the same-model
+    # refusal below, or a `" claude-opus-5"` beside a pinned
+    # `"claude-opus-5"` walks past it and buys a second 404 per review.
+    for name, off in (
+            ("severity_model",
+             " to post findings in the order the reviewer reported them"),
+            ("model", " to use your Claude Code default"),
+            ("fallback_model", " for no fallback")):
         named = config[name]
         if named is not None and not (isinstance(named, str)
                                       and named.strip()):
-            sys.exit("%s: %s must be the name of a model, or null, not %r"
-                     % (path, name, named))
+            sys.exit("%s: %s must be the name of a model, or null%s, not %r"
+                     % (path, name, off, named))
+        # Guarded by the same isinstance the refusal above rests on, not by
+        # `is not None`. The two are equivalent only while the refusal is
+        # intact, and a guard that raises the moment the one above it is
+        # weakened turns a clean failure into an AttributeError out of
+        # load_config.
+        if isinstance(named, str):
+            config[name] = named.strip()
 
     # A fallback naming the model it is a fallback for is not one. It buys
     # a second 404 per review and, worse, an operator who believes the
@@ -3424,6 +3429,43 @@ def partial_note(cause):
             "then and not a finished round." % cause)
 
 
+def unroutable(output, findings):
+    """Did that attempt fail only because its model could not be routed?
+
+    Five things have to hold together, and every one of them is what
+    stops a second attempt from costing something.
+
+    Measured on Claude Code 2.1.221, against `claude-opus-5[999m]` and
+    against a name that is not a model at all: both came back a result
+    event with `is_error` true, `api_error_status` 404 and
+    `total_cost_usd` 0, about a second in. `subtype` was "success" on
+    that same event, so nothing here may read it.
+
+    `total_cost_usd` is the one that keeps the promise the rest of this
+    rests on. A 404 need not arrive in the first second: the model can be
+    retired mid-run, or a finder subagent's can be. Such a run has spent
+    the review's budget, and re-running it would spend that budget again
+    for one pull request, three times over MAX_ATTEMPTS. Only a run that
+    bought nothing is free to throw away.
+
+    `is_error` because a 404 recorded on a run that *finished* is not a
+    routing failure: it would be a sub-request that failed and was
+    retried, and discarding the finished review to pay for another is the
+    opposite of the repair.
+
+    `findings is None` because nothing else in this file spends findings
+    already in hand to buy another attempt, and `output is not None`
+    because a stream that stopped before its result event has no status
+    to read and .get() on None raises out of review() into handle_pr's
+    catch-all, which records FAILED and re-reviews the same head at full
+    cost twice more.
+    """
+    return (findings is None and output is not None
+            and output.get("is_error")
+            and output.get("api_error_status") == 404
+            and not output.get("total_cost_usd"))
+
+
 def review(path, repo, pr, config, env, tokens, resent=False, check=None):
     prompt = "/code-review %s %d" % (config["effort"], pr["number"])
 
@@ -3560,16 +3602,27 @@ def review(path, repo, pr, config, env, tokens, resent=False, check=None):
     if config["fallback_model"]:
         models.append(config["fallback_model"])
 
+    # One bound across both attempts, not one each. load_config refuses a
+    # review_timeout over MAX_REVIEW_TIMEOUT and tells the operator, in the
+    # sentence it exits with, that one pull request holds the only poll
+    # thread for its review plus the severity pass. A fallback given its
+    # own fresh review_timeout makes that false: at the 7200 cap two
+    # attempts park the daemon for four hours while the watchdog reads a
+    # live pid and a quiet log as healthy, which is the exact failure that
+    # ceiling was added to make impossible.
+    left = config["review_timeout"]
+
     for model in models:
         started = time.monotonic()
         try:
             result = run(cmd + (["--model", model] if model else []),
-                         cwd=path, timeout=config["review_timeout"],
-                         env=reviewing)
+                         cwd=path, timeout=left, env=reviewing)
         except subprocess.TimeoutExpired as expired:
             # A timeout burned the budget it burned. Retrying would burn it
-            # again.
-            log("%s: killed after %ds" % (label, config["review_timeout"]))
+            # again, so this returns rather than reaching the fallback: a
+            # killed review is never re-run on another model, whatever the
+            # loop around it might suggest.
+            log("%s: killed after %ds" % (label, left))
 
             # What it managed to say before the kill is still in hand. The
             # review reports its findings and then writes a closing summary,
@@ -3608,20 +3661,29 @@ def review(path, repo, pr, config, env, tokens, resent=False, check=None):
 
         output, findings, spoken = read_stream(result.stdout, label)
 
-        # `findings is not None` because a 404 can in principle land after
-        # the reviewer has reported (a model retired mid-run, a finder
-        # subagent on a model the account lost), and nothing else in this
-        # file throws findings away to buy another attempt either.
-        #
         # `models[-1]` is an equality rather than an index because it reads
         # as what it means, and load_config refuses a fallback equal to the
         # model it stands in for, so the two cannot be confused for one.
-        if (model == models[-1] or findings is not None or output is None
-                or output.get("api_error_status") != 404):
+        if model == models[-1] or not unroutable(output, findings):
             break
+
+        # What the abandoned attempt cost, said here because nothing else
+        # will say it. `started` is reset below and the "reviewed in Nds"
+        # line at the end reads only the attempt that produced the review,
+        # so without this the discarded one leaves no trace of its wall
+        # time in a log whose one record of daemon spend is priced(). The
+        # cost prints as zero by construction, since unroutable() is what
+        # let the code get here, and printing it is what makes that
+        # checkable rather than merely claimed.
         log("%s: %s is not a model this account can reach, so the review "
-            "runs again on %s" % (label, model or "your Claude Code default",
-                                  config["fallback_model"]))
+            "runs again on %s. That attempt took %ds%s" % (
+                label, model or "your Claude Code default",
+                config["fallback_model"], took, priced(output)))
+        # The fallback inherits what is left of the one bound, never a
+        # fresh one. Floored at a second because `took` is rounded, so an
+        # attempt finishing a hair under the bound could otherwise hand the
+        # fallback a zero and have it killed before it started.
+        left = max(1, left - took)
 
     if output is None:
         # No terminal event, so the process died rather than finished: killed
