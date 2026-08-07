@@ -388,6 +388,13 @@ TIERS = ("blocker", "advisory", "note")
 # one: findings quote the branch under review and the model narrates
 # around its answer, so a sentence mentioning a tier is the likeliest
 # thing in the reply that is not the answer.
+#
+# The alternation says what an answer looks like; it is not what decides
+# which tiers are accepted. IGNORECASE folds four non-ASCII letters into
+# the ASCII ones, so read_tiers() checks what this captured against TIERS
+# and a word this let through is refused there. Loosening the alternation
+# would change nothing a caller can see, which is why the mutation for
+# that property is on the membership test rather than here.
 TIER_LINE = re.compile(r"\s*\[?(\d+)\]?[\s:.)-]+(%s)\b" % "|".join(TIERS),
                        re.IGNORECASE)
 
@@ -2579,7 +2586,16 @@ def triage(label, findings, config):
         severity_tally(tiered)))
     # Stable, so findings the pass judged equally serious stay in the order
     # the reviewer reported them, which is the order it thought mattered.
-    return sorted(tiered, key=lambda finding: TIERS.index(finding["tier"]))
+    #
+    # A tier this cannot rank sorts last rather than raising, for the
+    # reason describe() reads TIER_DOTS with a default: this line is past
+    # the except above, so a ValueError here is not an ordering step that
+    # failed, it is a finished review that posts nothing and saves no
+    # transcript while the outcome is recorded DONE. read_tiers() refuses
+    # a tier that is not in TIERS, so the drift this covers is TIERS
+    # itself losing a word its second spellings still carry.
+    return sorted(tiered, key=lambda finding: TIERS.index(finding["tier"])
+                  if finding["tier"] in TIERS else len(TIERS))
 
 
 def diff_lines(path, base, env, label):
@@ -2831,9 +2847,14 @@ def describe(finding):
     # and the path that saves the transcript, so a KeyError on a tier that
     # drifted out of TIER_DOTS would lose the review whole while the
     # outcome was still recorded DONE.
+    #
+    # The space travels with the dot rather than sitting in the format,
+    # which would leave a comment that lost its dot opening on a stray
+    # space instead.
     tier = str(finding.get("tier") or "").strip()
     if tier:
-        summary = "%s **%s** · %s" % (TIER_DOTS.get(tier, ""), tier, summary)
+        dot = TIER_DOTS.get(tier)
+        summary = "%s**%s** · %s" % (dot + " " if dot else "", tier, summary)
     # The verdict rides with the category when the effort level ran a verify
     # pass. CONFIRMED and PLAUSIBLE read very differently, and posting them
     # identically claims a certainty the reviewer did not.
