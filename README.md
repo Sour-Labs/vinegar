@@ -188,7 +188,7 @@ Every key in `config.example.json`:
 | `comment` | `true` | Post findings on the pull request. False runs the review and writes only to `~/.vinegar/reviews.dry/`, remembering what it did in `state.json.dry`. |
 | `model` | `null` | Model for the review. Null uses your Claude Code default. Read the note below before setting it. |
 | `fallback_model` | `null` | Model to run the review again on when `model` cannot be routed. Null means no fallback. See below. |
-| `review_on_push` | `false` | Review again when the head commit changes. |
+| `review_on_push` | `false` | Review again when the head commit changes. A second review reads only what was added since the last one that posted. See "The review". |
 | `max_changed_lines` | `3000` | Skip pull requests larger than this. |
 | `skip_drafts` | `true` | Skip drafts. |
 | `skip_bots` | `true` | Skip pull requests opened by bots. |
@@ -806,6 +806,85 @@ that is the only thing it is allowed to mean.
 
 Reviews are submitted with `event: COMMENT`. Vinegar never approves and never
 requests changes, so it cannot hold up a merge. See "What this is not".
+
+### A second review reads only what is new
+
+With `review_on_push` on, a pull request can be reviewed more than once, and the
+second pass does not read the first pass's work again. Vinegar records the
+commit whose findings actually reached the pull request, and the next pass is
+told to report only on `git diff <that commit>..HEAD`.
+
+The reviewer may still read anything it needs. Only what it reports on is
+narrowed. A diff read without the code around it produces confident findings
+about calls whose definitions the reviewer never saw.
+
+A pass only narrows when the one before it **covered its scope**: it reached the
+end of what it was asked to read, it reported findings through `ReportFindings`,
+and the review landed on the pull request. A review killed by `review_timeout`
+after reporting two findings from the first file still posts, and still counts
+as done, but it does not move the starting point. Neither does one that failed
+part-way holding findings, one that narrated without ever calling the reporting
+tool, one GitHub refused, or a dry run.
+
+Running on `fallback_model` does **not** stop a pass counting as covered. The
+review says so on the pull request, but a fallback that read the whole scope
+read the whole scope.
+
+Five things widen a pass back to the whole pull request, and all five are
+deliberate:
+
+- nothing has been reviewed yet, or the last review did not cover its scope
+- the commit is not in the clone
+- the branch was rewritten since it was reviewed
+- the branch has **merged** something in since it was reviewed, because
+  `<since>..HEAD` would then contain the whole base branch and the "narrowed"
+  scope would be wider than the pull request
+- the head has not moved since the last review
+
+Every failure here widens rather than narrows. Reading too much costs money and
+says so in the log; reading too little reports a change clean without having
+looked at it, and nothing downstream can tell.
+
+The comment says which happened, so "no findings" on a re-review is never
+ambiguous:
+
+> **Vinegar** · reviewed `89abcde` at high effort
+>
+> This pass reviewed only what was added since `0123456`, which is where the
+> last review of this pull request finished. Earlier findings are already on the
+> pull request as their own comments.
+
+Findings from an earlier pass are not repeated. Their comments are already on
+the pull request: GitHub keeps a comment live where the code around it did not
+change, and where it did change, that code is in the next pass's diff and gets
+read again.
+
+Two things this does **not** change. Inline comments are still anchored against
+the pull request's full diff, because that is the only thing GitHub will accept
+an anchor in, and one bad anchor loses the whole review. And `max_changed_lines`
+still counts the whole pull request, so one that grows past the cap is skipped
+even when each new push is small. That is the existing behaviour rather than a
+decision this made, and it is worth revisiting alongside whatever turns
+`review_on_push` on.
+
+The narrowing statement goes in the saved transcript as well as in the comment,
+because a refused review is delivered later from the transcript and would
+otherwise arrive reading as though it had covered everything. When that
+transcript is too large to post, the statement is lifted into the resend's own
+opening before the trim, since the trim keeps the tail and the statement is at
+the front.
+
+A `--dry-run` never narrows anything and never records a starting point: it
+posts nothing, so there is no author who has seen anything.
+
+**`vinegar --pr owner/repo#N` scopes itself the same way.** If an earlier review
+covered part of the pull request, a hand run reads only what came after it,
+which is usually not what you want when you are re-running because the last
+review was unsatisfying. Pass `--whole` to read all of it:
+
+```sh
+python3 vinegar.py --pr owner/repo#12 --whole
+```
 
 ## The checks list
 
