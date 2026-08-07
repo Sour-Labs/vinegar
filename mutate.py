@@ -398,8 +398,26 @@ MUTATIONS = [
      "    for finding, tier in zip(findings, tiers):\n"
      '        finding["tier"] = tier'),
     ("severity-label-opens-the-comment",
-     '        summary = "**%s** · %s" % (tier, summary)',
+     '        summary = "%s **%s** · %s" % (TIER_DOTS[tier], tier, summary)',
      "        pass"),
+    # The dot and the word are one label and neither half stands alone. A
+    # comment with no dot is the plain text this replaced, and one with no
+    # word says nothing to a reader who does not know the three colors.
+    ("severity-label-opens-with-a-dot",
+     '        summary = "%s **%s** · %s" % (TIER_DOTS[tier], tier, summary)',
+     '        summary = "**%s** · %s" % (tier, summary)'),
+    ("severity-label-keeps-its-word",
+     '        summary = "%s **%s** · %s" % (TIER_DOTS[tier], tier, summary)',
+     '        summary = "%s %s" % (TIER_DOTS[tier], summary)'),
+    # One color for all three is a dot that costs a character and tells the
+    # reader nothing, and it is what a careless palette edit produces.
+    ("severity-each-tier-has-its-own-dot",
+     'TIER_DOTS = {"blocker": "\\U0001f534",    # red circle\n'
+     '             "advisory": "\\U0001f535",   # blue circle\n'
+     '             "note": "\\u26aa"}           # white circle',
+     'TIER_DOTS = {"blocker": "\\U0001f534",\n'
+     '             "advisory": "\\U0001f534",\n'
+     '             "note": "\\U0001f534"}'),
     ("severity-tally-counts",
      '    return ", ".join("%d %s" % (count, tier)\n'
      "                     for tier, count in counted if count)",

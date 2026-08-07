@@ -391,6 +391,26 @@ TIERS = ("blocker", "advisory", "note")
 TIER_LINE = re.compile(r"\s*\[?(\d+)\]?[\s:.)-]+(%s)\b" % "|".join(TIERS),
                        re.IGNORECASE)
 
+# The colored dot each tier's label opens with, keyed by the same three
+# words as TIERS. The check that renders every tier holds the two
+# together, because a tier missing from here is a KeyError raised while a
+# finished review is being posted.
+#
+# An emoji rather than colored text, because GitHub sanitises a comment
+# body. Measured through its own markdown endpoint: `style` is stripped off
+# a `<span>` and a `<font color>` tag is dropped whole, so both arrive as
+# plain text. What is left that is genuinely colored is worse. A badge
+# image is fetched through camo, which puts a network round trip behind
+# every finding and greys out silently when it fails. An alert block is
+# block-level and cannot open a bullet. Neither survives the transcript,
+# which is plain text and is what repost() sends when the review is
+# refused.
+#
+# Unicode has no gray circle, so `note` takes the white one.
+TIER_DOTS = {"blocker": "\U0001f534",    # red circle
+             "advisory": "\U0001f535",   # blue circle
+             "note": "\u26aa"}           # white circle
+
 # What the severity pass is told. Kept beside TIERS because the tiers it
 # names and the tuple above have to be the same three words: a rule
 # describing a tier read_tiers() will not accept is a rule the model obeys
@@ -2779,13 +2799,19 @@ def describe(finding):
     # summary it would be a label nobody reaches until they have already
     # read the thing it was meant to help them skip.
     #
+    # The word stays beside the dot rather than being replaced by it. The
+    # color is what a reader picks the comment out by; the word is what
+    # tells them which tier it is without knowing the three colors, and it
+    # is all a screen reader has, because the dot is announced by its own
+    # name and not by what it means here.
+    #
     # Absent when the severity pass is off or did not answer, and then
     # this reads exactly as it did before tiers existed. read_tiers()
     # tiers all of the findings or none, so a comment never sits beside
     # one that was judged and says nothing.
     tier = str(finding.get("tier") or "").strip()
     if tier:
-        summary = "**%s** · %s" % (tier, summary)
+        summary = "%s **%s** · %s" % (TIER_DOTS[tier], tier, summary)
     # The verdict rides with the category when the effort level ran a verify
     # pass. CONFIRMED and PLAUSIBLE read very differently, and posting them
     # identically claims a certainty the reviewer did not.

@@ -1241,16 +1241,32 @@ check("every tier the pass is offered is one the answer can carry",
       all(tier in _prompt for tier in vinegar.TIERS), vinegar.TIERS)
 
 # --- how a tier reads ----------------------------------------------------
-check("the tier opens the comment it belongs to",
-      vinegar.describe({"summary": "s", "tier": "blocker"}).startswith(
-          "**blocker**"),
-      vinegar.describe({"summary": "s", "tier": "blocker"}))
+# Written out rather than built from TIER_DOTS, so that a palette that
+# drifts from the one asked for has to be meant. Four things ride on this
+# one rendering: a dot per tier, because a tier with no key there is a
+# KeyError raised while a finished review is being posted; the colors, red
+# then blue then palest, which is the whole of what the dot buys; the word
+# beside the dot, which is what a reader who does not know the three colors
+# reads, and all a screen reader is given; and the dot first, because the
+# opening characters are what a reader facing thirteen comments picks from.
+#
+# An emoji because GitHub's sanitiser leaves nothing else colored. Measured
+# through its own markdown endpoint: `style` is stripped off a `<span>` and
+# a `<font color>` tag is dropped whole, so either one posts as plain text.
+check("every tier opens its comment with its own color and its own word",
+      [vinegar.describe({"summary": "s", "tier": tier})
+       for tier in vinegar.TIERS]
+      == ["\U0001f534 **blocker** \u00b7 s",
+          "\U0001f535 **advisory** \u00b7 s",
+          "\u26aa **note** \u00b7 s"],
+      [vinegar.describe({"summary": "s", "tier": tier})
+       for tier in vinegar.TIERS])
 check("an untiered finding reads as it always did",
       vinegar.describe({"summary": "s", "category": "correctness"})
       == "s\n\n(correctness)",
       vinegar.describe({"summary": "s", "category": "correctness"}))
 check("the tier reaches an inline comment too",
-      "**note**" in vinegar.split_findings(
+      "\u26aa **note**" in vinegar.split_findings(
           [{"file": "vinegar.py", "line": 12, "summary": "s",
             "tier": "note"}], covered, L)[0][0]["body"],
       vinegar.split_findings([{"file": "vinegar.py", "line": 12,
