@@ -1524,7 +1524,19 @@ def claude_run(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
     if cmd[0] == "claude" and cmd[2].startswith("/code-review"):
         claude_run.saw, claude_run.env = cmd, env
         claude_run.cwd, claude_run.timeout = cwd, timeout
-        return subprocess.CompletedProcess(cmd, 0, claude_run.stream, "")
+        # Every review command, not only the last. A review whose model
+        # cannot be routed runs the reviewer twice, and a single slot
+        # cannot answer which model each attempt asked for: the second
+        # call has already overwritten the first by the time anything
+        # reads it.
+        claude_run.calls.append(cmd)
+        # Callable answers, the way the severity stub already takes them.
+        # One canned stream for both attempts would have the fallback 404
+        # as well, and every check below would pass with the fallback
+        # deleted.
+        canned = claude_run.stream
+        return subprocess.CompletedProcess(
+            cmd, 0, canned(cmd) if callable(canned) else canned, "")
     if cmd[0] == "claude":
         triage_run.saw, triage_run.env = cmd, env
         triage_run.cwd, triage_run.timeout = cwd, timeout
@@ -1545,6 +1557,7 @@ def result_event(**over):
 
 claude_run.saw, claude_run.env = [], {}
 claude_run.cwd, claude_run.timeout = None, None
+claude_run.calls = []
 claude_run.stream = stream(call(FINDINGS[:4]), result_event())
 
 triage_run.saw, triage_run.env = [], {}
@@ -1612,6 +1625,141 @@ del posted[:]
 check("an error holding nothing is retried, not posted",
       vinegar.review(ROOT, "o/r", PR, CONFIG, None, {}) == vinegar.FAILED
       and not posted, (posted,))
+
+
+# The model a review runs on, and the fallback it runs on when the first
+# cannot be routed.
+def _model_of(cmd):
+    """The model that command asked for, or "" when it named none.
+
+    Indexing straight in raises ValueError once `--model` is what a
+    mutation removed, and a raise here skips every check below it instead
+    of failing the one it belongs to.
+    """
+    return cmd[cmd.index("--model") + 1] if "--model" in cmd[:-1] else ""
+
+
+def _answers(*streams):
+    """One canned stream per review attempt, in order; the last repeats."""
+    queued = list(streams)
+    return lambda cmd: queued.pop(0) if len(queued) > 1 else queued[0]
+
+
+# What the CLI actually answers for a model it cannot route, measured on
+# Claude Code 2.1.221 against `claude-opus-5[999m]` and against a name that
+# is not a model at all. Both came back this way in about a second. The
+# `subtype` really is "success" on that event, so nothing may key off it,
+# and the cost really is zero, which is what makes a second attempt free.
+NOT_FOUND = result_event(
+    is_error=True, api_error_status=404, total_cost_usd=0,
+    result="There's an issue with the selected model (claude-opus-5[999m]). "
+           "It may not exist or you may not have access to it.")
+PINNED = dict(CONFIG, model="claude-opus-5[1m]")
+FALLING_BACK = dict(PINNED, fallback_model="claude-opus-5")
+
+vinegar.github_env = lambda *a, **k: None
+claude_run.stream = stream(call(FINDINGS[:4]), result_event())
+del claude_run.calls[:]
+vinegar.review(ROOT, "o/r", PR, PINNED, None, {})
+check("the review runs on the model the config pins",
+      _model_of(claude_run.calls[0]) == "claude-opus-5[1m]",
+      claude_run.calls[0])
+# No pin means no flag at all, which is how the Claude Code default is
+# selected. A literal `--model None` reaching argv is a 404 on every review
+# of every repository.
+del claude_run.calls[:]
+vinegar.review(ROOT, "o/r", PR, CONFIG, None, {})
+check("a config that pins no model passes no model flag",
+      "--model" not in claude_run.calls[0], claude_run.calls[0])
+
+claude_run.stream = _answers(stream(NOT_FOUND),
+                             stream(call(FINDINGS[:4]), result_event()))
+del posted[:]
+del claude_run.calls[:]
+check("a model that cannot be routed is reviewed again on the fallback",
+      vinegar.review(ROOT, "o/r", PR, FALLING_BACK, None, {}) == vinegar.DONE
+      and len(posted) == 1, (posted,))
+check("the second attempt asks for the model the config calls the fallback",
+      len(claude_run.calls) == 2
+      and _model_of(claude_run.calls[0]) == "claude-opus-5[1m]"
+      and _model_of(claude_run.calls[1]) == "claude-opus-5",
+      [_model_of(c) for c in claude_run.calls])
+
+# Only a routing failure. Every other failure has already spent the
+# review's budget by the time it is known. A live 529 arrived eight and a
+# half minutes into an xhigh run, and a second model does not repair it.
+# Without this check the guard passes just as well written as `if
+# output.get("is_error")`, which would run every overloaded review and
+# every subscription-limited one a second time.
+claude_run.stream = _answers(
+    stream(result_event(is_error=True, result=None,
+                        subtype="error_during_execution")),
+    stream(call(FINDINGS[:4]), result_event()))
+del posted[:]
+del claude_run.calls[:]
+check("a failure that is not a routing failure never reaches the fallback",
+      vinegar.review(ROOT, "o/r", PR, FALLING_BACK, None, {}) == vinegar.FAILED
+      and len(claude_run.calls) == 1, len(claude_run.calls))
+
+# A 404 arriving after the reviewer has reported keeps what it reported.
+# Nothing else in review() throws findings away to buy another attempt, and
+# this must not become the exception: the second run would pay a full
+# review to rediscover what is already in hand.
+claude_run.stream = _answers(
+    stream(call(FINDINGS[:4]), NOT_FOUND),
+    stream(call(FINDINGS[:4]), result_event()))
+del posted[:]
+del claude_run.calls[:]
+check("a routing failure holding findings posts them rather than retrying",
+      vinegar.review(ROOT, "o/r", PR, FALLING_BACK, None, {}) == vinegar.DONE
+      and len(claude_run.calls) == 1 and len(posted) == 1,
+      (len(claude_run.calls), len(posted)))
+
+# With no fallback configured a 404 is the ordinary failure it was before
+# any of this existed: left to MAX_ATTEMPTS, never a second model.
+claude_run.stream = _answers(stream(NOT_FOUND))
+del posted[:]
+del claude_run.calls[:]
+check("no fallback configured leaves a routing failure to the retries",
+      vinegar.review(ROOT, "o/r", PR, PINNED, None, {}) == vinegar.FAILED
+      and len(claude_run.calls) == 1 and not posted,
+      (len(claude_run.calls), posted))
+
+# One extra attempt, not a loop. A fallback that cannot be routed either is
+# the end of it, and the pull request waits for the next poll like any
+# other FAILED review.
+claude_run.stream = _answers(stream(NOT_FOUND))
+del posted[:]
+del claude_run.calls[:]
+check("a fallback that cannot be routed either stops at two attempts",
+      vinegar.review(ROOT, "o/r", PR, FALLING_BACK, None, {}) == vinegar.FAILED
+      and len(claude_run.calls) == 2 and not posted,
+      (len(claude_run.calls), posted))
+
+# The line an operator has to see to learn a fallback happened at all: a
+# review that quietly moves to another model is a review whose findings
+# came from somewhere other than the config says. And the line that must
+# not appear when there is nothing to move to, which is the whole of what
+# the `models[-1]` half of the guard buys: without it a config that pins
+# a model and names no fallback logs that the review "runs again on None".
+_fb_log = []
+_fb_real_log, vinegar.log = vinegar.log, lambda m: _fb_log.append(m)
+claude_run.stream = _answers(stream(NOT_FOUND),
+                             stream(call(FINDINGS[:4]), result_event()))
+del claude_run.calls[:]
+vinegar.review(ROOT, "o/r", PR, FALLING_BACK, None, {})
+_fell_back = list(_fb_log)
+del _fb_log[:]
+claude_run.stream = _answers(stream(NOT_FOUND))
+del claude_run.calls[:]
+vinegar.review(ROOT, "o/r", PR, PINNED, None, {})
+_no_fallback = list(_fb_log)
+vinegar.log = _fb_real_log
+check("the fallback says which model it left and which it moved to",
+      any("claude-opus-5[1m]" in m and "runs again on claude-opus-5" in m
+          for m in _fell_back), _fell_back)
+check("a config with no fallback never says the review runs again",
+      not any("runs again on" in m for m in _no_fallback), _no_fallback)
 
 claude_run.stream = stream(result_event(result=None))
 del posted[:]
@@ -2114,6 +2262,41 @@ check("a severity_model of the wrong shape refuses to start",
 check("a blank severity_model refuses rather than reaching argv",
       "severity_model must be" in _config_with(severity_model="  "),
       _config_with(severity_model="  "))
+# The same argument for the two models the review itself can run under.
+# Both reach argv as `claude --model`, where a number or a list raises
+# TypeError inside subprocess.run; that surfaces as one "unhandled error"
+# line per pull request per poll with nothing naming the config.
+check("a model that is not a name refuses to start",
+      "model must be the name of a model" in _config_with(model=5),
+      _config_with(model=5))
+check("a fallback_model of the wrong shape refuses to start",
+      "fallback_model must be" in _config_with(fallback_model=["opus"]),
+      _config_with(fallback_model=["opus"]))
+check("a blank fallback_model refuses rather than reaching argv",
+      "fallback_model must be" in _config_with(fallback_model="  "),
+      _config_with(fallback_model="  "))
+# A fallback naming the model it stands in for is not one. It buys a second
+# 404 per review and, worse, an operator who believes the daemon survives
+# its pinned model going away when it does not.
+check("a fallback naming the pinned model refuses to start",
+      "cannot stand in for it" in _config_with(
+          model="claude-opus-5", fallback_model="claude-opus-5"),
+      _config_with(model="claude-opus-5", fallback_model="claude-opus-5"))
+# Two nulls are not that case. Null means "no fallback", and refusing it
+# would refuse the shipped default and every config that pins nothing.
+check("no model and no fallback still starts",
+      _config_with(model=None, fallback_model=None) == "started",
+      _config_with(model=None, fallback_model=None))
+check("a pinned model with a fallback beside it starts",
+      _config_with(model="claude-opus-5[1m]",
+                   fallback_model="claude-opus-5") == "started",
+      _config_with(model="claude-opus-5[1m]",
+                   fallback_model="claude-opus-5"))
+# A fallback with nothing pinned is allowed on purpose: `model` null means
+# the Claude Code default, and that can stop resolving too.
+check("a fallback with no pinned model starts",
+      _config_with(fallback_model="claude-opus-5") == "started",
+      _config_with(fallback_model="claude-opus-5"))
 # null is the off switch the refusal above names, so it has to work.
 check("null turns the severity pass off without refusing to start",
       _config_with(severity_model=None) == "started",

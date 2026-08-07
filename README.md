@@ -187,6 +187,7 @@ Every key in `config.example.json`:
 | `effort` | `"high"` | Effort passed to `/code-review`: `low`, `medium`, `high`, `xhigh`, `max`. `ultra` is rejected. Read the note below before pairing it with `model`. |
 | `comment` | `true` | Post findings on the pull request. False runs the review and writes only to `~/.vinegar/reviews.dry/`, remembering what it did in `state.json.dry`. |
 | `model` | `null` | Model for the review. Null uses your Claude Code default. Read the note below before setting it. |
+| `fallback_model` | `null` | Model to run the review again on when `model` cannot be routed. Null means no fallback. See below. |
 | `review_on_push` | `false` | Review again when the head commit changes. |
 | `max_changed_lines` | `3000` | Skip pull requests larger than this. |
 | `skip_drafts` | `true` | Skip drafts. |
@@ -210,6 +211,27 @@ sweep. On this repository `xhigh` found 15 findings for $1.65 where `high`
 found between 2 and 6 for $1.31 to $2.18, so the deeper setting was both
 better and cheaper per finding. Measure on your own repository before
 believing that.
+
+**`fallback_model` is for the day `model` stops resolving.** A pinned model
+is not always a public model id. `claude-opus-5[1m]` selects a routing
+variant, and nothing promises a variant keeps answering across Claude Code
+releases or account changes. When one stops, every review comes back the same
+way: a result event carrying `api_error_status` 404, about a second in, having
+spent nothing. Vinegar retries three times, gives up, and then says nothing on
+any pull request in any repository it polls until somebody reads the log.
+
+Set `fallback_model` to a plain model id and that failure costs one extra
+second per review instead of every review. `"claude-opus-5"` is the sensible
+partner to a pinned `"claude-opus-5[1m]"`.
+
+Only that one failure falls back. An overload, a review killed at
+`review_timeout`, and a spent subscription have all burned the review's budget
+by the time Vinegar knows. A 529 measured live arrived eight and a half
+minutes into an `xhigh` run, and none of them is repaired by a second model.
+Those still fail and retry as before. The fallback is an availability switch,
+not a general retry.
+
+Vinegar refuses to start if `fallback_model` names the same model as `model`.
 
 ### Posting as Vinegar instead of as you
 

@@ -166,15 +166,15 @@ MUTATIONS = [
      '           "--strict-mcp-config"]',
      '           "--setting-sources", ""]'),
     ("review-timeout",
-     '        result = run(cmd, cwd=path, timeout=config["review_timeout"],\n'
-     "                     env=reviewing)",
-     "        result = run(cmd, cwd=path,\n"
-     "                     env=reviewing)"),
+     '                         cwd=path, timeout=config["review_timeout"],\n'
+     "                         env=reviewing)",
+     "                         cwd=path,\n"
+     "                         env=reviewing)"),
     ("review-cwd",
-     '        result = run(cmd, cwd=path, timeout=config["review_timeout"],\n'
-     "                     env=reviewing)",
-     '        result = run(cmd, timeout=config["review_timeout"],\n'
-     "                     env=reviewing)"),
+     '                         cwd=path, timeout=config["review_timeout"],\n'
+     "                         env=reviewing)",
+     '                         timeout=config["review_timeout"],\n'
+     "                         env=reviewing)"),
 
     # --- which pull requests are reviewed at all -----------------------
     ("skip-drafts",
@@ -430,6 +430,46 @@ MUTATIONS = [
      "    if chooser is not None and not (isinstance(chooser, str)\n"
      "                                    and chooser.strip()):",
      "    chooser = config[\"severity_model\"]\n"
+     "    if False:"),
+
+    # --- the fallback model --------------------------------------------
+    # A pinned model that stops resolving takes every review with it, so
+    # the fallback is an availability switch. Each half of it: that a
+    # second attempt happens at all, that only a routing failure buys one,
+    # that findings already in hand are never spent to get it, and that it
+    # is one extra attempt rather than a loop.
+    ("fallback-model-is-tried",
+     "    if config[\"fallback_model\"]:\n"
+     "        models.append(config[\"fallback_model\"])",
+     "    if False:\n"
+     "        models.append(config[\"fallback_model\"])"),
+    ("fallback-only-on-a-routing-failure",
+     "                or output.get(\"api_error_status\") != 404):",
+     "                or not output.get(\"is_error\")):"),
+    ("fallback-never-spends-findings",
+     "        if (model == models[-1] or findings is not None"
+     " or output is None\n",
+     "        if (model == models[-1] or output is None\n"),
+    ("fallback-stops-at-the-last-model",
+     "        if (model == models[-1] or findings is not None"
+     " or output is None\n",
+     "        if (findings is not None or output is None\n"),
+    # The pinned model reaching argv at all. Without it every review runs
+    # on whatever the machine defaults to and says nothing about it.
+    ("review-runs-the-configured-model",
+     "            result = run(cmd + ([\"--model\", model] if model else []),",
+     "            result = run(cmd,"),
+    ("review-models-validated",
+     "    for name in (\"model\", \"fallback_model\"):\n"
+     "        named = config[name]\n"
+     "        if named is not None and not (isinstance(named, str)\n"
+     "                                      and named.strip()):",
+     "    for name in (\"model\", \"fallback_model\"):\n"
+     "        named = config[name]\n"
+     "        if False:"),
+    ("fallback-differs-from-the-model",
+     "    if (config[\"fallback_model\"] is not None\n"
+     "            and config[\"fallback_model\"] == config[\"model\"]):",
      "    if False:"),
 
     # --- the checks-list indicator -------------------------------------

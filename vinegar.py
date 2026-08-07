@@ -494,6 +494,17 @@ DEFAULTS = {
     "effort": "high",
     "comment": True,
     "model": None,
+    # The model a review runs again on when the first one cannot be
+    # routed, or null for no fallback. `model` is allowed to name a
+    # routing identifier rather than a public model id, and those carry
+    # no promise of continuing to resolve: the deployment this was
+    # written for pins `claude-opus-5[1m]`. When one stops resolving the
+    # review comes back a 404 having spent nothing, FAILED is returned
+    # three times, and Vinegar goes quiet on every repository it polls
+    # until an operator reads the log. Null by default, the way `model`
+    # is, because most installs pin nothing and have nothing to fall
+    # back from.
+    "fallback_model": None,
     "review_on_push": False,
     "max_changed_lines": 3000,
     "skip_drafts": True,
@@ -747,6 +758,29 @@ def load_config(path):
         sys.exit("%s: severity_model must be the name of a model, or null to "
                  "post findings in the order the reviewer reported them, "
                  "not %r" % (path, chooser))
+
+    # The two models a review itself can run under, checked for the same
+    # reason and in the same place. Both reach argv as a `--model`
+    # argument, where a number or a list raises TypeError inside
+    # subprocess.run; that lands in handle_pr's catch-all as one
+    # "unhandled error" line per pull request per poll, with nothing in it
+    # naming the config as the cause. `model` was unchecked until
+    # `fallback_model` arrived beside it and made the gap visible.
+    for name in ("model", "fallback_model"):
+        named = config[name]
+        if named is not None and not (isinstance(named, str)
+                                      and named.strip()):
+            sys.exit("%s: %s must be the name of a model, or null, not %r"
+                     % (path, name, named))
+
+    # A fallback naming the model it is a fallback for is not one. It buys
+    # a second 404 per review and, worse, an operator who believes the
+    # daemon can survive its pinned model going away when it cannot. The
+    # equality is also what lets review() tell the two attempts apart.
+    if (config["fallback_model"] is not None
+            and config["fallback_model"] == config["model"]):
+        sys.exit("%s: fallback_model is the same model as model, so it "
+                 "cannot stand in for it" % path)
 
     if config["review_timeout"] > MAX_REVIEW_TIMEOUT:
         # The severity pass is named because the sentence is an argument
@@ -3433,8 +3467,6 @@ def review(path, repo, pr, config, env, tokens, resent=False, check=None):
            "--settings", reviewer_settings(path),
            "--setting-sources", "",
            "--strict-mcp-config"]
-    if config["model"]:
-        cmd += ["--model", config["model"]]
 
     # The env var is what makes the choice deterministic. Without it the
     # decision falls through to a server-side flag that is off by default,
@@ -3510,50 +3542,87 @@ def review(path, repo, pr, config, env, tokens, resent=False, check=None):
     log("%s: reviewing at %s effort%s" % (
         label, config["effort"], "" if config["comment"] else ", dry run"))
 
-    started = time.monotonic()
-    try:
-        result = run(cmd, cwd=path, timeout=config["review_timeout"],
-                     env=reviewing)
-    except subprocess.TimeoutExpired as expired:
-        # A timeout burned the budget it burned. Retrying would burn it again.
-        log("%s: killed after %ds" % (label, config["review_timeout"]))
+    # The configured model, then the fallback if there is one. Only one
+    # failure is worth a second attempt, and it is the cheapest: a model the
+    # API cannot route is refused before a token is spent. Measured on Claude
+    # Code 2.1.221 against `claude-opus-5[999m]` and a name that is not a
+    # model at all, both answered the same way: a result event carrying
+    # `api_error_status` 404 and `total_cost_usd` 0, about a second in. So
+    # the retry is free, and the review lands on this poll instead of three
+    # failed ones later.
+    #
+    # Nothing else falls back. An overload or a kill has already spent the
+    # review's budget by the time it is known. A live 529 arrived eight and
+    # a half minutes into an xhigh run, and a second model is not the repair
+    # those want. Nor is a spent subscription, which no model reachable from
+    # here is outside of. They stay FAILED, which is what MAX_ATTEMPTS is for.
+    models = [config["model"]]
+    if config["fallback_model"]:
+        models.append(config["fallback_model"])
 
-        # What it managed to say before the kill is still in hand. The review
-        # reports its findings and then writes a closing summary, so a kill
-        # during that summary lands after the tool call: the findings exist,
-        # they are in this buffer, and throwing it away would tell the pull
-        # request the review "returned nothing" while holding all of them.
-        # It is bytes even in text mode, because the timeout path skips the
-        # decoding the normal one does.
-        salvaged = expired.stdout or ""
-        if isinstance(salvaged, bytes):
-            salvaged = salvaged.decode(errors="replace")
-        _, findings, spoken = read_stream(salvaged, label)
+    for model in models:
+        started = time.monotonic()
+        try:
+            result = run(cmd + (["--model", model] if model else []),
+                         cwd=path, timeout=config["review_timeout"],
+                         env=reviewing)
+        except subprocess.TimeoutExpired as expired:
+            # A timeout burned the budget it burned. Retrying would burn it
+            # again.
+            log("%s: killed after %ds" % (label, config["review_timeout"]))
 
-        # Everything a killed run leaves goes through finish(), the same as
-        # a finished one: the findings it reported, or failing that whatever
-        # it said, and a transcript either way. A separate posting path for
-        # this case is how one of them came to say "returned nothing" while
-        # the reviewer's words sat in the buffer, and how a killed dry run
-        # came to leave no trace at all.
+            # What it managed to say before the kill is still in hand. The
+            # review reports its findings and then writes a closing summary,
+            # so a kill during that summary lands after the tool call: the
+            # findings exist, they are in this buffer, and throwing it away
+            # would tell the pull request the review "returned nothing" while
+            # holding all of them. It is bytes even in text mode, because the
+            # timeout path skips the decoding the normal one does.
+            salvaged = expired.stdout or ""
+            if isinstance(salvaged, bytes):
+                salvaged = salvaged.decode(errors="replace")
+            _, findings, spoken = read_stream(salvaged, label)
+
+            # Everything a killed run leaves goes through finish(), the same
+            # as a finished one: the findings it reported, or failing that
+            # whatever it said, and a transcript either way. A separate
+            # posting path for this case is how one of them came to say
+            # "returned nothing" while the reviewer's words sat in the
+            # buffer, and how a killed dry run came to leave no trace at all.
+            #
+            # `is not None`, not truthiness: a reviewer that reported an empty
+            # list looked and found nothing, and read_stream draws that
+            # distinction deliberately.
+            if findings is not None:
+                log("%s: it had already reported %d finding(s), posting those"
+                    % (label, len(findings)))
+                note = partial_note(
+                    "was killed after %ds" % config["review_timeout"])
+            else:
+                note = ("This review was killed after %ds. Read that as the "
+                        "review not finishing, not as the change being clean."
+                        % config["review_timeout"])
+            deliver(spoken, findings, note)
+            return DONE
+        took = round(time.monotonic() - started)
+
+        output, findings, spoken = read_stream(result.stdout, label)
+
+        # `findings is not None` because a 404 can in principle land after
+        # the reviewer has reported (a model retired mid-run, a finder
+        # subagent on a model the account lost), and nothing else in this
+        # file throws findings away to buy another attempt either.
         #
-        # `is not None`, not truthiness: a reviewer that reported an empty
-        # list looked and found nothing, and read_stream draws that
-        # distinction deliberately.
-        if findings is not None:
-            log("%s: it had already reported %d finding(s), posting those"
-                % (label, len(findings)))
-            note = partial_note(
-                "was killed after %ds" % config["review_timeout"])
-        else:
-            note = ("This review was killed after %ds. Read that as the "
-                    "review not finishing, not as the change being clean."
-                    % config["review_timeout"])
-        deliver(spoken, findings, note)
-        return DONE
-    took = round(time.monotonic() - started)
+        # `models[-1]` is an equality rather than an index because it reads
+        # as what it means, and load_config refuses a fallback equal to the
+        # model it stands in for, so the two cannot be confused for one.
+        if (model == models[-1] or findings is not None or output is None
+                or output.get("api_error_status") != 404):
+            break
+        log("%s: %s is not a model this account can reach, so the review "
+            "runs again on %s" % (label, model or "your Claude Code default",
+                                  config["fallback_model"]))
 
-    output, findings, spoken = read_stream(result.stdout, label)
     if output is None:
         # No terminal event, so the process died rather than finished: killed
         # for memory, a segfault, a truncated pipe. If it had already reported

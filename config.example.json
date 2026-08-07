@@ -4,6 +4,7 @@
   "effort": "high",
   "comment": true,
   "model": null,
+  "fallback_model": null,
   "review_on_push": false,
   "max_changed_lines": 3000,
   "skip_drafts": true,
