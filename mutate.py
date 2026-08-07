@@ -417,6 +417,24 @@ MUTATIONS = [
      "                                   tally=severity_tally(findings))}",
      "                                   note=note, verb=verb)}"),
 
+    # What a findings prompt can carry into argv. One entry per condition
+    # exec imposes, plus the choice the code argues for at length: a NUL
+    # replaced rather than dropped, because dropping it turns a quoted
+    # "a\\0.md" into a name that would pass the check being reported.
+    ("severity-prompt-drops-nul",
+     '    return text.encode("utf-8", "replace").decode("utf-8")'
+     '.replace("\\0", " ")',
+     '    return text.encode("utf-8", "replace").decode("utf-8")'),
+    ("severity-prompt-survives-a-surrogate",
+     '    return text.encode("utf-8", "replace").decode("utf-8")'
+     '.replace("\\0", " ")',
+     '    return text.replace("\\0", " ")'),
+    ("severity-prompt-replaces-nul-not-drops-it",
+     '    return text.encode("utf-8", "replace").decode("utf-8")'
+     '.replace("\\0", " ")',
+     '    return text.encode("utf-8", "replace").decode("utf-8")'
+     '.replace("\\0", "")'),
+
     # In finish(), so that all four routes to the pull request agree.
     ("severity-runs-in-finish",
      "    findings = triage(label, findings, config)",

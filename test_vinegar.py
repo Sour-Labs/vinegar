@@ -1006,6 +1006,74 @@ check("the severity pass is asked about the findings' own words",
       _prompt[:200])
 check("the severity pass is told how many answers to give",
       "exactly 3 lines" in _prompt, _prompt[-400:])
+
+# Two things a finding can quote that stop exec before the process starts,
+# each costing the severity pass and posting the findings untiered with a
+# bare exception name in the log to say why.
+#
+# The NUL was measured live on wonky-flow#95, where the reviewer quoted a
+# literal one to report that a name check accepted it. The unpaired
+# surrogate came out of reviewing that fix: json.loads produces one from a
+# \ud800 escape in the reviewer's stream, and exec then raises
+# UnicodeEncodeError, which subclasses ValueError and so reads much like
+# the first in a log.
+#
+# Both routes into the prompt are covered, because the fix has to sit after
+# both: flat() collapses whitespace and neither of these is whitespace in
+# Python, and finding_where() does not go through flat() at all.
+_HOSTILE = [{"file": "a\x00.py", "line": 1, "summary": "quotes a\x00byte",
+             "failure_scenario": 'assertCaptureName("a\x00.md") passes',
+             "category": "correctness"},
+            {"file": "b\ud800.py", "line": 2, "summary": "lone surrogate",
+             "failure_scenario": "json gave us \ud800 unpaired",
+             "category": "correctness"}]
+def _exec_can_carry(text):
+    """Whether exec could carry that string, as a bool and never a raise.
+
+    Asserting on `text.encode("utf-8")` directly reads fine and ends the
+    run: with the guard broken the encode raises out of the check
+    expression, and the suite aborts at that line instead of failing it,
+    skipping every check below. That is the shape this file was just
+    caught on twice, so the property is answered here rather than tested
+    by whether evaluating it explodes.
+    """
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return "\x00" not in text
+
+
+_hostile_prompt = vinegar.severity_brief(_HOSTILE)
+check("a finding quoting a NUL leaves none in the severity prompt",
+      _hostile_prompt.count("\x00") == 0, _hostile_prompt.count("\x00"))
+# The property exec actually imposes, rather than a list of the inputs
+# that break it. An earlier version of this named NUL and called itself
+# complete; the surrogate is what proved it was not.
+check("the severity prompt is something exec can carry",
+      _exec_can_carry(_hostile_prompt), repr(_hostile_prompt[:80]))
+# The NUL is replaced rather than dropped. Deleting it turns the quoted
+# "a\0.md" into "a.md", which reads as a name that would pass the check
+# the finding is complaining about, and this text is what the model judges
+# severity from.
+check("the byte is replaced, not deleted out of the quoted name",
+      "a .md" in _hostile_prompt, _hostile_prompt[-400:])
+
+# On what would actually be handed over, which is the check that keeps
+# meaning something if the prompt is ever assembled somewhere else.
+#
+# The command is required to be there. Reading it as `or []` made this
+# pass when no severity call had been made at all: `any()` over nothing is
+# False, so the check held whether or not the process was ever invoked,
+# which is the vacuous-assertion shape this suite exists to catch.
+_tiered_hostile = _triaged(_answer("blocker", "note"), findings=_HOSTILE)
+_asked = _severity_asked.get("cmd")
+check("the severity process is handed nothing exec would refuse",
+      bool(_asked) and all(_exec_can_carry(part) for part in _asked),
+      [part[:40] for part in _asked or []] or "no severity call was made")
+check("and the findings that quoted them are still tiered",
+      [f.get("tier") for f in _tiered_hostile] == ["blocker", "note"],
+      _tiered_hostile)
 # A one-finding review is a common shape, and an instruction that reads
 # "exactly 1 lines" invites the model to treat the whole line as
 # approximate.

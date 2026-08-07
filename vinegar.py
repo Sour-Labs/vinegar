@@ -1812,6 +1812,45 @@ def read_stream(stdout, label="review"):
     return result, findings, cap_spoken(spoken)
 
 
+def exec_safe(text):
+    """`text`, with everything an argv entry cannot carry taken out.
+
+    A prompt built from a reviewer's findings is handed to
+    subprocess.run as an argv entry, and the findings quote a branch
+    Vinegar does not trust. Two things there stop the process before it
+    starts, and each one costs the severity pass and posts the findings
+    untiered with a bare exception name in the log to say why:
+
+    - A NUL. Measured on wonky-flow#95, where the reviewer quoted a
+      literal one to report that a name check accepted it: the finding
+      was about NUL handling, and the byte it quoted is what stopped it
+      being tiered. CPython raises `ValueError: embedded null byte`.
+    - An unpaired surrogate. `json.loads` produces one happily from a
+      `\\ud800` escape in the reviewer's stream, and exec then raises
+      `UnicodeEncodeError: surrogates not allowed`. That subclasses
+      ValueError, so in a log it reads much like the first.
+
+    An earlier version of this named NUL and called itself complete. It
+    was not, and enumerating hostile inputs is how it got that wrong, so
+    this states the property instead: after the round trip the string is
+    something utf-8 can encode, and after the replace it holds no NUL.
+    Those are exactly the two conditions exec imposes, so anything else
+    the reviewer quotes survives untouched.
+
+    A space rather than a deletion for the NUL. Dropping it turns a
+    quoted "a\\0.md" into "a.md", which reads as a name that would
+    legitimately pass the check the finding is complaining about, and
+    this text is what the severity model judges from.
+
+    Only the prompt. Nothing here reaches the pull request, which
+    describe() renders from the finding itself, and the review command
+    is not exposed at all: reviewer_brief() interpolates the pull
+    request number and the base ref name, and git will not put either
+    of these in a ref name.
+    """
+    return text.encode("utf-8", "replace").decode("utf-8").replace("\0", " ")
+
+
 def severity_brief(findings):
     """Everything the severity pass is asked, the findings included.
 
@@ -1868,10 +1907,11 @@ def severity_brief(findings):
     # Pluralised, because a one-finding review is a common shape and
     # "Output exactly 1 lines" is the sort of wrongness that invites a
     # model to decide the instruction is approximate.
-    return SEVERITY_PROMPT.format(
+    #
+    return exec_safe(SEVERITY_PROMPT.format(
         count="%d line%s" % (len(findings),
                              "" if len(findings) == 1 else "s"),
-        findings="\n\n".join(blocks))
+        findings="\n\n".join(blocks)))
 
 
 def read_tiers(said, count):
