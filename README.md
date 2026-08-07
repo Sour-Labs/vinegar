@@ -187,6 +187,7 @@ Every key in `config.example.json`:
 | `effort` | `"high"` | Effort passed to `/code-review`: `low`, `medium`, `high`, `xhigh`, `max`. `ultra` is rejected. Read the note below before pairing it with `model`. |
 | `comment` | `true` | Post findings on the pull request. False runs the review and writes only to `~/.vinegar/reviews.dry/`, remembering what it did in `state.json.dry`. |
 | `model` | `null` | Model for the review. Null uses your Claude Code default. Read the note below before setting it. |
+| `fallback_model` | `null` | Model to run the review again on when `model` cannot be routed. Null means no fallback. See below. |
 | `review_on_push` | `false` | Review again when the head commit changes. |
 | `max_changed_lines` | `3000` | Skip pull requests larger than this. |
 | `skip_drafts` | `true` | Skip drafts. |
@@ -210,6 +211,40 @@ sweep. On this repository `xhigh` found 15 findings for $1.65 where `high`
 found between 2 and 6 for $1.31 to $2.18, so the deeper setting was both
 better and cheaper per finding. Measure on your own repository before
 believing that.
+
+**`fallback_model` is for the day `model` stops resolving.** A pinned model
+is not always a public model id. `claude-opus-5[1m]` selects a routing
+variant, and nothing promises a variant keeps answering across Claude Code
+releases or account changes. When one stops, every review comes back the same
+way: a result event carrying `api_error_status` 404, about a second in, having
+spent nothing. Vinegar retries three times and gives up. It says so on each
+pull request, so the failure is visible rather than silent, but no pull
+request in any repository it polls gets reviewed until somebody fixes the
+config.
+
+Set `fallback_model` to a plain model id and that failure costs one extra
+second per review instead of every review. `"claude-opus-5"` is the sensible
+partner to a pinned `"claude-opus-5[1m]"`.
+
+Only that one failure falls back. An overload, a review killed at
+`review_timeout`, and a spent subscription have all burned the review's budget
+by the time Vinegar knows. A 529 measured live arrived eight and a half
+minutes into an `xhigh` run, and none of them is repaired by a second model.
+Those still fail and retry as before. The fallback is an availability switch,
+not a general retry.
+
+**The two attempts divide one `review_timeout` between them**, rather than
+getting one each. A pull request holds the only poll thread for as long as its
+review runs, which is what the `review_timeout` ceiling exists to bound, and a
+fallback given its own fresh timeout would double that. The fallback inherits
+whatever the first attempt did not use, so budget `review_timeout` for the
+review, not for each attempt.
+
+When a review does fall back, it says so on the pull request as well as in the
+log. A fallback that works quietly is a pinned model that stays dead: the
+reviews keep arriving and read exactly like the configured model's.
+
+Vinegar refuses to start if `fallback_model` names the same model as `model`.
 
 ### Posting as Vinegar instead of as you
 

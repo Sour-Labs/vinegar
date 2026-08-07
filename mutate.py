@@ -166,15 +166,11 @@ MUTATIONS = [
      '           "--strict-mcp-config"]',
      '           "--setting-sources", ""]'),
     ("review-timeout",
-     '        result = run(cmd, cwd=path, timeout=config["review_timeout"],\n'
-     "                     env=reviewing)",
-     "        result = run(cmd, cwd=path,\n"
-     "                     env=reviewing)"),
+     "                         cwd=path, timeout=left, env=reviewing)",
+     "                         cwd=path, env=reviewing)"),
     ("review-cwd",
-     '        result = run(cmd, cwd=path, timeout=config["review_timeout"],\n'
-     "                     env=reviewing)",
-     '        result = run(cmd, timeout=config["review_timeout"],\n'
-     "                     env=reviewing)"),
+     "                         cwd=path, timeout=left, env=reviewing)",
+     "                         timeout=left, env=reviewing)"),
 
     # --- which pull requests are reviewed at all -----------------------
     ("skip-drafts",
@@ -425,11 +421,95 @@ MUTATIONS = [
     ("severity-runs-in-finish",
      "    findings = triage(label, findings, config)",
      "    pass"),
-    ("severity-model-validated",
-     "    chooser = config[\"severity_model\"]\n"
-     "    if chooser is not None and not (isinstance(chooser, str)\n"
-     "                                    and chooser.strip()):",
-     "    chooser = config[\"severity_model\"]\n"
+    # One loop now covers severity_model, model and fallback_model, so one
+    # entry covers the predicate all three share. Storing the stripped name
+    # is a separate guard: without it a hand-edited "claude-opus-5 " passes
+    # the check and then 404s every review of every repository.
+    ("model-names-validated",
+     "        if named is not None and not (isinstance(named, str)\n"
+     "                                      and named.strip()):",
+     "        if False:"),
+    ("model-names-are-stripped",
+     "        if isinstance(named, str):\n"
+     "            config[name] = named.strip()",
+     "        if False:\n"
+     "            config[name] = named.strip()"),
+
+    # --- the fallback model --------------------------------------------
+    # A pinned model that stops resolving takes every review with it, so
+    # the fallback is an availability switch. Each half of it: that a
+    # second attempt happens at all, that only a routing failure buys one,
+    # that findings already in hand are never spent to get it, and that it
+    # is one extra attempt rather than a loop.
+    ("fallback-model-is-tried",
+     "    if config[\"fallback_model\"]:\n"
+     "        models.append(config[\"fallback_model\"])",
+     "    if False:\n"
+     "        models.append(config[\"fallback_model\"])"),
+    # Each clause of unroutable() separately. Together they are the whole
+    # claim that a second attempt is free: a failed run, refused for the
+    # model rather than anything else, holding no findings, carrying a
+    # result event to read at all, and having spent nothing.
+    ("fallback-only-on-a-routing-failure",
+     '            and output.get("api_error_status") == 404\n',
+     ""),
+    ("fallback-only-on-a-failed-run",
+     '            and output.get("is_error")\n',
+     ""),
+    ("fallback-only-when-it-spent-nothing",
+     '            and output.get("total_cost_usd") == 0)',
+     "            )"),
+    # A missing cost field is not a report of having spent nothing, and
+    # `not output.get(...)` cannot tell the two apart.
+    ("fallback-cost-must-be-reported",
+     '            and output.get("total_cost_usd") == 0)',
+     '            and not output.get("total_cost_usd"))'),
+    ("fallback-never-spends-findings",
+     "    return (findings is None and output is not None",
+     "    return (output is not None"),
+    ("fallback-needs-a-result-event",
+     "    return (findings is None and output is not None\n",
+     "    return (findings is None\n"),
+    ("fallback-stops-at-the-last-model",
+     "        if index == len(models) - 1"
+     " or not unroutable(output, findings):",
+     "        if not unroutable(output, findings):"),
+    # The floor under the inherited bound. Without it a first attempt that
+    # rounds up to the whole bound hands the fallback a zero, and
+    # subprocess.run kills it before it has read a byte.
+    ("fallback-bound-never-reaches-zero",
+     "        left = max(1, left - took)",
+     "        left = left - took"),
+    # The pull request is told which model actually reviewed it. Otherwise
+    # a dead pin looks exactly like a healthy one to anyone reading GitHub.
+    ("fallback-is-disclosed-on-the-pull-request",
+     "        abandoned = model",
+     "        pass"),
+    # The kill is reported against the bound that killed it, not the
+    # configured one. On a fallback attempt those differ.
+    ("killed-note-quotes-the-bound-used",
+     '                note = partial_note("was killed after %ds" % left)',
+     '                note = partial_note("was killed after %ds"\n'
+     '                                    % config["review_timeout"])'),
+    ("killed-with-nothing-quotes-the-bound-used",
+     '                        "review not finishing, not as the change being '
+     'clean."\n                        % left)',
+     '                        "review not finishing, not as the change being '
+     'clean."\n                        % config["review_timeout"])'),
+    # The two attempts share one bound. A fresh review_timeout for the
+    # fallback lets one pull request park the only poll thread for twice
+    # it, which load_config exits with a sentence saying cannot happen.
+    ("fallback-shares-the-review-timeout",
+     "        left = max(1, left - took)",
+     '        left = config["review_timeout"]'),
+    # The pinned model reaching argv at all. Without it every review runs
+    # on whatever the machine defaults to and says nothing about it.
+    ("review-runs-the-configured-model",
+     "            result = run(cmd + ([\"--model\", model] if model else []),",
+     "            result = run(cmd,"),
+    ("fallback-differs-from-the-model",
+     "    if (config[\"fallback_model\"] is not None\n"
+     "            and config[\"fallback_model\"] == config[\"model\"]):",
      "    if False:"),
 
     # --- the checks-list indicator -------------------------------------
