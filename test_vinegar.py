@@ -156,6 +156,13 @@ def fake_run(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
     if cmd[:2] in (["git", "cat-file"], ["git", "merge-base"]):
         scoped.append(cmd)
         return subprocess.CompletedProcess(cmd, fake_run.scope_rc, "", "")
+    # The merge probe answers by printing, not by exiting non-zero, so it
+    # needs its own slot. Sharing `scope_rc` would have made "the branch
+    # merged something in" unreachable: rev-list exits 0 for a clean range
+    # and for one full of merges alike.
+    if cmd[:2] == ["git", "rev-list"]:
+        scoped.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, fake_run.merges, "")
     # Before the posting branch, and not folded into it. A check-run call
     # is `gh api ... --method ...` exactly like a review posting, so
     # without its own branch every indicator landed in `posted` and the
@@ -193,6 +200,7 @@ fake_run.diff_out = ""
 fake_run.look_rc = 0
 fake_run.look_out = ""
 fake_run.scope_rc = 0
+fake_run.merges = ""
 fake_run.post_err = "HTTP 422"
 GENUINE_RUN = vinegar.run
 vinegar.run = fake_run
@@ -231,6 +239,7 @@ def reset_stubs():
     fake_run.look_rc = 0
     fake_run.look_out = ""
     fake_run.scope_rc = 0
+    fake_run.merges = ""
     fake_run.post_err = "HTTP 422"
     fake_run.check_rc = 0
     fake_run.check_err = ""
@@ -779,6 +788,26 @@ check("a narrowed pass says what it actually read",
       and "No findings." in _narrowed, _narrowed)
 check("a full pass does not claim it was narrowed",
       "only what was added since" not in empty, empty)
+
+# repost() rebuilds a refused review's comment from the transcript under
+# its own opening, so the narrowing sentence living only in review_body
+# meant a review delivered that way arrived reading as though it had
+# covered the whole pull request. The transcript is also the artifact an
+# operator is told to send by hand once every retry is spent.
+_saved_dir = vinegar.REVIEW_DIR
+vinegar.REVIEW_DIR = tempfile.mkdtemp(prefix="vinegar-tx-scope-")
+_tx_path = GENUINE_SAVE_TRANSCRIPT(
+    "o/r", PR, "the words", [], None,
+    "0123456789abcdef0123456789abcdef01234567")
+with open(_tx_path) as _h:
+    _tx_body = _h.read()
+check("a narrowed review says so in the transcript, not only in the comment",
+      "Scope: only what was added since `0123456`" in _tx_body, _tx_body[:200])
+_tx_full = GENUINE_SAVE_TRANSCRIPT("o/r", PR, "the words", [], None)
+with open(_tx_full) as _h:
+    check("a full review's transcript claims no scope", "Scope:" not in _h.read())
+shutil.rmtree(vinegar.REVIEW_DIR, True)
+vinegar.REVIEW_DIR = _saved_dir
 
 # --- the severity pass ---------------------------------------------------
 reset_stubs()
@@ -1586,8 +1615,8 @@ real_env, real_transcript = vinegar.github_env, vinegar.save_transcript
 _tx_calls = []
 
 
-def stub_transcript(repo, pr, text, findings=None, note=None):
-    _tx_calls.append((repo, pr, text, findings, note))
+def stub_transcript(repo, pr, text, findings=None, note=None, since=None):
+    _tx_calls.append((repo, pr, text, findings, note, since))
     return "/dev/null"
 
 
@@ -1595,6 +1624,18 @@ assert (inspect.signature(stub_transcript).parameters.keys()
         == inspect.signature(vinegar.save_transcript).parameters.keys()), \
     "the save_transcript stub no longer matches the real signature"
 vinegar.save_transcript = stub_transcript
+
+def _ran(*a, **k):
+    """review()'s outcome alone.
+
+    review() answers a pair now: the outcome, and whether a whole reading
+    of the scope reached the author. The checks below were written against
+    the outcome and still ask only about it. The pair itself is asserted on
+    in its own section, and handle_pr's use of the second half is what the
+    reviewed_sha checks exercise.
+    """
+    return vinegar.review(*a, **k)[0]
+
 
 
 def exploding_env(*a, **k):
@@ -1663,7 +1704,7 @@ triage_run.answer = all_advisory
 vinegar.run, vinegar.github_env = claude_run, exploding_env
 del posted[:]
 check("a mint failure falls back rather than losing the review",
-      vinegar.review(ROOT, "o/r", PR, CONFIG, None, {}) == vinegar.DONE
+      _ran(ROOT, "o/r", PR, CONFIG, None, {}) == vinegar.DONE
       and len(posted) == 1, (len(posted),))
 
 # Posting itself raising, which is what announce() exists for: an exception
@@ -1674,7 +1715,7 @@ vinegar.post_review = exploding_post_review
 vinegar.github_env = lambda *a, **k: None
 del posted[:]
 check("a review whose posting raises is still recorded as done",
-      vinegar.review(ROOT, "o/r", PR, CONFIG, None, {}) == vinegar.DONE
+      _ran(ROOT, "o/r", PR, CONFIG, None, {}) == vinegar.DONE
       and not posted, (posted,))
 vinegar.post_review = _real_post
 
@@ -1688,19 +1729,19 @@ def exploding_save(*a, **k):
 vinegar.save_transcript = exploding_save
 del posted[:]
 check("a transcript that cannot be written still posts the review",
-      vinegar.review(ROOT, "o/r", PR, CONFIG, None, {}) == vinegar.DONE
+      _ran(ROOT, "o/r", PR, CONFIG, None, {}) == vinegar.DONE
       and len(posted) == 1, (len(posted),))
 vinegar.save_transcript = _real_save
 
 vinegar.github_env = lambda *a, **k: None
 del posted[:]
 check("a review that posts cleanly is done and posted once",
-      vinegar.review(ROOT, "o/r", PR, CONFIG, None, {}) == vinegar.DONE
+      _ran(ROOT, "o/r", PR, CONFIG, None, {}) == vinegar.DONE
       and len(posted) == 1, (len(posted),))
 
 del posted[:]
 check("a dry run reviews without minting or posting",
-      vinegar.review(ROOT, "o/r", PR, dict(CONFIG, comment=False), None,
+      _ran(ROOT, "o/r", PR, dict(CONFIG, comment=False), None,
                      {}) == vinegar.DONE and not posted, posted)
 
 # An error that still produced a review must not be thrown away and charged
@@ -1711,14 +1752,14 @@ claude_run.stream = stream(call(FINDINGS[:4]),
                                         subtype="error_max_turns"))
 del posted[:]
 check("an error holding a review is posted and recorded done",
-      vinegar.review(ROOT, "o/r", PR, CONFIG, None, {}) == vinegar.DONE
+      _ran(ROOT, "o/r", PR, CONFIG, None, {}) == vinegar.DONE
       and len(posted) == 1, (len(posted),))
 
 claude_run.stream = stream(result_event(is_error=True, result=None,
                                         subtype="error_during_execution"))
 del posted[:]
 check("an error holding nothing is retried, not posted",
-      vinegar.review(ROOT, "o/r", PR, CONFIG, None, {}) == vinegar.FAILED
+      _ran(ROOT, "o/r", PR, CONFIG, None, {}) == vinegar.FAILED
       and not posted, (posted,))
 
 
@@ -1755,7 +1796,7 @@ FALLING_BACK = dict(PINNED, fallback_model="claude-opus-5")
 vinegar.github_env = lambda *a, **k: None
 claude_run.stream = stream(call(FINDINGS[:4]), result_event())
 del claude_run.calls[:]
-vinegar.review(ROOT, "o/r", PR, PINNED, None, {})
+_ran(ROOT, "o/r", PR, PINNED, None, {})
 check("the review runs on the model the config pins",
       _model_of(claude_run.calls[0]) == "claude-opus-5[1m]",
       claude_run.calls[0])
@@ -1763,7 +1804,7 @@ check("the review runs on the model the config pins",
 # selected. A literal `--model None` reaching argv is a 404 on every review
 # of every repository.
 del claude_run.calls[:]
-vinegar.review(ROOT, "o/r", PR, CONFIG, None, {})
+_ran(ROOT, "o/r", PR, CONFIG, None, {})
 check("a config that pins no model passes no model flag",
       "--model" not in claude_run.calls[0], claude_run.calls[0])
 
@@ -1772,7 +1813,7 @@ claude_run.stream = _answers(stream(NOT_FOUND),
 del posted[:]
 del claude_run.calls[:]
 check("a model that cannot be routed is reviewed again on the fallback",
-      vinegar.review(ROOT, "o/r", PR, FALLING_BACK, None, {}) == vinegar.DONE
+      _ran(ROOT, "o/r", PR, FALLING_BACK, None, {}) == vinegar.DONE
       and len(posted) == 1, (posted,))
 check("the second attempt asks for the model the config calls the fallback",
       len(claude_run.calls) == 2
@@ -1792,7 +1833,7 @@ check("the pull request is told the review ran on the fallback",
 # about a model that answered perfectly well.
 claude_run.stream = stream(call(FINDINGS[:4]), result_event())
 del posted[:]
-vinegar.review(ROOT, "o/r", PR, FALLING_BACK, None, {})
+_ran(ROOT, "o/r", PR, FALLING_BACK, None, {})
 check("a review that never fell back says nothing about a fallback",
       posted and "could not be reached" not in posted[0][1]["body"],
       posted[0][1]["body"][:300] if posted else "nothing posted")
@@ -1810,7 +1851,7 @@ claude_run.stream = _answers(
 del posted[:]
 del claude_run.calls[:]
 check("a failure that is not a routing failure never reaches the fallback",
-      vinegar.review(ROOT, "o/r", PR, FALLING_BACK, None, {}) == vinegar.FAILED
+      _ran(ROOT, "o/r", PR, FALLING_BACK, None, {}) == vinegar.FAILED
       and len(claude_run.calls) == 1, len(claude_run.calls))
 
 # The same, but free. A spent subscription fails in about a second having
@@ -1825,7 +1866,7 @@ claude_run.stream = _answers(
 del posted[:]
 del claude_run.calls[:]
 check("a free failure with no 404 on it never reaches the fallback",
-      vinegar.review(ROOT, "o/r", PR, FALLING_BACK, None, {}) == vinegar.FAILED
+      _ran(ROOT, "o/r", PR, FALLING_BACK, None, {}) == vinegar.FAILED
       and len(claude_run.calls) == 1, len(claude_run.calls))
 
 # A 404 arriving after the reviewer has reported keeps what it reported.
@@ -1838,7 +1879,7 @@ claude_run.stream = _answers(
 del posted[:]
 del claude_run.calls[:]
 check("a routing failure holding findings posts them rather than retrying",
-      vinegar.review(ROOT, "o/r", PR, FALLING_BACK, None, {}) == vinegar.DONE
+      _ran(ROOT, "o/r", PR, FALLING_BACK, None, {}) == vinegar.DONE
       and len(claude_run.calls) == 1 and len(posted) == 1,
       (len(claude_run.calls), len(posted)))
 
@@ -1848,7 +1889,7 @@ claude_run.stream = _answers(stream(NOT_FOUND))
 del posted[:]
 del claude_run.calls[:]
 check("no fallback configured leaves a routing failure to the retries",
-      vinegar.review(ROOT, "o/r", PR, PINNED, None, {}) == vinegar.FAILED
+      _ran(ROOT, "o/r", PR, PINNED, None, {}) == vinegar.FAILED
       and len(claude_run.calls) == 1 and not posted,
       (len(claude_run.calls), posted))
 
@@ -1859,7 +1900,7 @@ claude_run.stream = _answers(stream(NOT_FOUND))
 del posted[:]
 del claude_run.calls[:]
 check("a fallback that cannot be routed either stops at two attempts",
-      vinegar.review(ROOT, "o/r", PR, FALLING_BACK, None, {}) == vinegar.FAILED
+      _ran(ROOT, "o/r", PR, FALLING_BACK, None, {}) == vinegar.FAILED
       and len(claude_run.calls) == 2 and not posted,
       (len(claude_run.calls), posted))
 
@@ -1875,7 +1916,7 @@ claude_run.stream = _answers(
 del posted[:]
 del claude_run.calls[:]
 check("a routing failure that already spent the budget is not retried",
-      vinegar.review(ROOT, "o/r", PR, FALLING_BACK, None, {}) == vinegar.FAILED
+      _ran(ROOT, "o/r", PR, FALLING_BACK, None, {}) == vinegar.FAILED
       and len(claude_run.calls) == 1, len(claude_run.calls))
 
 # A result event with no cost field at all. `not output.get(...)` cannot
@@ -1889,7 +1930,7 @@ claude_run.stream = _answers(stream(_NO_COST),
 del posted[:]
 del claude_run.calls[:]
 check("a routing failure that reported no cost at all is not retried",
-      vinegar.review(ROOT, "o/r", PR, FALLING_BACK, None, {}) == vinegar.FAILED
+      _ran(ROOT, "o/r", PR, FALLING_BACK, None, {}) == vinegar.FAILED
       and len(claude_run.calls) == 1, len(claude_run.calls))
 
 # A 404 recorded on a run that finished is not a routing failure. It would
@@ -1902,7 +1943,7 @@ claude_run.stream = _answers(
 del posted[:]
 del claude_run.calls[:]
 check("a 404 on a run that did not fail is not retried on the fallback",
-      vinegar.review(ROOT, "o/r", PR, FALLING_BACK, None, {}) == vinegar.DONE
+      _ran(ROOT, "o/r", PR, FALLING_BACK, None, {}) == vinegar.DONE
       and len(claude_run.calls) == 1, len(claude_run.calls))
 
 # A stream that stopped before its result event has no status to read, and
@@ -1918,7 +1959,7 @@ check("a 404 on a run that did not fail is not retried on the fallback",
 # check, and every check below it would go unrun.
 def _reviewed(config):
     try:
-        return vinegar.review(ROOT, "o/r", PR, config, None, {})
+        return _ran(ROOT, "o/r", PR, config, None, {})
     except Exception as err:
         return "raised %s" % type(err).__name__
 
@@ -1978,7 +2019,7 @@ claude_run.stream = _ticking(120, stream(NOT_FOUND),
 del posted[:]
 del claude_run.calls[:]
 del claude_run.bounds[:]
-vinegar.review(ROOT, "o/r", PR, FALLING_BACK, None, {})
+_ran(ROOT, "o/r", PR, FALLING_BACK, None, {})
 check("the fallback inherits what is left of the one bound, not a fresh one",
       claude_run.bounds == [FALLING_BACK["review_timeout"],
                             FALLING_BACK["review_timeout"] - 120],
@@ -1995,7 +2036,7 @@ claude_run.stream = _ticking(FALLING_BACK["review_timeout"],
 del posted[:]
 del claude_run.calls[:]
 del claude_run.bounds[:]
-vinegar.review(ROOT, "o/r", PR, FALLING_BACK, None, {})
+_ran(ROOT, "o/r", PR, FALLING_BACK, None, {})
 vinegar.time = _real_time
 check("a first attempt that used the whole bound still leaves the fallback "
       "a second", claude_run.bounds == [FALLING_BACK["review_timeout"], 1],
@@ -2030,7 +2071,7 @@ for _salvaged, _what in ((None, "having reported nothing"),
     claude_run.stream = _timing_out(120, _salvaged)
     del posted[:]
     del claude_run.calls[:]
-    vinegar.review(ROOT, "o/r", PR, FALLING_BACK, None, {})
+    _ran(ROOT, "o/r", PR, FALLING_BACK, None, {})
     vinegar.time = _real_time
     check("a fallback killed %s quotes the bound it was given" % _what,
           posted and "killed after %ds" % _inherited in posted[0][1]["body"],
@@ -2047,12 +2088,12 @@ _fb_real_log, vinegar.log = vinegar.log, lambda m: _fb_log.append(m)
 claude_run.stream = _answers(stream(NOT_FOUND),
                              stream(call(FINDINGS[:4]), result_event()))
 del claude_run.calls[:]
-vinegar.review(ROOT, "o/r", PR, FALLING_BACK, None, {})
+_ran(ROOT, "o/r", PR, FALLING_BACK, None, {})
 _fell_back = list(_fb_log)
 del _fb_log[:]
 claude_run.stream = _answers(stream(NOT_FOUND))
 del claude_run.calls[:]
-vinegar.review(ROOT, "o/r", PR, PINNED, None, {})
+_ran(ROOT, "o/r", PR, PINNED, None, {})
 _no_fallback = list(_fb_log)
 vinegar.log = _fb_real_log
 check("the fallback says which model it left and which it moved to",
@@ -2063,7 +2104,7 @@ check("a config with no fallback never says the review runs again",
 
 claude_run.stream = stream(result_event(result=None))
 del posted[:]
-vinegar.review(ROOT, "o/r", PR, CONFIG, None, {})
+_ran(ROOT, "o/r", PR, CONFIG, None, {})
 check("a null result is announced as nothing produced",
       len(posted) == 1 and "produced nothing" in posted[0][1]["body"],
       posted[0][1]["body"] if posted else "nothing posted")
@@ -2073,7 +2114,7 @@ check("a null result never posts the word None",
 
 claude_run.stream = stream(call(FINDINGS[:4]), result_event())
 del posted[:]
-vinegar.review(ROOT, "o/r", PR, CONFIG, None, {})
+_ran(ROOT, "o/r", PR, CONFIG, None, {})
 check("the review asks for the stream the tool call arrives in",
       "stream-json" in claude_run.saw and "--verbose" in claude_run.saw,
       claude_run.saw)
@@ -2774,7 +2815,7 @@ _tokened = {"GH_TOKEN": "ghs_installation_token",
 del posted[:]
 # Passed by reference deliberately: handing over a copy would make the
 # untouched-caller check below unable to fail, which is what it did first.
-vinegar.review(ROOT, "o/r", PR, CONFIG, _tokened, {})
+_ran(ROOT, "o/r", PR, CONFIG, _tokened, {})
 check("the reviewer is not given the installation token",
       "GH_TOKEN" not in (claude_run.env or {}), sorted(claude_run.env or {}))
 check("nor an operator's own GitHub token",
@@ -2793,14 +2834,14 @@ check("removing it from the reviewer does not disarm the posting fallback",
 claude_run.stream = stream(call(FINDINGS[:4]))
 del posted[:]
 check("findings survive a stream that never reached its result event",
-      vinegar.review(ROOT, "o/r", PR, CONFIG, None, {}) == vinegar.DONE
+      _ran(ROOT, "o/r", PR, CONFIG, None, {}) == vinegar.DONE
       and len(posted) == 1
       and "not a finished round" in posted[0][1]["body"], (len(posted),))
 
 claude_run.stream = ""
 del posted[:]
 check("a truncated stream with nothing reported is retried",
-      vinegar.review(ROOT, "o/r", PR, CONFIG, None, {}) == vinegar.FAILED
+      _ran(ROOT, "o/r", PR, CONFIG, None, {}) == vinegar.FAILED
       and not posted, (posted,))
 
 # Killed mid-summary, after the findings were already reported.
@@ -2815,7 +2856,7 @@ def timing_out(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
 vinegar.run = timing_out
 del posted[:]
 check("a kill after the findings were reported still posts them",
-      vinegar.review(ROOT, "o/r", PR, CONFIG, None, {}) == vinegar.DONE
+      _ran(ROOT, "o/r", PR, CONFIG, None, {}) == vinegar.DONE
       and len(posted) == 1
       and "comments" in posted[0][1], (len(posted),))
 check("a salvaged review says it was not a finished round",
@@ -2837,7 +2878,7 @@ def timing_out_clean(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
 vinegar.run = timing_out_clean
 del posted[:]
 check("a kill after a clean report is not called 'returned nothing'",
-      vinegar.review(ROOT, "o/r", PR, CONFIG, None, {}) == vinegar.DONE
+      _ran(ROOT, "o/r", PR, CONFIG, None, {}) == vinegar.DONE
       and len(posted) == 1
       and "returned nothing" not in posted[0][1]["body"]
       and "reported nothing before it stopped" in posted[0][1]["body"],
@@ -2853,7 +2894,7 @@ def timing_out_early(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
 vinegar.run = timing_out_early
 del posted[:]
 check("a kill with nothing reported still says so on the pull request",
-      vinegar.review(ROOT, "o/r", PR, CONFIG, None, {}) == vinegar.DONE
+      _ran(ROOT, "o/r", PR, CONFIG, None, {}) == vinegar.DONE
       and len(posted) == 1 and "killed after" in posted[0][1]["body"],
       posted[0][1]["body"][:120] if posted else "nothing posted")
 check("a killed review does not read as clean",
@@ -2870,7 +2911,7 @@ fake_run.rc = 1
 fake_run.post_err = "HTTP 502 Bad Gateway"
 fake_run.look_out = ""
 del posted[:]
-vinegar.review(ROOT, "o/r", PR, CONFIG, None, {})
+_ran(ROOT, "o/r", PR, CONFIG, None, {})
 check("the killed notice is retried when the failure is transient",
       len(posted) == 2, len(posted))
 fake_run.rc = 0
@@ -2892,7 +2933,7 @@ def timing_out_prose(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
 vinegar.run = timing_out_prose
 del posted[:]
 check("a kill after prose alone still posts the reviewer's words",
-      vinegar.review(ROOT, "o/r", PR, CONFIG, None, {}) == vinegar.DONE
+      _ran(ROOT, "o/r", PR, CONFIG, None, {}) == vinegar.DONE
       and len(posted) == 1
       and "the diff looks risky" in posted[0][1]["body"]
       and "killed after" in posted[0][1]["body"],
@@ -2904,7 +2945,7 @@ claude_run.stream = stream(call(FINDINGS[:4]),
                                         subtype="error_during_execution"))
 del posted[:]
 check("an error after the findings arrived posts them, not a retry",
-      vinegar.review(ROOT, "o/r", PR, CONFIG, None, {}) == vinegar.DONE
+      _ran(ROOT, "o/r", PR, CONFIG, None, {}) == vinegar.DONE
       and len(posted) == 1, (len(posted),))
 check("a failed run says so rather than reading as finished",
       posted and "failed before it finished" in posted[0][1]["body"],
@@ -2914,7 +2955,7 @@ claude_run.stream = stream(call([]),
                            result_event(is_error=True,
                                         subtype="error_during_execution"))
 del posted[:]
-vinegar.review(ROOT, "o/r", PR, CONFIG, None, {})
+_ran(ROOT, "o/r", PR, CONFIG, None, {})
 check("a failed run reporting nothing is never called clean",
       posted and "No findings." not in posted[0][1]["body"]
       and "reported nothing before it stopped" in posted[0][1]["body"],
@@ -2922,7 +2963,7 @@ check("a failed run reporting nothing is never called clean",
 
 claude_run.stream = stream(call(FINDINGS[:4]), result_event())
 del posted[:]
-vinegar.review(ROOT, "o/r", PR, CONFIG, None, {})
+_ran(ROOT, "o/r", PR, CONFIG, None, {})
 check("the brief reaches the reviewer",
       "--append-system-prompt" in claude_run.saw
       and any("release-2...HEAD" in a for a in claude_run.saw),
@@ -3180,6 +3221,46 @@ reset_stubs()
 vinegar.run = _hanging_probe
 check("a probe that hangs widens the pass rather than narrowing it",
       vinegar.review_scope(ROOT, PR_SINCE, REVIEWED, None, L) is None)
+
+
+def _exploding_probe(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
+    raise OSError("cannot allocate memory")
+
+
+# The call site sits after the attempt is charged and outside the try that
+# guards the review, so anything escaping here spends a retry on a review
+# that never ran. Three of those announce the pull request as given up on
+# with nothing having been attempted.
+reset_stubs()
+vinegar.run = _exploding_probe
+check("a probe that raises widens the pass instead of escaping",
+      vinegar.review_scope(ROOT, PR_SINCE, REVIEWED, None, L) is None)
+
+# `<since>..HEAD` is everything added to the branch, so a `git merge main`
+# puts the whole base branch inside the "narrowed" scope. Those lines are
+# absent from `refs/heads/<base>...HEAD`, so diff_lines() can anchor none
+# of the findings about them and the overflow trim can push the author's
+# real findings out of the comment.
+reset_stubs()
+fake_run.merges = "f00dcafef00dcafef00dcafef00dcafef00dcafe\n"
+check("a branch that merged something in widens the pass",
+      vinegar.review_scope(ROOT, PR_SINCE, REVIEWED, None, L) is None,
+      scoped)
+# rev-list reports by printing, not by exiting non-zero. Reading its exit
+# code the way the other two probes are read calls every merge safe.
+reset_stubs()
+check("a clean range of commits still narrows the pass",
+      vinegar.review_scope(ROOT, PR_SINCE, REVIEWED, None, L) == OLD_SHA,
+      scoped)
+
+# Unreachable from the daemon, whose DONE check returns first. Reached
+# routinely by hand: `--pr` has no such check on purpose, so that trying
+# another `--model` is possible at all.
+reset_stubs()
+check("a head that has already been reviewed is not diffed against itself",
+      vinegar.review_scope(ROOT, dict(PR_SINCE, headRefOid=OLD_SHA),
+                           REVIEWED, None, L) is None
+      and not scoped, scoped)
 reset_stubs()
 
 # --- the brief a re-review gets ------------------------------------------
@@ -3204,6 +3285,17 @@ check("a re-review has somewhere to go if the commit does not resolve",
 check("a first review's brief is left exactly as it was measured working",
       "refs/heads/release-2...HEAD` is the review scope" in brief
       and "re-review" not in brief, brief)
+# checkout() carries on when the base refresh fails, so a clone can hold
+# the head with neither base ref present. Telling the reviewer to report
+# that it could not establish the scope, while the paragraph after it hands
+# over one that resolves, is two instructions for one decision — and it can
+# settle that by refusing to review, which is a paid-for run posting
+# "could not establish the scope" with a good scope on offer.
+check("a re-review is not also told to give up when the base refs are gone",
+      "could not establish the scope" not in again
+      and "review the whole branch" in again, again)
+check("a first review is still told to give up rather than guess",
+      "could not establish the scope" in brief, brief)
 
 # --- handle_pr: the guard that bounds every crash --------------------------
 reset_stubs()
@@ -3343,7 +3435,10 @@ def _indicator_after(what, attempts, closes=None):
             vinegar.close_check(L, check, closes, CHK_ENV)
         if what == "raise":
             raise RuntimeError("the review process vanished")
-        return what
+        # Never covered. This section is about the indicator backstop, and
+        # its DONE case is the ending where the subscription was spent and
+        # nothing reached the pull request.
+        return what, False
 
     vinegar.review = review_stub
     state = {L: {"outcome": vinegar.FAILED, "sha": PR_LIVE["headRefOid"],
@@ -3437,7 +3532,7 @@ del checked[:]
 # process that is killed outright rather than raising.
 _hp_state.clear()
 del _hp_saved[:]
-vinegar.review = lambda *a, **k: vinegar.DONE
+vinegar.review = lambda *a, **k: (vinegar.DONE, True)
 vinegar.handle_pr("o/r", PR_LIVE, CONFIG, _hp_state, {})
 check("an attempt is on disk before the review starts",
       len(_hp_saved) == 2 and _hp_saved[0][L]["outcome"] == vinegar.FAILED,
@@ -3448,7 +3543,7 @@ check("the real outcome replaces the marker when the review finishes",
 # A skip must not hand back the retry budget the attempts already burned.
 _sk_state = {L: {"outcome": vinegar.FAILED, "sha": PR["headRefOid"],
                  "attempts": 2}}
-vinegar.review = lambda *a, **k: vinegar.FAILED
+vinegar.review = lambda *a, **k: (vinegar.FAILED, False)
 vinegar.handle_pr("o/r", dict(PR_LIVE, isDraft=True), CONFIG, _sk_state, {})
 check("a skip keeps the attempts burned at this head",
       _sk_state[L]["outcome"] == "skipped"
@@ -3458,7 +3553,7 @@ check("a skip that lifts resumes the budget rather than restarting it",
       _sk_state[L].get("attempts") == 3, _sk_state)
 vinegar.handle_pr("o/r", dict(PR_LIVE, isDraft=True), CONFIG, _sk_state, {})
 _sk_ran = []
-vinegar.review = lambda *a, **k: _sk_ran.append(1) or vinegar.DONE
+vinegar.review = lambda *a, **k: _sk_ran.append(1) or (vinegar.DONE, True)
 vinegar.handle_pr("o/r", PR_LIVE, CONFIG, _sk_state, {})
 check("a lifted skip cannot re-run a review whose budget is spent",
       not _sk_ran, (_sk_state, _sk_ran))
@@ -3630,7 +3725,7 @@ check("a dry run's give-up does not re-announce on every poll",
 _di_state = {L: {"outcome": vinegar.FAILED, "sha": PR["headRefOid"],
                  "attempts": vinegar.MAX_ATTEMPTS - 1}}
 _di_review, _di_checkout = vinegar.review, vinegar.checkout
-vinegar.review = lambda *a, **k: vinegar.FAILED
+vinegar.review = lambda *a, **k: (vinegar.FAILED, False)
 vinegar.checkout = lambda repo, pr, env: ROOT
 del posted[:]
 vinegar.handle_pr("o/r", PR_LIVE, dict(CONFIG, comment=False), _di_state, {})
@@ -3654,7 +3749,7 @@ check("a dry run's give-up counts as said, not as a silence",
 _ck_state = {L: {"outcome": vinegar.FAILED, "sha": PR["headRefOid"],
                  "attempts": 2}}
 _ck_log = []
-vinegar.review = lambda *a, **k: vinegar.DONE
+vinegar.review = lambda *a, **k: (vinegar.DONE, True)
 vinegar.save_state = lambda st: None
 vinegar.github_env = lambda *a, **k: None
 
@@ -3841,6 +3936,58 @@ check("the head-scoped counters do not outlive the head moving",
       "reviewed_sha" not in vinegar.carry_forward({}))
 os.remove(vinegar.STATE_PATH)
 
+# --- what review() answers about its own coverage ------------------------
+# DONE is every ending that spent the subscription. Narrowing the next pass
+# on it steps over lines nothing ever read, so the second answer exists and
+# nothing may be inferred from the first.
+reset_stubs()
+vinegar.run = claude_run
+vinegar.save_transcript = stub_transcript
+claude_run.stream = stream(call(FINDINGS[:1]), result_event())
+_cov_whole = vinegar.review(ROOT, "o/r", PR, CONFIG, None, {})
+check("a review that finished and posted answers that it covered its scope",
+      _cov_whole == (vinegar.DONE, True), _cov_whole)
+
+# A run cut off part-way still posts what it had, and still answers DONE.
+reset_stubs()
+vinegar.run = claude_run
+vinegar.save_transcript = stub_transcript
+claude_run.stream = stream(call(FINDINGS[:1]))
+_cov_part = vinegar.review(ROOT, "o/r", PR, CONFIG, None, {})
+check("a run cut off part-way is done but does not claim to have covered",
+      _cov_part == (vinegar.DONE, False), _cov_part)
+
+# And a dry run, which answers POSTED for correctly posting nothing.
+reset_stubs()
+vinegar.run = claude_run
+vinegar.save_transcript = stub_transcript
+claude_run.stream = stream(call(FINDINGS[:1]), result_event())
+_cov_dry = vinegar.review(ROOT, "o/r", PR, dict(CONFIG, comment=False),
+                          None, {})
+check("a dry run covers nothing, because nobody was shown anything",
+      _cov_dry == (vinegar.DONE, False), _cov_dry)
+
+# finish() has to hand the scope on. The sentence lived only in the review
+# comment, so a refused review that repost() later delivered from the
+# transcript arrived reading as though it had covered the whole thing.
+reset_stubs()
+vinegar.run = claude_run
+vinegar.save_transcript = stub_transcript
+claude_run.stream = stream(call(FINDINGS[:1]), result_event())
+del _tx_calls[:]
+vinegar.review(ROOT, "o/r", PR, CONFIG, None, {}, since=OLD_SHA)
+check("the transcript is told the scope, not only the review comment",
+      _tx_calls and _tx_calls[-1][5] == OLD_SHA, _tx_calls[-1:])
+reset_stubs()
+
+# One rule, two callers. Writing it out twice is how a hand-run review
+# would quietly widen or narrow every later daemon pass.
+check("the starting point moves only when the pass covered its scope",
+      vinegar.reviewed_through(True, NEW_SHA, REVIEWED)["reviewed_sha"]
+      == NEW_SHA
+      and vinegar.reviewed_through(False, NEW_SHA, REVIEWED)["reviewed_sha"]
+      == OLD_SHA)
+
 # --- a second pass reads only what is new --------------------------------
 reset_stubs()
 _ag_real = (vinegar.review, vinegar.checkout, vinegar.github_env,
@@ -3906,7 +4053,7 @@ def _could_not_post(*a, **k):
     os.makedirs(vinegar.REVIEW_DIR, exist_ok=True)
     with open(vinegar.unposted_path("o/r", PR_AGAIN), "w") as handle:
         handle.write("%s\n" % NEW_SHA)
-    return vinegar.DONE
+    return vinegar.DONE, False
 
 
 # DONE is not the same as posted. deliver() keeps the outcome DONE whatever
@@ -3923,12 +4070,14 @@ check("a failed review does not move where the next one starts",
       _ag_failed.get("reviewed_sha") == OLD_SHA, _ag_failed)
 
 # A dry run posts nothing by definition, and post_review answers POSTED
-# there and writes no marker, so both tests above pass while the pull
-# request carries nothing. One --dry-run against the real VINEGAR_HOME
-# would otherwise tell the live daemon this commit had been shown to the
-# author.
+# for having correctly posted nothing, so "it posted" is true of a run no
+# author saw. Not a cross-instance hazard: main() sends STATE_PATH to
+# `state.json.dry` whenever `comment` is false, so a dry run cannot write
+# into the live daemon's file at all. What it would corrupt is its own
+# next pass, which would then read an increment against a starting point
+# nobody was ever shown.
 _ag_dry = _second_pass(REVIEWED, config=dict(AGAIN_CFG, comment=False),
-                       review=lambda *a, **k: vinegar.DONE)
+                       review=lambda *a, **k: (vinegar.DONE, False))
 check("a dry run does not move where the next one starts",
       _ag_dry.get("reviewed_sha") == OLD_SHA, _ag_dry)
 
@@ -3961,14 +4110,14 @@ fake_run.post_err = "HTTP 502"
 fake_run.look_out = vinegar.BODY_MARK + " reviewed `a1b2c3d` ...\n"
 del posted[:]
 del looked[:]
-vinegar.review(ROOT, "o/r", PR, CONFIG, None, {})
+_ran(ROOT, "o/r", PR, CONFIG, None, {})
 check("an ambiguous refusal asks before resending",
       len(looked) == 1, (len(looked), len(posted)))
 check("a review that already landed is not posted twice",
       len(posted) == 1, len(posted))
 fake_run.look_out = "A human reviewed this at the same commit.\n"
 del posted[:]
-vinegar.review(ROOT, "o/r", PR, CONFIG, None, {})
+_ran(ROOT, "o/r", PR, CONFIG, None, {})
 check("someone else's review at the same commit does not suppress ours",
       len(posted) == 2, len(posted))
 
@@ -4029,7 +4178,7 @@ claude_run.stream = stream(call(FINDINGS[:1]), result_event())
 fake_run.look_out = vinegar.BODY_MARK + " reviewed `a1b2c3d` ...\n"
 del posted[:]
 del looked[:]
-vinegar.review(ROOT, "o/r", PR, CONFIG, None, {})
+_ran(ROOT, "o/r", PR, CONFIG, None, {})
 check("a landed review is not resent by the anchored retry either",
       len(posted) == 1 and len(looked) == 1, (len(posted), len(looked)))
 
@@ -4066,14 +4215,14 @@ fake_run.rc, fake_run.post_err = 1, "HTTP 502"
 claude_run.stream = stream(call([]), result_event())
 fake_run.look_out = ""
 del posted[:]
-vinegar.review(ROOT, "o/r", PR, CONFIG, None, {})
+_ran(ROOT, "o/r", PR, CONFIG, None, {})
 check("a review that did not land is resent",
       len(posted) == 2, len(posted))
 
 fake_run.post_err = "HTTP 422"
 del posted[:]
 del looked[:]
-vinegar.review(ROOT, "o/r", PR, CONFIG, None, {})
+_ran(ROOT, "o/r", PR, CONFIG, None, {})
 check("a definite refusal never asks whether it landed",
       len(looked) == 0, (len(posted), len(looked)))
 check("a definite refusal of a clean review is not resent",
@@ -4084,7 +4233,7 @@ check("a definite refusal of a clean review is not resent",
 claude_run.stream = stream(call(FINDINGS[:1]), result_event())
 del posted[:]
 del looked[:]
-vinegar.review(ROOT, "o/r", PR, CONFIG, None, {})
+_ran(ROOT, "o/r", PR, CONFIG, None, {})
 check("a refused anchor is still retried without the read",
       len(posted) == 2 and len(looked) == 0
       and "comments" in posted[0][1] and "comments" not in posted[1][1],
@@ -4118,7 +4267,7 @@ def claude_then_flaky(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
 vinegar.run = claude_then_flaky
 del posted[:]
 del _seq[:]
-vinegar.review(ROOT, "o/r", PR, CONFIG, None, {})
+_ran(ROOT, "o/r", PR, CONFIG, None, {})
 check("a resend refused over an anchor still reaches the anchorless retry",
       len(_seq) == 3 and "comments" in _seq[0] and "comments" in _seq[1]
       and "comments" not in _seq[2], [sorted(p) for p in _seq])
@@ -4161,7 +4310,7 @@ claude_run.stream = stream(
         {"type": "text", "text": "I could not finish, but the risk is here."}]}},
     result_event(result=None))
 del posted[:]
-vinegar.review(ROOT, "o/r", PR, CONFIG, None, {})
+_ran(ROOT, "o/r", PR, CONFIG, None, {})
 check("an empty result field falls back to the reviewer's own words",
       posted and "the risk is here" in posted[0][1]["body"]
       and "produced nothing" not in posted[0][1]["body"],
@@ -4232,7 +4381,7 @@ vinegar.run, vinegar.github_env = claude_run, lambda *a, **k: None
 for value, shown in ((1.5, "1.50 USD"), (2, "2.00 USD"), (0, "0.00 USD")):
     claude_run.stream = stream(call([]), result_event(total_cost_usd=value))
     del logged[:]
-    vinegar.review(ROOT, "o/r", PR, CONFIG, None, {})
+    _ran(ROOT, "o/r", PR, CONFIG, None, {})
     check("a cost of %r is reported, whatever its JSON type" % (value,),
           any(shown in m for m in logged),
           [m for m in logged if "reviewed in" in m])
@@ -4245,7 +4394,7 @@ claude_run.stream = stream(result_event(is_error=True, result="529 boom",
                                         total_cost_usd=2.5))
 del logged[:]
 check("a failed review is retried and its cost still reported",
-      vinegar.review(ROOT, "o/r", PR, CONFIG, None, {}) == vinegar.FAILED
+      _ran(ROOT, "o/r", PR, CONFIG, None, {}) == vinegar.FAILED
       and any("2.50 USD" in m for m in logged),
       [m for m in logged if "failed" in m])
 
@@ -4261,7 +4410,7 @@ claude_run.stream = stream(call(FINDINGS[:2]),
                            result_event(is_error=True, total_cost_usd=1.5,
                                         subtype="error_max_turns"))
 del logged[:]
-vinegar.review(ROOT, "o/r", PR, CONFIG, None, {})
+_ran(ROOT, "o/r", PR, CONFIG, None, {})
 check("a failed run is not also logged as a completed one",
       len([m for m in logged
            if "USD equivalent" in m and "triaged" not in m]) == 1
@@ -4281,7 +4430,7 @@ claude_run.stream = stream(
 del posted[:]
 del _tx_calls[:]
 check("a failed attempt is retried, not posted",
-      vinegar.review(ROOT, "o/r", PR, CONFIG, None, {}) == vinegar.FAILED
+      _ran(ROOT, "o/r", PR, CONFIG, None, {}) == vinegar.FAILED
       and not posted, (posted,))
 check("a failed attempt still keeps the reviewer's words on disk",
       _tx_calls and "Twenty minutes of analysis." in _tx_calls[-1][2],
@@ -4294,7 +4443,7 @@ check("a failed attempt's transcript does not claim to be a review",
 _gu_state = {L: {"outcome": vinegar.FAILED, "sha": PR["headRefOid"],
                  "attempts": vinegar.MAX_ATTEMPTS - 1}}
 _real_review2 = vinegar.review
-vinegar.review = lambda *a, **k: vinegar.FAILED
+vinegar.review = lambda *a, **k: (vinegar.FAILED, False)
 vinegar.checkout = lambda repo, pr, env: ROOT
 vinegar.save_state = lambda st: None
 del posted[:]
@@ -4509,7 +4658,7 @@ _pr_real = (vinegar.review, vinegar.find_pr, vinegar.checkout,
 os.makedirs(os.environ["VINEGAR_HOME"], exist_ok=True)
 with open(os.path.join(os.environ["VINEGAR_HOME"], "config.json"), "w") as h:
     json.dump({"repos": ["o/r"]}, h)
-vinegar.review = lambda *a, **k: _pr_kw.update(k) or vinegar.DONE
+vinegar.review = lambda *a, **k: _pr_kw.update(k) or (vinegar.DONE, True)
 vinegar.find_pr = lambda repo, number, env: PR_LIVE
 vinegar.checkout = lambda repo, pr, env: ROOT
 vinegar.github_env = lambda *a, **k: None
@@ -4528,6 +4677,56 @@ finally:
 # and discarded.
 check("a --pr run posts what it reviewed rather than deferring",
       _pr_kw.get("resent") in (None, False), _pr_kw)
+
+
+def _hand_scoped(entry, argv=("vinegar.py", "--pr", "o/r#12")):
+    """What `--pr` scopes itself to, and what it records afterwards.
+
+    The manual half of the narrowing was reachable by no check and anchored
+    by no mutation: `since=` and the starting point it records could both
+    have been deleted with the suite green. The suite already carries that
+    lesson about this same code path once.
+    """
+    reset_stubs()
+    kept = (vinegar.review, vinegar.find_pr, vinegar.checkout,
+            vinegar.github_env, vinegar.save_transcript, sys.argv)
+    seen = {}
+    vinegar.review = lambda *a, **k: seen.update(k) or (vinegar.DONE, True)
+    vinegar.find_pr = lambda repo, number, env: dict(PR_LIVE,
+                                                     headRefOid=NEW_SHA)
+    vinegar.checkout = lambda repo, pr, env: ROOT
+    vinegar.github_env = lambda *a, **k: None
+    vinegar.save_transcript = stub_transcript
+    vinegar.save_state({"o/r#12": dict(entry)} if entry else {})
+    sys.argv = list(argv)
+    try:
+        vinegar.main()
+    except SystemExit:
+        pass
+    finally:
+        (vinegar.review, vinegar.find_pr, vinegar.checkout,
+         vinegar.github_env, vinegar.save_transcript, sys.argv) = kept
+    return seen, vinegar.load_state().get("o/r#12", {})
+
+
+_hs_seen, _hs_state = _hand_scoped(REVIEWED)
+check("a hand run narrows itself the way the daemon would",
+      _hs_seen.get("since") == OLD_SHA, _hs_seen)
+check("a hand run that posted moves where the next pass starts",
+      _hs_state.get("reviewed_sha") == NEW_SHA, _hs_state)
+# The operator reaching for --pr after an unsatisfying review wants the
+# whole thing read again. Silently handing them the increment gives a
+# near-empty diff and a review that says nothing.
+_hw_seen, _hw_state = _hand_scoped(
+    REVIEWED, ("vinegar.py", "--pr", "o/r#12", "--whole"))
+check("--whole reads the pull request entire",
+      _hw_seen.get("since") is None, _hw_seen)
+check("--whole still records where this review got to",
+      _hw_state.get("reviewed_sha") == NEW_SHA, _hw_state)
+_hn_seen, _hn_state = _hand_scoped({})
+check("a hand run with nothing reviewed before it reads the whole thing",
+      _hn_seen.get("since") is None, _hn_seen)
+vinegar.save_state({})
 
 
 def _hand_run(review_stub, app=True):
@@ -4560,11 +4759,11 @@ def _hand_run(review_stub, app=True):
 # A hand run is minutes of silence on a real pull request too, and this
 # whole path was reachable by no check and anchored by no mutation: it
 # could have been deleted outright with the suite green.
-_hand_done = _hand_run(lambda *a, **k: vinegar.DONE)
+_hand_done = _hand_run(lambda *a, **k: (vinegar.DONE, True))
 check("a hand run opens and finishes the indicator too",
       _hand_done == ["The review ran but nothing reached the pull request"],
       _hand_done)
-_hand_failed = _hand_run(lambda *a, **k: vinegar.FAILED)
+_hand_failed = _hand_run(lambda *a, **k: (vinegar.FAILED, False))
 check("a hand run that failed says so on the indicator",
       _hand_failed == ["The review failed"], _hand_failed)
 
@@ -4601,7 +4800,7 @@ def _review_that_could_not_post(*a, **k):
     os.makedirs(vinegar.REVIEW_DIR, exist_ok=True)
     with open(_mr_marker, "w") as handle:
         handle.write("%s\n" % PR_LIVE["headRefOid"])
-    return vinegar.DONE
+    return vinegar.DONE, True
 
 
 vinegar.review = _review_that_could_not_post
@@ -4627,7 +4826,7 @@ vinegar.forget(_mr_marker)
 # meant the daemon reviewed the same head a minute later at full cost
 # and posted a second complete review, because its first attempt does
 # not ask GitHub — the state file is what usually tells it.
-vinegar.review = lambda *a, **k: vinegar.DONE
+vinegar.review = lambda *a, **k: (vinegar.DONE, True)
 vinegar.find_pr = lambda repo, number, env: PR_LIVE
 vinegar.checkout = lambda repo, pr, env: ROOT
 vinegar.github_env = lambda *a, **k: None
@@ -4647,7 +4846,7 @@ check("a manual run that posted is recorded, so the daemon does not repeat it",
 # And a manual review that never ran is recorded as failed, not done.
 # Written as DONE, the daemon returns at the DONE check for ever and the
 # pull request is closed off with no comment and no retry.
-vinegar.review = lambda *a, **k: vinegar.FAILED
+vinegar.review = lambda *a, **k: (vinegar.FAILED, False)
 vinegar.find_pr = lambda repo, number, env: PR_LIVE
 vinegar.checkout = lambda repo, pr, env: ROOT
 vinegar.github_env = lambda *a, **k: None
@@ -4711,7 +4910,7 @@ fake_run.look_out = ""
 vinegar.run, vinegar.github_env = claude_run, lambda *a, **k: None
 claude_run.stream = stream(call(FINDINGS[:1]), result_event())
 del posted[:]
-vinegar.review(ROOT, "o/r", PR_LOST, CONFIG, None, {})
+_ran(ROOT, "o/r", PR_LOST, CONFIG, None, {})
 check("a review GitHub refused is marked for another attempt",
       os.path.exists(_lost_marker), _lost_marker)
 
@@ -4724,7 +4923,7 @@ fake_run.rc = 1
 fake_run.post_err = "gh: API rate limit exceeded (HTTP 403)"
 vinegar.run = claude_run
 claude_run.stream = stream(call(FINDINGS[:1]), result_event())
-vinegar.review(ROOT, "o/r", PR_TL, CONFIG, None, {})
+_ran(ROOT, "o/r", PR_TL, CONFIG, None, {})
 vinegar.run = fake_run
 check("a rate-limited first post keeps the review for later",
       os.path.exists(_tl_marker), _tl_marker)
@@ -4779,7 +4978,7 @@ _flag_real = (vinegar.review, vinegar.checkout, vinegar.save_state)
 def _review_that_leaves_a_marker(*a, **k):
     with open(_flag_marker, "w") as handle:
         handle.write("%s\n" % PR_FLAG["headRefOid"])
-    return vinegar.DONE
+    return vinegar.DONE, False
 
 
 vinegar.review = _review_that_leaves_a_marker
@@ -4934,10 +5133,10 @@ check("a posted review clears the mark",
 fake_run.rc = 1
 vinegar.run = claude_run
 del posted[:]
-vinegar.review(ROOT, "o/r", PR_LOST, CONFIG, None, {})
+_ran(ROOT, "o/r", PR_LOST, CONFIG, None, {})
 _marked = os.path.exists(_lost_marker)
 fake_run.rc = 0
-vinegar.review(ROOT, "o/r", PR_LOST, CONFIG, None, {})
+_ran(ROOT, "o/r", PR_LOST, CONFIG, None, {})
 check("a review that posts clears an earlier attempt's mark",
       _marked and not os.path.exists(_lost_marker),
       (_marked, os.path.exists(_lost_marker)))
@@ -4955,7 +5154,7 @@ vinegar.save_transcript = exploding_save
 fake_run.rc = 1
 vinegar.run = claude_run
 del posted[:]
-vinegar.review(ROOT, "o/r", PR_NOWRITE, CONFIG, None, {})
+_ran(ROOT, "o/r", PR_NOWRITE, CONFIG, None, {})
 vinegar.save_transcript = _nw_save
 check("a transcript that could not be written is not marked for reposting",
       not os.path.exists(_nw_marker)
@@ -4967,7 +5166,7 @@ check("a transcript that could not be written is not marked for reposting",
 _nw_log = []
 vinegar.log = lambda m: _nw_log.append(m)
 vinegar.save_transcript = exploding_save
-vinegar.review(ROOT, "o/r", PR_NOWRITE, CONFIG, None, {})
+_ran(ROOT, "o/r", PR_NOWRITE, CONFIG, None, {})
 vinegar.save_transcript = _nw_save
 vinegar.log = lambda message: None
 check("a review with nothing saved does not promise a retry",
@@ -4981,7 +5180,7 @@ vinegar.run = fake_run
 fake_run.rc, fake_run.post_err = 1, "HTTP 403 Resource not accessible"
 vinegar.run = claude_run
 del posted[:]
-vinegar.review(ROOT, "o/r", PR_LOST, CONFIG, None, {})
+_ran(ROOT, "o/r", PR_LOST, CONFIG, None, {})
 vinegar.run = fake_run
 _bound_state = {_lost_key: {"outcome": vinegar.DONE,
                             "sha": PR_LOST["headRefOid"], "attempts": 1}}
@@ -5036,7 +5235,7 @@ _rerun = {_rerun_key: {"outcome": vinegar.FAILED,
                        "post_tries": 2}}
 _rerun_real = (vinegar.review, vinegar.checkout, vinegar.save_state)
 _rerun_saved = []
-vinegar.review = lambda *a, **k: vinegar.DONE
+vinegar.review = lambda *a, **k: (vinegar.DONE, True)
 vinegar.checkout = lambda repo, pr, env: ROOT
 vinegar.save_state = lambda st: _rerun_saved.append(dict(st[_rerun_key]))
 vinegar.handle_pr("o/r", PR_RERUN, CONFIG, _rerun, {})
@@ -5058,7 +5257,7 @@ check("the marker written before a review starts it over too",
 _moved_budget = {_rerun_key: {"outcome": vinegar.DONE, "sha": "0ldhead0",
                               "attempts": 1,
                               "post_tries": vinegar.MAX_ATTEMPTS}}
-vinegar.review = lambda *a, **k: vinegar.DONE
+vinegar.review = lambda *a, **k: (vinegar.DONE, True)
 vinegar.checkout = lambda repo, pr, env: ROOT
 vinegar.save_state = lambda st: None
 vinegar.handle_pr("o/r", PR_RERUN, dict(CONFIG, review_on_push=True),
@@ -5165,7 +5364,7 @@ _gone = vinegar.read_mark
 _gone_review, _gone_checkout = vinegar.review, vinegar.checkout
 vinegar.read_mark = lambda path: None
 vinegar.checkout = lambda repo, pr, env: ROOT
-vinegar.review = lambda *a, **k: vinegar.DONE
+vinegar.review = lambda *a, **k: (vinegar.DONE, True)
 _gone_state = {}
 del posted[:]
 vinegar.handle_pr("o/r", PR_LOST, CONFIG, _gone_state, {})
@@ -5301,7 +5500,7 @@ del _tx_calls[:]
 vinegar.save_transcript = stub_transcript
 vinegar.run = timing_out
 del posted[:]
-vinegar.review(ROOT, "o/r", PR, CONFIG, None, {})
+_ran(ROOT, "o/r", PR, CONFIG, None, {})
 check("the killed-run marker reaches the transcript, not just the comment",
       _tx_calls and _tx_calls[-1][4] and "killed after" in _tx_calls[-1][4],
       _tx_calls[-1][4] if _tx_calls else "never called")

@@ -700,18 +700,13 @@ MUTATIONS = [
     ("scope-commit-probe",
      '            (["git", "cat-file", "-e", since + "^{commit}"],\n'
      '             "the commit its last review finished at is not in this '
-     'clone"),\n'
-     '            (["git", "merge-base", "--is-ancestor", since, '
-     'pr["headRefOid"]],\n'
-     '             "the branch was rewritten since its last review")):',
-     '            (["git", "merge-base", "--is-ancestor", since, '
-     'pr["headRefOid"]],\n'
-     '             "the branch was rewritten since its last review"),):'),
+     'clone"),\n',
+     ""),
     ("scope-ancestor-probe",
      '            (["git", "merge-base", "--is-ancestor", since, '
      'pr["headRefOid"]],\n'
-     '             "the branch was rewritten since its last review")):',
-     "            ):"),
+     '             "the branch was rewritten since its last review"),\n',
+     ""),
     # `-e <sha>` answers yes for a blob or a tree carrying that id.
     ("scope-commit-peel",
      '(["git", "cat-file", "-e", since + "^{commit}"],',
@@ -725,7 +720,7 @@ MUTATIONS = [
      "            return None",
      "            return since"),
     ("scope-probe-refused",
-     "        if result.returncode != 0:\n"
+     "        if refused:\n"
      '            log("%s: %s, so the whole pull request is reviewed"\n'
      "                % (label, why))\n"
      "            return None",
@@ -758,29 +753,9 @@ MUTATIONS = [
      "                                    waivers=0))"),
 
     # --- the three conditions that let a pass narrow the next one ------
-    ("reviewed-sha-unposted",
-     "                       head if outcome == DONE and not unposted\n"
-     '                       and config["comment"] '
-     'else done.get("reviewed_sha"))))',
-     "                       head if outcome == DONE\n"
-     '                       and config["comment"] '
-     'else done.get("reviewed_sha"))))'),
-    ("reviewed-sha-outcome",
-     "                       head if outcome == DONE and not unposted\n",
-     "                       head if not unposted\n"),
-    ("reviewed-sha-dry-run",
-     '                       and config["comment"] '
-     'else done.get("reviewed_sha"))))',
-     '                       else done.get("reviewed_sha"))))'),
-
-    # --- telling the reviewer, and telling the pull request ------------
     ("brief-since",
      '           "--append-system-prompt", reviewer_brief(pr, since),',
      '           "--append-system-prompt", reviewer_brief(pr),'),
-    ("handle-pr-since",
-     "                             resent=attempts > 1, check=check, "
-     "since=since)",
-     "                             resent=attempts > 1, check=check)"),
     ("brief-scope-name",
      '           "the pull request\'s full diff" if since '
      'else "the review scope",',
@@ -804,6 +779,88 @@ MUTATIONS = [
     # only on a line in the pull request's diff, and the reviews endpoint
     # applies the review whole or not at all, so narrowing the anchors
     # along with the reading scope loses every finding to one bad anchor.
+    # --- what review() answers about its own coverage ------------------
+    ("covered-needs-a-whole-reading",
+     '            if not note and config["comment"]:',
+     '            if config["comment"]:'),
+    ("covered-needs-a-pull-request",
+     '            if not note and config["comment"]:',
+     "            if not note:"),
+    ("covered-needs-the-post-to-land",
+     "                note, resent=resent, check=check, since=since)) "
+     "== POSTED:",
+     "                note, resent=resent, check=check, since=since)) "
+     "or True:"),
+    ("reviewed-through-rule",
+     '    return {"reviewed_sha": head if covered else was.get('
+     '"reviewed_sha")}',
+     '    return {"reviewed_sha": head}'),
+
+    # --- the probes added after the first review -----------------------
+    ("scope-merge-probe",
+     '            (["git", "rev-list", "--max-count=1", "--merges",\n'
+     '              "%s..%s" % (since, pr["headRefOid"])],\n'
+     '             "the branch has merged something in since its last '
+     'review")):',
+     "            ):"),
+    # rev-list reports by printing; reading its exit code calls every
+    # merge safe.
+    ("scope-merge-read-as-exit-code",
+     '        refused = (result.stdout.strip() if probe[1] == "rev-list"\n'
+     "                   else result.returncode != 0)",
+     "        refused = result.returncode != 0"),
+    ("scope-same-head",
+     '    if since == pr["headRefOid"]:\n'
+     '        log("%s: nothing has been pushed since its last review, so the '
+     'whole "\n'
+     '            "pull request is reviewed" % label)\n'
+     "        return None",
+     "    pass"),
+    ("scope-probe-raises",
+     "        except Exception as err:\n"
+     '            log("%s: %s could not be run (%s), so the whole pull '
+     'request is "\n'
+     '                "reviewed" % (label, " ".join(probe), err))\n'
+     "            return None",
+     "        except Exception:\n"
+     "            return since"),
+
+    # --- saying so where a repost will find it -------------------------
+    ("transcript-says-the-scope",
+     "    if since:\n"
+     '        body = "Scope: only what was added since `%s`.\\n\\n%s" % (\n'
+     "            since[:7], body)",
+     "    pass"),
+    ("transcript-gets-the-scope",
+     "            label, save_transcript(repo, pr, text, findings, note, "
+     "since))))",
+     "            label, save_transcript(repo, pr, text, findings, note))))"),
+
+    # --- the brief's two instructions for one decision -----------------
+    ("brief-no-contradictory-give-up",
+     '           "If `%s` does not resolve either, review the whole branch '
+     'and "\n'
+     '           "say which refs you could not reach." % since if since else\n'
+     '           "If neither resolves, say you could not establish the scope "\n'
+     '           "rather than guessing at one.",',
+     '           "If neither resolves, say you could not establish the scope "\n'
+     '           "rather than guessing at one.",'),
+
+    # --- the manual half, which no check reached before ----------------
+    ("hand-run-since",
+     "                outcome, covered = review(where, repo, pr, config, env,\n"
+     "                                          tokens, check=hand, "
+     "since=since)",
+     "                outcome, covered = review(where, repo, pr, config, env,\n"
+     "                                          tokens, check=hand)"),
+    ("hand-run-whole-flag",
+     "            since = None if args.whole else review_scope(",
+     "            since = None or review_scope("),
+    ("hand-run-records-the-start",
+     "                           **reviewed_through(covered, pr[\"headRefOid\"],\n"
+     "                                              was)))",
+     "                           ))"),
+
     ("anchors-from-the-base",
      '            findings, diff_lines(path, pr["baseRefName"], env, label), '
      "label)",

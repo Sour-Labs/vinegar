@@ -818,12 +818,27 @@ The reviewer may still read anything it needs. Only what it reports on is
 narrowed. A diff read without the code around it produces confident findings
 about calls whose definitions the reviewer never saw.
 
-Three things widen a pass back to the whole pull request, and all three are
-deliberate: the commit is not in the clone, the branch was rewritten since it
-was reviewed, or nothing has been reviewed yet. Every failure here widens rather
-than narrows. Reading too much costs money and says so in the log; reading too
-little reports a change clean without having looked at it, and nothing
-downstream can tell.
+A pass only narrows when the one before it **covered its scope**: it reached the
+end of what it was asked to read, and its findings landed on the pull request. A
+review killed by `review_timeout` after reporting two findings from the first
+file still posts, and still counts as done, but it does not move the starting
+point. Neither does one GitHub refused, one whose transcript could not be
+written, or a dry run.
+
+Five things widen a pass back to the whole pull request, and all five are
+deliberate:
+
+- nothing has been reviewed yet, or the last review did not cover its scope
+- the commit is not in the clone
+- the branch was rewritten since it was reviewed
+- the branch has **merged** something in since it was reviewed, because
+  `<since>..HEAD` would then contain the whole base branch and the "narrowed"
+  scope would be wider than the pull request
+- the head has not moved since the last review
+
+Every failure here widens rather than narrows. Reading too much costs money and
+says so in the log; reading too little reports a change clean without having
+looked at it, and nothing downstream can tell.
 
 The comment says which happened, so "no findings" on a re-review is never
 ambiguous:
@@ -847,8 +862,21 @@ even when each new push is small. That is the existing behaviour rather than a
 decision this made, and it is worth revisiting alongside whatever turns
 `review_on_push` on.
 
-A `--dry-run` never narrows anything: it posts nothing, so there is nothing an
-author has seen, and it deliberately records no starting point for later passes.
+The narrowing statement goes in the saved transcript as well as in the comment,
+because a refused review is delivered later from the transcript and would
+otherwise arrive reading as though it had covered everything.
+
+A `--dry-run` never narrows anything and never records a starting point: it
+posts nothing, so there is no author who has seen anything.
+
+**`vinegar --pr owner/repo#N` scopes itself the same way.** If an earlier review
+covered part of the pull request, a hand run reads only what came after it,
+which is usually not what you want when you are re-running because the last
+review was unsatisfying. Pass `--whole` to read all of it:
+
+```sh
+python3 vinegar.py --pr owner/repo#12 --whole
+```
 
 ## The checks list
 
