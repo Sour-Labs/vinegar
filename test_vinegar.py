@@ -817,7 +817,7 @@ check("a narrowed review says so in the transcript, not only in the comment",
 # it exists for — a narrowed review too big to post — was exactly the case
 # that lost it. repost lifts it into its own opening before the cut.
 check("the scope line is recognisable to the repost that has to keep it",
-      _tx_body[_tx_body.index("---") + 5:].lstrip().startswith(
+      _tx_body[_tx_body.index("---") + 3:].lstrip().startswith(
           vinegar.SCOPE_MARK), _tx_body[:200])
 _tx_full = GENUINE_SAVE_TRANSCRIPT("o/r", PR, "the words", [], None)
 with open(_tx_full) as _h:
@@ -3925,8 +3925,9 @@ check("dropping a bad entry does not quarantine the good ones",
 # reaches `git cat-file -e` as one argument and exits non-zero — and
 # taking the entry with it was strictly worse: an operator hand-editing
 # the short sha they read in the comment would have lost `unposted` too,
-# and handle_pr forgets a marker whose entry is gone. That deletes a
-# paid-for review, unsent, and buys it again.
+# and handle_pr forgets a marker whose entry is gone. That deleted a
+# paid-for review, unsent, and bought it again. Dropping the key costs
+# one widened pass instead.
 with open(vinegar.STATE_PATH, "w") as h:
     h.write('{"o/r#12": {"outcome": "reviewed", "sha": "a", '
             '"unposted": true, "reviewed_sha": "a1b2c3d"},'
@@ -5587,6 +5588,41 @@ check("an oversized narrowed review still says what it read",
       and "only what was added since `0123456`" in posted[0][1]["body"]
       and "## Findings" in posted[0][1]["body"],
       posted[0][1]["body"][:300] if posted else "nothing posted")
+
+# The reviewer writes its own summary and it goes into the transcript
+# verbatim, so a paragraph of it beginning "Scope: " must not be mistaken
+# for Vinegar's own statement, hoisted above the `---` where Vinegar's
+# statements live, and cut out of the review. Read at the offset the
+# separator gives rather than anywhere in the file.
+# The reviewer's own words, carrying Vinegar's exact mark, and not at the
+# very start of the body. Both details matter. Prose saying only
+# "Scope: f0f6ee9..HEAD" no longer matches the mark at all, so an
+# unanchored read would find nothing and the check would pass against
+# the bug it names. And prose that opens the body is where Vinegar's own
+# statement would sit, which no reading can tell apart; that ambiguity is
+# accepted, since the mark is a whole sentence the reviewer is not asked
+# to write.
+vinegar.save_transcript(
+    "o/r", PR_LOST,
+    "Some narration first.\n\n%sthe last pass, roughly.\n\nand the rest"
+    % vinegar.SCOPE_MARK, FINDINGS[:1])
+with open(_lost_marker, "w") as h:
+    h.write("%s\n" % PR_LOST["headRefOid"])
+_prose_state = {_lost_key: {"outcome": vinegar.DONE,
+                            "sha": PR_LOST["headRefOid"], "attempts": 1,
+                            "unposted": True}}
+fake_run.rc = 0
+del posted[:]
+vinegar.handle_pr("o/r", PR_LOST, CONFIG, _prose_state, {})
+_prose_body = posted[0][1]["body"] if posted else ""
+# Hoisting moves the line above the transcript's own heading, which is
+# what tells the two apart: both endings leave it under a `---`, so
+# the separator says nothing about which happened.
+check("the reviewer's own prose is not mistaken for Vinegar's scope line",
+      "the last pass, roughly." in _prose_body
+      and _prose_body.index("# o/r#")
+      < _prose_body.index(vinegar.SCOPE_MARK),
+      _prose_body[:400])
 fake_run.rc = 1
 
 check("a repost that raises still spends its attempt and stops",

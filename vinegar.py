@@ -133,11 +133,13 @@ REVIEW_DIR = os.path.join(HOME, "reviews")
 #
 # The other fields in an entry are counters and flags, and load_state()
 # type-checks them because the give-up's own log line tells operators to
-# edit this file by hand. This one is a string that reaches a git command
-# line, so a type check is not enough: `"reviewed_sha": "; rm -rf ~"` is a
-# perfectly good str. Forty lowercase hex characters is the whole of what a
-# resolved commit can be, it is what `git rev-parse` answers with, and
-# anything else means the entry is not describing a commit.
+# edit this file by hand. This one is a string that is concatenated and
+# then handed to git, so the shape matters twice: a non-string raises
+# where review_scope builds the probe, which is outside the try that
+# catches a probe failing, and a string that is not a commit sends a pass
+# looking for one that cannot exist. Forty lowercase hex characters is the
+# whole of what a resolved commit can be and what `git rev-parse` answers
+# with. Not an injection guard: run() never uses a shell.
 #
 # Anchored at both ends. `re.match` alone would take a valid sha with
 # anything at all after it, which is the half of the check that matters.
@@ -147,7 +149,17 @@ FULL_SHA = re.compile(r"\A[0-9a-f]{40}\Z")
 # request. One definition, because repost() has to recognise it in a file
 # save_transcript() wrote, and a repost that cannot find it sends a
 # narrowed review with nothing saying so.
-SCOPE_MARK = "Scope: "
+#
+# The whole written prefix rather than "Scope: ". repost() reads the file,
+# reviewer prose included, and the reviewer writes its own summary: a
+# closing paragraph beginning "Scope: f0f6ee9..HEAD, three commits" would
+# have been hoisted into the resend's opening and cut out of the review.
+SCOPE_MARK = "Scope: only what was added since "
+
+# Between a transcript's heading and its body. Named because both the
+# writer and repost()'s reader have to agree on it, and because reading
+# the scope statement is only unambiguous at a known offset.
+TRANSCRIPT_SEP = "\n\n---\n\n"
 
 # Checkouts sit beside HOME rather than inside it, and that is load-bearing
 # rather than tidiness. The reviewer is denied every read under HOME, so a
@@ -1268,12 +1280,11 @@ def state_entry(head, outcome, attempts=0, reason=None, announced=False,
         #
         # Checked on the way in as well as on the way out, and the two
         # checks are not the same check. load_state() drops a bad one
-        # because an operator can hand-edit this file. This one is about
-        # never writing what that reader would reject: the reader throws
-        # away the *whole entry*, so an entry that fails its own validator
-        # is one that forgets a finished review and buys it again. Not
-        # narrowing is the cheap way to be wrong; this is the expensive
-        # one.
+        # because an operator can hand-edit this file; this one is about
+        # never writing what that reader would reject, so that the file
+        # this process wrote never needs repairing on the way back in.
+        # Both cost the same thing now, one widened pass, since the
+        # reader drops the key rather than the entry.
         entry["reviewed_sha"] = reviewed_sha
     return entry
 
@@ -1397,19 +1408,23 @@ def load_state():
                    # pull request that is never told Vinegar gave up.
                    or any(not isinstance(done[field], bool)
                           for field in ("announced", "unposted")
-                          if field in done)
-                   ]
+                          if field in done)]
             for key in bad:
                 log("%s: its entry in %s cannot be read, so it is forgotten "
                     "and will be reviewed again" % (key, STATE_PATH))
                 del state[key]
             # The one string, and it loses only itself. The fields above
             # are counters and flags that crash a comparison, so an entry
-            # carrying a bad one has to go. This one cannot crash
-            # anything: run() never uses a shell, so a junk value reaches
-            # `git cat-file -e` as one argument, exits non-zero, and
-            # widens the pass — which is the outcome dropping it asks for
-            # anyway.
+            # carrying a bad one has to go. A bad value here is not worth
+            # that: what it costs, once dropped, is one widened pass,
+            # which is the outcome dropping it asks for anyway.
+            #
+            # Dropped rather than left to fail downstream, because it does
+            # not fail harmlessly. A non-string raises on the `since + ...`
+            # that builds the probe, and review_scope builds that outside
+            # the try that catches a probe refusing, so it would escape
+            # handle_pr with an attempt already charged. Only this check
+            # stands between the two.
             #
             # Dropping the entry for it was strictly worse than dropping
             # the key. An operator following the give-up log's own advice
@@ -1688,8 +1703,7 @@ def save_transcript(repo, pr, text, findings=None, note=None, since=None):
     # hand when every retry is spent, and it said nothing about the scope
     # either.
     if since:
-        body = "%sonly what was added since `%s`.\n\n%s" % (
-            SCOPE_MARK, since[:7], body)
+        body = "%s`%s`.\n\n%s" % (SCOPE_MARK, since[:7], body)
     if findings:
         body += "\n\n## Findings\n\n" + "\n\n".join(
             finding_bullet(finding) for finding in findings)
@@ -1702,8 +1716,9 @@ def save_transcript(repo, pr, text, findings=None, note=None, since=None):
     # the run, silently gone. write_atomic carries both, and finish() reads
     # this file's existence as "the attempts left words worth keeping",
     # which a half-written file must not be able to wear.
-    return write_atomic(path, "# %s#%d %s\n\n%s\n\n---\n\n%s\n" % (
-        repo, pr["number"], pr["headRefOid"][:7], pr["url"], body))
+    return write_atomic(path, "# %s#%d %s\n\n%s%s%s\n" % (
+        repo, pr["number"], pr["headRefOid"][:7], pr["url"],
+        TRANSCRIPT_SEP, body))
 
 
 def review_scope(path, pr, done, env, label):
@@ -1778,11 +1793,20 @@ def review_scope(path, pr, done, env, label):
     # convention out of the command line, so adding `git -c
     # core.quotepath=false rev-list ...` — the form diff_lines() already
     # uses — would have silently reverted every merge to "safe".
-    by_exit = lambda result: result.returncode != 0
-    # Non-zero as well as any output. rev-list can fail having printed
-    # nothing, and reading only stdout called that "no merges" and
-    # narrowed, which is the one direction this function may not fail in.
-    by_output = lambda result: result.returncode != 0 or result.stdout.strip()
+    def by_exit(result):
+        """Refused when the command said so with its exit code."""
+        return result.returncode != 0
+
+    def by_output(result):
+        """Refused when the command printed anything, or could not run.
+
+        Non-zero as well as any output. rev-list can fail having printed
+        nothing, and reading only stdout called that "no merges" and
+        narrowed, which is the one direction this function may not fail
+        in.
+        """
+        return result.returncode != 0 or result.stdout.strip()
+
     for probe, why, refused_if in (
             (["git", "cat-file", "-e", since + "^{commit}"],
              "the commit its last review finished at is not in this clone",
@@ -3653,11 +3677,14 @@ def repost(key, repo, pr, config, state, tokens, done, marker, sha):
             # Found as a line rather than at position zero: what is read
             # here is the whole file, so the transcript's own heading and
             # the `---` come first.
-            mark = body.find("\n%s" % SCOPE_MARK)
-            end = body.find("\n\n", mark + 1) if mark != -1 else -1
+            sep = body.find(TRANSCRIPT_SEP)
+            starts = sep + len(TRANSCRIPT_SEP) if sep != -1 else -1
+            end = (body.find("\n\n", starts)
+                   if starts != -1 and body.startswith(SCOPE_MARK, starts)
+                   else -1)
             if end != -1:
-                opening += "%s\n\n" % body[mark + 1:end]
-                body = body[:mark + 1] + body[end + 2:]
+                opening += "%s\n\n" % body[starts:end]
+                body = body[:starts] + body[end + 2:]
             # Measured, not a hand-picked slack. The old constant was
             # chosen for the length of the sentence above it, so
             # rewording that sentence longer would have pushed the body
@@ -4327,7 +4354,8 @@ def spend_announce(key, config, state, head, attempts, tries, said):
     was = state.get(key, {})
     entry = state_entry(head, FAILED, attempts,
                         announced=said == POSTED or spent, tries=tries,
-                        **dict(carry_forward(was), **reviewed_through(False, head, was)))
+                        **dict(carry_forward(was),
+                               **reviewed_through(False, head, was)))
     state[key] = entry
     save_state(state)
 
@@ -4363,7 +4391,8 @@ def record_once(state, key, done, head, outcome, reason):
     # request would then be read whole on the next pass that does run,
     # silently, with only the bill to show for it.
     state[key] = state_entry(head, outcome, kept.get("attempts", 0), reason,
-                             **dict(carry_forward(kept), **reviewed_through(False, head, done)))
+                             **dict(carry_forward(kept),
+                                    **reviewed_through(False, head, done)))
     state[key]["seen"] = seen
     save_state(state)
 

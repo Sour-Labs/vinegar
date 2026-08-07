@@ -697,12 +697,18 @@ MUTATIONS = [
     # grouping rather than a tuple, so the loop unpacks the probe itself
     # and raises. That comes back ABORTED, which hides whether any check
     # would have caught it.
-    ('scope-commit-probe',
-     '            (["git", "cat-file", "-e", since + "^{commit}"],\n             "the commit its last review finished at is not in this clone",\n             by_exit),\n',
-     ''),
-    ('scope-ancestor-probe',
-     '            (["git", "merge-base", "--is-ancestor", since, pr["headRefOid"]],\n             "the branch was rewritten since its last review", by_exit),\n',
-     ''),
+    ("scope-commit-probe",
+     "            ([\"git\", \"cat-file\", \"-e\", since + \"^{commit}\"],\n"
+     "             \"the commit its last review finished at is not in this clone\",\n"
+     "             by_exit),\n"
+     "",
+     ""),
+    ("scope-ancestor-probe",
+     "            ([\"git\", \"merge-base\", \"--is-ancestor\", since, pr[\"headRefOid\"]],\n"
+     "             \"the branch was rewritten since its last review\", by_exit),\n"
+     "",
+     ""),
+    # `-e <sha>` answers yes for a blob or a tree carrying that id.
     ("scope-commit-peel",
      '(["git", "cat-file", "-e", since + "^{commit}"],',
      '(["git", "cat-file", "-e", since],'),
@@ -714,20 +720,26 @@ MUTATIONS = [
      'DIFF_TIMEOUT))\n'
      "            return None",
      "            return since"),
-    ('scope-probe-refused',
-     '        if refused_if(result):\n            log("%s: %s, so the whole pull request is reviewed"\n                % (label, why))\n            return None',
-     '        pass'),
+    ("scope-probe-refused",
+     "        if refused_if(result):\n"
+     "            log(\"%s: %s, so the whole pull request is reviewed\"\n"
+     "                % (label, why))\n"
+     "            return None",
+     "        pass"),
+    # --- what may be recorded as reviewed ------------------------------
     ("state-entry-sha-shape",
      "    if reviewed_sha and FULL_SHA.match(reviewed_sha):",
      "    if reviewed_sha:"),
-    ('load-state-sha-shape',
-     '                if seen is not None and not (isinstance(seen, str)\n                                             and FULL_SHA.match(seen)):',
-     '                if False:'),
+    ("load-state-sha-shape",
+     "                if seen is not None and not (isinstance(seen, str)\n"
+     "                                             and FULL_SHA.match(seen)):",
+     "                if False:"),
+    # Unanchored, `re.match` takes a good sha with anything after it.
     ("full-sha-anchored",
      'FULL_SHA = re.compile(r"\\A[0-9a-f]{40}\\Z")',
      'FULL_SHA = re.compile(r"[0-9a-f]{40}")'),
 
-    # --- carrying it past the head it was written at -------------------
+    # --- telling the reviewer, and telling the pull request ------------
     ("brief-since",
      '           "--append-system-prompt", reviewer_brief(pr, since),',
      '           "--append-system-prompt", reviewer_brief(pr),'),
@@ -764,20 +776,29 @@ MUTATIONS = [
     ("covered-needs-a-pull-request",
      '            if whole and findings is not None and config["comment"]:',
      "            if whole and findings is not None:"),
-    ('whole-is-not-the-note',
-     '        notes.append(partial_note("failed before it finished"))\n        whole = False',
-     '        notes.append(partial_note("failed before it finished"))'),
-    ('whole-reaches-deliver',
-     '    deliver(text, findings, " ".join(notes) or None, whole=whole)',
-     '    deliver(text, findings, " ".join(notes) or None, whole=True)'),
+    ("whole-is-not-the-note",
+     "        notes.append(partial_note(\"failed before it finished\"))\n"
+     "        whole = False",
+     "        notes.append(partial_note(\"failed before it finished\"))"),
+    ("whole-reaches-deliver",
+     "    deliver(text, findings, \" \".join(notes) or None, whole=whole)",
+     "    deliver(text, findings, \" \".join(notes) or None, whole=True)"),
     ("covered-needs-the-post-to-land",
      "                note, resent=resent, check=check, since=since)) "
      "== POSTED:",
      "                note, resent=resent, check=check, since=since)) "
      "or True:"),
-    ('reviewed-through-rule',
-     '    return {"reviewed_sha": head if covered else was.get("reviewed_sha")}',
-     '    return {"reviewed_sha": head}'),
+    # The two the third review found anchored by nothing.
+    ("load-state-drops-the-entry",
+     '                    del done["reviewed_sha"]',
+     "                    done.clear()"),
+    ("covered-is-not-the-note-either",
+     '            if whole and findings is not None and config["comment"]:',
+     "            if (whole and not note and findings is not None\n"
+     '                    and config["comment"]):'),
+    ("reviewed-through-rule",
+     "    return {\"reviewed_sha\": head if covered else was.get(\"reviewed_sha\")}",
+     "    return {\"reviewed_sha\": head}"),
     ("scope-same-head",
      '    if since == pr["headRefOid"]:\n'
      '        log("%s: nothing has been pushed since its last review, so the '
@@ -795,9 +816,10 @@ MUTATIONS = [
      "            return since"),
 
     # --- saying so where a repost will find it -------------------------
-    ('transcript-says-the-scope',
-     '    if since:\n        body = "%sonly what was added since `%s`.\\n\\n%s" % (\n            SCOPE_MARK, since[:7], body)',
-     '    pass'),
+    ("transcript-says-the-scope",
+     "    if since:\n"
+     '        body = "%s`%s`.\\n\\n%s" % (SCOPE_MARK, since[:7], body)',
+     "    pass"),
     ("transcript-gets-the-scope",
      "            label, save_transcript(repo, pr, text, findings, note, "
      "since))))",
@@ -836,16 +858,18 @@ MUTATIONS = [
 
     # --- what the second review found ----------------------------------
     ("scope-merge-honours-exit-code",
-     "    by_output = lambda result: result.returncode != 0 or "
-     "result.stdout.strip()",
-     "    by_output = lambda result: result.stdout.strip()"),
+     "        return result.returncode != 0 or result.stdout.strip()",
+     "        return result.stdout.strip()"),
     ("scope-probe-bound",
      "            result = run(probe, cwd=path, env=env, "
      "timeout=DIFF_TIMEOUT)",
      "            result = run(probe, cwd=path, env=env)"),
-    ('state-sha-drops-only-itself',
-     '                    log("%s: its reviewed_sha in %s is not a commit id, so "\n                        "the whole pull request is reviewed" % (\n                            key, STATE_PATH))\n                    del done["reviewed_sha"]',
-     '                    done["reviewed_sha"] = "0" * 40'),
+    ("state-sha-drops-only-itself",
+     "                    log(\"%s: its reviewed_sha in %s is not a commit id, so \"\n"
+     "                        \"the whole pull request is reviewed\" % (\n"
+     "                            key, STATE_PATH))\n"
+     "                    del done[\"reviewed_sha\"]",
+     "                    done[\"reviewed_sha\"] = \"0\" * 40"),
     ("whole-flag-needs-pr",
      "    if args.whole and not args.pr:\n"
      '        sys.exit("--whole only means something with --pr; the '
@@ -853,12 +877,24 @@ MUTATIONS = [
      '                 "scoping is not a command-line choice")',
      "    pass"),
     ("repost-keeps-the-scope",
-     '            mark = body.find("\\n%s" % SCOPE_MARK)\n'
-     '            end = body.find("\\n\\n", mark + 1) if mark != -1 else -1\n'
+     "            sep = body.find(TRANSCRIPT_SEP)\n"
+     "            starts = sep + len(TRANSCRIPT_SEP) if sep != -1 else -1\n"
+     '            end = (body.find("\\n\\n", starts)\n'
+     "                   if starts != -1 and body.startswith(SCOPE_MARK, starts)\n"
+     "                   else -1)\n"
      "            if end != -1:\n"
-     '                opening += "%s\\n\\n" % body[mark + 1:end]\n'
-     "                body = body[:mark + 1] + body[end + 2:]",
+     '                opening += "%s\\n\\n" % body[starts:end]\n'
+     "                body = body[:starts] + body[end + 2:]",
      "            pass"),
+    # Read anywhere in the file rather than at the offset the separator
+    # gives, which is what let the reviewer's own prose be hoisted into
+    # the resend's opening and cut out of the review.
+    ("repost-scope-read-unanchored",
+     '            end = (body.find("\\n\\n", starts)\n'
+     "                   if starts != -1 and body.startswith(SCOPE_MARK, starts)\n"
+     "                   else -1)",
+     "            starts = body.find(SCOPE_MARK)\n"
+     '            end = body.find("\\n\\n", starts) if starts != -1 else -1'),
 ]
 
 
