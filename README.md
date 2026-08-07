@@ -189,7 +189,7 @@ Every key in `config.example.json`:
 | `model` | `null` | Model for the review. Null uses your Claude Code default. Read the note below before setting it. |
 | `fallback_model` | `null` | Model to run the review again on when `model` cannot be routed. Null means no fallback. See below. |
 | `review_on_push` | `false` | Review again when the head commit changes. A second review reads only what was added since the last one that posted. See "The review". |
-| `blockers_only_after` | `2` | After this many reviews of one pull request, later reviews still run on every push but report only blockers. Null reports everything, every time. See below. |
+| `blockers_only_after` | `2` | After this many reviews of one pull request, later reviews of it report only blockers. Nothing stops them running. Reached on every push with `review_on_push` on, and through repeated `--pr` runs without it. Null reports everything, every time. See below. |
 | `max_changed_lines` | `3000` | Skip pull requests larger than this. |
 | `skip_drafts` | `true` | Skip drafts. |
 | `skip_bots` | `true` | Skip pull requests opened by bots. |
@@ -896,10 +896,16 @@ likely to break.
 
 What changes instead is what gets reported. `blockers_only_after` sets how many
 reviews of one pull request report everything they find. Every review after
-those still runs on every push and still reads the same way, and reports only
-blockers: findings where you can name what goes wrong at runtime for a user or
-an operator. A missing test, a stale comment, a duplicated helper and a clumsy
+those still runs and still reads the same way, and reports only blockers:
+findings where you can name what goes wrong at runtime for a user or an
+operator. A missing test, a stale comment, a duplicated helper and a clumsy
 structure are never blockers there, however serious the code they concern.
+
+**How a pull request gets that many reviews depends on `review_on_push`.** With
+it on, one per push. With it off, which is the shipped default, the daemon
+reviews a pull request once and never again, so the only way to reach a later
+round is to run `--pr` against the same pull request repeatedly. Both count on
+the same rule.
 
 **The narrowing is in the reviewer's instructions, not a filter on what it
 sent back.** That distinction is the whole design. Vinegar could post the

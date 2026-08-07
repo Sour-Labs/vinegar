@@ -842,20 +842,18 @@ MUTATIONS = [
 
     # --- the manual half, which no check reached before ----------------
     ("hand-run-since",
-     "                outcome, covered = review(where, repo, pr, config, env,\n"
-     "                                          tokens, check=hand, since=since,\n"
-     "                                          blockers=blockers)",
-     "                outcome, covered = review(where, repo, pr, config, env,\n"
-     "                                          tokens, check=hand,\n"
-     "                                          blockers=blockers)"),
+     "                    where, repo, pr, config, env, tokens, check=hand,\n"
+     "                    since=since, blockers=blockers)",
+     "                    where, repo, pr, config, env, tokens, check=hand,\n"
+     "                    blockers=blockers)"),
     ("hand-run-whole-flag",
      "            since = None if args.whole else review_scope(",
      "            since = None or review_scope("),
     ("hand-run-records-the-start",
      "                           **reviewed_through(covered, pr[\"headRefOid\"],\n"
      "                                              was),\n"
-     "                           **rounds_done(outcome == DONE and not saved, was)))",
-     "                           **rounds_done(outcome == DONE and not saved, was)))"),
+     "                           **rounds_done(reached, was)))",
+     "                           **rounds_done(reached, was)))"),
 
     ("anchors-from-the-base",
      '            findings, diff_lines(path, pr["baseRefName"], env, label), '
@@ -936,9 +934,9 @@ MUTATIONS = [
     # count never reaches two and nothing is ever narrowed.
     ("rounds-survive-the-head-moving",
      "                   **reviewed_through(covered, head, done),\n"
-     "                   **rounds_done(outcome == DONE and not saved, done)))",
+     "                   **rounds_done(reached, done)))",
      "                   **reviewed_through(covered, head, done),\n"
-     "                   **rounds_done(outcome == DONE and not saved, kept)))"),
+     "                   **rounds_done(reached, kept)))"),
     # The rebuilds that are not reviews handing the count back. One draft
     # toggle or one failed clone and the pull request reports everything
     # again.
@@ -976,9 +974,9 @@ MUTATIONS = [
     # The pull request not told, so a quiet later review reads as the change
     # being clean when it only means nothing in it breaks at runtime.
     ("blockers-said-on-the-pull-request",
-     '        lines += ["", "The first %d reviews of a pull request report "\n'
-     '                      "everything they find. This is a later one, so it was "',
-     '        lines += ["", "" if True else "everything they find, so it was "'),
+     '        lines += ["", "The first %s of a pull request %s everything %s "\n'
+     '                      "find%s. This is a later one, so it was asked for "',
+     '        lines += ["", "" if True else "%s%s%s%s"'),
     # Written outside the block the repost lifts, so the mark survives on
     # disk and is lost from every review delivered from a transcript.
     ("blockers-mark-inside-the-lifted-block",
@@ -1005,12 +1003,25 @@ MUTATIONS = [
     # findings are on the pull request already", on a pull request that
     # carries nothing at all.
     ("rounds-need-the-post-to-land",
-     "                   **rounds_done(outcome == DONE and not saved, done)))",
+     "                   **rounds_done(reached, done)))",
      "                   **rounds_done(outcome == DONE, done)))"),
     ("hand-run-rounds-need-the-post-to-land",
-     "                           **rounds_done(outcome == DONE and not saved, "
-     "was)))",
+     "                           **rounds_done(reached, was)))",
      "                           **rounds_done(outcome == DONE, was)))"),
+    # Read off the filesystem rather than off review()'s answer. The
+    # marker is written only when the transcript write succeeded, so a run
+    # that could neither save nor post leaves none and reads as a round
+    # the author never saw.
+    ("rounds-not-inferred-from-the-marker",
+     "                   **rounds_done(reached, done)))",
+     "                   **rounds_done(outcome == DONE and not os.path.exists(\n"
+     "                       unposted_path(repo, pr)), done)))"),
+    # The `comment` guard, which is what keeps a dry run from counting.
+    # post_review answers POSTED for correctly posting nothing.
+    ("rounds-need-a-pull-request-to-reach",
+     '            if config["comment"]:\n'
+     "                reached.append(True)",
+     "            reached.append(True)"),
     # And the other side of that rule: the send that finally lands is the
     # one moment a refused review reaches the author, so the round it never
     # got is counted there. Dropped, a pull request whose posting failed
@@ -1043,13 +1054,11 @@ MUTATIONS = [
     # The hand-run path's own wire, which shipped uncovered once before on
     # this same code and did again here.
     ("hand-run-blockers",
-     "            blockers = not args.whole and this_round(entry, config, "
-     "args.pr)",
+     "            blockers = narrows and not args.whole",
      "            blockers = False"),
     ("hand-run-whole-widens-severity-too",
-     "            blockers = not args.whole and this_round(entry, config, "
-     "args.pr)",
-     "            blockers = this_round(entry, config, args.pr)"),
+     "            blockers = narrows and not args.whole",
+     "            blockers = narrows"),
     # The transcript's flag, which travelled beside `since` with no guard
     # of its own. Dropped, BLOCKERS_MARK reaches no transcript a real
     # review produced, and the repost reads the mark rather than the flag.
