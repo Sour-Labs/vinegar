@@ -907,6 +907,38 @@ check("prose that mentions a tier is not read as the answer",
 check("a tier outside the three is not an answer",
       _tiers("0 critical\n1 note", 2) is None,
       _tiers("0 critical\n1 note", 2))
+# A tier that matches the alternation and is still not one of the three.
+# IGNORECASE folds four non-ASCII letters into the ASCII ones here:
+# \u0131, \u0130, \u017f and \u212a. Only the Kelvin sign lowers back into
+# the word it came from, so the other three reach .lower() and come out
+# still holding the lookalike. Measured on 3.9, not read off the re docs,
+# whose paragraph on this covers the ranges [a-z] and [A-Z] and says
+# nothing about a literal alternation: what folds these is sre_compile's
+# own equivalences table, plus the lowercase mapping that pulls \u0130 in.
+#
+# What it costs unchecked is a whole review: the word is written onto the
+# finding, TIERS.index() in triage()'s sort raises on it, and that sort is
+# past the except that keeps an ordering step from costing a review, so a
+# finished review posts nothing and saves no transcript.
+#
+# Each check asserts the premise as well as the refusal, because None is
+# also what a line TIER_LINE never matched returns. Without it, a CPython
+# that drops one of these equivalences leaves three checks passing while
+# exercising nothing.
+for _letter, _said in (("\u0131 dotless i", "adv\u0131sory"),
+                       ("\u0130 I with dot", "adv\u0130sory"),
+                       ("\u017f long s", "advi\u017fory")):
+    check("a tier holding %s is not an answer" % _letter,
+          vinegar.TIER_LINE.match("0 %s" % _said) is not None
+          and _tiers("0 %s\n1 note" % _said, 2) is None,
+          (vinegar.TIER_LINE.match("0 %s" % _said),
+           _tiers("0 %s\n1 note" % _said, 2)))
+# The fourth one is accepted, because it is the same word once lowered.
+# Here so that the lines above read as a membership test and not as a
+# reason to start refusing anything that arrived non-ASCII.
+check("a lookalike that lowers into a real tier is that tier",
+      _tiers("0 bloc\u212aer\n1 note", 2) == ["blocker", "note"],
+      _tiers("0 bloc\u212aer\n1 note", 2))
 check("the answer is read whatever case it arrives in",
       _tiers("0 BLOCKER\n1 Advisory", 2) == ["blocker", "advisory"],
       _tiers("0 BLOCKER\n1 Advisory", 2))
@@ -1005,6 +1037,19 @@ check("findings the pass judged alike keep the reviewer's order",
       [f["summary"] for f in _triaged(_answer("note", "note", "note"))])
 check("tiering copies the findings rather than writing into them",
       not any("tier" in finding for finding in _FOUND), _FOUND)
+# The sort is past triage()'s except, so a tier it cannot rank is not an
+# ordering step that failed: it is a finished, paid-for review that posts
+# nothing and saves no transcript. read_tiers() refuses a tier outside
+# TIERS, which is what makes standing in for it the only way here, and the
+# drift it stands for is TIERS losing a word its second spellings keep.
+_real_read_tiers, vinegar.read_tiers = vinegar.read_tiers, \
+    lambda said, count: ["nope"] * count
+_unrankable = _triaged(_answer("note", "note", "note"))
+vinegar.read_tiers = _real_read_tiers
+check("a tier the sort cannot rank does not cost the review",
+      isinstance(_unrankable, list)
+      and [f["summary"] for f in _unrankable] == ["first", "second", "third"],
+      _unrankable)
 
 # Everything below is a way the call can fail, and every one of them has to
 # land on the same answer: the findings exactly as they arrived. The review
@@ -1241,16 +1286,59 @@ check("every tier the pass is offered is one the answer can carry",
       all(tier in _prompt for tier in vinegar.TIERS), vinegar.TIERS)
 
 # --- how a tier reads ----------------------------------------------------
-check("the tier opens the comment it belongs to",
-      vinegar.describe({"summary": "s", "tier": "blocker"}).startswith(
-          "**blocker**"),
-      vinegar.describe({"summary": "s", "tier": "blocker"}))
+# Named on its own, because TIER_DOTS is a second spelling of TIERS and a
+# tier that drifts out of it costs every comment of that tier its dot
+# without any of them looking wrong on their own.
+check("every tier has a dot",
+      set(vinegar.TIER_DOTS) == set(vinegar.TIERS), vinegar.TIER_DOTS)
+
+
+def _described(finding):
+    """describe(), with a raise reported rather than ending the run.
+
+    The same reason as _tiers above. What the check below establishes is
+    that a tier with no dot does not raise, and asserting that inside a
+    check's own argument list would abort the run rather than fail it.
+    """
+    try:
+        return vinegar.describe(finding)
+    except Exception as err:
+        return "%s: %s" % (type(err).__name__, err)
+
+
+# describe() runs on the path that posts and the path that saves the
+# transcript, both with the review finished and paid for, so the default
+# is the whole of what keeps a drifted palette from costing one. Nothing
+# else in the suite reaches it: every tier the other checks render is in
+# TIERS and the check above guarantees those all have a dot, so the
+# subscript this replaced passes them all.
+check("a tier with no dot loses the dot and nothing else",
+      _described({"summary": "s", "tier": "nope"}) == "**nope** · s",
+      _described({"summary": "s", "tier": "nope"}))
+# Written out rather than built from TIER_DOTS, so that a palette that
+# drifts from the one asked for has to be meant. Three things ride on this
+# one rendering: the colors, red then blue then palest, which is the whole
+# of what the dot buys; the word beside the dot, which is what a reader who
+# does not know the three colors reads, and all a screen reader is given;
+# and the dot first, because the opening characters are what a reader
+# facing thirteen comments picks from.
+#
+# An emoji because GitHub's sanitiser leaves nothing else colored. The
+# measurement behind that is beside TIER_DOTS in vinegar.py.
+check("every tier opens its comment with its own color and its own word",
+      [vinegar.describe({"summary": "s", "tier": tier})
+       for tier in vinegar.TIERS]
+      == ["\U0001f534 **blocker** \u00b7 s",
+          "\U0001f535 **advisory** \u00b7 s",
+          "\u26aa **note** \u00b7 s"],
+      [vinegar.describe({"summary": "s", "tier": tier})
+       for tier in vinegar.TIERS])
 check("an untiered finding reads as it always did",
       vinegar.describe({"summary": "s", "category": "correctness"})
       == "s\n\n(correctness)",
       vinegar.describe({"summary": "s", "category": "correctness"}))
 check("the tier reaches an inline comment too",
-      "**note**" in vinegar.split_findings(
+      "\u26aa **note**" in vinegar.split_findings(
           [{"file": "vinegar.py", "line": 12, "summary": "s",
             "tier": "note"}], covered, L)[0][0]["body"],
       vinegar.split_findings([{"file": "vinegar.py", "line": 12,
@@ -5495,7 +5583,8 @@ vinegar.run = fake_run
 _tier_said = " ".join(post[1]["body"] for post in posted)
 _tier_file = open(vinegar.transcript_path("o/r", PR_TIER)).read()
 check("the tier reaches the transcript a repost would send",
-      "**blocker**" in _tier_file and "**note**" in _tier_file,
+      "\U0001f534 **blocker**" in _tier_file
+      and "\u26aa **note**" in _tier_file,
       _tier_file[-400:])
 check("the comment says how the findings were tiered",
       "(1 blocker, 1 note)" in _tier_said, _tier_said[:300])

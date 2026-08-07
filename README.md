@@ -790,7 +790,7 @@ there were, including when there were none:
 >
 > These could not be anchored in the diff:
 >
-> - `vinegar.py:812`: **blocker** · The caller this relies on drops the error.
+> - `vinegar.py:812`: 🔴 **blocker** · The caller this relies on drops the error.
 >   Failure: a failed fetch returns None and the loop treats it as empty.
 >   (correctness)
 
@@ -1050,17 +1050,25 @@ the verdict.
 Instead, when the review finishes, one cheap model call reads the findings and
 gives each a tier:
 
-- **blocker**: something goes wrong at runtime for a user or an operator: a
+- 🔴 **blocker**: something goes wrong at runtime for a user or an operator: a
   wrong result, lost data, a security hole, a hang, a crash, or a silent
   failure. Someone should act before this merges.
-- **advisory**: a real defect with bounded cost. It degrades quality, misleads
+- 🔵 **advisory**: a real defect with bounded cost. It degrades quality, misleads
   a reader, leaves a gap in tests, or wastes resources, but nothing at runtime
   behaves wrongly because of it.
-- **note**: taste, naming, structure, or a small cleanup.
+- ⚪ **note**: taste, naming, structure, or a small cleanup.
 
-The tier opens each comment and the findings are posted most serious first. The
-top-level comment counts them. Nothing is ever dropped for being minor: the
-tier changes the order and the label, never whether you see it.
+The tier opens each comment, its dot first, and the findings are posted most
+serious first. The top-level comment counts them. Nothing is ever dropped for
+being minor: the tier changes the order and the label, never whether you see it.
+
+The dot is an emoji because GitHub sanitises a comment body: `style` is stripped
+off a `<span>` and a `<font color>` tag is dropped whole, so both post as plain
+text. The alternatives that do come out colored are worse. A badge image is
+fetched through camo, which puts a network round trip behind every finding, and
+an alert block cannot open a bullet. Neither survives the transcript, which is
+plain text and is what a refused review is reposted from. Unicode has no gray
+circle, so `note` takes the white one.
 
 **The triage model never re-judges whether a finding is true.** It is given the
 findings' own words and no repository, no diff, and no tools, and it is told to

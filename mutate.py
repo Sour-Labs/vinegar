@@ -291,17 +291,21 @@ MUTATIONS = [
      "    return [seen[i] for i in range(count)] if len(seen) == count else None",
      "    return [seen[i] for i in sorted(seen)]"),
     ("severity-answer-index-in-range",
-     "        if 0 <= index < count and index not in seen:",
-     "        if index not in seen:"),
+     "        if tier in TIERS and 0 <= index < count and index not in seen:",
+     "        if tier in TIERS and index not in seen:"),
     ("severity-answer-first-wins",
-     "        if 0 <= index < count and index not in seen:",
-     "        if 0 <= index < count:"),
+     "        if tier in TIERS and 0 <= index < count and index not in seen:",
+     "        if tier in TIERS and 0 <= index < count:"),
     ("severity-answer-anchored-at-line-start",
      "        match = TIER_LINE.match(line)",
      "        match = TIER_LINE.search(line)"),
+    # The alternation in TIER_LINE is the first filter and the membership
+    # test is what enforces it, so the mutation lands on the test. Breaking
+    # the alternation alone changes nothing a caller can see: a word it
+    # then lets through is refused one line later.
     ("severity-answer-known-tiers-only",
-     r'TIER_LINE = re.compile(r"\s*\[?(\d+)\]?[\s:.)-]+(%s)\b" % "|".join(TIERS),',
-     r'TIER_LINE = re.compile(r"\s*\[?(\d+)\]?[\s:.)-]+([a-z]+)\b" % (),'),
+     "        if tier in TIERS and 0 <= index < count and index not in seen:",
+     "        if 0 <= index < count and index not in seen:"),
     ("severity-answer-any-case",
      "                       re.IGNORECASE)", "                       0)"),
 
@@ -389,8 +393,15 @@ MUTATIONS = [
 
     # What the tiers are for: an order, and a label on each comment.
     ("severity-sorts-most-serious-first",
-     '    return sorted(tiered, key=lambda finding: TIERS.index(finding["tier"]))',
+     '    return sorted(tiered, key=lambda finding: TIERS.index(finding["tier"])\n'
+     '                  if finding["tier"] in TIERS else len(TIERS))',
      "    return tiered"),
+    # The sort is past triage()'s except, so this one does not fail an
+    # ordering step, it loses a finished review whole.
+    ("severity-sort-ranks-an-unknown-tier-last",
+     '    return sorted(tiered, key=lambda finding: TIERS.index(finding["tier"])\n'
+     '                  if finding["tier"] in TIERS else len(TIERS))',
+     '    return sorted(tiered, key=lambda finding: TIERS.index(finding["tier"]))'),
     ("severity-copies-rather-than-writes",
      "    tiered = [dict(finding, tier=tier)\n"
      "              for finding, tier in zip(findings, tiers)]",
@@ -398,8 +409,35 @@ MUTATIONS = [
      "    for finding, tier in zip(findings, tiers):\n"
      '        finding["tier"] = tier'),
     ("severity-label-opens-the-comment",
-     '        summary = "**%s** · %s" % (tier, summary)',
+     '        summary = "%s**%s** \u00b7 %s" % (dot + " " if dot else "", tier, summary)',
      "        pass"),
+    # The dot and the word are one label and neither half stands alone. A
+    # comment with no dot is the plain text this replaced, and one with no
+    # word says nothing to a reader who does not know the three colors.
+    ("severity-label-opens-with-a-dot",
+     '        summary = "%s**%s** \u00b7 %s" % (dot + " " if dot else "", tier, summary)',
+     '        summary = "**%s** \\u00b7 %s" % (tier, summary)'),
+    ("severity-label-keeps-its-word",
+     '        summary = "%s**%s** \u00b7 %s" % (dot + " " if dot else "", tier, summary)',
+     '        summary = "%s %s" % (dot, summary)'),
+    # One color for all three is a dot that costs a character and tells the
+    # reader nothing, and it is what a careless palette edit produces.
+    ("severity-each-tier-has-its-own-dot",
+     'TIER_DOTS = {"blocker": "\\U0001f534",    # red circle\n'
+     '             "advisory": "\\U0001f535",   # blue circle\n'
+     '             "note": "\\u26aa"}           # white circle',
+     'TIER_DOTS = {"blocker": "\\U0001f534",\n'
+     '             "advisory": "\\U0001f534",\n'
+     '             "note": "\\U0001f534"}'),
+    # Read with a default, which is what lets the drift below fail a check
+    # instead of raising out of one: it came back ABORTED as a subscript,
+    # 146 checks of 670, with everything under it skipped rather than run.
+    ("severity-dot-read-with-a-default",
+     '        dot = TIER_DOTS.get(tier)',
+     '        dot = TIER_DOTS[tier]'),
+    ("severity-every-tier-has-a-dot",
+     '             "note": "\\u26aa"}           # white circle',
+     '             "n0te": "\\u26aa"}           # white circle'),
     ("severity-tally-counts",
      '    return ", ".join("%d %s" % (count, tier)\n'
      "                     for tier, count in counted if count)",

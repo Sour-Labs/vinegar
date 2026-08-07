@@ -388,8 +388,35 @@ TIERS = ("blocker", "advisory", "note")
 # one: findings quote the branch under review and the model narrates
 # around its answer, so a sentence mentioning a tier is the likeliest
 # thing in the reply that is not the answer.
+#
+# The alternation says what an answer looks like; it is not what decides
+# which tiers are accepted. IGNORECASE folds four non-ASCII letters into
+# the ASCII ones, so read_tiers() checks what this captured against TIERS
+# and a word this let through is refused there. Loosening the alternation
+# would change nothing a caller can see, which is why the mutation for
+# that property is on the membership test rather than here.
 TIER_LINE = re.compile(r"\s*\[?(\d+)\]?[\s:.)-]+(%s)\b" % "|".join(TIERS),
                        re.IGNORECASE)
+
+# The colored dot each tier's label opens with, keyed by the same three
+# words as TIERS. A check holds the two together, and describe() reads it
+# with a default rather than a subscript, so a tier that drifts out of
+# here costs its comment a dot and never a review.
+#
+# An emoji rather than colored text, because GitHub sanitises a comment
+# body. Measured through its own markdown endpoint: `style` is stripped off
+# a `<span>` and a `<font color>` tag is dropped whole, so both arrive as
+# plain text. What is left that is genuinely colored is worse. A badge
+# image is fetched through camo, which puts a network round trip behind
+# every finding and greys out silently when it fails. An alert block is
+# block-level and cannot open a bullet. Neither survives the transcript,
+# which is plain text and is what repost() sends when the review is
+# refused.
+#
+# Unicode has no gray circle, so `note` takes the white one.
+TIER_DOTS = {"blocker": "\U0001f534",    # red circle
+             "advisory": "\U0001f535",   # blue circle
+             "note": "\u26aa"}           # white circle
 
 # What the severity pass is told. Kept beside TIERS because the tiers it
 # names and the tuple above have to be the same three words: a rule
@@ -2410,9 +2437,10 @@ def read_tiers(said, count):
 
     TIER_LINE is anchored at the start of a line, so that prose mentioning
     a tier ("finding 3 is arguably a blocker") cannot be read as the
-    answer. Every other character of the reply is discarded, which is what
-    keeps the output surface of an attacker-influenced call down to three
-    words per finding.
+    answer. Every other character of the reply is discarded, and what is
+    left is checked against TIERS rather than trusted for having matched,
+    which together are what keep the output surface of an
+    attacker-influenced call down to three words per finding.
     """
     seen = {}
     for line in said.splitlines():
@@ -2420,12 +2448,27 @@ def read_tiers(said, count):
         if not match:
             continue
         index = int(match.group(1))
+        # Matching the alternation is not enough to be one of the three.
+        # TIER_LINE is compiled IGNORECASE and a Unicode pattern under
+        # that flag also matches four non-ASCII letters, of which only the
+        # Kelvin sign lowers back into the word it came from. Measured on
+        # 3.9: `0 advısory` matches and comes out of .lower() still
+        # holding the dotless i.
+        #
+        # What that costs without this line is a whole review. The word is
+        # written onto the finding, TIERS.index() in triage()'s sort
+        # raises ValueError on it, and that sort is past the except that
+        # exists to keep an ordering step from costing a review: nothing
+        # is posted, no transcript is saved, and the outcome is still
+        # recorded DONE, so with review_on_push off the pull request is
+        # never looked at again.
+        tier = match.group(2).lower()
         # The first answer for an index wins, and a repeat does not
         # overwrite it. A model that answers the same finding twice has
         # contradicted itself, and the coverage check below is what
         # decides whether the reply is usable at all.
-        if 0 <= index < count and index not in seen:
-            seen[index] = match.group(2).lower()
+        if tier in TIERS and 0 <= index < count and index not in seen:
+            seen[index] = tier
     return [seen[i] for i in range(count)] if len(seen) == count else None
 
 
@@ -2543,7 +2586,16 @@ def triage(label, findings, config):
         severity_tally(tiered)))
     # Stable, so findings the pass judged equally serious stay in the order
     # the reviewer reported them, which is the order it thought mattered.
-    return sorted(tiered, key=lambda finding: TIERS.index(finding["tier"]))
+    #
+    # A tier this cannot rank sorts last rather than raising, for the
+    # reason describe() reads TIER_DOTS with a default: this line is past
+    # the except above, so a ValueError here is not an ordering step that
+    # failed, it is a finished review that posts nothing and saves no
+    # transcript while the outcome is recorded DONE. read_tiers() refuses
+    # a tier that is not in TIERS, so the drift this covers is TIERS
+    # itself losing a word its second spellings still carry.
+    return sorted(tiered, key=lambda finding: TIERS.index(finding["tier"])
+                  if finding["tier"] in TIERS else len(TIERS))
 
 
 def diff_lines(path, base, env, label):
@@ -2779,13 +2831,30 @@ def describe(finding):
     # summary it would be a label nobody reaches until they have already
     # read the thing it was meant to help them skip.
     #
+    # The word stays beside the dot rather than being replaced by it. The
+    # color is what a reader picks the comment out by; the word is what
+    # tells them which tier it is without knowing the three colors, and it
+    # is all a screen reader has, because the dot is announced by its own
+    # name and not by what it means here.
+    #
     # Absent when the severity pass is off or did not answer, and then
     # this reads exactly as it did before tiers existed. read_tiers()
     # tiers all of the findings or none, so a comment never sits beside
     # one that was judged and says nothing.
+    #
+    # A default and not a subscript, like every other field here. This
+    # runs with the review finished and paid for, on the path that posts
+    # and the path that saves the transcript, so a KeyError on a tier that
+    # drifted out of TIER_DOTS would lose the review whole while the
+    # outcome was still recorded DONE.
+    #
+    # The space travels with the dot rather than sitting in the format,
+    # which would leave a comment that lost its dot opening on a stray
+    # space instead.
     tier = str(finding.get("tier") or "").strip()
     if tier:
-        summary = "**%s** · %s" % (tier, summary)
+        dot = TIER_DOTS.get(tier)
+        summary = "%s**%s** · %s" % (dot + " " if dot else "", tier, summary)
     # The verdict rides with the category when the effort level ran a verify
     # pass. CONFIRMED and PLAUSIBLE read very differently, and posting them
     # identically claims a certainty the reviewer did not.
