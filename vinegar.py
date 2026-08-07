@@ -2012,6 +2012,17 @@ def reviewer_brief(pr, config, since=None, blockers=False):
     one sentence in the brief that argues against leaving anything out, so
     a paragraph telling the reviewer to leave most things out has to be
     the one that answers it rather than the one it answers.
+
+    What it cannot run sits beside the network, for the reason the network
+    is there at all: a reviewer discovering a denial one command at a time
+    pays a turn for each. Measured across the three rounds of PR #24, of
+    sixteen denied commands about six were `sed`, `find` and `awk` doing
+    what Read, Grep and Glob already do, and most of the rest were
+    `python3` trying to run the suite. The last sentence is the one that
+    earns its place: told only which commands are denied, a reviewer plans
+    a review around running the tests and discovers three times that it
+    cannot. It is also true rather than tactful, and the transcript of a
+    review that says so is worth more than one that quietly did less.
     """
     base = pr["baseRefName"]
     # Named as what it is in each case. Calling the base diff "the review
@@ -2028,8 +2039,11 @@ def reviewer_brief(pr, config, since=None, blockers=False):
         "clone carries even when the branch itself was not fetched, and say "
         "in your summary that you used it. %s You have "
         "no network: `gh` cannot reach GitHub from here, so do not reach for "
-        "it. Do not substitute a branch of your own choosing, and do not "
-        "assume `main`.%s\n\n"
+        "it. Use Read, Grep and Glob to read this checkout: `sed`, `awk`, "
+        "`find` and every interpreter, `python3` among them, are denied, so "
+        "reaching for one costs a turn and returns nothing. You cannot run "
+        "this repository's tests or any of its code. Do not substitute a "
+        "branch of your own choosing, and do not assume `main`.%s\n\n"
         "Post nothing to GitHub yourself. Report every finding through the "
         "%s tool, including when you found none, and give `file` relative to "
         "the repository root. Vinegar reads that call and posts the whole "

@@ -470,6 +470,16 @@ are what remain, and a review that wants more than those says so: a refused
 `Bash` command is recorded in `permission_denials`, which the log reports
 after every run.
 
+The reviewer is told this up front rather than left to find it out. The brief
+names Read, Grep and Glob as how it reads a checkout, says `sed`, `awk`, `find`
+and the interpreters are denied, and says plainly that it cannot run the
+repository's tests or any of its code. Measured across the three rounds of
+PR #24: sixteen denied commands, about six of them `sed`, `find` and `awk`
+doing what Read, Grep and Glob already do, and most of the rest `python3`
+trying to run the suite three separate times. Each cost a turn and returned
+nothing. Saying it once is cheaper, and it leaves `permission_denials` closer
+to what it is for, which is the denials worth acting on.
+
 Reads are path-denied for `~/.vinegar`, `~/.claude`, `~/.ssh`, `~/.aws`,
 `~/.gnupg`, `~/.config/gh`, `.netrc` and `.env`. Without that, the App's own
 private key is a file the reviewer can read, and that key is the one
