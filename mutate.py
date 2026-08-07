@@ -576,8 +576,32 @@ MUTATIONS = [
     ("check-conclusion-never-fails",
      'CHECK_CONCLUSION = "neutral"', 'CHECK_CONCLUSION = "failure"'),
     ("check-conclusion-is-used",
-     '"status": "completed", "conclusion": CHECK_CONCLUSION,',
+     '"status": "completed", "conclusion": conclusion,',
      '"status": "completed", "conclusion": "success",'),
+    # Green is the one ending that is a pass, and the four ways it can be
+    # claimed wrongly are four entries: nothing found is the only one that
+    # earns it, and an unreadable answer, a killed run and a review that
+    # never landed each report nothing without being clean.
+    ("check-clean-is-a-pass",
+     'CHECK_CLEAN = "success"', 'CHECK_CLEAN = "neutral"'),
+    ("check-green-only-when-nothing-was-found",
+     "    clean = findings == [] and not note and posted == POSTED",
+     "    clean = True"),
+    ("check-green-not-for-an-unreadable-answer",
+     "    clean = findings == [] and not note and posted == POSTED",
+     "    clean = not findings and not note and posted == POSTED"),
+    ("check-green-not-for-a-killed-run",
+     "    clean = findings == [] and not note and posted == POSTED",
+     "    clean = findings == [] and posted == POSTED"),
+    ("check-green-not-for-a-review-that-never-landed",
+     "    clean = findings == [] and not note and posted == POSTED",
+     "    clean = findings == [] and not note"),
+    # A refused PATCH is retried by a backstop carrying the grey
+    # conclusion, so without this a clean review ends grey under a title
+    # still saying it found nothing.
+    ("check-conclusion-rides-with-the-title",
+     '    conclusion = check.get("conclusion") or conclusion\n',
+     ""),
     # Only an App can own a check run, so without one this is a 403 per
     # review about a permission the operator cannot grant.
     ("check-needs-an-app",

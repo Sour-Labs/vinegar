@@ -1541,6 +1541,22 @@ check("a retry repeats the first attempt's title, not the backstop's",
       _tries == ["first try", "first try"], _tries)
 check("a close that lands marks the handle closed", _stuck["closed"] is True,
       _stuck)
+# The conclusion travels with the title, for the same reason. The backstop
+# brings the ordinary grey one, so without this a clean review whose first
+# PATCH was refused would end up grey under a title still saying it found
+# nothing.
+_green = {"repo": "o/r", "id": 9, "closed": False}
+fake_run.check_rc = 1
+del checked[:]
+vinegar.close_check(L, _green, "No findings", CHK_ENV, "",
+                    vinegar.CHECK_CLEAN)
+fake_run.check_rc = 0
+vinegar.close_check(L, _green, "The review ran but nothing reached the "
+                    "pull request", CHK_ENV)
+_green_tries = [(a["conclusion"], a["output"]["title"])
+                for h, _, a in checked if h == "PATCH"]
+check("a retry repeats the first attempt's conclusion, not the backstop's",
+      _green_tries == [("success", "No findings")] * 2, _green_tries)
 # The reuse branch needs the id guard the create branch has, or every
 # close on the handle sends `PATCH check-runs/None`.
 check("a reusable run with no id is not adopted",
@@ -5610,20 +5626,26 @@ vinegar.forget(vinegar.unposted_path("o/r", PR_TIER))
 # request. The checks list is what people look at before the comment, so
 # what it says has to be true on its own.
 _titles = []
+_conclusions = []
 
 
-def _titled(findings, note=None, sha="d0d0d0d0d0d0", blockers=False):
+def _titled(findings, note=None, sha="d0d0d0d0d0d0", blockers=False,
+            posts=True):
     handle = {"repo": "o/r", "id": 7, "closed": False}
     del checked[:]
     at = dict(PR_LIVE, headRefOid=sha)
-    fake_run.rc, fake_run.post_err = 0, ""
+    # `rc` is the review posting and `check_rc` is the indicator, so a
+    # refused post still leaves a PATCH to read the conclusion off.
+    fake_run.rc, fake_run.post_err = (0, "") if posts else (1, "HTTP 500")
     vinegar.run = _run_and_tier
     vinegar.finish(L, "o/r", at, ROOT, "words", findings, CONFIG, None, {},
                    note, check=handle, blockers=blockers)
     vinegar.run = fake_run
+    fake_run.rc, fake_run.post_err = 0, ""
     vinegar.forget(vinegar.unposted_path("o/r", at))
     said = [asked for how, _, asked in checked if how == "PATCH"]
     _titles.append(said[0]["output"]["title"] if said else "(never closed)")
+    _conclusions.append(said[0]["conclusion"] if said else "(never closed)")
     return _titles[-1]
 
 
@@ -5659,6 +5681,36 @@ check("an ordinary review's finished check claims no narrowing",
 check("a narrowed run that was killed still says it was killed, last",
       _titled(_tier_found, note="killed at 30 minutes", sha="ac00ac00ac00",
               blockers=True).endswith("did not finish"), _titles[-1])
+
+# The conclusion, which is a second thing the closed indicator says and the
+# one people read before any title. Green is the exception and every other
+# ending is the grey mark that cannot block a merge.
+_titled([], sha="ad00ad00ad00")
+check("a review that found nothing is a pass in the checks list",
+      _conclusions[-1] == "success", _conclusions[-1])
+_titled(_tier_found, sha="ae00ae00ae00")
+check("a review that found something is not a pass",
+      _conclusions[-1] == "neutral", _conclusions[-1])
+# The three endings that report nothing because little was read. Each is
+# the false all-clear a green tick would be, and each reaches this line by
+# a different route, so each is asked separately.
+_titled(None, sha="af00af00af00")
+check("a review whose output could not be read is not a pass",
+      _conclusions[-1] == "neutral", _conclusions[-1])
+_titled([], note="killed at 30 minutes", sha="ba00ba00ba00")
+check("a review that found nothing before it was killed is not a pass",
+      _conclusions[-1] == "neutral", _conclusions[-1])
+_titled([], sha="bc00bc00bc00", posts=False)
+check("a clean review that never reached the pull request is not a pass",
+      _conclusions[-1] == "neutral", _conclusions[-1])
+# Green is not sticky. Each review closes the indicator on its own head
+# commit, so a clean first pass and a later pass that finds something are
+# two entries with two conclusions, and the pull request shows the one
+# belonging to the commit it is sitting on.
+_titled([], sha="bd00bd00bd00")
+_titled(_tier_found, sha="be00be00be00")
+check("a later pass that finds something is not still a pass",
+      _conclusions[-2:] == ["success", "neutral"], _conclusions[-2:])
 
 fake_run.rc, fake_run.post_err = 1, "HTTP 403 Resource not accessible"
 # This block's ambiguous post consulted the landed-review read; the

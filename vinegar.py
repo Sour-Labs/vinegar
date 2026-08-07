@@ -534,7 +534,7 @@ TRIAGE_SETTINGS = {
 CHECK_NAME = "Vinegar"
 
 # How a finished review reports itself in that list, and it is never
-# `failure` or `success`.
+# `failure`.
 #
 # `failure` would make Vinegar a merge gate wherever the check is required,
 # which the README promises it is not, and reviews are submitted as COMMENT
@@ -543,13 +543,35 @@ CHECK_NAME = "Vinegar"
 # measured 45% on two of four reviews, so the gate would be closed most of
 # the time on a judgement that is only good enough to sort a list.
 #
-# `success` is the other trap. A green tick on a pull request carrying
-# twelve findings is a statement nobody made, and the tick is what people
-# read rather than the title beside it.
-#
 # `neutral` renders as a grey mark that cannot block anything, and the
-# count goes in the title where it says something true.
+# count goes in the title where it says something true. It is what every
+# ending gets except the one below, including the three that found nothing
+# because little was read: a review whose output could not be read, one
+# killed part way, and one that never reached the pull request.
 CHECK_CONCLUSION = "neutral"
+
+# And the one ending that is a pass, so a clean pull request reads as clean
+# in the list rather than as a grey mark beside the failures.
+#
+# A green tick on a pull request carrying twelve findings would be a
+# statement nobody made, which is why this is the exception and not the
+# rule. On a review that reported nothing it is the statement the reviewer
+# did make.
+#
+# Deliberately not conditioned on how much the pass read. A scoped later
+# round that reads one commit, finds nothing and goes green leaves a tick
+# on a pull request whose earlier rounds may have findings still open.
+#
+# That case was put up with its worst reading and accepted, so do not
+# close it as an oversight. The argument for it: a finding still open
+# several rounds later is usually one somebody decided not to act on, and
+# what the list is wanted for is the state of the latest run, which is
+# what the pull request mostly is. Two alternatives were costed and
+# declined. Green only on a whole-pull-request read turns a green pull
+# request grey when a clean commit is pushed to it. Remembering in the
+# state file whether any round found anything is a new field to keep
+# correct for a tick.
+CHECK_CLEAN = "success"
 
 # Characters a review comment may carry. GitHub's own ceiling is 65536 and it
 # refuses the whole review for going over, which on the path that posts the
@@ -3264,7 +3286,8 @@ def ended_title(outcome, attempts=0):
     return "The review ran but nothing reached the pull request"
 
 
-def close_check(label, check, title, env, summary=""):
+def close_check(label, check, title, env, summary="",
+                conclusion=CHECK_CONCLUSION):
     """Finish the indicator, whatever ended the review.
 
     The credentials come in here rather than riding along on the handle,
@@ -3277,9 +3300,11 @@ def close_check(label, check, title, env, summary=""):
     are current, and finish() hands over the fresh ones it just minted to
     post with.
 
-    Always `neutral`, never a pass or a fail: CHECK_CONCLUSION says why at
-    length. The title is the whole of what this communicates, so it says
-    what happened rather than how it feels about it.
+    `neutral` unless the caller says otherwise, and never `failure`:
+    CHECK_CONCLUSION and CHECK_CLEAN say why at length. Only finish()
+    passes anything else, because it is the only caller that knows both
+    what was found and whether it landed. The title carries the rest, so
+    it says what happened rather than how it feels about it.
 
     Closed on the handle only once it is really closed. finish() closes
     it with the tally and the caller closes it again as a backstop, so
@@ -3303,10 +3328,17 @@ def close_check(label, check, title, env, summary=""):
     # the wrong answer the one that stuck.
     title = check.get("said") or title
     summary = check.get("summary") or summary
+    # The conclusion travels with the title it belongs to, and for the same
+    # reason. A clean review whose PATCH was refused is retried by a
+    # backstop that knows only "the indicator is still open", so without
+    # this a green review would come back grey under a title still saying
+    # it found nothing.
+    conclusion = check.get("conclusion") or conclusion
     check["said"], check["summary"] = title, summary
+    check["conclusion"] = conclusion
     settled = check_api(
         label, check["repo"], "check-runs/%s" % check["id"], "PATCH", {
-            "status": "completed", "conclusion": CHECK_CONCLUSION,
+            "status": "completed", "conclusion": conclusion,
             "completed_at": utc_stamp(),
             # GitHub refuses a title over 255 characters and would refuse
             # the whole update with it, leaving the indicator running.
@@ -3867,10 +3899,18 @@ def finish(label, repo, pr, path, text, findings, config, env, tokens,
     # Last, because it is the caveat that most changes how the rest reads.
     if note:
         title = "%s, and the review did not finish" % title
+    # Green only for the ending that is a pass. `findings == []` and not
+    # `not findings`, because None is the review whose output could not be
+    # read, and the branch above already refuses to call that clean. A run
+    # that was killed and a review that never reached the pull request are
+    # not clean either: each reported nothing because it stopped early, and
+    # the summary beside the tick would contradict it.
+    clean = findings == [] and not note and posted == POSTED
     close_check(label, check, title, sending or env,
                 "The review is on the pull request." if posted == POSTED
                 else "The review did not reach the pull request. The log "
-                     "says where it is saved.")
+                     "says where it is saved.",
+                CHECK_CLEAN if clean else CHECK_CONCLUSION)
     return posted
 
 

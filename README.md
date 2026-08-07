@@ -1022,13 +1022,31 @@ When the review ends, the same entry carries the tally the comment carries:
 `10 findings (2 blocker, 8 advisory)`, or `No findings`, or
 `The review failed 3 times and was given up on`.
 
-**It is never a pass and never a fail.** The conclusion is always `neutral`, a
-grey mark that cannot block a merge even where the check is required. `failure`
-would make Vinegar a merge gate, which "What this is not" says it isn't, and
-severity triage is not accurate enough to be one: the blocker rate measured 45%
-on two of four reviews. `success` is the opposite trap, because a green tick on
-a pull request carrying twelve findings is a statement nobody made, and the tick
-is what people read.
+**It is never a fail, and a pass only when the review found nothing.**
+`failure` would make Vinegar a merge gate, which "What this is not" says it
+isn't, and severity triage is not accurate enough to be one: the blocker rate
+measured 45% on two of four reviews. Every other ending is `neutral`, a grey
+mark that cannot block a merge even where the check is required, because a green
+tick on a pull request carrying twelve findings is a statement nobody made and
+the tick is what people read.
+
+A review that reported nothing is the one ending where a tick says what the
+reviewer said, so that one is `success`. Three endings that also report nothing
+are not it, because each of them reported nothing after reading little: a review
+whose output Vinegar could not read, one killed part way, and one that never
+reached the pull request.
+
+**Green belongs to a commit, not to a pull request.** Each review closes the
+entry on the head it reviewed, so a clean first pass is green and a later pass
+that finds something is grey on its own commit, which is the one the pull
+request shows. The accepted cost is the other order: a later pass narrowed to
+the new commits, or to blockers only, goes green on a pull request whose earlier
+findings are still open.
+
+That is a choice and not an oversight. A finding still open several rounds later
+is usually one somebody decided not to act on, and what the list is wanted for is
+the state of the latest run, which is what the pull request mostly is. The title
+carries what the pass was asked for and the comments carry the rest.
 
 **It needs the App's `checks: write` permission, which is not granted by
 default.** Adding it to the App is only half of it: GitHub holds the change as a
