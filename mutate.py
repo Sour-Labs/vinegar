@@ -83,6 +83,9 @@ EXPECT = {
 }
 
 # name, the text that implements a guard in vinegar.py, what breaks it
+CLEAN = "    clean = findings == [] and whole and landed and not resent"
+
+# name, the text that implements a guard in vinegar.py, what breaks it
 MUTATIONS = [
     # This one raises at module level rather than failing a check, so it
     # must come back ABORTED. Kept permanently: the day it comes back
@@ -585,17 +588,18 @@ MUTATIONS = [
     ("check-clean-is-a-pass",
      'CHECK_CLEAN = "success"', 'CHECK_CLEAN = "neutral"'),
     ("check-green-only-when-nothing-was-found",
-     "    clean = findings == [] and not note and posted == POSTED",
-     "    clean = True"),
+     CLEAN, "    clean = True"),
     ("check-green-not-for-an-unreadable-answer",
-     "    clean = findings == [] and not note and posted == POSTED",
-     "    clean = not findings and not note and posted == POSTED"),
+     CLEAN,
+     "    clean = not findings and whole and landed and not resent"),
     ("check-green-not-for-a-killed-run",
-     "    clean = findings == [] and not note and posted == POSTED",
-     "    clean = findings == [] and posted == POSTED"),
+     CLEAN, "    clean = findings == [] and landed and not resent"),
     ("check-green-not-for-a-review-that-never-landed",
-     "    clean = findings == [] and not note and posted == POSTED",
-     "    clean = findings == [] and not note"),
+     CLEAN, "    clean = findings == [] and whole and not resent"),
+    # post_review answers POSTED without posting when a retry finds the
+    # review already up, and that earlier review is the one on the commit.
+    ("check-green-not-for-a-retry-that-posted-nothing",
+     CLEAN, "    clean = findings == [] and whole and landed"),
     # A refused PATCH is retried by a backstop carrying the grey
     # conclusion, so without this a clean review ends grey under a title
     # still saying it found nothing.
@@ -655,8 +659,21 @@ MUTATIONS = [
      '        title = "Nothing Vinegar could read"',
      '        title = "No findings"'),
     ("check-title-says-a-partial-run",
-     "    if note:\n"
+     "    if not whole:\n"
      '        title = "%s, and the review did not finish" % title',
+     "    if False:\n        pass"),
+    # Off `whole` and not off the note, or a review that ran to the end on
+    # the fallback model is titled as one that was cut short.
+    ("check-title-partial-off-whole-not-the-note",
+     "    if not whole:\n"
+     '        title = "%s, and the review did not finish" % title',
+     "    if note:\n"
+     '        title = "%s, and the review did not finish" % title'),
+    # The scope had never reached the closed title, which mattered less
+    # while a narrowed clean round was grey like every other ending.
+    ("check-title-says-what-was-read",
+     "    if since:\n"
+     '        title = "%s in what was added since `%s`" % (title, since[:7])',
      "    if False:\n        pass"),
     ("check-closed-in-finish",
      "    close_check(label, check, title,",
@@ -864,9 +881,15 @@ MUTATIONS = [
      "    deliver(text, findings, \" \".join(notes) or None, whole=True)"),
     ("covered-needs-the-post-to-land",
      "                note, resent=resent, check=check, since=since,\n"
-     "                blockers=blockers)) == POSTED:",
+     "                blockers=blockers, whole=whole)) == POSTED:",
      "                note, resent=resent, check=check, since=since,\n"
-     "                blockers=blockers)) or True:"),
+     "                blockers=blockers, whole=whole)) or True:"),
+    # `whole` is passed rather than read off the note for the reason
+    # deliver's own comment gives, and finish() now needs it for the tick
+    # as well as the title.
+    ("check-whole-reaches-finish",
+     "                blockers=blockers, whole=whole)) == POSTED:",
+     "                blockers=blockers)) == POSTED:"),
     # The two the third review found anchored by nothing.
     ("load-state-drops-the-entry",
      '                    del done["reviewed_sha"]',

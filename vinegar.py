@@ -545,9 +545,10 @@ CHECK_NAME = "Vinegar"
 #
 # `neutral` renders as a grey mark that cannot block anything, and the
 # count goes in the title where it says something true. It is what every
-# ending gets except the one below, including the three that found nothing
-# because little was read: a review whose output could not be read, one
-# killed part way, and one that never reached the pull request.
+# ending gets except the one below, including the four that report nothing
+# without being clean: a review whose output could not be read, one killed
+# part way, one that never reached the pull request, and a retry whose
+# posting was the earlier attempt's. finish() names them in one line.
 CHECK_CONCLUSION = "neutral"
 
 # And the one ending that is a pass, so a clean pull request reads as clean
@@ -3275,8 +3276,10 @@ def ended_title(outcome, attempts=0):
     all. finish() closes the indicator itself on every ending that did
     post, so a caller reaching for this with the indicator still open is
     in the case where the posting is exactly what did not happen. Saying
-    it finished would be the same false all-clear CHECK_CONCLUSION
-    refuses a green tick for.
+    it finished would be the same false all-clear the `clean` line in
+    finish() refuses the tick for. This path never passes a conclusion, so
+    it takes the grey default, which is the right answer for every ending
+    that reaches it.
     """
     if outcome == FAILED and attempts >= MAX_ATTEMPTS:
         return "The review failed %d times and was given up on" % attempts
@@ -3724,7 +3727,7 @@ def keep(label, repo, pr, text, why):
 
 def finish(label, repo, pr, path, text, findings, config, env, tokens,
            note=None, verb="reviewed", preserve=False, resent=False,
-           check=None, since=None, blockers=False):
+           check=None, since=None, blockers=False, whole=False):
     """Record the review on disk and post it, whatever ended the run.
 
     Answers post_review()'s answer: whether the pull request carries it.
@@ -3853,12 +3856,15 @@ def finish(label, repo, pr, path, text, findings, config, env, tokens,
     # `== POSTED`, not truthiness. THROTTLED is a string and every string
     # is true, so a rate-limited post — which had just logged that the
     # review is safe and will be sent again — deleted the marker that was
-    # the only thing able to send it.
+    # the only thing able to send it. Named once and read three times
+    # below, so the next ending added here cannot get the comparison right
+    # in two places and wrong in the third.
+    landed = posted == POSTED
     #
     # `not preserve` as well, because the give-up writes no marker, so
     # forgetting one on its way out could only ever delete somebody
     # else's.
-    if posted == POSTED and not preserve:
+    if landed and not preserve:
         forget(marker)
 
     # The indicator is finished here, for the reason the two lines at the
@@ -3873,8 +3879,7 @@ def finish(label, repo, pr, path, text, findings, config, env, tokens,
     if findings is None:
         # Not "no findings". The reviewer said something Vinegar could not
         # read, and a checks list saying the change is clean would be the
-        # same false all-clear that CHECK_CONCLUSION refuses a green tick
-        # for.
+        # false all-clear the `clean` line below refuses the tick for.
         title = "Nothing Vinegar could read"
     elif not findings:
         title = "No findings"
@@ -3883,31 +3888,53 @@ def finish(label, repo, pr, path, text, findings, config, env, tokens,
         title = "%d finding%s%s" % (
             len(findings), "" if len(findings) == 1 else "s",
             " (%s)" % tally if tally else "")
-    # And what the pass was asked for, which the title has to carry or the
-    # narrowing reaches the checks list only while the review is running.
-    # open_check() puts it in the in_progress title, this overwrites that
-    # title on the way out, and the one it leaves behind is the one that
-    # stands for the rest of the pull request's life. Without this, "No
-    # findings" from a blockers-only fifth round is the same six
+    # And what the pass was asked for, both narrowings, which the title has
+    # to carry or they reach the checks list only while the review is
+    # running. open_check() puts them in the in_progress title, this
+    # overwrites that title on the way out, and the one it leaves behind is
+    # the one that stands for the rest of the pull request's life. Without
+    # this, "No findings" from a narrowed fifth round is the same six
     # characters as "No findings" from a first review that read
-    # everything, and `gh pr checks` is where an agent reads it.
+    # everything, and `gh pr checks` is where an agent reads it. It matters
+    # more now than it did: that fifth round closes green.
+    if since:
+        title = "%s in what was added since `%s`" % (title, since[:7])
     if blockers:
         title = "%s, reporting blockers only" % title
     # A partial run says so in the title rather than only in the comment.
     # "3 findings" from a review killed at minute thirty reads as the
     # whole answer, and the checks list is what people look at first.
     # Last, because it is the caveat that most changes how the rest reads.
-    if note:
+    #
+    # Off `whole` and not off `note`, which is the distinction review()
+    # keeps the two apart for: a note also carries the fallback-model
+    # notice, and a review that ran to the end on the fallback model was
+    # titled as one that was cut short.
+    if not whole:
         title = "%s, and the review did not finish" % title
-    # Green only for the ending that is a pass. `findings == []` and not
-    # `not findings`, because None is the review whose output could not be
-    # read, and the branch above already refuses to call that clean. A run
-    # that was killed and a review that never reached the pull request are
-    # not clean either: each reported nothing because it stopped early, and
-    # the summary beside the tick would contradict it.
-    clean = findings == [] and not note and posted == POSTED
+    # Green only for the ending that is a pass, and every term here is one
+    # way of reporting nothing without being clean.
+    #
+    # `findings == []` and not `not findings`, because None is the review
+    # whose output could not be read, which the branch above already
+    # refuses to call clean.
+    #
+    # `whole`, for the reason the title uses it: a killed run reported
+    # nothing because it stopped, and reading that off `note` would deny
+    # the tick to every clean review on a deployment whose pinned model
+    # stopped routing.
+    #
+    # `not resent`, because post_review answers POSTED without posting
+    # when a retry finds the review already up, and that earlier review is
+    # the one on the pull request. A retry that itself reports nothing
+    # would otherwise tick a commit whose visible review is full of
+    # findings. It costs a clean resend its tick, which is the safe
+    # direction and the reason this is a term rather than a new answer
+    # from post_review: telling "I posted" from "someone posted" reaches
+    # the `covered` logic that decides narrowing.
+    clean = findings == [] and whole and landed and not resent
     close_check(label, check, title, sending or env,
-                "The review is on the pull request." if posted == POSTED
+                "The review is on the pull request." if landed
                 else "The review did not reach the pull request. The log "
                      "says where it is saved.",
                 CHECK_CLEAN if clean else CHECK_CONCLUSION)
@@ -4357,7 +4384,7 @@ def review(path, repo, pr, config, env, tokens, resent=False, check=None,
         if announce(label, lambda: finish(
                 label, repo, pr, path, text, findings, config, env, tokens,
                 note, resent=resent, check=check, since=since,
-                blockers=blockers)) == POSTED:
+                blockers=blockers, whole=whole)) == POSTED:
             # Four, and none of them is implied by another. POSTED says the
             # pull request carries it. `whole` says the reviewer reached the
             # end of the scope, and it is passed in rather than read off
