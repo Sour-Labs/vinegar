@@ -1868,10 +1868,32 @@ def severity_brief(findings):
     # Pluralised, because a one-finding review is a common shape and
     # "Output exactly 1 lines" is the sort of wrongness that invites a
     # model to decide the instruction is approximate.
+    #
+    # NUL goes last, on the whole assembled prompt rather than inside
+    # flat(), because this string is handed to subprocess.run as an argv
+    # entry and NUL is the one byte exec cannot carry. CPython raises
+    # `ValueError: embedded null byte` before the process starts, triage()
+    # catches it the way it catches everything, and the findings post
+    # untiered with the bare word "ValueError" in the log to say why.
+    # Measured on wonky-flow#95, where the reviewer quoted a literal NUL
+    # to report that a name check accepted one: the finding was about NUL
+    # handling and the byte it quoted is what stopped it being tiered.
+    #
+    # Here rather than per field because both routes leak it: flat()
+    # collapses whitespace and NUL is not whitespace in Python, and
+    # finding_where() does not go through flat() at all. One replace on
+    # the finished string is the only version of this that is provably
+    # complete.
+    #
+    # A space, not a deletion. Dropping it turns the quoted "a\0.md" into
+    # "a.md", which reads as a name that would legitimately pass the check
+    # the finding is complaining about, and this text is what the model
+    # judges severity from. Nothing here reaches the pull request;
+    # describe() renders that from the finding itself.
     return SEVERITY_PROMPT.format(
         count="%d line%s" % (len(findings),
                              "" if len(findings) == 1 else "s"),
-        findings="\n\n".join(blocks))
+        findings="\n\n".join(blocks)).replace("\0", " ")
 
 
 def read_tiers(said, count):

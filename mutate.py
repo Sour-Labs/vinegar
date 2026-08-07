@@ -418,6 +418,12 @@ MUTATIONS = [
      "                                   note=note, verb=verb)}"),
 
     # In finish(), so that all four routes to the pull request agree.
+    # NUL is the one byte exec cannot carry in an argv entry, so a finding
+    # that quotes one stopped the severity pass with ValueError before the
+    # process started. Measured live on wonky-flow#95.
+    ("severity-prompt-drops-nul",
+     '        findings="\\n\\n".join(blocks)).replace("\\0", " ")',
+     '        findings="\\n\\n".join(blocks))'),
     ("severity-runs-in-finish",
      "    findings = triage(label, findings, config)",
      "    pass"),

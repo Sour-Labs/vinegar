@@ -1006,6 +1006,40 @@ check("the severity pass is asked about the findings' own words",
       _prompt[:200])
 check("the severity pass is told how many answers to give",
       "exactly 3 lines" in _prompt, _prompt[-400:])
+
+# NUL is the one byte exec cannot carry in an argument, so a finding that
+# quotes one stops the severity pass with `ValueError: embedded null byte`
+# before the process starts. triage() catches it like any other failure and
+# the findings post untiered, with the bare word "ValueError" in the log to
+# say why. Measured live on wonky-flow#95, where the reviewer quoted a
+# literal NUL to report that a name check accepted one.
+#
+# Both routes in are covered here, because the fix has to sit after both:
+# flat() collapses whitespace and NUL is not whitespace in Python, and
+# finding_where() does not go through flat() at all.
+_NULLED = [{"file": "a\x00.py", "line": 1, "summary": "quotes a\x00byte",
+            "failure_scenario": 'assertCaptureName("a\x00.md") passes',
+            "category": "correctness"}]
+check("a finding quoting a NUL leaves none in the severity prompt",
+      vinegar.severity_brief(_NULLED).count("\x00") == 0,
+      vinegar.severity_brief(_NULLED).count("\x00"))
+# The invariant exec actually imposes, checked on what would be handed to
+# it. The check above is the fix; this is the property the fix exists for,
+# and it is the one that keeps meaning something if the prompt is ever
+# assembled somewhere else.
+_tiered_nul = _triaged(_answer("blocker"), findings=_NULLED)
+check("nothing carrying a NUL is handed to the severity process",
+      not any("\x00" in part for part in _severity_asked.get("cmd") or []),
+      [part[:40] for part in _severity_asked.get("cmd") or []])
+check("and the finding that quoted one is still tiered",
+      [f.get("tier") for f in _tiered_nul] == ["blocker"], _tiered_nul)
+# The NUL is replaced rather than dropped. Deleting it turns the quoted
+# "a\0.md" into "a.md", which reads as a name that would pass the check
+# the finding is complaining about, and this text is what the model judges
+# severity from.
+check("the byte is replaced, not deleted out of the quoted name",
+      "a .md" in vinegar.severity_brief(_NULLED),
+      vinegar.severity_brief(_NULLED)[-300:])
 # A one-finding review is a common shape, and an instruction that reads
 # "exactly 1 lines" invites the model to treat the whole line as
 # approximate.
