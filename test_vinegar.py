@@ -1688,6 +1688,23 @@ check("the second attempt asks for the model the config calls the fallback",
       and _model_of(claude_run.calls[0]) == "claude-opus-5[1m]"
       and _model_of(claude_run.calls[1]) == "claude-opus-5",
       [_model_of(c) for c in claude_run.calls])
+# Said where an operator will see it. A fallback that only ever reaches the
+# daemon log leaves the pinned model dead and every pull request looking
+# exactly as it did before, which is the degradation this feature exists to
+# end rather than to hide.
+check("the pull request is told the review ran on the fallback",
+      posted and "claude-opus-5[1m]" in posted[0][1]["body"]
+      and "could not be reached" in posted[0][1]["body"],
+      posted[0][1]["body"][:300] if posted else "nothing posted")
+
+# And not told so when it did not happen, or every review carries a warning
+# about a model that answered perfectly well.
+claude_run.stream = stream(call(FINDINGS[:4]), result_event())
+del posted[:]
+vinegar.review(ROOT, "o/r", PR, FALLING_BACK, None, {})
+check("a review that never fell back says nothing about a fallback",
+      posted and "could not be reached" not in posted[0][1]["body"],
+      posted[0][1]["body"][:300] if posted else "nothing posted")
 
 # Only a routing failure. Every other failure has already spent the
 # review's budget by the time it is known. A live 529 arrived eight and a
@@ -1770,6 +1787,20 @@ check("a routing failure that already spent the budget is not retried",
       vinegar.review(ROOT, "o/r", PR, FALLING_BACK, None, {}) == vinegar.FAILED
       and len(claude_run.calls) == 1, len(claude_run.calls))
 
+# A result event with no cost field at all. `not output.get(...)` cannot
+# tell that from a reported zero, so a shape this file has not measured
+# would read as free and buy a second full-price review, with priced()
+# printing nothing beside it to contradict the claim.
+_NO_COST = result_event(is_error=True, api_error_status=404, result=None)
+del _NO_COST["total_cost_usd"]
+claude_run.stream = _answers(stream(_NO_COST),
+                             stream(call(FINDINGS[:4]), result_event()))
+del posted[:]
+del claude_run.calls[:]
+check("a routing failure that reported no cost at all is not retried",
+      vinegar.review(ROOT, "o/r", PR, FALLING_BACK, None, {}) == vinegar.FAILED
+      and len(claude_run.calls) == 1, len(claude_run.calls))
+
 # A 404 recorded on a run that finished is not a routing failure. It would
 # be a sub-request that failed and was retried, and throwing the finished
 # review away to pay for another is the opposite of the repair.
@@ -1821,7 +1852,7 @@ check("a truncated stream with a fallback configured fails, never raises",
 # the arithmetic exists. Charging the fake clock 120 seconds per attempt is
 # what makes the difference observable, and the suite still runs instantly.
 class _Clock:
-    """Only the two `time` names review() reaches for."""
+    """The one `time` name review() reaches for."""
 
     def __init__(self):
         self.now = 0.0
@@ -1829,30 +1860,90 @@ class _Clock:
     def monotonic(self):
         return self.now
 
-    def sleep(self, seconds):
-        self.now += seconds
+
+def _ticking(by, *streams):
+    """`_answers`, with each attempt charged `by` seconds on the fake clock.
+
+    Wrapping _answers rather than counting `claude_run.calls` again: a
+    second queueing mechanism reading the stub's own bookkeeping means the
+    check holds only while `del claude_run.calls[:]` sits immediately
+    above it, and quietly tests something else the day a check is inserted
+    between them.
+    """
+    queued = _answers(*streams)
+
+    def answer(cmd):
+        _clock.now += by
+        return queued(cmd)
+
+    return answer
 
 
 _clock = _Clock()
 _real_time, vinegar.time = vinegar.time, _clock
 
+claude_run.stream = _ticking(120, stream(NOT_FOUND),
+                             stream(call(FINDINGS[:4]), result_event()))
+del posted[:]
+del claude_run.calls[:]
+del claude_run.bounds[:]
+vinegar.review(ROOT, "o/r", PR, FALLING_BACK, None, {})
+check("the fallback inherits what is left of the one bound, not a fresh one",
+      claude_run.bounds == [FALLING_BACK["review_timeout"],
+                            FALLING_BACK["review_timeout"] - 120],
+      claude_run.bounds)
 
-def _ticking(cmd):
-    _clock.now += 120
-    return stream(NOT_FOUND) if len(claude_run.calls) == 1 else stream(
-        call(FINDINGS[:4]), result_event())
-
-
-claude_run.stream = _ticking
+# The floor under that subtraction. A first attempt that 404s a hair under
+# the bound rounds to the whole of it, and an unfloored `left - took` hands
+# the fallback a zero: subprocess.run raises TimeoutExpired before it has
+# read a byte, so the fallback never runs and the pull request is told the
+# review was killed.
+claude_run.stream = _ticking(FALLING_BACK["review_timeout"],
+                             stream(NOT_FOUND),
+                             stream(call(FINDINGS[:4]), result_event()))
 del posted[:]
 del claude_run.calls[:]
 del claude_run.bounds[:]
 vinegar.review(ROOT, "o/r", PR, FALLING_BACK, None, {})
 vinegar.time = _real_time
-check("the fallback inherits what is left of the one bound, not a fresh one",
-      claude_run.bounds == [FALLING_BACK["review_timeout"],
-                            FALLING_BACK["review_timeout"] - 120],
+check("a first attempt that used the whole bound still leaves the fallback "
+      "a second", claude_run.bounds == [FALLING_BACK["review_timeout"], 1],
       claude_run.bounds)
+
+
+# A fallback killed at the inherited bound has to be described by the bound
+# that killed it. Quoting the configured one tells the pull request it was
+# killed after a duration nothing waited, and sends anyone grepping the log
+# for that number to nothing at all.
+def _timing_out(by, salvage=None):
+    """404 the first attempt after `by` seconds, then hang the fallback.
+
+    `salvage` is what the killed fallback had written to stdout by then,
+    which is what decides whether the pull request gets the partial note
+    or the nothing-arrived one. Both quote a duration and both are wrong
+    on a fallback attempt if they quote the configured bound.
+    """
+    def answer(cmd):
+        _clock.now += by
+        if len(claude_run.calls) == 1:
+            return stream(NOT_FOUND)
+        raise subprocess.TimeoutExpired("claude", 0, output=salvage)
+    return answer
+
+
+_inherited = FALLING_BACK["review_timeout"] - 120
+for _salvaged, _what in ((None, "having reported nothing"),
+                         (stream(call(FINDINGS[:4])), "holding findings")):
+    _real_time, vinegar.time = vinegar.time, _clock
+    _clock.now = 0.0
+    claude_run.stream = _timing_out(120, _salvaged)
+    del posted[:]
+    del claude_run.calls[:]
+    vinegar.review(ROOT, "o/r", PR, FALLING_BACK, None, {})
+    vinegar.time = _real_time
+    check("a fallback killed %s quotes the bound it was given" % _what,
+          posted and "killed after %ds" % _inherited in posted[0][1]["body"],
+          posted[0][1]["body"][:300] if posted else "nothing posted")
 
 # The line an operator has to see to learn a fallback happened at all: a
 # review that quietly moves to another model is a review whose findings
@@ -2331,15 +2422,27 @@ check("a private key under the denied component is accepted",
 # The numbers are read as numbers. A hand-edited string sails past every
 # other check and then raises inside checkout_grace on every pull request
 # on every poll, with nothing reviewed and no give-up ever announced.
-def _config_with(**over):
+def _loaded(**over):
+    """The config load_config made of those overrides, or why it refused.
+
+    One body for both helpers. As two, a change to how a test config is
+    materialised (a key added to DEFAULTS that the seed has to carry, a
+    move away from SystemExit) had to be made twice, or one set of checks
+    quietly started testing something else.
+    """
     path = os.path.join(_home, "num-config.json")
     with open(path, "w") as handle:
         json.dump(dict({"repos": ["o/r"]}, **over), handle)
     try:
-        vinegar.load_config(path)
-        return "started"
+        return vinegar.load_config(path)
     except SystemExit as err:
         return str(err)
+
+
+def _config_with(**over):
+    """The same, as the word "started" or the refusal."""
+    loaded = _loaded(**over)
+    return "started" if isinstance(loaded, dict) else loaded
 
 
 check("a timeout given as a string refuses to start",
@@ -2423,16 +2526,6 @@ check("a blank model refuses rather than reaching argv",
 # `"model": "claude-opus-5 "` passes every check above and then 404s every
 # review of every repository, which is the failure those checks exist to
 # prevent, and an unstripped fallback walks past the same-model refusal.
-def _loaded(**over):
-    path = os.path.join(_home, "strip-config.json")
-    with open(path, "w") as handle:
-        json.dump(dict({"repos": ["o/r"]}, **over), handle)
-    try:
-        return vinegar.load_config(path)
-    except SystemExit as err:
-        return str(err)
-
-
 check("a model with whitespace around it is stored stripped",
       _loaded(model=" claude-opus-5 ")["model"] == "claude-opus-5",
       _loaded(model=" claude-opus-5 ")["model"])

@@ -457,8 +457,13 @@ MUTATIONS = [
      '            and output.get("is_error")\n',
      ""),
     ("fallback-only-when-it-spent-nothing",
-     '            and not output.get("total_cost_usd"))',
+     '            and output.get("total_cost_usd") == 0)',
      "            )"),
+    # A missing cost field is not a report of having spent nothing, and
+    # `not output.get(...)` cannot tell the two apart.
+    ("fallback-cost-must-be-reported",
+     '            and output.get("total_cost_usd") == 0)',
+     '            and not output.get("total_cost_usd"))'),
     ("fallback-never-spends-findings",
      "    return (findings is None and output is not None",
      "    return (output is not None"),
@@ -466,8 +471,31 @@ MUTATIONS = [
      "    return (findings is None and output is not None\n",
      "    return (findings is None\n"),
     ("fallback-stops-at-the-last-model",
-     "        if model == models[-1] or not unroutable(output, findings):",
+     "        if index == len(models) - 1"
+     " or not unroutable(output, findings):",
      "        if not unroutable(output, findings):"),
+    # The floor under the inherited bound. Without it a first attempt that
+    # rounds up to the whole bound hands the fallback a zero, and
+    # subprocess.run kills it before it has read a byte.
+    ("fallback-bound-never-reaches-zero",
+     "        left = max(1, left - took)",
+     "        left = left - took"),
+    # The pull request is told which model actually reviewed it. Otherwise
+    # a dead pin looks exactly like a healthy one to anyone reading GitHub.
+    ("fallback-is-disclosed-on-the-pull-request",
+     "        abandoned = model",
+     "        pass"),
+    # The kill is reported against the bound that killed it, not the
+    # configured one. On a fallback attempt those differ.
+    ("killed-note-quotes-the-bound-used",
+     '                note = partial_note("was killed after %ds" % left)',
+     '                note = partial_note("was killed after %ds"\n'
+     '                                    % config["review_timeout"])'),
+    ("killed-with-nothing-quotes-the-bound-used",
+     '                        "review not finishing, not as the change being '
+     'clean."\n                        % left)',
+     '                        "review not finishing, not as the change being '
+     'clean."\n                        % config["review_timeout"])'),
     # The two attempts share one bound. A fresh review_timeout for the
     # fallback lets one pull request park the only poll thread for twice
     # it, which load_config exits with a sentence saying cannot happen.

@@ -233,6 +233,17 @@ minutes into an `xhigh` run, and none of them is repaired by a second model.
 Those still fail and retry as before. The fallback is an availability switch,
 not a general retry.
 
+**The two attempts divide one `review_timeout` between them**, rather than
+getting one each. A pull request holds the only poll thread for as long as its
+review runs, which is what the `review_timeout` ceiling exists to bound, and a
+fallback given its own fresh timeout would double that. The fallback inherits
+whatever the first attempt did not use, so budget `review_timeout` for the
+review, not for each attempt.
+
+When a review does fall back, it says so on the pull request as well as in the
+log. A fallback that works quietly is a pinned model that stays dead: the
+reviews keep arriving and read exactly like the configured model's.
+
 Vinegar refuses to start if `fallback_model` names the same model as `model`.
 
 ### Posting as Vinegar instead of as you

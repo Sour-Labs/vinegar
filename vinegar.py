@@ -3448,6 +3448,13 @@ def unroutable(output, findings):
     for one pull request, three times over MAX_ATTEMPTS. Only a run that
     bought nothing is free to throw away.
 
+    Compared against 0 rather than tested for falsiness, because a missing
+    key is not a report of having spent nothing. `not output.get(...)` is
+    true for both, so a result shape that omits the field entirely would
+    read as free and buy a second full-price review, while priced() would
+    print nothing beside it and leave the log with no cost to contradict
+    the claim. An absent field is unknown, and unknown is not free.
+
     `is_error` because a 404 recorded on a run that *finished* is not a
     routing failure: it would be a sub-request that failed and was
     retried, and discarding the finished review to pay for another is the
@@ -3463,7 +3470,7 @@ def unroutable(output, findings):
     return (findings is None and output is not None
             and output.get("is_error")
             and output.get("api_error_status") == 404
-            and not output.get("total_cost_usd"))
+            and output.get("total_cost_usd") == 0)
 
 
 def review(path, repo, pr, config, env, tokens, resent=False, check=None):
@@ -3612,7 +3619,15 @@ def review(path, repo, pr, config, env, tokens, resent=False, check=None):
     # ceiling was added to make impossible.
     left = config["review_timeout"]
 
-    for model in models:
+    # Which model was abandoned, or None. The pull request is told, because
+    # a fallback that works silently is a pin that stays dead: reviews keep
+    # arriving, they read exactly like the pinned model's, and the only
+    # record is one daemon log line nobody greps. Weeks of that is the
+    # quiet degradation this feature exists to end, not something it may
+    # introduce.
+    abandoned = None
+
+    for index, model in enumerate(models):
         started = time.monotonic()
         try:
             result = run(cmd + (["--model", model] if model else []),
@@ -3646,25 +3661,35 @@ def review(path, repo, pr, config, env, tokens, resent=False, check=None):
             # `is not None`, not truthiness: a reviewer that reported an empty
             # list looked and found nothing, and read_stream draws that
             # distinction deliberately.
+            #
+            # `left`, not `config["review_timeout"]`, in both notes and in
+            # the log line above. On a fallback attempt those differ, and
+            # quoting the configured value would tell the pull request it
+            # was killed after a duration nothing ever waited: an operator
+            # grepping the log for the number in the comment finds nothing,
+            # and in the floored case the comment claims half an hour for
+            # an attempt that was given one second.
             if findings is not None:
                 log("%s: it had already reported %d finding(s), posting those"
                     % (label, len(findings)))
-                note = partial_note(
-                    "was killed after %ds" % config["review_timeout"])
+                note = partial_note("was killed after %ds" % left)
             else:
                 note = ("This review was killed after %ds. Read that as the "
                         "review not finishing, not as the change being clean."
-                        % config["review_timeout"])
+                        % left)
             deliver(spoken, findings, note)
             return DONE
         took = round(time.monotonic() - started)
 
         output, findings, spoken = read_stream(result.stdout, label)
 
-        # `models[-1]` is an equality rather than an index because it reads
-        # as what it means, and load_config refuses a fallback equal to the
-        # model it stands in for, so the two cannot be confused for one.
-        if model == models[-1] or not unroutable(output, findings):
+        # By position, not by comparing the model to the last entry. That
+        # comparison was correct only while load_config keeps refusing a
+        # fallback equal to `model`: relax that rule three thousand lines
+        # away, or add a second fallback, and `["x", "x"]` matches on the
+        # first iteration, breaks, and disables the fallback with every
+        # check in the suite still green.
+        if index == len(models) - 1 or not unroutable(output, findings):
             break
 
         # What the abandoned attempt cost, said here because nothing else
@@ -3679,6 +3704,7 @@ def review(path, repo, pr, config, env, tokens, resent=False, check=None):
             "runs again on %s. That attempt took %ds%s" % (
                 label, model or "your Claude Code default",
                 config["fallback_model"], took, priced(output)))
+        abandoned = model
         # The fallback inherits what is left of the one bound, never a
         # fresh one. Floored at a second because `took` is rounded, so an
         # attempt finishing a hair under the bound could otherwise hand the
@@ -3770,7 +3796,20 @@ def review(path, repo, pr, config, env, tokens, resent=False, check=None):
     # what broke and never said what it cost.
     spent = priced(output)
 
-    note = None
+    # Said on the pull request, not only in the log. A fallback that works
+    # quietly leaves the pin dead and everything looking fine: the reviews
+    # keep arriving and read exactly like the configured model's. This is
+    # the one place an operator who only reads pull requests can learn
+    # otherwise, and it composes with the partial-run note below rather
+    # than replacing it, because a run can both fall back and be cut short.
+    notes = []
+    if abandoned is not None:
+        notes.append(
+            "This review did not run on the model Vinegar is configured to "
+            "use. `%s` could not be reached, so `%s` reviewed instead. The "
+            "findings stand; the configuration needs looking at."
+            % (abandoned, config["fallback_model"]))
+
     if output.get("is_error"):
         log("%s: review failed after %ds%s: %s" % (
             label, took, spent, text[:400]))
@@ -3779,7 +3818,7 @@ def review(path, repo, pr, config, env, tokens, resent=False, check=None):
             return FAILED
         log("%s: it failed with %d finding(s) already reported, so those are "
             "posted" % (label, len(findings)))
-        note = partial_note("failed before it finished")
+        notes.append(partial_note("failed before it finished"))
     else:
         # Only when it did not fail. Moving the price above the error
         # handling so a failed run reports it left this line printing a
@@ -3793,7 +3832,11 @@ def review(path, repo, pr, config, env, tokens, resent=False, check=None):
     # recover from a failed post would spend it again. What happens to
     # the transcript and to the token is finish()'s and posting_env()'s,
     # and each says so where it happens.
-    deliver(text, findings, note)
+    #
+    # None rather than "" when there is nothing to say, because review_body
+    # tests the note for truthiness and an empty string would be as silent
+    # as None while reading like a value.
+    deliver(text, findings, " ".join(notes) or None)
     return DONE
 
 
