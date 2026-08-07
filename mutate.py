@@ -291,17 +291,21 @@ MUTATIONS = [
      "    return [seen[i] for i in range(count)] if len(seen) == count else None",
      "    return [seen[i] for i in sorted(seen)]"),
     ("severity-answer-index-in-range",
-     "        if 0 <= index < count and index not in seen:",
-     "        if index not in seen:"),
+     "        if tier in TIERS and 0 <= index < count and index not in seen:",
+     "        if tier in TIERS and index not in seen:"),
     ("severity-answer-first-wins",
-     "        if 0 <= index < count and index not in seen:",
-     "        if 0 <= index < count:"),
+     "        if tier in TIERS and 0 <= index < count and index not in seen:",
+     "        if tier in TIERS and 0 <= index < count:"),
     ("severity-answer-anchored-at-line-start",
      "        match = TIER_LINE.match(line)",
      "        match = TIER_LINE.search(line)"),
+    # The alternation in TIER_LINE is the first filter and the membership
+    # test is what enforces it, so the mutation lands on the test. Breaking
+    # the alternation alone changes nothing a caller can see: a word it
+    # then lets through is refused one line later.
     ("severity-answer-known-tiers-only",
-     r'TIER_LINE = re.compile(r"\s*\[?(\d+)\]?[\s:.)-]+(%s)\b" % "|".join(TIERS),',
-     r'TIER_LINE = re.compile(r"\s*\[?(\d+)\]?[\s:.)-]+([a-z]+)\b" % (),'),
+     "        if tier in TIERS and 0 <= index < count and index not in seen:",
+     "        if 0 <= index < count and index not in seen:"),
     ("severity-answer-any-case",
      "                       re.IGNORECASE)", "                       0)"),
 
@@ -398,17 +402,17 @@ MUTATIONS = [
      "    for finding, tier in zip(findings, tiers):\n"
      '        finding["tier"] = tier'),
     ("severity-label-opens-the-comment",
-     '        summary = "%s **%s** · %s" % (TIER_DOTS[tier], tier, summary)',
+     '        summary = "%s **%s** \u00b7 %s" % (TIER_DOTS.get(tier, ""), tier, summary)',
      "        pass"),
     # The dot and the word are one label and neither half stands alone. A
     # comment with no dot is the plain text this replaced, and one with no
     # word says nothing to a reader who does not know the three colors.
     ("severity-label-opens-with-a-dot",
-     '        summary = "%s **%s** · %s" % (TIER_DOTS[tier], tier, summary)',
-     '        summary = "**%s** · %s" % (tier, summary)'),
+     '        summary = "%s **%s** \u00b7 %s" % (TIER_DOTS.get(tier, ""), tier, summary)',
+     '        summary = "**%s** \u00b7 %s" % (tier, summary)'),
     ("severity-label-keeps-its-word",
-     '        summary = "%s **%s** · %s" % (TIER_DOTS[tier], tier, summary)',
-     '        summary = "%s %s" % (TIER_DOTS[tier], summary)'),
+     '        summary = "%s **%s** \u00b7 %s" % (TIER_DOTS.get(tier, ""), tier, summary)',
+     '        summary = "%s %s" % (TIER_DOTS.get(tier, ""), summary)'),
     # One color for all three is a dot that costs a character and tells the
     # reader nothing, and it is what a careless palette edit produces.
     ("severity-each-tier-has-its-own-dot",
@@ -418,6 +422,11 @@ MUTATIONS = [
      'TIER_DOTS = {"blocker": "\\U0001f534",\n'
      '             "advisory": "\\U0001f534",\n'
      '             "note": "\\U0001f534"}'),
+    # A tier with no dot is the one way TIER_DOTS goes wrong, and it goes
+    # wrong as a raise. The check has to fail on it rather than abort.
+    ("severity-every-tier-has-a-dot",
+     '             "note": "\\u26aa"}           # white circle',
+     '             "n0te": "\\u26aa"}           # white circle'),
     ("severity-tally-counts",
      '    return ", ".join("%d %s" % (count, tier)\n'
      "                     for tier, count in counted if count)",

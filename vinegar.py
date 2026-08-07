@@ -392,9 +392,9 @@ TIER_LINE = re.compile(r"\s*\[?(\d+)\]?[\s:.)-]+(%s)\b" % "|".join(TIERS),
                        re.IGNORECASE)
 
 # The colored dot each tier's label opens with, keyed by the same three
-# words as TIERS. The check that renders every tier holds the two
-# together, because a tier missing from here is a KeyError raised while a
-# finished review is being posted.
+# words as TIERS. A check holds the two together, and describe() reads it
+# with a default rather than a subscript, so a tier that drifts out of
+# here costs its comment a dot and never a review.
 #
 # An emoji rather than colored text, because GitHub sanitises a comment
 # body. Measured through its own markdown endpoint: `style` is stripped off
@@ -2430,9 +2430,10 @@ def read_tiers(said, count):
 
     TIER_LINE is anchored at the start of a line, so that prose mentioning
     a tier ("finding 3 is arguably a blocker") cannot be read as the
-    answer. Every other character of the reply is discarded, which is what
-    keeps the output surface of an attacker-influenced call down to three
-    words per finding.
+    answer. Every other character of the reply is discarded, and what is
+    left is checked against TIERS rather than trusted for having matched,
+    which together are what keep the output surface of an
+    attacker-influenced call down to three words per finding.
     """
     seen = {}
     for line in said.splitlines():
@@ -2440,12 +2441,27 @@ def read_tiers(said, count):
         if not match:
             continue
         index = int(match.group(1))
+        # Matching the alternation is not enough to be one of the three.
+        # TIER_LINE is compiled IGNORECASE and a Unicode pattern under
+        # that flag also matches four non-ASCII letters, of which only the
+        # Kelvin sign lowers back into the word it came from. Measured on
+        # 3.9: `0 advısory` matches and comes out of .lower() still
+        # holding the dotless i.
+        #
+        # What that costs without this line is a whole review. The word is
+        # written onto the finding, TIERS.index() in triage()'s sort
+        # raises ValueError on it, and that sort is past the except that
+        # exists to keep an ordering step from costing a review: nothing
+        # is posted, no transcript is saved, and the outcome is still
+        # recorded DONE, so with review_on_push off the pull request is
+        # never looked at again.
+        tier = match.group(2).lower()
         # The first answer for an index wins, and a repeat does not
         # overwrite it. A model that answers the same finding twice has
         # contradicted itself, and the coverage check below is what
         # decides whether the reply is usable at all.
-        if 0 <= index < count and index not in seen:
-            seen[index] = match.group(2).lower()
+        if tier in TIERS and 0 <= index < count and index not in seen:
+            seen[index] = tier
     return [seen[i] for i in range(count)] if len(seen) == count else None
 
 
@@ -2809,9 +2825,15 @@ def describe(finding):
     # this reads exactly as it did before tiers existed. read_tiers()
     # tiers all of the findings or none, so a comment never sits beside
     # one that was judged and says nothing.
+    #
+    # A default and not a subscript, like every other field here. This
+    # runs with the review finished and paid for, on the path that posts
+    # and the path that saves the transcript, so a KeyError on a tier that
+    # drifted out of TIER_DOTS would lose the review whole while the
+    # outcome was still recorded DONE.
     tier = str(finding.get("tier") or "").strip()
     if tier:
-        summary = "%s **%s** · %s" % (TIER_DOTS[tier], tier, summary)
+        summary = "%s **%s** · %s" % (TIER_DOTS.get(tier, ""), tier, summary)
     # The verdict rides with the category when the effort level ran a verify
     # pass. CONFIRMED and PLAUSIBLE read very differently, and posting them
     # identically claims a certainty the reviewer did not.

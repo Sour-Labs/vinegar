@@ -907,6 +907,30 @@ check("prose that mentions a tier is not read as the answer",
 check("a tier outside the three is not an answer",
       _tiers("0 critical\n1 note", 2) is None,
       _tiers("0 critical\n1 note", 2))
+# A tier that matches the alternation and is still not one of the three.
+# TIER_LINE is compiled IGNORECASE, and per the re docs a Unicode pattern
+# under that flag also matches \u0131, \u0130, \u017f and \u212a. Only the
+# Kelvin sign lowers back into the word it came from, so the other three
+# reach .lower() and come out still holding the lookalike. Measured on
+# 3.9, and it is why the answer is checked against TIERS rather than
+# trusted for having matched.
+#
+# What it costs unchecked is a whole review: the word is written onto the
+# finding, TIERS.index() in triage()'s sort raises on it, and that sort is
+# past the except that keeps an ordering step from costing a review, so a
+# finished review posts nothing and saves no transcript.
+for _letter, _said in (("\u0131 dotless i", "adv\u0131sory"),
+                       ("\u0130 I with dot", "adv\u0130sory"),
+                       ("\u017f long s", "advi\u017fory")):
+    check("a tier holding %s is not an answer" % _letter,
+          _tiers("0 %s\n1 note" % _said, 2) is None,
+          _tiers("0 %s\n1 note" % _said, 2))
+# The fourth one is accepted, because it is the same word once lowered.
+# Here so that the lines above read as a membership test and not as a
+# reason to start refusing anything that arrived non-ASCII.
+check("a lookalike that lowers into a real tier is that tier",
+      _tiers("0 bloc\u212aer\n1 note", 2) == ["blocker", "note"],
+      _tiers("0 bloc\u212aer\n1 note", 2))
 check("the answer is read whatever case it arrives in",
       _tiers("0 BLOCKER\n1 Advisory", 2) == ["blocker", "advisory"],
       _tiers("0 BLOCKER\n1 Advisory", 2))
@@ -1241,18 +1265,21 @@ check("every tier the pass is offered is one the answer can carry",
       all(tier in _prompt for tier in vinegar.TIERS), vinegar.TIERS)
 
 # --- how a tier reads ----------------------------------------------------
+# Named on its own, because TIER_DOTS is a second spelling of TIERS and a
+# tier that drifts out of it costs every comment of that tier its dot
+# without any of them looking wrong on their own.
+check("every tier has a dot",
+      set(vinegar.TIER_DOTS) == set(vinegar.TIERS), vinegar.TIER_DOTS)
 # Written out rather than built from TIER_DOTS, so that a palette that
-# drifts from the one asked for has to be meant. Four things ride on this
-# one rendering: a dot per tier, because a tier with no key there is a
-# KeyError raised while a finished review is being posted; the colors, red
-# then blue then palest, which is the whole of what the dot buys; the word
-# beside the dot, which is what a reader who does not know the three colors
-# reads, and all a screen reader is given; and the dot first, because the
-# opening characters are what a reader facing thirteen comments picks from.
+# drifts from the one asked for has to be meant. Three things ride on this
+# one rendering: the colors, red then blue then palest, which is the whole
+# of what the dot buys; the word beside the dot, which is what a reader who
+# does not know the three colors reads, and all a screen reader is given;
+# and the dot first, because the opening characters are what a reader
+# facing thirteen comments picks from.
 #
-# An emoji because GitHub's sanitiser leaves nothing else colored. Measured
-# through its own markdown endpoint: `style` is stripped off a `<span>` and
-# a `<font color>` tag is dropped whole, so either one posts as plain text.
+# An emoji because GitHub's sanitiser leaves nothing else colored. The
+# measurement behind that is beside TIER_DOTS in vinegar.py.
 check("every tier opens its comment with its own color and its own word",
       [vinegar.describe({"summary": "s", "tier": tier})
        for tier in vinegar.TIERS]
@@ -5511,7 +5538,8 @@ vinegar.run = fake_run
 _tier_said = " ".join(post[1]["body"] for post in posted)
 _tier_file = open(vinegar.transcript_path("o/r", PR_TIER)).read()
 check("the tier reaches the transcript a repost would send",
-      "**blocker**" in _tier_file and "**note**" in _tier_file,
+      "\U0001f534 **blocker**" in _tier_file
+      and "\u26aa **note**" in _tier_file,
       _tier_file[-400:])
 check("the comment says how the findings were tiered",
       "(1 blocker, 1 note)" in _tier_said, _tier_said[:300])
