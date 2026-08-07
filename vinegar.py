@@ -156,6 +156,16 @@ FULL_SHA = re.compile(r"\A[0-9a-f]{40}\Z")
 # have been hoisted into the resend's opening and cut out of the review.
 SCOPE_MARK = "Scope: only what was added since "
 
+# The transcript's other narrowing line. Beside SCOPE_MARK because
+# repost() lifts both out of the transcript by matching them, and a mark
+# that is written but not matched is a review delivered from disk reading
+# as though it had reported everything it found.
+#
+# No number in it, unlike the scope line's commit. What the reader needs
+# is that findings were held back, and the configured round count is not
+# something a transcript posted days later can still speak for.
+BLOCKERS_MARK = "Reported: blockers only."
+
 # Between a transcript's heading and its body. Named because both the
 # writer and repost()'s reader have to agree on it, and because reading
 # the scope statement is only unambiguous at a known offset.
@@ -538,6 +548,16 @@ DEFAULTS = {
     # back from.
     "fallback_model": None,
     "review_on_push": False,
+    # How many reviews of one pull request report everything they find.
+    # Every review after that keeps reviewing every push and reports only
+    # blockers, so a branch under rework is never left unwatched and its
+    # author is not handed the same list of small findings on every push.
+    # Null for no narrowing at all, which with `review_on_push` on is a
+    # full review of every push for the life of the pull request.
+    #
+    # Inert while `review_on_push` is false, since there is never a second
+    # review to narrow.
+    "blockers_only_after": 2,
     "max_changed_lines": 3000,
     "skip_drafts": True,
     "skip_bots": True,
@@ -775,6 +795,24 @@ def load_config(path):
                 "lines" if name == "max_changed_lines" else "seconds", value))
         if value <= 0:
             sys.exit("%s: %s must be greater than zero" % (path, name))
+
+    # Its own check rather than the loop above, because null is a value
+    # here and that loop refuses one.
+    #
+    # Zero is refused as well as a non-number, and the two failures are
+    # not the same failure. A non-number raises TypeError inside
+    # blockers_only() on every review, which is the class the loop above
+    # exists for. Zero parses and compares perfectly and means a first
+    # review that reports only blockers: the pull request is then never
+    # told anything smaller, once, and nothing on it says so. An operator
+    # who wants that is describing a different tool, and one who typed it
+    # meaning "off" wanted null.
+    rounds = config["blockers_only_after"]
+    if rounds is not None and (not isinstance(rounds, int)
+                               or isinstance(rounds, bool) or rounds <= 0):
+        sys.exit("%s: blockers_only_after must be a whole number of reviews "
+                 "greater than zero, or null for every review to report "
+                 "everything it finds, not %r" % (path, rounds))
 
     # Every setting that names a model, in one place because they are one
     # rule. Each reaches argv as a `--model` argument, where a number or a
@@ -1223,9 +1261,35 @@ def reviewed_through(covered, head, was):
     return {"reviewed_sha": head if covered else was.get("reviewed_sha")}
 
 
+def rounds_done(outcome, was):
+    """How many reviews this pull request has had, as a keyword for
+    state_entry.
+
+    Counted per pull request rather than per commit, which is what makes
+    it unlike `attempts` and why it reads `was` rather than `kept`: the
+    head moving is the normal way a round ends, so a counter emptied along
+    with the head-scoped ones would never reach two.
+
+    Every rebuild carries it, for reviewed_through()'s reason and at a
+    higher cost than there. A skip, a failed checkout or a give-up that
+    reset this hands back every round already spent, so a pull request
+    that draws one draft toggle or one bad clone goes back to reporting
+    everything it finds and stays there.
+
+    A review counts when it reached an ending that spent the subscription,
+    which is what DONE means, whether or not it covered its scope: a
+    partial review still put findings in front of the author, which is the
+    thing later rounds narrow against repeating. FAILED does not count.
+    MAX_ATTEMPTS already bounds those, and charging a round for one would
+    let three bad minutes at GitHub decide that the next real review of
+    that pull request reports only blockers.
+    """
+    return {"rounds": was.get("rounds", 0) + (1 if outcome == DONE else 0)}
+
+
 def state_entry(head, outcome, attempts=0, reason=None, announced=False,
                 tries=0, post_tries=0, unposted=False, waivers=0,
-                announce_waivers=0, reviewed_sha=None):
+                announce_waivers=0, reviewed_sha=None, rounds=0):
     """One pull request's record, built the one way.
 
     Four sites used to spell this out as a fresh literal, each deciding for
@@ -1286,6 +1350,13 @@ def state_entry(head, outcome, attempts=0, reason=None, announced=False,
         # Both cost the same thing now, one widened pass, since the
         # reader drops the key rather than the entry.
         entry["reviewed_sha"] = reviewed_sha
+    if rounds:
+        # Not beside `attempts`, though both are counters, because they
+        # are counted over different things: `attempts` bounds the tries
+        # at one commit and empties when the head moves, this counts the
+        # reviews this pull request has had over its whole life.
+        # rounds_done() is where that difference is argued.
+        entry["rounds"] = rounds
     return entry
 
 
@@ -1399,7 +1470,7 @@ def load_state():
                           or isinstance(done[field], bool)
                           for field in ("attempts", "announce_tries",
                                         "post_tries", "post_waivers",
-                                        "announce_waivers", "seen")
+                                        "announce_waivers", "seen", "rounds")
                           if field in done)
                    # The flags too, and for the same reason: this file is
                    # hand-edited on the log's own advice, and a bare
@@ -1677,7 +1748,8 @@ def transcript_path(repo, pr):
     return os.path.join(REVIEW_DIR, name)
 
 
-def save_transcript(repo, pr, text, findings=None, note=None, since=None):
+def save_transcript(repo, pr, text, findings=None, note=None, since=None,
+                    blockers=False):
     """Write the review to disk, findings included.
 
     They have to be written explicitly now. The reviewer reports them through
@@ -1702,8 +1774,14 @@ def save_transcript(repo, pr, text, findings=None, note=None, since=None):
     # The transcript is also the artifact an operator is told to send by
     # hand when every retry is spent, and it said nothing about the scope
     # either.
-    if since:
-        body = "%s`%s`.\n\n%s" % (SCOPE_MARK, since[:7], body)
+    # Both narrowings, as one block ending in a blank line, because
+    # repost() lifts the block whole and a second one written elsewhere in
+    # the file would not be found. "No findings" means a different thing
+    # under each of them and a third thing under both.
+    marks = ([] if not since else ["%s`%s`." % (SCOPE_MARK, since[:7])]) + (
+        [BLOCKERS_MARK] if blockers else [])
+    if marks:
+        body = "%s\n\n%s" % ("\n".join(marks), body)
     if findings:
         body += "\n\n## Findings\n\n" + "\n\n".join(
             finding_bullet(finding) for finding in findings)
@@ -1834,7 +1912,7 @@ def review_scope(path, pr, done, env, label):
     return since
 
 
-def reviewer_brief(pr, since=None):
+def reviewer_brief(pr, config, since=None, blockers=False):
     """What the reviewer cannot work out from the checkout it wakes up in.
 
     Two things, and both of them are things it otherwise guesses at.
@@ -1879,6 +1957,17 @@ def reviewer_brief(pr, since=None):
     absent. It is the arrangement that was measured working after two others
     cost live reviews, and the first pass of every pull request still runs
     through it.
+
+    `blockers` narrows the same way `since` does, one axis over: `since`
+    says which lines may be reported on, this says which findings among
+    them are worth reporting.
+
+    It goes last, after the reporting contract, where `since` goes before
+    it. That is not symmetry for its own sake. The contract ends "a
+    finding you leave out of it is a finding nobody sees", which is the
+    one sentence in the brief that argues against leaving anything out, so
+    a paragraph telling the reviewer to leave most things out has to be
+    the one that answers it rather than the one it answers.
     """
     base = pr["baseRefName"]
     # Named as what it is in each case. Calling the base diff "the review
@@ -1901,7 +1990,7 @@ def reviewer_brief(pr, since=None):
         "%s tool, including when you found none, and give `file` relative to "
         "the repository root. Vinegar reads that call and posts the whole "
         "review from it, so a finding you leave out of it is a finding "
-        "nobody sees."
+        "nobody sees.%s"
         % (pr["number"], base, base,
            "the pull request's full diff" if since else "the review scope",
            base,
@@ -1917,7 +2006,8 @@ def reviewer_brief(pr, since=None):
            "say which refs you could not reach." % since if since else
            "If neither resolves, say you could not establish the scope "
            "rather than guessing at one.",
-           since_brief(since) if since else "", REPORT_TOOL))
+           since_brief(since) if since else "", REPORT_TOOL,
+           blockers_brief(config) if blockers else ""))
 
 
 def since_brief(since):
@@ -1939,6 +2029,78 @@ def since_brief(since):
         "raising it again is noise. If `%s` does not resolve, review the "
         "pull request's full diff instead and say so in your summary."
         % (since, since, since))
+
+
+def blockers_only(round_number, config):
+    """Whether the review that is about to run reports only blockers.
+
+    One rule, because the answer has to reach three places that would
+    otherwise each compare a config key themselves: the reviewer's brief,
+    the comment that explains why the pass went quiet about small things,
+    and the checks list. Two of those disagreeing is a pull request told
+    that findings were held back by a review that was never asked to hold
+    any back.
+
+    `round_number` counts this review, so the first one is 1. Reading it
+    as the count of reviews already done narrowed a pull request one round
+    early, which is a whole round of findings nobody was ever shown.
+    """
+    after = config["blockers_only_after"]
+    return after is not None and round_number > after
+
+
+def blockers_brief(config):
+    """The paragraph that turns a full review into a blockers-only one.
+
+    Beside since_brief() and for its reason: it is a half of the brief
+    that changes, and a test reaching it should not have to spell out the
+    base-branch half to get there.
+
+    It narrows what is reported without narrowing what is read, which is
+    the same division since_brief() draws and for a sharper reason here. A
+    reviewer told to *look* only for blockers reads less carefully and
+    finds fewer of them; the judgement of whether a thing is a blocker is
+    the expensive judgement this whole program buys, and it cannot be made
+    from a diff skimmed for severity.
+
+    The definition here has to mean what SEVERITY_PROMPT's means. That
+    prompt tiers these findings afterwards and the comment prints the
+    tally, so a reviewer working to a wider definition reports findings
+    the tally then counts as advisory: a pull request told it is being
+    shown blockers only, under a list of things Vinegar itself calls
+    smaller. The two texts are separate because SEVERITY_PROMPT is a
+    measured prompt whose variants did worse and is not worth rewording to
+    share a constant, so they are held together by a test that both name
+    the same runtime harms instead. Edit neither alone.
+
+    Permission to report nothing is explicit, and it is the load-bearing
+    sentence. The measured failure of the severity pass was inflation:
+    asked to name the harm behind each tier it invented one for every
+    finding and promoted more of them, at 2.4 times the cost. A reviewer
+    that believes it must hand something back has the same incentive and
+    the whole pull request to find it in.
+    """
+    return (
+        "\n\nThe first %d reviews of this pull request reported everything "
+        "they found, and those findings are on the pull request already. "
+        "Every review after those, this one included, reports only "
+        "blockers.\n\n"
+        "A blocker is a finding where someone must act before this merges, "
+        "and to call one you must be able to name what goes wrong at "
+        "runtime for a user or an operator: a wrong result, lost data, a "
+        "security hole, a hang, a crash, or a failure that happens "
+        "silently. A missing test, a stale comment, a duplicated helper, a "
+        "wasted cycle and a clumsy structure are never blockers, however "
+        "real and however serious the code they concern, because nothing "
+        "at runtime behaves wrongly because of them.\n\n"
+        "Read and judge exactly as carefully as you would on any other "
+        "pass. Only what you report is narrowed: report every blocker you "
+        "find, through the tool named above and by the same rules, and "
+        "leave out everything that is not one. Reporting no findings at "
+        "all is the expected outcome here, and it is the right answer "
+        "whenever you cannot name the runtime harm. Do not promote a "
+        "smaller finding so that this pass has something to say."
+        % config["blockers_only_after"])
 
 
 def clamp(label, body):
@@ -2674,7 +2836,7 @@ def overflow_note(dropped):
 
 def review_body(label, pr, config, inline, general, raw=None,
                 heading="These could not be anchored in the diff:", note=None,
-                verb="reviewed", tally="", since=None):
+                verb="reviewed", tally="", since=None, blockers=False):
     """The review's top-level comment.
 
     Always present, and not only because the endpoint requires one for a
@@ -2704,6 +2866,22 @@ def review_body(label, pr, config, inline, general, raw=None,
                       "which is where the last review of this pull request "
                       "finished. Earlier findings are already on the pull "
                       "request as their own comments." % since[:7]]
+
+    # The other half of what "no findings" means here, and it has to be
+    # said for the same reason the scope line is: without it a quiet
+    # re-review reads as the change being clean when it only means nothing
+    # in it would break at runtime. Said after the scope line, because a
+    # reader needs to know what was read before what was reported from it.
+    #
+    # It names the number rather than saying "later reviews", so the
+    # author can tell whether this is Vinegar's rule or something someone
+    # configured for this repository, without reading the daemon's config.
+    if blockers:
+        lines += ["", "The first %d reviews of a pull request report "
+                      "everything they find. This is a later one, so it "
+                      "reports only blockers: findings where something goes "
+                      "wrong at runtime. Anything smaller it found is not "
+                      "listed here." % config["blockers_only_after"]]
 
     # A run that was killed or that errored still reports whatever it had
     # got to, and without this that is indistinguishable from a finished
@@ -2837,7 +3015,7 @@ def check_api(label, repo, path, method, payload, env):
         return {}
 
 
-def open_check(label, repo, pr, config, env):
+def open_check(label, repo, pr, config, env, blockers=False):
     """Say in the pull request's checks that a review is running.
 
     Answers a handle to close afterwards, or None when there is nothing to
@@ -2892,10 +3070,16 @@ def open_check(label, repo, pr, config, env):
             % label)
         return {"repo": repo, "id": mine[0].get("id"), "closed": False}
 
+    # The narrowing is in the title as well as in the comment, because the
+    # checks list is the half of this an agent reads. `gh pr checks`
+    # returning a review that reported nothing means one thing on a first
+    # pass and another on a fifth, and the comment saying so does not
+    # reach anything polling the check.
     asked = {"name": CHECK_NAME, "head_sha": sha, "status": "in_progress",
              "started_at": utc_stamp(),
              "output": {
-                 "title": "Reviewing at %s effort" % config["effort"],
+                 "title": "Reviewing at %s effort%s" % (
+                     config["effort"], ", blockers only" if blockers else ""),
                  "summary": "Vinegar is reviewing this commit. The findings "
                             "arrive as one review when it finishes."}}
     # Only when there is one. An empty `details_url` is not a URL and
@@ -3155,7 +3339,8 @@ def already_posted(label, repo, pr, env, verb="reviewed"):
 
 
 def post_review(label, repo, pr, path, text, findings, config, env,
-                note=None, verb="reviewed", resent=False, since=None):
+                note=None, verb="reviewed", resent=False, since=None,
+                blockers=False):
     """Turn what the reviewer reported into one review on the pull request.
 
     Answers POSTED when the pull request carries the review, THROTTLED
@@ -3218,7 +3403,7 @@ def post_review(label, repo, pr, path, text, findings, config, env,
                "body": review_body(label, pr, config, inline, general, raw,
                                    note=note, verb=verb,
                                    tally=severity_tally(findings),
-                                   since=since)}
+                                   since=since, blockers=blockers)}
     if inline:
         payload["comments"] = inline
 
@@ -3304,7 +3489,7 @@ def post_review(label, repo, pr, path, text, findings, config, env,
         payload.pop("comments")
         payload["body"] = review_body(
             label, pr, config, [], findings, note=note, verb=verb,
-            tally=severity_tally(findings), since=since,
+            tally=severity_tally(findings), since=since, blockers=blockers,
             heading="GitHub refused the inline comments, so all of it is "
                     "here:")
     else:
@@ -3360,7 +3545,7 @@ def keep(label, repo, pr, text, why):
 
 def finish(label, repo, pr, path, text, findings, config, env, tokens,
            note=None, verb="reviewed", preserve=False, resent=False,
-           check=None, since=None):
+           check=None, since=None, blockers=False):
     """Record the review on disk and post it, whatever ended the run.
 
     Answers post_review()'s answer: whether the pull request carries it.
@@ -3451,7 +3636,8 @@ def finish(label, repo, pr, path, text, findings, config, env, tokens,
         wrote = save_or_log(label, append_ending)
     else:
         wrote = save_or_log(label, lambda: log("%s: transcript at %s" % (
-            label, save_transcript(repo, pr, text, findings, note, since))))
+            label, save_transcript(repo, pr, text, findings, note, since,
+                                   blockers))))
     # Marked before the posting, not after. Written afterwards it was
     # skipped entirely by anything that raised out of post_review — `gh`
     # missing from PATH, a fork that cannot allocate — so a transcript
@@ -3476,7 +3662,8 @@ def finish(label, repo, pr, path, text, findings, config, env, tokens,
     # freshly minted where the review's own may be an hour old by now.
     sending = posting_env(label, config, repo, tokens, env)
     posted = post_review(label, repo, pr, path, text, findings, config,
-                         sending, note, verb, resent, since=since)
+                         sending, note, verb, resent, since=since,
+                         blockers=blockers)
     # Cleared once it is on the pull request. What is left behind says a
     # review is saved and waiting, which is what handle_pr acts on: the
     # outcome is recorded DONE either way, `review_on_push` is false, and
@@ -3677,10 +3864,17 @@ def repost(key, repo, pr, config, state, tokens, done, marker, sha):
             # Found as a line rather than at position zero: what is read
             # here is the whole file, so the transcript's own heading and
             # the `---` come first.
+            #
+            # Either mark opens the block, and the block runs to the blank
+            # line, so one find serves however many lines save_transcript
+            # wrote. Matching only the scope line lost the blockers-only
+            # line on a pass that reported narrowly and read everything,
+            # which is the transcript that carries that mark alone.
             sep = body.find(TRANSCRIPT_SEP)
             starts = sep + len(TRANSCRIPT_SEP) if sep != -1 else -1
             end = (body.find("\n\n", starts)
-                   if starts != -1 and body.startswith(SCOPE_MARK, starts)
+                   if starts != -1 and body.startswith(
+                       (SCOPE_MARK, BLOCKERS_MARK), starts)
                    else -1)
             if end != -1:
                 opening += "%s\n\n" % body[starts:end]
@@ -3819,7 +4013,7 @@ def unroutable(output, findings):
 
 
 def review(path, repo, pr, config, env, tokens, resent=False, check=None,
-           since=None):
+           since=None, blockers=False):
     """Run one review and post it. Answers the outcome and whether it covered.
 
     Two answers rather than one, for the reason post_review() has three:
@@ -3871,7 +4065,8 @@ def review(path, repo, pr, config, env, tokens, resent=False, check=None,
     # part of the final result, and this is the combination that was measured
     # working rather than the one that reads most likely.
     cmd = ["claude", "-p", prompt,
-           "--append-system-prompt", reviewer_brief(pr, since),
+           "--append-system-prompt", reviewer_brief(pr, config, since,
+                                                    blockers),
            "--output-format", "stream-json", "--verbose",
            "--settings", reviewer_settings(path),
            "--setting-sources", "",
@@ -3944,7 +4139,8 @@ def review(path, repo, pr, config, env, tokens, resent=False, check=None,
         # next ending to honour that nothing checked.
         if announce(label, lambda: finish(
                 label, repo, pr, path, text, findings, config, env, tokens,
-                note, resent=resent, check=check, since=since)) == POSTED:
+                note, resent=resent, check=check, since=since,
+                blockers=blockers)) == POSTED:
             # Four, and none of them is implied by another. POSTED says the
             # pull request carries it. `whole` says the reviewer reached the
             # end of the scope, and it is passed in rather than read off
@@ -4355,7 +4551,8 @@ def spend_announce(key, config, state, head, attempts, tries, said):
     entry = state_entry(head, FAILED, attempts,
                         announced=said == POSTED or spent, tries=tries,
                         **dict(carry_forward(was),
-                               **reviewed_through(False, head, was)))
+                               **reviewed_through(False, head, was),
+                               **rounds_done(FAILED, was)))
     state[key] = entry
     save_state(state)
 
@@ -4392,7 +4589,8 @@ def record_once(state, key, done, head, outcome, reason):
     # silently, with only the bill to show for it.
     state[key] = state_entry(head, outcome, kept.get("attempts", 0), reason,
                              **dict(carry_forward(kept),
-                                    **reviewed_through(False, head, done)))
+                                    **reviewed_through(False, head, done),
+                                    **rounds_done(outcome, done)))
     state[key]["seen"] = seen
     save_state(state)
 
@@ -4621,7 +4819,8 @@ def handle_pr(repo, pr, config, state, tokens):
     state[key] = state_entry(head, FAILED, attempts,
                              **dict(carry_forward(kept), post_tries=0,
                                     waivers=0,
-                                    **reviewed_through(False, head, done)))
+                                    **reviewed_through(False, head, done),
+                                    **rounds_done(FAILED, done)))
     save_state(state)
 
     # Worked out before the review, because it is what the review is told,
@@ -4629,6 +4828,22 @@ def handle_pr(repo, pr, config, state, tokens):
     since = review_scope(path, pr, done, env, key)
     if since:
         log("%s: reviewing what was added since %s" % (key, since[:7]))
+
+    # Worked out from the entry rather than from a counter of this run,
+    # because the round this review is has to survive the process dying
+    # between two reviews. `+ 1` counts this one: the entry holds what has
+    # already happened.
+    #
+    # Said in the log with the number, and that is the only place a
+    # runaway shows up early. Nothing stops re-reviewing a pull request
+    # now, deliberately, so a branch pushed to forty times buys forty
+    # reviews; the state file records it and this line is what makes it
+    # greppable before the bill arrives.
+    this_round = done.get("rounds", 0) + 1
+    blockers = blockers_only(this_round, config)
+    if blockers:
+        log("%s: review %d of this pull request, so it reports only blockers"
+            % (key, this_round))
 
     # Opened here rather than inside review(), so that the one place that
     # sees every ending is also the place that finishes it. review()
@@ -4659,7 +4874,7 @@ def handle_pr(repo, pr, config, state, tokens):
         # again until MAX_ATTEMPTS was spent on a pull request nobody had
         # reviewed. check_api's docstring promises nothing here is worth a
         # review; this is what makes that structural.
-        check = open_check(key, repo, pr, config, env)
+        check = open_check(key, repo, pr, config, env, blockers)
         try:
             # A second attempt at a head asks before posting. The marker
             # above is written before review() runs and the real outcome
@@ -4672,7 +4887,7 @@ def handle_pr(repo, pr, config, state, tokens):
             # crash window.
             outcome, covered = review(path, repo, pr, config, env, tokens,
                                       resent=attempts > 1, check=check,
-                                      since=since)
+                                      since=since, blockers=blockers)
         except Exception as err:
             # The subscription is spent by the time most of these can
             # happen, and an unrecorded pull request is reviewed again on
@@ -4694,7 +4909,8 @@ def handle_pr(repo, pr, config, state, tokens):
             head, outcome, attempts,
             **dict(carry_forward(kept), post_tries=0, waivers=0,
                    unposted=os.path.exists(unposted_path(repo, pr)),
-                   **reviewed_through(covered, head, done)))
+                   **reviewed_through(covered, head, done),
+                   **rounds_done(outcome, done)))
         save_state(state)
 
         if outcome == FAILED and attempts >= MAX_ATTEMPTS:
@@ -4950,12 +5166,28 @@ def main():
             # after an unsatisfying review wants the whole thing read
             # again, and silently handing them the increment gives them a
             # near-empty diff and a review that says nothing.
+            # Read once and used for both, where the scope alone used to
+            # read it inline. Two loads would be two different files the
+            # moment the daemon is running under the same VINEGAR_HOME,
+            # and the two answers would then describe different rounds.
+            entry = load_state().get(pr_key(repo, pr), {})
             since = None if args.whole else review_scope(
-                where, pr, load_state().get(pr_key(repo, pr), {}), env,
-                args.pr)
+                where, pr, entry, env, args.pr)
             if since:
                 log("%s: reviewing what was added since %s"
                     % (args.pr, since[:7]))
+            # Counted the way the daemon counts it, and `--whole` does not
+            # opt out. That flag says to read the whole pull request again,
+            # which is a question about scope; whether an author who has
+            # already had five reviews wants a sixth list of small findings
+            # is a different question, and answering both from one flag is
+            # how a hand-run review comes to say something the daemon never
+            # would.
+            hand_round = entry.get("rounds", 0) + 1
+            blockers = blockers_only(hand_round, config)
+            if blockers:
+                log("%s: review %d of this pull request, so it reports only "
+                    "blockers" % (args.pr, hand_round))
             # Wrapped, so the recording below always happens. The
             # subscription is spent by the time most of these can fire,
             # and dying here left no entry at all: the daemon reviewed
@@ -4985,9 +5217,10 @@ def main():
             # cheap artifact and not the expensive one was the asymmetry
             # this fixes.
             try:
-                hand = open_check(args.pr, repo, pr, config, env)
+                hand = open_check(args.pr, repo, pr, config, env, blockers)
                 outcome, covered = review(where, repo, pr, config, env,
-                                          tokens, check=hand, since=since)
+                                          tokens, check=hand, since=since,
+                                          blockers=blockers)
             except Exception as err:
                 log("%s: the review did not complete: %s" % (args.pr, err))
                 outcome, covered = FAILED, False
@@ -5032,7 +5265,8 @@ def main():
                            unposted=bool(
                                unposted_for(repo, pr, scan=False)[0]),
                            **reviewed_through(covered, pr["headRefOid"],
-                                              was)))
+                                              was),
+                           **rounds_done(outcome, was)))
                 save_state(state)
                 if state[pr_key(repo, pr)].get("unposted"):
                     log("%s: the review is saved to be posted on a later "

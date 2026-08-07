@@ -819,9 +819,43 @@ check("a narrowed review says so in the transcript, not only in the comment",
 check("the scope line is recognisable to the repost that has to keep it",
       _tx_body[_tx_body.index("---") + 3:].lstrip().startswith(
           vinegar.SCOPE_MARK), _tx_body[:200])
+# Read into a name rather than checked in place. Every call here writes the
+# same repository, number and sha, so they all name one file: a later write
+# overwrites this one, and re-opening the path further down reads whichever
+# transcript was written last.
 _tx_full = GENUINE_SAVE_TRANSCRIPT("o/r", PR, "the words", [], None)
 with open(_tx_full) as _h:
-    check("a full review's transcript claims no scope", "Scope:" not in _h.read())
+    _tx_full_body = _h.read()
+check("a full review's transcript claims no scope",
+      "Scope:" not in _tx_full_body, _tx_full_body[:200])
+# The other narrowing, written for the same reason and lifted by the same
+# code. A blockers-only review delivered from its transcript days later
+# would otherwise arrive as a review that found one thing, rather than one
+# that was only reporting the things that break at runtime.
+_tx_both = GENUINE_SAVE_TRANSCRIPT(
+    "o/r", PR, "the words", [], None,
+    "0123456789abcdef0123456789abcdef01234567", True)
+with open(_tx_both) as _h:
+    _tx_both_body = _h.read()
+check("a blockers-only review says so in the transcript too",
+      vinegar.BLOCKERS_MARK in _tx_both_body, _tx_both_body[:300])
+# Both marks in one block ending at the blank line, because repost() lifts
+# from the separator to the first blank line: a second mark written
+# anywhere else in the file is one repost never finds.
+_tx_block = _tx_both_body[_tx_both_body.index("---") + 3:].lstrip()
+check("the two marks are one block the repost can lift whole",
+      _tx_block.startswith(vinegar.SCOPE_MARK)
+      and vinegar.BLOCKERS_MARK in _tx_block[:_tx_block.index("\n\n")],
+      _tx_block[:300])
+_tx_bl_only = GENUINE_SAVE_TRANSCRIPT("o/r", PR, "the words", [], None,
+                                      None, True)
+with open(_tx_bl_only) as _h:
+    _tx_bl_body = _h.read()
+check("a blockers-only pass that read everything still marks itself",
+      _tx_bl_body[_tx_bl_body.index("---") + 3:].lstrip().startswith(
+          vinegar.BLOCKERS_MARK), _tx_bl_body[:300])
+check("an ordinary review's transcript claims neither",
+      vinegar.BLOCKERS_MARK not in _tx_full_body, _tx_full_body[:200])
 shutil.rmtree(vinegar.REVIEW_DIR, True)
 vinegar.REVIEW_DIR = _saved_dir
 
@@ -1270,11 +1304,12 @@ CHK_CONFIG = dict(CONFIG, github_app={"app_id": 77, "private_key": "/k.pem"})
 CHK_ENV = {"GH_TOKEN": "x"}
 
 
-def _opened(config=None, **stub):
+def _opened(config=None, blockers=False, **stub):
     for name, value in stub.items():
         setattr(fake_run, name, value)
     del checked[:]
-    got = vinegar.open_check(L, "o/r", PR, config or CHK_CONFIG, CHK_ENV)
+    got = vinegar.open_check(L, "o/r", PR, config or CHK_CONFIG, CHK_ENV,
+                             blockers)
     return got
 
 
@@ -1299,6 +1334,17 @@ check("the indicator carries one name and the effort",
       and "high" in _post[0]["output"]["title"], _post[0])
 check("the handle carries the id the caller must close",
       _made and _made["id"] == 4242, _made)
+# The checks list is the half of this an agent reads, and `gh pr checks`
+# saying a review reported nothing means one thing on a first pass and
+# another on a fifth. The comment that explains the narrowing reaches
+# nobody polling the check.
+_opened(blockers=True)
+_bl_post = [asked for how, _, asked in checked if how == "POST"]
+check("a blockers-only review says so in the checks list",
+      _bl_post and "blockers only" in _bl_post[0]["output"]["title"],
+      _bl_post)
+check("an ordinary review's indicator claims no narrowing",
+      "blockers" not in _post[0]["output"]["title"], _post[0])
 def _has_secret(handle):
     """Whether a handle carries anything credential-shaped, at any depth."""
     return any(
@@ -1499,6 +1545,20 @@ check("the retry does not blame anchoring for GitHub's refusal",
       "GitHub refused the inline comments" in posted[1][1]["body"]
       and "could not be anchored" not in posted[1][1]["body"],
       posted[1][1]["body"])
+# The retry rebuilds the body from scratch, so anything the first one said
+# about how the pass was scoped has to be passed in again. This is the
+# comment the author actually gets when the anchors are refused, and it is
+# the only one: a narrowing dropped here is dropped everywhere.
+del posted[:]
+# The literal rather than OLD_SHA, which is bound eighteen hundred lines
+# below this and would be a NameError at module level here.
+vinegar.post_review(L, "o/r", PR, ROOT, text, FINDINGS[:4], CONFIG, None,
+                    since="0123456789abcdef0123456789abcdef01234567",
+                    blockers=True)
+check("the anchor-refused retry still says how the pass was scoped",
+      len(posted) == 2 and "reports only blockers" in posted[1][1]["body"]
+      and "only what was added since" in posted[1][1]["body"],
+      posted[1][1]["body"][:400] if len(posted) > 1 else posted)
 fake_run.rc = 0
 
 try:
@@ -1631,8 +1691,9 @@ real_env, real_transcript = vinegar.github_env, vinegar.save_transcript
 _tx_calls = []
 
 
-def stub_transcript(repo, pr, text, findings=None, note=None, since=None):
-    _tx_calls.append((repo, pr, text, findings, note, since))
+def stub_transcript(repo, pr, text, findings=None, note=None, since=None,
+                    blockers=False):
+    _tx_calls.append((repo, pr, text, findings, note, since, blockers))
     return "/dev/null"
 
 
@@ -2605,6 +2666,23 @@ check("a boolean is not a number here either",
 check("the numbers as numbers still start",
       _config_with(poll_interval=30, review_timeout=900,
                    max_changed_lines=100) == "started")
+# Its own check rather than the loop's, because null is a value here, and
+# the two failures it catches are different. A string raises TypeError
+# inside blockers_only() on every review; a zero parses and compares
+# perfectly and means a first review that reports only blockers, so the
+# pull request is never told anything smaller and nothing says why.
+check("a blockers_only_after given as a string refuses to start",
+      "whole number of reviews" in _config_with(blockers_only_after="2"),
+      _config_with(blockers_only_after="2"))
+check("a zero blockers_only_after refuses to start",
+      "greater than zero" in _config_with(blockers_only_after=0),
+      _config_with(blockers_only_after=0))
+check("a boolean blockers_only_after is not a number either",
+      "whole number of reviews" in _config_with(blockers_only_after=True),
+      _config_with(blockers_only_after=True))
+check("null blockers_only_after starts, and is how it is turned off",
+      _config_with(blockers_only_after=None) == "started",
+      _config_with(blockers_only_after=None))
 # The effort is not validated again after this: it goes into the prompt as
 # `/code-review <effort> <number>`, so a value the slash command does not
 # know is not refused anywhere downstream. It reviews at whatever the
@@ -3133,7 +3211,7 @@ check("the checkout and review together stay inside a token's life",
 vinegar.github_env = _real_env
 
 # --- reviewer_brief ------------------------------------------------------
-brief = vinegar.reviewer_brief(PR)
+brief = vinegar.reviewer_brief(PR, CONFIG)
 check("brief names the pull request's real base",
       "git diff refs/heads/release-2...HEAD" in brief, brief)
 check("brief tells the reviewer not to fall back to main",
@@ -3294,7 +3372,7 @@ check("a head that has already been reviewed is not diffed against itself",
 reset_stubs()
 
 # --- the brief a re-review gets ------------------------------------------
-again = vinegar.reviewer_brief(PR_SINCE, OLD_SHA)
+again = vinegar.reviewer_brief(PR_SINCE, CONFIG, OLD_SHA)
 check("a re-review names the increment as the review scope",
       "`git diff %s..HEAD` is the review scope" % OLD_SHA in again, again)
 # Two scopes named as the scope is two instructions for one decision, and
@@ -3459,7 +3537,7 @@ def _indicator_after(what, attempts, closes=None):
     del posted[:]
 
     def review_stub(path, repo, pr, config, env, tokens, resent=False,
-                    check=None, since=None):
+                    check=None, since=None, blockers=False):
         checked.append(("REVIEW", "", None))
         if closes:
             vinegar.close_check(L, check, closes, CHK_ENV)
@@ -3470,6 +3548,14 @@ def _indicator_after(what, attempts, closes=None):
         # nothing reached the pull request.
         return what, False
 
+    # Signature-checked like the save_transcript stub above, and for the
+    # reason written there. A stub that rejects the call it stands in for
+    # sends every check in this section through handle_pr's "the review did
+    # not complete" branch, so three assertions about how an indicator is
+    # closed start reporting on a review that never ran.
+    assert (inspect.signature(review_stub).parameters.keys()
+            == inspect.signature(_real_review).parameters.keys()), \
+        "the review stub no longer matches the real signature"
     vinegar.review = review_stub
     state = {L: {"outcome": vinegar.FAILED, "sha": PR_LIVE["headRefOid"],
                  "attempts": attempts}} if attempts else {}
@@ -4075,11 +4161,15 @@ AGAIN_CFG = dict(CONFIG, review_on_push=True)
 _ag_saves = []
 
 
-def _second_pass(entry, config=None, review=None):
+def _second_pass(entry, config=None, review=None, checkout=None):
     """One handle_pr over a pull request that was reviewed at OLD_SHA."""
     reset_stubs()
     del _ag_saves[:]
-    vinegar.checkout = lambda repo, pr, env: ROOT
+    # After reset_stubs, not before it: reset_stubs puts the genuine
+    # functions back, so a caller that stubbed the checkout on its own
+    # would watch this line overwrite it and then assert on a pass that
+    # checked out perfectly well.
+    vinegar.checkout = checkout or (lambda repo, pr, env: ROOT)
     vinegar.github_env = lambda *a, **k: {"GH_TOKEN": "x"}
     # Every save, deep-copied. handle_pr writes the entry twice, once
     # before the review and once after, and the two are the same mutable
@@ -4170,6 +4260,149 @@ _ag_first = _second_pass({})
 check("a first pass is not narrowed by an entry that has no commit in it",
       "This is a re-review" not in claude_run.saw[
           claude_run.saw.index("--append-system-prompt") + 1])
+
+# --- a later review reports only blockers --------------------------------
+# Nothing stops re-reviewing a pull request, on purpose: a branch under
+# heavy rework is the last one worth going quiet about. What changes after
+# the first few rounds is what gets reported, so the author is not handed
+# the same list of small findings on every push.
+check("the round after the configured count is where blockers-only starts",
+      not vinegar.blockers_only(2, AGAIN_CFG)
+      and vinegar.blockers_only(3, AGAIN_CFG),
+      [vinegar.blockers_only(n, AGAIN_CFG) for n in (1, 2, 3)])
+# Off the by-one that matters. Reading the count as reviews already done
+# rather than as the review about to run narrows a round early, and that
+# round's small findings are ones nobody is ever shown.
+check("the first review is never blockers-only",
+      not vinegar.blockers_only(1, dict(AGAIN_CFG, blockers_only_after=1)))
+check("null is how blockers-only is turned off",
+      not vinegar.blockers_only(99, dict(AGAIN_CFG, blockers_only_after=None)))
+
+# The counter is per pull request, not per commit, which is the whole
+# difference between it and `attempts`. Every rebuild of an entry has to
+# carry it: the head moving is the normal way a round ends.
+_rd_first = _second_pass(REVIEWED)
+check("a review that ran counts a round",
+      _rd_first.get("rounds") == 1, _rd_first)
+_rd_third = _second_pass(dict(REVIEWED, rounds=2))
+check("a round is counted on top of the rounds already recorded",
+      _rd_third.get("rounds") == 3, _rd_third)
+# FAILED is already bounded by MAX_ATTEMPTS. Charging a round for one lets
+# three bad minutes at GitHub decide that the next real review of that pull
+# request reports only blockers.
+_rd_failed = _second_pass(dict(REVIEWED, rounds=1),
+                          review=lambda *a, **k: (vinegar.FAILED, False))
+check("a failed review does not count a round",
+      _rd_failed.get("rounds") == 1, _rd_failed)
+# The three rebuilds that are not reviews. Any one of them dropping the
+# count hands back every round already spent, and a pull request that draws
+# one draft toggle or one bad clone goes back to reporting everything.
+_rd_skipped = _second_pass(dict(REVIEWED, rounds=2),
+                           config=dict(AGAIN_CFG, authors=["nobody"]))
+check("a skip does not hand back the rounds already spent",
+      _rd_skipped.get("rounds") == 2, _rd_skipped)
+
+
+def _checkout_fails(repo, pr, env):
+    raise RuntimeError("clone failed")
+
+
+_rd_broken = _second_pass(dict(REVIEWED, rounds=2), checkout=_checkout_fails)
+check("a failed checkout does not hand back the rounds already spent",
+      _rd_broken.get("rounds") == 2 and _rd_broken.get("outcome") == "checkout",
+      _rd_broken)
+# And the marker written before the review runs, which is what a process
+# killed mid-review leaves behind. Counting the round there would charge
+# for a review that never reported anything.
+check("the marker written before the review has not counted the round yet",
+      _ag_saves and _ag_saves[0][L].get("rounds") == 2, _ag_saves[:1])
+
+# What the reviewer is actually told, which is the whole feature. A filter
+# applied to the tiers afterwards would not do: the severity pass reads a
+# one-line summary with no code in front of it, and dropping a finding the
+# reviewer read the code and chose to report is the wrong way round.
+_bl_state = _second_pass(dict(REVIEWED, rounds=2))
+_bl_brief = claude_run.saw[claude_run.saw.index("--append-system-prompt") + 1]
+# Snapshotted here. Every _second_pass starts with reset_stubs, which
+# empties `posted`, so asserting on it after the round-2 run below reports
+# on the review that was deliberately not narrowed.
+_bl_posted = [body["body"] for _cmd, body in posted]
+check("a later review is told to report only blockers",
+      "reports only blockers" in _bl_brief, _bl_brief)
+# Narrowing what is reported must not narrow what is read. A reviewer told
+# to look only for blockers reads less carefully and finds fewer of them,
+# and that judgement is the expensive thing this program buys.
+check("a blockers-only review still reads and judges everything",
+      "as carefully as you would on any other pass" in _bl_brief, _bl_brief)
+# The measured failure of the severity pass was inflation: asked to justify
+# a tier it invented a harm for every finding and promoted more of them. A
+# reviewer that believes it must hand something back has that incentive and
+# a whole pull request to find something in.
+check("a blockers-only review is told that finding nothing is expected",
+      "Reporting no findings at all is the expected outcome" in _bl_brief,
+      _bl_brief)
+# It has to answer the reporting contract rather than be answered by it.
+# That paragraph ends "a finding you leave out of it is a finding nobody
+# sees", which is the one sentence in the brief arguing against leaving
+# anything out.
+
+
+
+def _in_order(text, first, second):
+    """Whether both are there and in that order, without raising if not.
+
+    `.index` on a missing phrase raises, and a check that raises ends the
+    run where it stands rather than failing: every check below it is
+    skipped, and the mutation that removed the phrase comes back ABORTED,
+    which says nothing about whether anything was guarding it.
+    """
+    at, then = text.find(first), text.find(second)
+    return at != -1 and then != -1 and at < then
+
+
+check("the narrowing comes after the sentence it has to qualify",
+      _in_order(_bl_brief, "a finding nobody sees",
+                "leave out everything that is not one"), _bl_brief)
+_bl_second = _second_pass(dict(REVIEWED, rounds=1))
+check("the rounds before the cut are told nothing about blockers",
+      "blockers" not in claude_run.saw[
+          claude_run.saw.index("--append-system-prompt") + 1])
+# A reviewer working to a wider definition than the tier that orders these
+# findings reports things the tally then counts as advisory: a pull request
+# told it is seeing blockers only, under a list of what Vinegar calls
+# smaller. The two prompts are separate because SEVERITY_PROMPT is measured
+# and not worth rewording, so this is what holds them together.
+#
+# Whitespace-normalised on both sides. SEVERITY_PROMPT lays its tiers out
+# as an indented table, so "a crash" is written across a line break there
+# and a plain substring test passes for the wrong reason: it finds the
+# phrases that happen not to wrap and misses the ones that do.
+_bl_text = " ".join(vinegar.blockers_brief(AGAIN_CFG).split())
+_bl_sev = " ".join(vinegar.SEVERITY_PROMPT.split())
+check("the reviewer and the severity pass mean the same by blocker",
+      all(harm in _bl_text and harm in _bl_sev
+          for harm in ("a wrong result", "lost data", "a security hole",
+                       "a hang", "a crash",
+                       "a failure that happens silently")), _bl_text)
+check("both refuse the same things as blockers whatever their severity",
+      all(never in _bl_text and never in _bl_sev
+          for never in ("missing test", "stale comment", "duplicated helper",
+                        "wasted cycle")), _bl_text)
+
+# And what the pull request is told, because "no findings" means a
+# different thing here. Without it a quiet later review reads as the change
+# being clean when it only means nothing in it breaks at runtime.
+check("the pull request is told that smaller findings were held back",
+      any("reports only blockers" in body for body in _bl_posted), _bl_posted)
+check("it names the number rather than leaving the author to guess",
+      any("first 2 reviews" in body for body in _bl_posted), _bl_posted)
+_bl_body = vinegar.review_body(L, PR, CONFIG, [], [], since=OLD_SHA,
+                               blockers=True)
+check("what was read is said before what was reported from it",
+      _in_order(_bl_body, "only what was added since",
+                "reports only blockers"), _bl_body)
+check("an ordinary review says none of it",
+      "blockers" not in vinegar.review_body(L, PR, CONFIG, [], []))
 
 (vinegar.review, vinegar.checkout, vinegar.github_env, vinegar.save_state,
  vinegar.run) = _ag_real
@@ -5588,6 +5821,53 @@ check("an oversized narrowed review still says what it read",
       and "only what was added since `0123456`" in posted[0][1]["body"]
       and "## Findings" in posted[0][1]["body"],
       posted[0][1]["body"][:300] if posted else "nothing posted")
+
+# Both marks, because both are written and the lift reads to the blank
+# line rather than taking one line. Matching only the scope mark kept the
+# scope line and left the blockers line in the body, where the cut then
+# took it: a review that reported one finding out of everything it saw,
+# arriving days later as a review that found one thing.
+vinegar.save_transcript("o/r", PR_LOST, "narration " * 9000, FINDINGS[:1],
+                        None, "0123456789abcdef0123456789abcdef01234567",
+                        True)
+with open(_lost_marker, "w") as h:
+    h.write("%s\n" % PR_LOST["headRefOid"])
+_both_state = {_lost_key: {"outcome": vinegar.DONE,
+                           "sha": PR_LOST["headRefOid"], "attempts": 1,
+                           "unposted": True}}
+fake_run.rc = 0
+del posted[:]
+vinegar.handle_pr("o/r", PR_LOST, CONFIG, _both_state, {})
+check("an oversized blockers-only review still says what it reported",
+      len(posted) == 1
+      and len(posted[0][1]["body"]) <= vinegar.MAX_BODY
+      and "only what was added since `0123456`" in posted[0][1]["body"]
+      and vinegar.BLOCKERS_MARK in posted[0][1]["body"]
+      and "## Findings" in posted[0][1]["body"],
+      posted[0][1]["body"][:400] if posted else "nothing posted")
+
+# And the same review with nothing else in front of it. With both marks
+# written the block runs to the same blank line whichever one is matched,
+# so a lift that recognises only the scope line passes the case above for
+# the wrong reason. This is the transcript that has no scope line to carry
+# the blockers line for it: a pass that read the whole pull request and
+# reported only what breaks at runtime.
+vinegar.save_transcript("o/r", PR_LOST, "narration " * 9000, FINDINGS[:1],
+                        None, None, True)
+with open(_lost_marker, "w") as h:
+    h.write("%s\n" % PR_LOST["headRefOid"])
+_bl_alone = {_lost_key: {"outcome": vinegar.DONE,
+                         "sha": PR_LOST["headRefOid"], "attempts": 1,
+                         "unposted": True}}
+fake_run.rc = 0
+del posted[:]
+vinegar.handle_pr("o/r", PR_LOST, CONFIG, _bl_alone, {})
+check("an oversized blockers-only review that read it all says so too",
+      len(posted) == 1
+      and len(posted[0][1]["body"]) <= vinegar.MAX_BODY
+      and vinegar.BLOCKERS_MARK in posted[0][1]["body"]
+      and "## Findings" in posted[0][1]["body"],
+      posted[0][1]["body"][:400] if posted else "nothing posted")
 
 # The reviewer writes its own summary and it goes into the transcript
 # verbatim, so a paragraph of it beginning "Scope: " must not be mistaken

@@ -189,6 +189,7 @@ Every key in `config.example.json`:
 | `model` | `null` | Model for the review. Null uses your Claude Code default. Read the note below before setting it. |
 | `fallback_model` | `null` | Model to run the review again on when `model` cannot be routed. Null means no fallback. See below. |
 | `review_on_push` | `false` | Review again when the head commit changes. A second review reads only what was added since the last one that posted. See "The review". |
+| `blockers_only_after` | `2` | After this many reviews of one pull request, later reviews still run on every push but report only blockers. Null reports everything, every time. See below. |
 | `max_changed_lines` | `3000` | Skip pull requests larger than this. |
 | `skip_drafts` | `true` | Skip drafts. |
 | `skip_bots` | `true` | Skip pull requests opened by bots. |
@@ -886,6 +887,79 @@ review was unsatisfying. Pass `--whole` to read all of it:
 python3 vinegar.py --pr owner/repo#12 --whole
 ```
 
+### A later review reports only blockers
+
+Nothing stops Vinegar re-reviewing a pull request. There is no cap on rounds
+and no point at which it goes quiet, because a branch under heavy rework is the
+last one worth leaving unwatched: the code that changes most is the code most
+likely to break.
+
+What changes instead is what gets reported. `blockers_only_after` sets how many
+reviews of one pull request report everything they find. Every review after
+those still runs on every push and still reads the same way, and reports only
+blockers: findings where you can name what goes wrong at runtime for a user or
+an operator. A missing test, a stale comment, a duplicated helper and a clumsy
+structure are never blockers there, however serious the code they concern.
+
+**The narrowing is in the reviewer's instructions, not a filter on what it
+sent back.** That distinction is the whole design. Vinegar could post the
+findings tiered `blocker` by the severity pass and drop the rest, and that
+would be worse: the severity pass reads a one-line summary with no code in
+front of it, and measured on real reviews about 45% of findings came back
+`blocker`, including `test-coverage` findings against its own written rule.
+Dropping a finding the reviewer read the code and chose to report, on the say
+so of a smaller model reading a summary, is the wrong way round. The reviewer
+has the code, so the reviewer decides. Nothing filters what it hands back.
+
+The reviewer is told in the same breath that reporting nothing is the expected
+outcome. Without that it has an incentive to promote something smaller so the
+pass has something to say, which is the failure the severity pass measured when
+it was asked to justify each tier: it invented a harm for every finding and
+promoted more of them, at 2.4 times the cost.
+
+The pull request is told, because "no findings" means a different thing here:
+
+> **Vinegar** · reviewed `89abcde` at high effort
+>
+> This pass reviewed only what was added since `0123456`, which is where the
+> last review of this pull request finished. Earlier findings are already on the
+> pull request as their own comments.
+>
+> The first 2 reviews of a pull request report everything they find. This is a
+> later one, so it reports only blockers: findings where something goes wrong at
+> runtime. Anything smaller it found is not listed here.
+>
+> No findings.
+
+The checks list says it too, as `Reviewing at high effort, blockers only`, since
+that is the half of this an agent polling `gh pr checks` can read. So does the
+transcript, for the same reason the narrowing statement is written there.
+
+The count is per pull request and it survives everything: the head moving, a
+skip, a failed checkout, a review that failed and was retried. Only a review
+that ran to an ending counts a round. It lives in `state.json` as `rounds`, so
+deleting an entry starts that pull request over at round one.
+
+Set `blockers_only_after` to `null` to turn this off. With `review_on_push` on
+that means a full review of every push for the life of the pull request, and
+nothing bounds what one pull request can cost.
+
+**What this does not bound is spend.** A branch pushed to fifteen times buys
+fifteen reviews, and each one parks the single poll thread for nine to
+twenty-two minutes while nothing else is listed or reviewed. That is deliberate:
+going quiet on the most-reworked code in the repository is the worse failure.
+The round is in the log line for every narrowed review, which is where a runaway
+shows up before the bill does.
+
+**Each review posts its own comment rather than updating one in place**, unlike
+the triage note above. The two look like the same shape and are not. A review
+comment is about one commit, names it, and sits above that pass's inline
+findings; rewriting it on the next push would erase what the last pass said
+about code that has since been rewritten, and leave its inline comments with
+nothing introducing them. The accumulation is small in practice, because a
+review only runs when the head has moved and later ones are usually "No
+findings."
+
 ## The checks list
 
 A review is nine to twenty-two minutes of nothing. Until it posts, a pull
@@ -966,12 +1040,12 @@ unparseable answer, or an answer that does not tier every finding. The review
 is finished and paid for by the time this runs, so an ordering step is never
 allowed to cost it.
 
-**What it does not do yet.** On two of the four reviews measured, about 45% of
+**What it does not do.** On two of the four reviews measured, about 45% of
 findings still came back `blocker`, and on one of them three `test-coverage`
 findings did, against the rule the model is given. That is good enough to order
-a comment. It is not good enough on its own to decide when to stop re-reviewing
-a pull request, so `review_on_push` is still `false` and whatever turns it on
-will need a bound that does not depend on the blocker count falling.
+a comment. It is not good enough to decide which findings reach the pull request
+at all, which is why `blockers_only_after` narrows the reviewer's instructions
+rather than filtering these tiers. See "A later review reports only blockers".
 
 Two things that measured worse and are recorded so they are not retried.
 Requiring the model to name the runtime harm beside each tier, which sounds

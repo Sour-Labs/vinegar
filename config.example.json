@@ -6,6 +6,7 @@
   "model": null,
   "fallback_model": null,
   "review_on_push": false,
+  "blockers_only_after": 2,
   "max_changed_lines": 3000,
   "skip_drafts": true,
   "skip_bots": true,
