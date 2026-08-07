@@ -819,9 +819,43 @@ check("a narrowed review says so in the transcript, not only in the comment",
 check("the scope line is recognisable to the repost that has to keep it",
       _tx_body[_tx_body.index("---") + 3:].lstrip().startswith(
           vinegar.SCOPE_MARK), _tx_body[:200])
+# Read into a name rather than checked in place. Every call here writes the
+# same repository, number and sha, so they all name one file: a later write
+# overwrites this one, and re-opening the path further down reads whichever
+# transcript was written last.
 _tx_full = GENUINE_SAVE_TRANSCRIPT("o/r", PR, "the words", [], None)
 with open(_tx_full) as _h:
-    check("a full review's transcript claims no scope", "Scope:" not in _h.read())
+    _tx_full_body = _h.read()
+check("a full review's transcript claims no scope",
+      "Scope:" not in _tx_full_body, _tx_full_body[:200])
+# The other narrowing, written for the same reason and lifted by the same
+# code. A blockers-only review delivered from its transcript days later
+# would otherwise arrive as a review that found one thing, rather than one
+# that was only reporting the things that break at runtime.
+_tx_both = GENUINE_SAVE_TRANSCRIPT(
+    "o/r", PR, "the words", [], None,
+    "0123456789abcdef0123456789abcdef01234567", True)
+with open(_tx_both) as _h:
+    _tx_both_body = _h.read()
+check("a blockers-only review says so in the transcript too",
+      vinegar.BLOCKERS_MARK in _tx_both_body, _tx_both_body[:300])
+# Both marks in one block ending at the blank line, because repost() lifts
+# from the separator to the first blank line: a second mark written
+# anywhere else in the file is one repost never finds.
+_tx_block = _tx_both_body[_tx_both_body.index("---") + 3:].lstrip()
+check("the two marks are one block the repost can lift whole",
+      _tx_block.startswith(vinegar.SCOPE_MARK)
+      and vinegar.BLOCKERS_MARK in _tx_block[:_tx_block.index("\n\n")],
+      _tx_block[:300])
+_tx_bl_only = GENUINE_SAVE_TRANSCRIPT("o/r", PR, "the words", [], None,
+                                      None, True)
+with open(_tx_bl_only) as _h:
+    _tx_bl_body = _h.read()
+check("a blockers-only pass that read everything still marks itself",
+      _tx_bl_body[_tx_bl_body.index("---") + 3:].lstrip().startswith(
+          vinegar.BLOCKERS_MARK), _tx_bl_body[:300])
+check("an ordinary review's transcript claims neither",
+      vinegar.BLOCKERS_MARK not in _tx_full_body, _tx_full_body[:200])
 shutil.rmtree(vinegar.REVIEW_DIR, True)
 vinegar.REVIEW_DIR = _saved_dir
 
@@ -1270,11 +1304,12 @@ CHK_CONFIG = dict(CONFIG, github_app={"app_id": 77, "private_key": "/k.pem"})
 CHK_ENV = {"GH_TOKEN": "x"}
 
 
-def _opened(config=None, **stub):
+def _opened(config=None, blockers=False, **stub):
     for name, value in stub.items():
         setattr(fake_run, name, value)
     del checked[:]
-    got = vinegar.open_check(L, "o/r", PR, config or CHK_CONFIG, CHK_ENV)
+    got = vinegar.open_check(L, "o/r", PR, config or CHK_CONFIG, CHK_ENV,
+                             blockers)
     return got
 
 
@@ -1299,6 +1334,17 @@ check("the indicator carries one name and the effort",
       and "high" in _post[0]["output"]["title"], _post[0])
 check("the handle carries the id the caller must close",
       _made and _made["id"] == 4242, _made)
+# The checks list is the half of this an agent reads, and `gh pr checks`
+# saying a review reported nothing means one thing on a first pass and
+# another on a fifth. The comment that explains the narrowing reaches
+# nobody polling the check.
+_opened(blockers=True)
+_bl_post = [asked for how, _, asked in checked if how == "POST"]
+check("a blockers-only review says so in the checks list",
+      _bl_post and "blockers only" in _bl_post[0]["output"]["title"],
+      _bl_post)
+check("an ordinary review's indicator claims no narrowing",
+      "blockers" not in _post[0]["output"]["title"], _post[0])
 def _has_secret(handle):
     """Whether a handle carries anything credential-shaped, at any depth."""
     return any(
@@ -1499,6 +1545,20 @@ check("the retry does not blame anchoring for GitHub's refusal",
       "GitHub refused the inline comments" in posted[1][1]["body"]
       and "could not be anchored" not in posted[1][1]["body"],
       posted[1][1]["body"])
+# The retry rebuilds the body from scratch, so anything the first one said
+# about how the pass was scoped has to be passed in again. This is the
+# comment the author actually gets when the anchors are refused, and it is
+# the only one: a narrowing dropped here is dropped everywhere.
+del posted[:]
+# The literal rather than OLD_SHA, which is bound eighteen hundred lines
+# below this and would be a NameError at module level here.
+vinegar.post_review(L, "o/r", PR, ROOT, text, FINDINGS[:4], CONFIG, None,
+                    since="0123456789abcdef0123456789abcdef01234567",
+                    blockers=True)
+check("the anchor-refused retry still says how the pass was scoped",
+      len(posted) == 2 and "asked for blockers only" in posted[1][1]["body"]
+      and "only what was added since" in posted[1][1]["body"],
+      posted[1][1]["body"][:400] if len(posted) > 1 else posted)
 fake_run.rc = 0
 
 try:
@@ -1631,8 +1691,9 @@ real_env, real_transcript = vinegar.github_env, vinegar.save_transcript
 _tx_calls = []
 
 
-def stub_transcript(repo, pr, text, findings=None, note=None, since=None):
-    _tx_calls.append((repo, pr, text, findings, note, since))
+def stub_transcript(repo, pr, text, findings=None, note=None, since=None,
+                    blockers=False):
+    _tx_calls.append((repo, pr, text, findings, note, since, blockers))
     return "/dev/null"
 
 
@@ -2605,6 +2666,23 @@ check("a boolean is not a number here either",
 check("the numbers as numbers still start",
       _config_with(poll_interval=30, review_timeout=900,
                    max_changed_lines=100) == "started")
+# Its own check rather than the loop's, because null is a value here, and
+# the two failures it catches are different. A string raises TypeError
+# inside blockers_only() on every review; a zero parses and compares
+# perfectly and means a first review that reports only blockers, so the
+# pull request is never told anything smaller and nothing says why.
+check("a blockers_only_after given as a string refuses to start",
+      "whole number of reviews" in _config_with(blockers_only_after="2"),
+      _config_with(blockers_only_after="2"))
+check("a zero blockers_only_after refuses to start",
+      "greater than zero" in _config_with(blockers_only_after=0),
+      _config_with(blockers_only_after=0))
+check("a boolean blockers_only_after is not a number either",
+      "whole number of reviews" in _config_with(blockers_only_after=True),
+      _config_with(blockers_only_after=True))
+check("null blockers_only_after starts, and is how it is turned off",
+      _config_with(blockers_only_after=None) == "started",
+      _config_with(blockers_only_after=None))
 # The effort is not validated again after this: it goes into the prompt as
 # `/code-review <effort> <number>`, so a value the slash command does not
 # know is not refused anywhere downstream. It reviews at whatever the
@@ -3133,7 +3211,7 @@ check("the checkout and review together stay inside a token's life",
 vinegar.github_env = _real_env
 
 # --- reviewer_brief ------------------------------------------------------
-brief = vinegar.reviewer_brief(PR)
+brief = vinegar.reviewer_brief(PR, CONFIG)
 check("brief names the pull request's real base",
       "git diff refs/heads/release-2...HEAD" in brief, brief)
 check("brief tells the reviewer not to fall back to main",
@@ -3294,7 +3372,7 @@ check("a head that has already been reviewed is not diffed against itself",
 reset_stubs()
 
 # --- the brief a re-review gets ------------------------------------------
-again = vinegar.reviewer_brief(PR_SINCE, OLD_SHA)
+again = vinegar.reviewer_brief(PR_SINCE, CONFIG, OLD_SHA)
 check("a re-review names the increment as the review scope",
       "`git diff %s..HEAD` is the review scope" % OLD_SHA in again, again)
 # Two scopes named as the scope is two instructions for one decision, and
@@ -3459,7 +3537,7 @@ def _indicator_after(what, attempts, closes=None):
     del posted[:]
 
     def review_stub(path, repo, pr, config, env, tokens, resent=False,
-                    check=None, since=None):
+                    check=None, since=None, blockers=False):
         checked.append(("REVIEW", "", None))
         if closes:
             vinegar.close_check(L, check, closes, CHK_ENV)
@@ -3468,8 +3546,16 @@ def _indicator_after(what, attempts, closes=None):
         # Never covered. This section is about the indicator backstop, and
         # its DONE case is the ending where the subscription was spent and
         # nothing reached the pull request.
-        return what, False
+        return what, False, what == vinegar.DONE
 
+    # Signature-checked like the save_transcript stub above, and for the
+    # reason written there. A stub that rejects the call it stands in for
+    # sends every check in this section through handle_pr's "the review did
+    # not complete" branch, so three assertions about how an indicator is
+    # closed start reporting on a review that never ran.
+    assert (inspect.signature(review_stub).parameters.keys()
+            == inspect.signature(_real_review).parameters.keys()), \
+        "the review stub no longer matches the real signature"
     vinegar.review = review_stub
     state = {L: {"outcome": vinegar.FAILED, "sha": PR_LIVE["headRefOid"],
                  "attempts": attempts}} if attempts else {}
@@ -3562,7 +3648,7 @@ del checked[:]
 # process that is killed outright rather than raising.
 _hp_state.clear()
 del _hp_saved[:]
-vinegar.review = lambda *a, **k: (vinegar.DONE, True)
+vinegar.review = lambda *a, **k: (vinegar.DONE, True, True)
 vinegar.handle_pr("o/r", PR_LIVE, CONFIG, _hp_state, {})
 check("an attempt is on disk before the review starts",
       len(_hp_saved) == 2 and _hp_saved[0][L]["outcome"] == vinegar.FAILED,
@@ -3573,7 +3659,7 @@ check("the real outcome replaces the marker when the review finishes",
 # A skip must not hand back the retry budget the attempts already burned.
 _sk_state = {L: {"outcome": vinegar.FAILED, "sha": PR["headRefOid"],
                  "attempts": 2}}
-vinegar.review = lambda *a, **k: (vinegar.FAILED, False)
+vinegar.review = lambda *a, **k: (vinegar.FAILED, False, False)
 vinegar.handle_pr("o/r", dict(PR_LIVE, isDraft=True), CONFIG, _sk_state, {})
 check("a skip keeps the attempts burned at this head",
       _sk_state[L]["outcome"] == "skipped"
@@ -3583,7 +3669,7 @@ check("a skip that lifts resumes the budget rather than restarting it",
       _sk_state[L].get("attempts") == 3, _sk_state)
 vinegar.handle_pr("o/r", dict(PR_LIVE, isDraft=True), CONFIG, _sk_state, {})
 _sk_ran = []
-vinegar.review = lambda *a, **k: _sk_ran.append(1) or (vinegar.DONE, True)
+vinegar.review = lambda *a, **k: _sk_ran.append(1) or (vinegar.DONE, True, True)
 vinegar.handle_pr("o/r", PR_LIVE, CONFIG, _sk_state, {})
 check("a lifted skip cannot re-run a review whose budget is spent",
       not _sk_ran, (_sk_state, _sk_ran))
@@ -3723,6 +3809,17 @@ vinegar.handle_pr("o/r", PR_LIVE, CONFIG, _gm_state, {})
 check("a token that cannot be minted counts as an attempt",
       not posted and _gm_state[L].get("announce_tries") == 1,
       (len(posted), _gm_state))
+# The give-up rebuilds the entry like every other path, so it carries the
+# rounds already spent or hands them all back. rounds_done()'s docstring
+# names this case by name: a pull request that reaches MAX_ATTEMPTS once,
+# which is three bad minutes at GitHub, would otherwise go back to
+# reporting everything it finds from then on.
+_gr_state = {L: {"outcome": vinegar.FAILED, "sha": PR["headRefOid"],
+                 "attempts": vinegar.MAX_ATTEMPTS, "rounds": 2}}
+del posted[:]
+vinegar.handle_pr("o/r", PR_LIVE, CONFIG, _gr_state, {})
+check("a give-up does not hand back the rounds already spent",
+      _gr_state[L].get("rounds") == 2, _gr_state)
 vinegar.github_env = lambda *a, **k: None
 
 # A dry run must not tell the live daemon the give-up was already said:
@@ -3755,7 +3852,7 @@ check("a dry run's give-up does not re-announce on every poll",
 _di_state = {L: {"outcome": vinegar.FAILED, "sha": PR["headRefOid"],
                  "attempts": vinegar.MAX_ATTEMPTS - 1}}
 _di_review, _di_checkout = vinegar.review, vinegar.checkout
-vinegar.review = lambda *a, **k: (vinegar.FAILED, False)
+vinegar.review = lambda *a, **k: (vinegar.FAILED, False, False)
 vinegar.checkout = lambda repo, pr, env: ROOT
 del posted[:]
 vinegar.handle_pr("o/r", PR_LIVE, dict(CONFIG, comment=False), _di_state, {})
@@ -3779,7 +3876,7 @@ check("a dry run's give-up counts as said, not as a silence",
 _ck_state = {L: {"outcome": vinegar.FAILED, "sha": PR["headRefOid"],
                  "attempts": 2}}
 _ck_log = []
-vinegar.review = lambda *a, **k: (vinegar.DONE, True)
+vinegar.review = lambda *a, **k: (vinegar.DONE, True, True)
 vinegar.save_state = lambda st: None
 vinegar.github_env = lambda *a, **k: None
 
@@ -3986,7 +4083,7 @@ vinegar.save_transcript = stub_transcript
 claude_run.stream = stream(call(FINDINGS[:1]), result_event())
 _cov_whole = vinegar.review(ROOT, "o/r", PR, CONFIG, None, {})
 check("a review that finished and posted answers that it covered its scope",
-      _cov_whole == (vinegar.DONE, True), _cov_whole)
+      _cov_whole == (vinegar.DONE, True, True), _cov_whole)
 
 # A run cut off part-way still posts what it had, and still answers DONE.
 reset_stubs()
@@ -3995,7 +4092,7 @@ vinegar.save_transcript = stub_transcript
 claude_run.stream = stream(call(FINDINGS[:1]))
 _cov_part = vinegar.review(ROOT, "o/r", PR, CONFIG, None, {})
 check("a run cut off part-way is done but does not claim to have covered",
-      _cov_part == (vinegar.DONE, False), _cov_part)
+      _cov_part == (vinegar.DONE, False, True), _cov_part)
 
 # And a dry run, which answers POSTED for correctly posting nothing.
 reset_stubs()
@@ -4005,7 +4102,14 @@ claude_run.stream = stream(call(FINDINGS[:1]), result_event())
 _cov_dry = vinegar.review(ROOT, "o/r", PR, dict(CONFIG, comment=False),
                           None, {})
 check("a dry run covers nothing, because nobody was shown anything",
-      _cov_dry == (vinegar.DONE, False), _cov_dry)
+      _cov_dry == (vinegar.DONE, False, False), _cov_dry)
+# And reaches nobody, which is the separate half. post_review answers
+# POSTED for a dry run, for having correctly posted nothing, so counting
+# a round off the outcome narrowed a dry daemon's own later passes, and
+# a dry run's transcript is its entire output, so the findings it then
+# left out existed nowhere at all.
+check("a dry run reaches nobody, so it is not a round either",
+      _cov_dry[2] is False, _cov_dry)
 
 # A note is anything the pull request should be told, which is not the
 # same as being cut short. Reading completeness off it turned the
@@ -4019,7 +4123,7 @@ claude_run.stream = _answers(
     stream(NOT_FOUND), stream(call(FINDINGS[:1]), result_event()))
 _cov_fell_back = vinegar.review(ROOT, "o/r", PR, FALLING_BACK, None, {})
 check("a review that fell back and finished still covered its scope",
-      _cov_fell_back == (vinegar.DONE, True), _cov_fell_back)
+      _cov_fell_back == (vinegar.DONE, True, True), _cov_fell_back)
 
 # A run can end cleanly having narrated instead of calling the reporting
 # tool. Its prose reaches the pull request; its findings never existed.
@@ -4029,7 +4133,7 @@ vinegar.save_transcript = stub_transcript
 claude_run.stream = stream(result_event())
 _cov_no_tool = vinegar.review(ROOT, "o/r", PR, CONFIG, None, {})
 check("a run that reported no findings at all has covered nothing",
-      _cov_no_tool == (vinegar.DONE, False), _cov_no_tool)
+      _cov_no_tool == (vinegar.DONE, False, True), _cov_no_tool)
 
 # A run that failed holding findings posts them, because they are paid for
 # and real, and is still not a whole reading of the scope. This is the
@@ -4041,7 +4145,7 @@ vinegar.save_transcript = stub_transcript
 claude_run.stream = stream(call(FINDINGS[:1]), result_event(is_error=True))
 _cov_err = vinegar.review(ROOT, "o/r", PR, CONFIG, None, {})
 check("a run that failed holding findings posts them but covered nothing",
-      _cov_err == (vinegar.DONE, False), _cov_err)
+      _cov_err == (vinegar.DONE, False, True), _cov_err)
 
 # finish() has to hand the scope on. The sentence lived only in the review
 # comment, so a refused review that repost() later delivered from the
@@ -4075,11 +4179,15 @@ AGAIN_CFG = dict(CONFIG, review_on_push=True)
 _ag_saves = []
 
 
-def _second_pass(entry, config=None, review=None):
+def _second_pass(entry, config=None, review=None, checkout=None):
     """One handle_pr over a pull request that was reviewed at OLD_SHA."""
     reset_stubs()
     del _ag_saves[:]
-    vinegar.checkout = lambda repo, pr, env: ROOT
+    # After reset_stubs, not before it: reset_stubs puts the genuine
+    # functions back, so a caller that stubbed the checkout on its own
+    # would watch this line overwrite it and then assert on a pass that
+    # checked out perfectly well.
+    vinegar.checkout = checkout or (lambda repo, pr, env: ROOT)
     vinegar.github_env = lambda *a, **k: {"GH_TOKEN": "x"}
     # Every save, deep-copied. handle_pr writes the entry twice, once
     # before the review and once after, and the two are the same mutable
@@ -4129,7 +4237,7 @@ def _could_not_post(*a, **k):
     os.makedirs(vinegar.REVIEW_DIR, exist_ok=True)
     with open(vinegar.unposted_path("o/r", PR_AGAIN), "w") as handle:
         handle.write("%s\n" % NEW_SHA)
-    return vinegar.DONE, False
+    return vinegar.DONE, False, False
 
 
 # DONE is not the same as posted. deliver() keeps the outcome DONE whatever
@@ -4153,7 +4261,7 @@ check("a failed review does not move where the next one starts",
 # next pass, which would then read an increment against a starting point
 # nobody was ever shown.
 _ag_dry = _second_pass(REVIEWED, config=dict(AGAIN_CFG, comment=False),
-                       review=lambda *a, **k: (vinegar.DONE, False))
+                       review=lambda *a, **k: (vinegar.DONE, False, True))
 check("a dry run does not move where the next one starts",
       _ag_dry.get("reviewed_sha") == OLD_SHA, _ag_dry)
 
@@ -4170,6 +4278,208 @@ _ag_first = _second_pass({})
 check("a first pass is not narrowed by an entry that has no commit in it",
       "This is a re-review" not in claude_run.saw[
           claude_run.saw.index("--append-system-prompt") + 1])
+
+# --- a later review reports only blockers --------------------------------
+# Nothing stops re-reviewing a pull request, on purpose: a branch under
+# heavy rework is the last one worth going quiet about. What changes after
+# the first few rounds is what gets reported, so the author is not handed
+# the same list of small findings on every push.
+check("the round after the configured count is where blockers-only starts",
+      not vinegar.blockers_only(2, AGAIN_CFG)
+      and vinegar.blockers_only(3, AGAIN_CFG),
+      [vinegar.blockers_only(n, AGAIN_CFG) for n in (1, 2, 3)])
+# Off the by-one that matters. Reading the count as reviews already done
+# rather than as the review about to run narrows a round early, and that
+# round's small findings are ones nobody is ever shown.
+check("the first review is never blockers-only",
+      not vinegar.blockers_only(1, dict(AGAIN_CFG, blockers_only_after=1)))
+check("null is how blockers-only is turned off",
+      not vinegar.blockers_only(99, dict(AGAIN_CFG, blockers_only_after=None)))
+
+# The counter is per pull request, not per commit, which is the whole
+# difference between it and `attempts`. Every rebuild of an entry has to
+# carry it: the head moving is the normal way a round ends.
+_rd_first = _second_pass(REVIEWED)
+check("a review that ran counts a round",
+      _rd_first.get("rounds") == 1, _rd_first)
+_rd_third = _second_pass(dict(REVIEWED, rounds=2))
+check("a round is counted on top of the rounds already recorded",
+      _rd_third.get("rounds") == 3, _rd_third)
+# FAILED is already bounded by MAX_ATTEMPTS. Charging a round for one lets
+# three bad minutes at GitHub decide that the next real review of that pull
+# request reports only blockers.
+_rd_failed = _second_pass(dict(REVIEWED, rounds=1),
+                          review=lambda *a, **k: (vinegar.FAILED, False, False))
+check("a failed review does not count a round",
+      _rd_failed.get("rounds") == 1, _rd_failed)
+# The three rebuilds that are not reviews. Any one of them dropping the
+# count hands back every round already spent, and a pull request that draws
+# one draft toggle or one bad clone goes back to reporting everything.
+_rd_skipped = _second_pass(dict(REVIEWED, rounds=2),
+                           config=dict(AGAIN_CFG, authors=["nobody"]))
+check("a skip does not hand back the rounds already spent",
+      _rd_skipped.get("rounds") == 2, _rd_skipped)
+# DONE is not the same as posted. deliver() keeps the outcome DONE
+# whatever the posting answered, so a review GitHub refused arrives here
+# looking exactly like one that landed. Counting it means round three
+# telling an author that the first two "reported everything they found,
+# and those findings are on the pull request already" on a pull request
+# carrying nothing at all.
+_rd_unposted = _second_pass(dict(REVIEWED, rounds=1), review=_could_not_post)
+check("a review that reached nobody does not count a round",
+      _rd_unposted.get("rounds") == 1, _rd_unposted)
+vinegar.forget(vinegar.unposted_path("o/r", PR_AGAIN))
+
+
+def _saved_nothing_either(*a, **k):
+    """Spent the subscription, posted nothing, saved nothing.
+
+    The path a reviews directory left root-owned by one `sudo` run
+    produces. It leaves no marker, so any test of "did this reach the
+    author" that reads the filesystem calls it a round the author never
+    saw. review() answers it instead, which is why this stub can say so.
+    """
+    return vinegar.DONE, False, False
+
+
+_rd_nothing = _second_pass(dict(REVIEWED, rounds=1),
+                           review=_saved_nothing_either)
+check("a review that saved nothing either does not count a round",
+      _rd_nothing.get("rounds") == 1, _rd_nothing)
+# A dry run posts nothing by definition and post_review answers POSTED for
+# it, so counting the outcome made every dry pass a round. A dry daemon
+# would then narrow its own third review, and its transcript is the whole
+# of what it produces.
+_rd_dry = _second_pass(dict(REVIEWED, rounds=1),
+                       config=dict(AGAIN_CFG, comment=False))
+check("a dry run does not count a round",
+      _rd_dry.get("rounds") == 1, _rd_dry)
+
+
+def _checkout_fails(repo, pr, env):
+    raise RuntimeError("clone failed")
+
+
+_rd_broken = _second_pass(dict(REVIEWED, rounds=2), checkout=_checkout_fails)
+check("a failed checkout does not hand back the rounds already spent",
+      _rd_broken.get("rounds") == 2 and _rd_broken.get("outcome") == "checkout",
+      _rd_broken)
+# And the marker written before the review runs, which is what a process
+# killed mid-review leaves behind. Counting the round there would charge
+# for a review that never reported anything, and dropping the carry would
+# hand back every round the pull request had already spent.
+#
+# Read off a pass that reached the marker. A failed checkout returns from
+# record_once and never gets that far, so taking the saves from the run
+# above tested record_once's copy twice and left this one covered by
+# nothing at all.
+_rd_marker = _second_pass(dict(REVIEWED, rounds=2))
+check("the marker written before the review has not counted the round yet",
+      len(_ag_saves) > 1 and _ag_saves[0][L].get("rounds") == 2,
+      _ag_saves[:1])
+check("the marker written before the review keeps the rounds already spent",
+      _rd_marker.get("rounds") == 3, (_ag_saves[:1], _rd_marker))
+
+# What the reviewer is actually told, which is the whole feature. A filter
+# applied to the tiers afterwards would not do: the severity pass reads a
+# one-line summary with no code in front of it, and dropping a finding the
+# reviewer read the code and chose to report is the wrong way round.
+#
+# Read off the pass above rather than run again. It is the same entry and
+# the same config, so a second call drove a whole handle_pr (the stubbed
+# reviewer, the transcript, the posting) for values identical to the ones
+# already in hand, on every one of mutate.py's ~190 runs.
+_bl_brief = claude_run.saw[claude_run.saw.index("--append-system-prompt") + 1]
+# Snapshotted here. Every _second_pass starts with reset_stubs, which
+# empties `posted`, so asserting on it after the round-2 run below reports
+# on the review that was deliberately not narrowed.
+_bl_posted = [body["body"] for _cmd, body in posted]
+check("a later review is told to report only blockers",
+      "reports only blockers" in _bl_brief, _bl_brief)
+# The transcript is told too, and read off the file the pass actually
+# wrote rather than off a direct call to save_transcript. The wire from
+# review() through finish() carried `since` under two guards and
+# `blockers` under none, so dropping it there left BLOCKERS_MARK on no
+# transcript any real review produced — and the repost that delivers a
+# refused review days later reads the mark, not the flag.
+with open(vinegar.transcript_path("o/r", PR_AGAIN)) as _h:
+    _bl_tx = _h.read()
+check("the transcript of a blockers-only review is told it was one",
+      vinegar.BLOCKERS_MARK in _bl_tx, _bl_tx[:300])
+# Narrowing what is reported must not narrow what is read. A reviewer told
+# to look only for blockers reads less carefully and finds fewer of them,
+# and that judgement is the expensive thing this program buys.
+check("a blockers-only review still reads and judges everything",
+      "as carefully as you would on any other pass" in _bl_brief, _bl_brief)
+# The measured failure of the severity pass was inflation: asked to justify
+# a tier it invented a harm for every finding and promoted more of them. A
+# reviewer that believes it must hand something back has that incentive and
+# a whole pull request to find something in.
+check("a blockers-only review is told that finding nothing is expected",
+      "Reporting no findings at all is the expected outcome" in _bl_brief,
+      _bl_brief)
+# It has to answer the reporting contract rather than be answered by it.
+# That paragraph ends "a finding you leave out of it is a finding nobody
+# sees", which is the one sentence in the brief arguing against leaving
+# anything out.
+
+
+
+def _in_order(text, first, second):
+    """Whether both are there and in that order, without raising if not.
+
+    `.index` on a missing phrase raises, and a check that raises ends the
+    run where it stands rather than failing: every check below it is
+    skipped, and the mutation that removed the phrase comes back ABORTED,
+    which says nothing about whether anything was guarding it.
+    """
+    at, then = text.find(first), text.find(second)
+    return at != -1 and then != -1 and at < then
+
+
+check("the narrowing comes after the sentence it has to qualify",
+      _in_order(_bl_brief, "a finding nobody sees",
+                "leave out everything that is not one"), _bl_brief)
+_second_pass(dict(REVIEWED, rounds=1))
+check("the rounds before the cut are told nothing about blockers",
+      "blockers" not in claude_run.saw[
+          claude_run.saw.index("--append-system-prompt") + 1])
+# A reviewer working to a wider definition than the tier that orders these
+# findings reports things the tally then counts as advisory: a pull request
+# told it is seeing blockers only, under a list of what Vinegar calls
+# smaller. The two prompts are separate because SEVERITY_PROMPT is measured
+# and not worth rewording, so this is what holds them together.
+#
+# Whitespace-normalised on both sides. SEVERITY_PROMPT lays its tiers out
+# as an indented table, so "a crash" is written across a line break there
+# and a plain substring test passes for the wrong reason: it finds the
+# phrases that happen not to wrap and misses the ones that do.
+_bl_text = " ".join(vinegar.blockers_brief(AGAIN_CFG).split())
+_bl_sev = " ".join(vinegar.SEVERITY_PROMPT.split())
+check("the reviewer and the severity pass mean the same by blocker",
+      all(harm in _bl_text and harm in _bl_sev
+          for harm in ("a wrong result", "lost data", "a security hole",
+                       "a hang", "a crash",
+                       "a failure that happens silently")), _bl_text)
+check("both refuse the same things as blockers whatever their severity",
+      all(never in _bl_text and never in _bl_sev
+          for never in ("missing test", "stale comment", "duplicated helper",
+                        "wasted cycle")), _bl_text)
+
+# And what the pull request is told, because "no findings" means a
+# different thing here. Without it a quiet later review reads as the change
+# being clean when it only means nothing in it breaks at runtime.
+check("the pull request is told that smaller findings were held back",
+      any("asked for blockers only" in body for body in _bl_posted), _bl_posted)
+check("it names the number rather than leaving the author to guess",
+      any("first 2 reviews" in body for body in _bl_posted), _bl_posted)
+_bl_body = vinegar.review_body(L, PR, CONFIG, [], [], since=OLD_SHA,
+                               blockers=True)
+check("what was read is said before what was reported from it",
+      _in_order(_bl_body, "only what was added since",
+                "asked for blockers only"), _bl_body)
+check("an ordinary review says none of it",
+      "blockers" not in vinegar.review_body(L, PR, CONFIG, [], []))
 
 (vinegar.review, vinegar.checkout, vinegar.github_env, vinegar.save_state,
  vinegar.run) = _ag_real
@@ -4519,7 +4829,7 @@ check("a failed attempt's transcript does not claim to be a review",
 _gu_state = {L: {"outcome": vinegar.FAILED, "sha": PR["headRefOid"],
                  "attempts": vinegar.MAX_ATTEMPTS - 1}}
 _real_review2 = vinegar.review
-vinegar.review = lambda *a, **k: (vinegar.FAILED, False)
+vinegar.review = lambda *a, **k: (vinegar.FAILED, False, False)
 vinegar.checkout = lambda repo, pr, env: ROOT
 vinegar.save_state = lambda st: None
 del posted[:]
@@ -4734,7 +5044,7 @@ _pr_real = (vinegar.review, vinegar.find_pr, vinegar.checkout,
 os.makedirs(os.environ["VINEGAR_HOME"], exist_ok=True)
 with open(os.path.join(os.environ["VINEGAR_HOME"], "config.json"), "w") as h:
     json.dump({"repos": ["o/r"]}, h)
-vinegar.review = lambda *a, **k: _pr_kw.update(k) or (vinegar.DONE, True)
+vinegar.review = lambda *a, **k: _pr_kw.update(k) or (vinegar.DONE, True, True)
 vinegar.find_pr = lambda repo, number, env: PR_LIVE
 vinegar.checkout = lambda repo, pr, env: ROOT
 vinegar.github_env = lambda *a, **k: None
@@ -4755,7 +5065,7 @@ check("a --pr run posts what it reviewed rather than deferring",
       _pr_kw.get("resent") in (None, False), _pr_kw)
 
 
-def _hand_scoped(entry, argv=("vinegar.py", "--pr", "o/r#12")):
+def _hand_scoped(entry, argv=("vinegar.py", "--pr", "o/r#12"), review=None):
     """What `--pr` scopes itself to, and what it records afterwards.
 
     The manual half of the narrowing was reachable by no check and anchored
@@ -4767,7 +5077,8 @@ def _hand_scoped(entry, argv=("vinegar.py", "--pr", "o/r#12")):
     kept = (vinegar.review, vinegar.find_pr, vinegar.checkout,
             vinegar.github_env, vinegar.save_transcript, sys.argv)
     seen = {}
-    vinegar.review = lambda *a, **k: seen.update(k) or (vinegar.DONE, True)
+    vinegar.review = review or (
+        lambda *a, **k: seen.update(k) or (vinegar.DONE, True, True))
     vinegar.find_pr = lambda repo, number, env: dict(PR_LIVE,
                                                      headRefOid=NEW_SHA)
     vinegar.checkout = lambda repo, pr, env: ROOT
@@ -4802,6 +5113,51 @@ check("--whole still records where this review got to",
 _hn_seen, _hn_state = _hand_scoped({})
 check("a hand run with nothing reviewed before it reads the whole thing",
       _hn_seen.get("since") is None, _hn_seen)
+
+# The other half of the manual path, and it shipped the same way the
+# scoping half did: the round count, the narrowing it decides and the
+# round it records were all reachable by no check. This harness only ever
+# passed entries without `rounds`, so `blockers` was False on every hand
+# run and every line computing it could have been deleted.
+_hb_seen, _hb_state = _hand_scoped(dict(REVIEWED, rounds=2))
+check("a hand run narrows to blockers on the round the daemon would",
+      _hb_seen.get("blockers") is True, _hb_seen)
+check("a hand run counts the round it just spent",
+      _hb_state.get("rounds") == 3, _hb_state)
+_he_seen, _ = _hand_scoped(dict(REVIEWED, rounds=1))
+check("a hand run before the cut still reports everything",
+      _he_seen.get("blockers") is False, _he_seen)
+# `--whole` is the only way out of this, and there is no second flag. An
+# operator hand-running a fourth review wants all of it: a review scoped
+# to everything that still withholds anything smaller than a blocker is
+# not the whole review its own flag promises.
+_hwb_seen, _hwb_state = _hand_scoped(
+    dict(REVIEWED, rounds=2), ("vinegar.py", "--pr", "o/r#12", "--whole"))
+check("--whole opts out of the blockers narrowing as well as the scope",
+      _hwb_seen.get("blockers") is False and _hwb_seen.get("since") is None,
+      _hwb_seen)
+check("--whole still counts the round it spent",
+      _hwb_state.get("rounds") == 3, _hwb_state)
+
+
+def _hand_could_not_post(*a, **k):
+    """A hand run that spent the subscription and reached nobody."""
+    os.makedirs(vinegar.REVIEW_DIR, exist_ok=True)
+    with open(vinegar.unposted_path("o/r", dict(PR_LIVE, headRefOid=NEW_SHA)),
+              "w") as handle:
+        handle.write("%s\n" % NEW_SHA)
+    return vinegar.DONE, False, False
+
+
+# The same rule as the daemon's, and it needed saying here too: a hand run
+# answers DONE whatever the posting did, so counting on the outcome alone
+# charges a round for a review the author never saw.
+_, _hu_state = _hand_scoped(dict(REVIEWED, rounds=1),
+                            review=_hand_could_not_post)
+check("a hand run that reached nobody does not count a round",
+      _hu_state.get("rounds") == 1, _hu_state)
+vinegar.forget(vinegar.unposted_path("o/r", dict(PR_LIVE,
+                                                 headRefOid=NEW_SHA)))
 
 # Refused rather than ignored. `--whole` is read only by the --pr branch,
 # so as a bare flag it was accepted, did nothing, and said nothing: an
@@ -4858,11 +5214,11 @@ def _hand_run(review_stub, app=True):
 # A hand run is minutes of silence on a real pull request too, and this
 # whole path was reachable by no check and anchored by no mutation: it
 # could have been deleted outright with the suite green.
-_hand_done = _hand_run(lambda *a, **k: (vinegar.DONE, True))
+_hand_done = _hand_run(lambda *a, **k: (vinegar.DONE, True, True))
 check("a hand run opens and finishes the indicator too",
       _hand_done == ["The review ran but nothing reached the pull request"],
       _hand_done)
-_hand_failed = _hand_run(lambda *a, **k: (vinegar.FAILED, False))
+_hand_failed = _hand_run(lambda *a, **k: (vinegar.FAILED, False, False))
 check("a hand run that failed says so on the indicator",
       _hand_failed == ["The review failed"], _hand_failed)
 
@@ -4899,7 +5255,7 @@ def _review_that_could_not_post(*a, **k):
     os.makedirs(vinegar.REVIEW_DIR, exist_ok=True)
     with open(_mr_marker, "w") as handle:
         handle.write("%s\n" % PR_LIVE["headRefOid"])
-    return vinegar.DONE, True
+    return vinegar.DONE, False, False
 
 
 vinegar.review = _review_that_could_not_post
@@ -4925,7 +5281,7 @@ vinegar.forget(_mr_marker)
 # meant the daemon reviewed the same head a minute later at full cost
 # and posted a second complete review, because its first attempt does
 # not ask GitHub — the state file is what usually tells it.
-vinegar.review = lambda *a, **k: (vinegar.DONE, True)
+vinegar.review = lambda *a, **k: (vinegar.DONE, True, True)
 vinegar.find_pr = lambda repo, number, env: PR_LIVE
 vinegar.checkout = lambda repo, pr, env: ROOT
 vinegar.github_env = lambda *a, **k: None
@@ -4945,7 +5301,7 @@ check("a manual run that posted is recorded, so the daemon does not repeat it",
 # And a manual review that never ran is recorded as failed, not done.
 # Written as DONE, the daemon returns at the DONE check for ever and the
 # pull request is closed off with no comment and no retry.
-vinegar.review = lambda *a, **k: (vinegar.FAILED, False)
+vinegar.review = lambda *a, **k: (vinegar.FAILED, False, False)
 vinegar.find_pr = lambda repo, number, env: PR_LIVE
 vinegar.checkout = lambda repo, pr, env: ROOT
 vinegar.github_env = lambda *a, **k: None
@@ -5077,7 +5433,7 @@ _flag_real = (vinegar.review, vinegar.checkout, vinegar.save_state)
 def _review_that_leaves_a_marker(*a, **k):
     with open(_flag_marker, "w") as handle:
         handle.write("%s\n" % PR_FLAG["headRefOid"])
-    return vinegar.DONE, False
+    return vinegar.DONE, False, False
 
 
 vinegar.review = _review_that_leaves_a_marker
@@ -5155,14 +5511,14 @@ vinegar.forget(vinegar.unposted_path("o/r", PR_TIER))
 _titles = []
 
 
-def _titled(findings, note=None, sha="d0d0d0d0d0d0"):
+def _titled(findings, note=None, sha="d0d0d0d0d0d0", blockers=False):
     handle = {"repo": "o/r", "id": 7, "closed": False}
     del checked[:]
     at = dict(PR_LIVE, headRefOid=sha)
     fake_run.rc, fake_run.post_err = 0, ""
     vinegar.run = _run_and_tier
     vinegar.finish(L, "o/r", at, ROOT, "words", findings, CONFIG, None, {},
-                   note, check=handle)
+                   note, check=handle, blockers=blockers)
     vinegar.run = fake_run
     vinegar.forget(vinegar.unposted_path("o/r", at))
     said = [asked for how, _, asked in checked if how == "PATCH"]
@@ -5186,6 +5542,22 @@ check("a review that did not finish says so in the checks list",
 check("one finding is not reported as 1 findings",
       _titled(_tier_found[:1], sha="ee00ee00ee00").startswith("1 finding ("),
       _titles[-1])
+# The narrowing has to survive into the closed title. open_check puts it in
+# the running one, this overwrites that title, and the one left behind is
+# what stands for the rest of the pull request's life: without it "No
+# findings" from a blockers-only fifth round is the same six characters as
+# "No findings" from a first review that read everything, and `gh pr
+# checks` is where an agent reads it.
+check("a blockers-only review says so in the finished check too",
+      _titled([], sha="ff00ff00ff00", blockers=True)
+      == "No findings, reporting blockers only", _titles[-1])
+check("an ordinary review's finished check claims no narrowing",
+      "blockers" not in _titled([], sha="ab00ab00ab00"), _titles[-1])
+# The note stays last, because it is the caveat that most changes how the
+# rest of the title reads.
+check("a narrowed run that was killed still says it was killed, last",
+      _titled(_tier_found, note="killed at 30 minutes", sha="ac00ac00ac00",
+              blockers=True).endswith("did not finish"), _titles[-1])
 
 fake_run.rc, fake_run.post_err = 1, "HTTP 403 Resource not accessible"
 # This block's ambiguous post consulted the landed-review read; the
@@ -5334,7 +5706,7 @@ _rerun = {_rerun_key: {"outcome": vinegar.FAILED,
                        "post_tries": 2}}
 _rerun_real = (vinegar.review, vinegar.checkout, vinegar.save_state)
 _rerun_saved = []
-vinegar.review = lambda *a, **k: (vinegar.DONE, True)
+vinegar.review = lambda *a, **k: (vinegar.DONE, True, True)
 vinegar.checkout = lambda repo, pr, env: ROOT
 vinegar.save_state = lambda st: _rerun_saved.append(dict(st[_rerun_key]))
 vinegar.handle_pr("o/r", PR_RERUN, CONFIG, _rerun, {})
@@ -5356,7 +5728,7 @@ check("the marker written before a review starts it over too",
 _moved_budget = {_rerun_key: {"outcome": vinegar.DONE, "sha": "0ldhead0",
                               "attempts": 1,
                               "post_tries": vinegar.MAX_ATTEMPTS}}
-vinegar.review = lambda *a, **k: (vinegar.DONE, True)
+vinegar.review = lambda *a, **k: (vinegar.DONE, True, True)
 vinegar.checkout = lambda repo, pr, env: ROOT
 vinegar.save_state = lambda st: None
 vinegar.handle_pr("o/r", PR_RERUN, dict(CONFIG, review_on_push=True),
@@ -5463,7 +5835,7 @@ _gone = vinegar.read_mark
 _gone_review, _gone_checkout = vinegar.review, vinegar.checkout
 vinegar.read_mark = lambda path: None
 vinegar.checkout = lambda repo, pr, env: ROOT
-vinegar.review = lambda *a, **k: (vinegar.DONE, True)
+vinegar.review = lambda *a, **k: (vinegar.DONE, True, True)
 _gone_state = {}
 del posted[:]
 vinegar.handle_pr("o/r", PR_LOST, CONFIG, _gone_state, {})
@@ -5564,6 +5936,13 @@ check("an oversized saved review keeps its findings, not its narration",
       and "## Findings" in posted[0][1]["body"]
       and "the beginning was cut" in posted[0][1]["body"],
       len(posted[0][1]["body"]) if posted else "nothing posted")
+# The round the refused review never got. handle_pr deliberately does not
+# count one for a review whose findings did not land, so this send is the
+# moment the author is finally shown something, and the only one: the
+# marker is forgotten on the next line. Missed here, a pull request whose
+# posting failed twice would report everything for ever.
+check("the send that finally lands counts the round it never got",
+      _big_state[_lost_key].get("rounds") == 1, _big_state)
 check("a posted saved review stops arming the directory scan",
       _big_state[_lost_key].get("unposted") is None, _big_state)
 
@@ -5588,6 +5967,54 @@ check("an oversized narrowed review still says what it read",
       and "only what was added since `0123456`" in posted[0][1]["body"]
       and "## Findings" in posted[0][1]["body"],
       posted[0][1]["body"][:300] if posted else "nothing posted")
+
+# Both marks arrive, which is the cheap half of this and does not by
+# itself prove the lift matches either one: they are joined by a single
+# newline, so `find("\n\n")` runs past both whichever mark sat at the
+# start. The case that actually holds the lift honest is the blockers-only
+# transcript below, which has no scope line in front of it. Kept for the
+# shape both-marks-at-once produces, not as the guard.
+vinegar.save_transcript("o/r", PR_LOST, "narration " * 9000, FINDINGS[:1],
+                        None, "0123456789abcdef0123456789abcdef01234567",
+                        True)
+with open(_lost_marker, "w") as h:
+    h.write("%s\n" % PR_LOST["headRefOid"])
+_both_state = {_lost_key: {"outcome": vinegar.DONE,
+                           "sha": PR_LOST["headRefOid"], "attempts": 1,
+                           "unposted": True}}
+fake_run.rc = 0
+del posted[:]
+vinegar.handle_pr("o/r", PR_LOST, CONFIG, _both_state, {})
+check("an oversized blockers-only review still says what it reported",
+      len(posted) == 1
+      and len(posted[0][1]["body"]) <= vinegar.MAX_BODY
+      and "only what was added since `0123456`" in posted[0][1]["body"]
+      and vinegar.BLOCKERS_MARK in posted[0][1]["body"]
+      and "## Findings" in posted[0][1]["body"],
+      posted[0][1]["body"][:400] if posted else "nothing posted")
+
+# And the same review with nothing else in front of it. With both marks
+# written the block runs to the same blank line whichever one is matched,
+# so a lift that recognises only the scope line passes the case above for
+# the wrong reason. This is the transcript that has no scope line to carry
+# the blockers line for it: a pass that read the whole pull request and
+# reported only what breaks at runtime.
+vinegar.save_transcript("o/r", PR_LOST, "narration " * 9000, FINDINGS[:1],
+                        None, None, True)
+with open(_lost_marker, "w") as h:
+    h.write("%s\n" % PR_LOST["headRefOid"])
+_bl_alone = {_lost_key: {"outcome": vinegar.DONE,
+                         "sha": PR_LOST["headRefOid"], "attempts": 1,
+                         "unposted": True}}
+fake_run.rc = 0
+del posted[:]
+vinegar.handle_pr("o/r", PR_LOST, CONFIG, _bl_alone, {})
+check("an oversized blockers-only review that read it all says so too",
+      len(posted) == 1
+      and len(posted[0][1]["body"]) <= vinegar.MAX_BODY
+      and vinegar.BLOCKERS_MARK in posted[0][1]["body"]
+      and "## Findings" in posted[0][1]["body"],
+      posted[0][1]["body"][:400] if posted else "nothing posted")
 
 # The reviewer writes its own summary and it goes into the transcript
 # verbatim, so a paragraph of it beginning "Scope: " must not be mistaken

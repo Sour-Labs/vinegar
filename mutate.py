@@ -415,9 +415,9 @@ MUTATIONS = [
     ("severity-tally-passed-to-the-body",
      "                                   note=note, verb=verb,\n"
      "                                   tally=severity_tally(findings),\n"
-     "                                   since=since)}",
+     "                                   since=since, blockers=blockers)}",
      "                                   note=note, verb=verb,\n"
-     "                                   since=since)}"),
+     "                                   since=since, blockers=blockers)}"),
 
     # What a findings prompt can carry into argv. One entry per condition
     # exec imposes, plus the choice the code argues for at length: a NUL
@@ -651,13 +651,14 @@ MUTATIONS = [
      '            == config["github_app"].get("app_id") and was.get("id")]'),
     # Opening it is the one call here that parses a reply GitHub sent.
     ("check-opened-inside-the-try",
-     "        check = open_check(key, repo, pr, config, env)\n"
+     "        check = open_check(key, repo, pr, config, env, blockers)\n"
      "        try:",
      "        try:"),
     # The hand-run path: reachable by no check and anchored by no
     # mutation until the second pass said so.
     ("check-hand-run-opens-one",
-     "                hand = open_check(args.pr, repo, pr, config, env)",
+     "                hand = open_check(args.pr, repo, pr, config, env, "
+     "blockers)",
      "                hand = None"),
     ("check-hand-run-closes-it",
      "                close_check(args.pr, hand, ended_title(outcome),",
@@ -741,8 +742,10 @@ MUTATIONS = [
 
     # --- telling the reviewer, and telling the pull request ------------
     ("brief-since",
-     '           "--append-system-prompt", reviewer_brief(pr, since),',
-     '           "--append-system-prompt", reviewer_brief(pr),'),
+     '           "--append-system-prompt", reviewer_brief(pr, config, since,\n'
+     '                                                    blockers),',
+     '           "--append-system-prompt", reviewer_brief(pr, config, None,\n'
+     '                                                    blockers),'),
     ("brief-scope-name",
      '           "the pull request\'s full diff" if since '
      'else "the review scope",',
@@ -784,10 +787,10 @@ MUTATIONS = [
      "    deliver(text, findings, \" \".join(notes) or None, whole=whole)",
      "    deliver(text, findings, \" \".join(notes) or None, whole=True)"),
     ("covered-needs-the-post-to-land",
-     "                note, resent=resent, check=check, since=since)) "
-     "== POSTED:",
-     "                note, resent=resent, check=check, since=since)) "
-     "or True:"),
+     "                note, resent=resent, check=check, since=since,\n"
+     "                blockers=blockers)) == POSTED:",
+     "                note, resent=resent, check=check, since=since,\n"
+     "                blockers=blockers)) or True:"),
     # The two the third review found anchored by nothing.
     ("load-state-drops-the-entry",
      '                    del done["reviewed_sha"]',
@@ -818,12 +821,14 @@ MUTATIONS = [
     # --- saying so where a repost will find it -------------------------
     ("transcript-says-the-scope",
      "    if since:\n"
-     '        body = "%s`%s`.\\n\\n%s" % (SCOPE_MARK, since[:7], body)',
-     "    pass"),
+     "        marks.append(\"%s`%s`.\" % (SCOPE_MARK, since[:7]))",
+     "    if False:\n"
+     "        marks.append(\"%s`%s`.\" % (SCOPE_MARK, since[:7]))"),
     ("transcript-gets-the-scope",
-     "            label, save_transcript(repo, pr, text, findings, note, "
-     "since))))",
-     "            label, save_transcript(repo, pr, text, findings, note))))"),
+     "            label, save_transcript(repo, pr, text, findings, note, since,\n"
+     "                                   blockers))))",
+     "            label, save_transcript(repo, pr, text, findings, note,\n"
+     "                                   blockers=blockers))))"),
 
     # --- the brief's two instructions for one decision -----------------
     ("brief-no-contradictory-give-up",
@@ -837,18 +842,18 @@ MUTATIONS = [
 
     # --- the manual half, which no check reached before ----------------
     ("hand-run-since",
-     "                outcome, covered = review(where, repo, pr, config, env,\n"
-     "                                          tokens, check=hand, "
-     "since=since)",
-     "                outcome, covered = review(where, repo, pr, config, env,\n"
-     "                                          tokens, check=hand)"),
+     "                    where, repo, pr, config, env, tokens, check=hand,\n"
+     "                    since=since, blockers=blockers)",
+     "                    where, repo, pr, config, env, tokens, check=hand,\n"
+     "                    blockers=blockers)"),
     ("hand-run-whole-flag",
      "            since = None if args.whole else review_scope(",
      "            since = None or review_scope("),
     ("hand-run-records-the-start",
      "                           **reviewed_through(covered, pr[\"headRefOid\"],\n"
-     "                                              was)))",
-     "                           ))"),
+     "                                              was),\n"
+     "                           **rounds_done(reached, was)))",
+     "                           **rounds_done(reached, was)))"),
 
     ("anchors-from-the-base",
      '            findings, diff_lines(path, pr["baseRefName"], env, label), '
@@ -880,7 +885,8 @@ MUTATIONS = [
      "            sep = body.find(TRANSCRIPT_SEP)\n"
      "            starts = sep + len(TRANSCRIPT_SEP) if sep != -1 else -1\n"
      '            end = (body.find("\\n\\n", starts)\n'
-     "                   if starts != -1 and body.startswith(SCOPE_MARK, starts)\n"
+     "                   if starts != -1 and body.startswith(\n"
+     "                       (SCOPE_MARK, BLOCKERS_MARK), starts)\n"
      "                   else -1)\n"
      "            if end != -1:\n"
      '                opening += "%s\\n\\n" % body[starts:end]\n'
@@ -891,10 +897,183 @@ MUTATIONS = [
     # the resend's opening and cut out of the review.
     ("repost-scope-read-unanchored",
      '            end = (body.find("\\n\\n", starts)\n'
-     "                   if starts != -1 and body.startswith(SCOPE_MARK, starts)\n"
+     "                   if starts != -1 and body.startswith(\n"
+     "                       (SCOPE_MARK, BLOCKERS_MARK), starts)\n"
      "                   else -1)",
      "            starts = body.find(SCOPE_MARK)\n"
      '            end = body.find("\\n\\n", starts) if starts != -1 else -1'),
+    # Matching one mark rather than either. Harmless on a transcript that
+    # carries both, since they are one newline apart and the lift reads to
+    # the blank line past them either way; what it loses is the pass that
+    # read everything and reported narrowly, whose only mark is the
+    # blockers one. That transcript then keeps its mark in the body for the
+    # cut to take, and a review that reported only what breaks at runtime
+    # arrives days later as a review that found one thing.
+    ("repost-lifts-only-the-scope-mark",
+     "                   if starts != -1 and body.startswith(\n"
+     "                       (SCOPE_MARK, BLOCKERS_MARK), starts)",
+     "                   if starts != -1 and body.startswith(SCOPE_MARK, starts)"),
+
+    # --- a later review reports only blockers ---------------------------
+    # The by-one that costs a whole round of findings nobody is shown.
+    ("blockers-round-boundary",
+     "    return after is not None and round_number > after",
+     "    return after is not None and round_number >= after"),
+    # Counting the rounds already done rather than the one about to run,
+    # which is the same round early by another route.
+    ("blockers-counts-the-review-about-to-run",
+     '    number = entry.get("rounds", 0) + 1',
+     '    number = entry.get("rounds", 0)'),
+    # A round charged for a review that never reported anything. Three bad
+    # minutes at GitHub then decide that the next real review is narrowed.
+    ("rounds-only-for-a-review-that-ran",
+     '    return {"rounds": was.get("rounds", 0) + (1 if reached else 0)}',
+     '    return {"rounds": was.get("rounds", 0) + 1}'),
+    # Read off the head-scoped copy, which is empty whenever the head has
+    # moved — and the head moving is the normal way a round ends, so the
+    # count never reaches two and nothing is ever narrowed.
+    ("rounds-survive-the-head-moving",
+     "                   **reviewed_through(covered, head, done),\n"
+     "                   **rounds_done(reached, done)))",
+     "                   **reviewed_through(covered, head, done),\n"
+     "                   **rounds_done(reached, kept)))"),
+    # The rebuilds that are not reviews handing the count back. One draft
+    # toggle or one failed clone and the pull request reports everything
+    # again.
+    ("rounds-survive-a-skip",
+     "                             **dict(carry_forward(kept),\n"
+     "                                    **reviewed_through(False, head, done),\n"
+     "                                    **rounds_done(False, done)))",
+     "                             **dict(carry_forward(kept),\n"
+     "                                    **reviewed_through(False, head, done)))"),
+    # The reviewer told nothing, so the narrowing is a sentence on the pull
+    # request about a review that was never asked to hold anything back.
+    ("blockers-reach-the-reviewer",
+     '           blockers_brief(config) if blockers else ""))',
+     '           ""))'),
+    # The paragraph put where `since` goes, ahead of the reporting contract
+    # rather than after it. The contract then has the last word, and it
+    # ends "a finding you leave out of it is a finding nobody sees".
+    ("blockers-answer-the-reporting-contract",
+     '           since_brief(since) if since else "", REPORT_TOOL,\n'
+     '           blockers_brief(config) if blockers else ""))',
+     '           blockers_brief(config) if blockers else "", REPORT_TOOL,\n'
+     '           since_brief(since) if since else ""))'),
+    # Read as a licence to look for less rather than to report less. The
+    # judgement of whether a thing is a blocker is the expensive judgement
+    # this program buys, and it cannot be made from a skimmed diff.
+    ("blockers-narrow-reporting-not-reading",
+     '        "Read and judge exactly as carefully as you would on any other "\n'
+     '        "pass. Only what you report is narrowed: report every blocker you "',
+     '        "Look only for blockers and skim the rest. Report every blocker "'),
+    # The permission to find nothing removed, which is the sentence that
+    # stands between this and the inflation the severity pass measured.
+    ("blockers-may-report-nothing",
+     '        "all is the expected outcome here, and it is the right answer "',
+     '        "all would be a surprise, so look until you have one, and it is "'),
+    # The pull request not told, so a quiet later review reads as the change
+    # being clean when it only means nothing in it breaks at runtime.
+    ("blockers-said-on-the-pull-request",
+     '        lines += ["", "The first %s of a pull request %s everything %s "\n'
+     '                      "find%s. This is a later one, so it was asked for "',
+     '        lines += ["", "" if True else "%s%s%s%s"'),
+    # Written outside the block the repost lifts, so the mark survives on
+    # disk and is lost from every review delivered from a transcript.
+    ("blockers-mark-inside-the-lifted-block",
+     '    if marks:\n'
+     '        body = "%s\\n\\n%s" % ("\\n".join(marks), body)',
+     '    if marks:\n'
+     '        body = "%s\\n\\n%s" % ("\\n\\n".join(marks), body)'),
+    # The checks list left saying a full review ran. `gh pr checks` is the
+    # half of this an agent reads, and the comment does not reach it.
+    ("blockers-in-the-checks-list",
+     '                 "title": "Reviewing at %s effort%s" % (\n'
+     '                     config["effort"], ", blockers only" if blockers else ""),',
+     '                 "title": "Reviewing at %s effort" % config["effort"],'),
+    # The retry rebuilds the body from nothing, so a scope dropped here is
+    # dropped from the only comment the author gets when GitHub refuses the
+    # anchors.
+    ("blockers-survive-the-anchor-retry",
+     "            tally=severity_tally(findings), since=since, "
+     "blockers=blockers,",
+     "            tally=severity_tally(findings), since=since,"),
+    # Counting a round for a review whose findings never reached the pull
+    # request. Two refused postings and the third round tells the author
+    # that the first two "reported everything they found, and those
+    # findings are on the pull request already", on a pull request that
+    # carries nothing at all.
+    ("rounds-need-the-post-to-land",
+     "                   **rounds_done(reached, done)))",
+     "                   **rounds_done(outcome == DONE, done)))"),
+    ("hand-run-rounds-need-the-post-to-land",
+     "                           **rounds_done(reached, was)))",
+     "                           **rounds_done(outcome == DONE, was)))"),
+    # Read off the filesystem rather than off review()'s answer. The
+    # marker is written only when the transcript write succeeded, so a run
+    # that could neither save nor post leaves none and reads as a round
+    # the author never saw.
+    ("rounds-not-inferred-from-the-marker",
+     "                   **rounds_done(reached, done)))",
+     "                   **rounds_done(outcome == DONE and not os.path.exists(\n"
+     "                       unposted_path(repo, pr)), done)))"),
+    # The `comment` guard, which is what keeps a dry run from counting.
+    # post_review answers POSTED for correctly posting nothing.
+    ("rounds-need-a-pull-request-to-reach",
+     '            if config["comment"]:\n'
+     "                reached.append(True)",
+     "            reached.append(True)"),
+    # And the other side of that rule: the send that finally lands is the
+    # one moment a refused review reaches the author, so the round it never
+    # got is counted there. Dropped, a pull request whose posting failed
+    # twice reports everything for ever.
+    ("rounds-counted-when-the-repost-lands",
+     "            entry.update(rounds_done(True, done))",
+     "            entry.update(rounds_done(False, done))"),
+    # The marker written before the review runs, which is what a process
+    # killed mid-review leaves behind. Dropping the carry there hands back
+    # every round already spent.
+    ("rounds-survive-the-pre-review-marker",
+     "                                    waivers=0,\n"
+     "                                    **reviewed_through(False, head, done),\n"
+     "                                    **rounds_done(False, done)))",
+     "                                    waivers=0,\n"
+     "                                    **reviewed_through(False, head, done)))"),
+    # The give-up rebuild, which rounds_done()'s own docstring names as a
+    # case it exists for and which nothing was holding.
+    ("rounds-survive-a-give-up",
+     "                               **reviewed_through(False, head, was),\n"
+     "                               **rounds_done(False, was)))",
+     "                               **reviewed_through(False, head, was)))"),
+    # The narrowing reaching the checks list only while the review runs.
+    # close_check overwrites the in_progress title on the way out, and the
+    # one it leaves behind stands for the rest of the pull request's life.
+    ("blockers-in-the-finished-check",
+     '    if blockers:\n'
+     '        title = "%s, reporting blockers only" % title',
+     "    pass"),
+    # The hand-run path's own wire, which shipped uncovered once before on
+    # this same code and did again here.
+    ("hand-run-blockers",
+     "            blockers = narrows and not args.whole",
+     "            blockers = False"),
+    ("hand-run-whole-widens-severity-too",
+     "            blockers = narrows and not args.whole",
+     "            blockers = narrows"),
+    # The transcript's flag, which travelled beside `since` with no guard
+    # of its own. Dropped, BLOCKERS_MARK reaches no transcript a real
+    # review produced, and the repost reads the mark rather than the flag.
+    ("transcript-gets-the-blockers-flag",
+     "            label, save_transcript(repo, pr, text, findings, note, since,\n"
+     "                                   blockers))))",
+     "            label, save_transcript(repo, pr, text, findings, note, "
+     "since))))"),
+    # A zero accepted, which means a first review that reports only
+    # blockers: the pull request is never told anything smaller, once, and
+    # nothing on it says why.
+    ("blockers-only-after-refuses-zero",
+     "    if rounds is not None and (not isinstance(rounds, int)\n"
+     "                               or isinstance(rounds, bool) or rounds <= 0):",
+     "    if rounds is not None and not isinstance(rounds, int):"),
 ]
 
 
