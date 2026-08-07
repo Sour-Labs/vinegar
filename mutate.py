@@ -432,6 +432,149 @@ MUTATIONS = [
      "    chooser = config[\"severity_model\"]\n"
      "    if False:"),
 
+    # --- the checks-list indicator -------------------------------------
+    # A check that can fail is a merge gate, and the README promises
+    # Vinegar is not one. Both halves: the constant and its use.
+    ("check-conclusion-never-fails",
+     'CHECK_CONCLUSION = "neutral"', 'CHECK_CONCLUSION = "failure"'),
+    ("check-conclusion-is-used",
+     '"status": "completed", "conclusion": CHECK_CONCLUSION,',
+     '"status": "completed", "conclusion": "success",'),
+    # Only an App can own a check run, so without one this is a 403 per
+    # review about a permission the operator cannot grant.
+    ("check-needs-an-app",
+     '    if not config["comment"] or not config.get("github_app"):\n'
+     "        return None",
+     "    if False:\n        return None"),
+    # An indicator an earlier attempt left running is reused rather than
+    # joined by a second one that also never finishes.
+    ("check-reuses-a-running-one",
+     "    if mine:\n"
+     '        log("%s: reusing the check run an earlier attempt left running"\n'
+     "            % label)\n"
+     '        return {"repo": repo, "id": mine[0].get("id"), "closed": False}',
+     "    if False:\n        pass"),
+    ("check-ignores-another-apps",
+     '            if str((was.get("app") or {}).get("id"))\n'
+     '            == str(config["github_app"].get("app_id")) and was.get("id")]',
+     "            if was.get(\"id\")]"),
+    # A handle with no id would PATCH `check-runs/None` on every ending.
+    ("check-handle-needs-an-id",
+     '    return {"repo": repo, "id": made["id"], "closed": False} \\\n'
+     "        if made and made.get(\"id\") else None",
+     '    return {"repo": repo, "id": (made or {}).get("id"),\n'
+     '            "closed": False}'),
+    # A handle holding a token is one log line from publishing it.
+    ("check-handle-holds-no-credential",
+     '        return {"repo": repo, "id": mine[0].get("id"), "closed": False}',
+     '        return {"repo": repo, "id": mine[0].get("id"), "env": env,\n'
+     '                "closed": False}'),
+    ("check-closes-once",
+     '    if not check or check["closed"]:\n        return',
+     "    if not check:\n        return"),
+    # GitHub refuses a title over 255 characters, and refuses the whole
+    # update with it, leaving the indicator running.
+    ("check-title-fits",
+     '"output": {"title": title[:255], "summary": summary or title}},',
+     '"output": {"title": title, "summary": summary or title}},'),
+    # An empty details_url is not a URL and GitHub judges the whole
+    # request on it, so the create fails and no indicator appears at all.
+    ("check-omits-an-empty-url",
+     '    if pr.get("url"):\n        asked["details_url"] = pr["url"]',
+     '    asked["details_url"] = pr.get("url") or ""'),
+    # The title is the whole of what the checks list communicates.
+    ("check-title-counts-findings",
+     '        tally = severity_tally(findings)\n'
+     '        title = "%d finding%s%s" % (\n'
+     '            len(findings), "" if len(findings) == 1 else "s",\n'
+     '            " (%s)" % tally if tally else "")',
+     '        title = "Reviewed"'),
+    ("check-title-not-clean-when-unreadable",
+     '        title = "Nothing Vinegar could read"',
+     '        title = "No findings"'),
+    ("check-title-says-a-partial-run",
+     "    if note:\n"
+     '        title = "%s, and the review did not finish" % title',
+     "    if False:\n        pass"),
+    ("check-closed-in-finish",
+     "    close_check(label, check, title,",
+     "    (lambda *a, **k: None)(label, check, title,"),
+    # Left open, the pull request lists a Vinegar check that spins for
+    # ever and the next attempt reuses it rather than clearing it.
+    ("check-closed-when-the-review-fails",
+     "        close_check(key, check, ended_title(outcome, attempts),",
+     "        (lambda *a, **k: None)(key, check, ended_title(outcome, attempts),"),
+
+    # --- what the first review pass found ------------------------------
+    ("check-close-retryable-after-a-refusal",
+     '    check["closed"] = settled is not None',
+     '    check["closed"] = True'),
+    ("check-reuse-needs-an-id",
+     '            == str(config["github_app"].get("app_id")) and was.get("id")]',
+     '            == str(config["github_app"].get("app_id"))]'),
+    ("check-body-matches-the-flag",
+     "    body = json.dumps(payload) if payload is not None else None",
+     "    body = json.dumps(payload) if payload else None"),
+    ("check-closed-even-if-recording-raises",
+     "    finally:\n"
+     "        # Its own credentials, minted now. The ones above were asked to",
+     "    except BaseException:\n"
+     "        raise\n"
+     "    else:\n"
+     "        # Its own credentials, minted now. The ones above were asked to"),
+    ("check-done-that-posted-nothing-is-not-finished",
+     '    return "The review ran but nothing reached the pull request"',
+     '    return "The review finished"'),
+    ("check-closed-on-fresh-credentials",
+     "        close_check(key, check, ended_title(outcome, attempts),\n"
+     "                    posting_env(key, config, repo, tokens, env) or env)",
+     "        close_check(key, check, ended_title(outcome, attempts), env)"),
+    # Not the extraction, which changes no behaviour and so nothing can
+    # catch: the format itself, which GitHub rejects the update over.
+    ("utc-stamp-format",
+     '    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")',
+     '    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")'),
+
+    # --- what the second review pass found -----------------------------
+    # A refused close must not let the backstop relabel a posted review as
+    # one that never posted.
+    ("check-retry-repeats-the-first-title",
+     '    title = check.get("said") or title\n'
+     '    summary = check.get("summary") or summary',
+     "    pass"),
+    # app_jwt signs with str(app_id), so a quoted one mints and matched
+    # nothing here.
+    ("check-app-id-compared-as-strings",
+     '            if str((was.get("app") or {}).get("id"))\n'
+     '            == str(config["github_app"].get("app_id")) and was.get("id")]',
+     '            if (was.get("app") or {}).get("id")\n'
+     '            == config["github_app"].get("app_id") and was.get("id")]'),
+    # Opening it is the one call here that parses a reply GitHub sent.
+    ("check-opened-inside-the-try",
+     "        check = open_check(key, repo, pr, config, env)\n"
+     "        try:",
+     "        try:"),
+    # The hand-run path: reachable by no check and anchored by no
+    # mutation until the second pass said so.
+    ("check-hand-run-opens-one",
+     "                hand = open_check(args.pr, repo, pr, config, env)",
+     "                hand = None"),
+    ("check-hand-run-closes-it",
+     "                close_check(args.pr, hand, ended_title(outcome),",
+     "                (lambda *a, **k: None)(args.pr, hand, ended_title(outcome),"),
+    ("check-hand-run-records-through-ctrl-c",
+     "            finally:\n"
+     "                # Not \"finished\" for a review that answered DONE. finish()",
+     "            except BaseException:\n"
+     "                raise\n"
+     "            else:\n"
+     "                # Not \"finished\" for a review that answered DONE. finish()"),
+    # The reuse lookup's query. Dropping the status filter adopts a
+    # completed run, and a completed run cannot be reopened.
+    ("check-reuse-asks-for-running-only",
+     '        "commits/%s/check-runs?check_name=%s&status=in_progress"',
+     '        "commits/%s/check-runs?check_name=%s"'),
+
     # --- constants -----------------------------------------------------
     ("max-attempts", "MAX_ATTEMPTS = 3", "MAX_ATTEMPTS = 99"),
     ("severity-timeout-value",

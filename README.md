@@ -772,6 +772,38 @@ that is the only thing it is allowed to mean.
 Reviews are submitted with `event: COMMENT`. Vinegar never approves and never
 requests changes, so it cannot hold up a merge. See "What this is not".
 
+## The checks list
+
+A review is nine to twenty-two minutes of nothing. Until it posts, a pull
+request Vinegar is working on looks exactly like one it has never heard of, so
+Vinegar puts itself in the pull request's list of checks while it works:
+
+> **Vinegar** · Reviewing at xhigh effort
+
+When the review ends, the same entry carries the tally the comment carries:
+`10 findings (2 blocker, 8 advisory)`, or `No findings`, or
+`The review failed 3 times and was given up on`.
+
+**It is never a pass and never a fail.** The conclusion is always `neutral`, a
+grey mark that cannot block a merge even where the check is required. `failure`
+would make Vinegar a merge gate, which "What this is not" says it isn't, and
+severity triage is not accurate enough to be one: the blocker rate measured 45%
+on two of four reviews. `success` is the opposite trap, because a green tick on
+a pull request carrying twelve findings is a statement nobody made, and the tick
+is what people read.
+
+**It needs the App's `checks: write` permission, which is not granted by
+default.** Adding it to the App is only half of it: GitHub holds the change as a
+request until the installation accepts it too, on the installation's settings
+page. Until both are done, every review says so in the log, once for each
+call that was refused. Without a configured GitHub App there is no entry at
+all, because no user token can own a check run.
+
+A retried review adds a second entry rather than reusing the first. An entry a
+killed review left running *is* reused, so a daemon stopped mid-review does not
+leave a check spinning for ever, but a completed one cannot be reopened:
+measured, that PATCH returns 200 and changes nothing.
+
 ## Severity
 
 A review of this repository reports nine to thirteen findings. Measured across
