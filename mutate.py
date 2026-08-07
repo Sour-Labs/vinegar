@@ -697,17 +697,12 @@ MUTATIONS = [
     # grouping rather than a tuple, so the loop unpacks the probe itself
     # and raises. That comes back ABORTED, which hides whether any check
     # would have caught it.
-    ("scope-commit-probe",
-     '            (["git", "cat-file", "-e", since + "^{commit}"],\n'
-     '             "the commit its last review finished at is not in this '
-     'clone"),\n',
-     ""),
-    ("scope-ancestor-probe",
-     '            (["git", "merge-base", "--is-ancestor", since, '
-     'pr["headRefOid"]],\n'
-     '             "the branch was rewritten since its last review"),\n',
-     ""),
-    # `-e <sha>` answers yes for a blob or a tree carrying that id.
+    ('scope-commit-probe',
+     '            (["git", "cat-file", "-e", since + "^{commit}"],\n             "the commit its last review finished at is not in this clone",\n             by_exit),\n',
+     ''),
+    ('scope-ancestor-probe',
+     '            (["git", "merge-base", "--is-ancestor", since, pr["headRefOid"]],\n             "the branch was rewritten since its last review", by_exit),\n',
+     ''),
     ("scope-commit-peel",
      '(["git", "cat-file", "-e", since + "^{commit}"],',
      '(["git", "cat-file", "-e", since],'),
@@ -719,40 +714,20 @@ MUTATIONS = [
      'DIFF_TIMEOUT))\n'
      "            return None",
      "            return since"),
-    ("scope-probe-refused",
-     "        if refused:\n"
-     '            log("%s: %s, so the whole pull request is reviewed"\n'
-     "                % (label, why))\n"
-     "            return None",
-     "        pass"),
-
-    # --- what may be recorded as reviewed ------------------------------
+    ('scope-probe-refused',
+     '        if refused_if(result):\n            log("%s: %s, so the whole pull request is reviewed"\n                % (label, why))\n            return None',
+     '        pass'),
     ("state-entry-sha-shape",
      "    if reviewed_sha and FULL_SHA.match(reviewed_sha):",
      "    if reviewed_sha:"),
-    ("load-state-sha-shape",
-     '                   or ("reviewed_sha" in done\n'
-     '                       and not (isinstance(done["reviewed_sha"], str)\n'
-     '                                and FULL_SHA.match('
-     'done["reviewed_sha"])))]',
-     "                   ]"),
-    # Unanchored, `re.match` takes a good sha with anything after it.
+    ('load-state-sha-shape',
+     '                if seen is not None and not (isinstance(seen, str)\n                                             and FULL_SHA.match(seen)):',
+     '                if False:'),
     ("full-sha-anchored",
      'FULL_SHA = re.compile(r"\\A[0-9a-f]{40}\\Z")',
      'FULL_SHA = re.compile(r"[0-9a-f]{40}")'),
 
     # --- carrying it past the head it was written at -------------------
-    ("carry-pr-record-once",
-     "                             **dict(carry_forward(kept), "
-     "**carry_pr(done)))",
-     "                             **carry_forward(kept))"),
-    ("carry-pr-pre-review",
-     "                             **dict(carry_forward(kept), post_tries=0,\n"
-     "                                    waivers=0, **carry_pr(done)))",
-     "                             **dict(carry_forward(kept), post_tries=0,\n"
-     "                                    waivers=0))"),
-
-    # --- the three conditions that let a pass narrow the next one ------
     ("brief-since",
      '           "--append-system-prompt", reviewer_brief(pr, since),',
      '           "--append-system-prompt", reviewer_brief(pr),'),
@@ -781,34 +756,28 @@ MUTATIONS = [
     # along with the reading scope loses every finding to one bad anchor.
     # --- what review() answers about its own coverage ------------------
     ("covered-needs-a-whole-reading",
-     '            if not note and config["comment"]:',
-     '            if config["comment"]:'),
+     '            if whole and findings is not None and config["comment"]:',
+     '            if findings is not None and config["comment"]:'),
+    ("covered-needs-findings",
+     '            if whole and findings is not None and config["comment"]:',
+     '            if whole and config["comment"]:'),
     ("covered-needs-a-pull-request",
-     '            if not note and config["comment"]:',
-     "            if not note:"),
+     '            if whole and findings is not None and config["comment"]:',
+     "            if whole and findings is not None:"),
+    ('whole-is-not-the-note',
+     '        notes.append(partial_note("failed before it finished"))\n        whole = False',
+     '        notes.append(partial_note("failed before it finished"))'),
+    ('whole-reaches-deliver',
+     '    deliver(text, findings, " ".join(notes) or None, whole=whole)',
+     '    deliver(text, findings, " ".join(notes) or None, whole=True)'),
     ("covered-needs-the-post-to-land",
      "                note, resent=resent, check=check, since=since)) "
      "== POSTED:",
      "                note, resent=resent, check=check, since=since)) "
      "or True:"),
-    ("reviewed-through-rule",
-     '    return {"reviewed_sha": head if covered else was.get('
-     '"reviewed_sha")}',
+    ('reviewed-through-rule',
+     '    return {"reviewed_sha": head if covered else was.get("reviewed_sha")}',
      '    return {"reviewed_sha": head}'),
-
-    # --- the probes added after the first review -----------------------
-    ("scope-merge-probe",
-     '            (["git", "rev-list", "--max-count=1", "--merges",\n'
-     '              "%s..%s" % (since, pr["headRefOid"])],\n'
-     '             "the branch has merged something in since its last '
-     'review")):',
-     "            ):"),
-    # rev-list reports by printing; reading its exit code calls every
-    # merge safe.
-    ("scope-merge-read-as-exit-code",
-     '        refused = (result.stdout.strip() if probe[1] == "rev-list"\n'
-     "                   else result.returncode != 0)",
-     "        refused = result.returncode != 0"),
     ("scope-same-head",
      '    if since == pr["headRefOid"]:\n'
      '        log("%s: nothing has been pushed since its last review, so the '
@@ -826,11 +795,9 @@ MUTATIONS = [
      "            return since"),
 
     # --- saying so where a repost will find it -------------------------
-    ("transcript-says-the-scope",
-     "    if since:\n"
-     '        body = "Scope: only what was added since `%s`.\\n\\n%s" % (\n'
-     "            since[:7], body)",
-     "    pass"),
+    ('transcript-says-the-scope',
+     '    if since:\n        body = "%sonly what was added since `%s`.\\n\\n%s" % (\n            SCOPE_MARK, since[:7], body)',
+     '    pass'),
     ("transcript-gets-the-scope",
      "            label, save_transcript(repo, pr, text, findings, note, "
      "since))))",
@@ -866,6 +833,32 @@ MUTATIONS = [
      "label)",
      "            findings, diff_lines(path, since or pr[\"baseRefName\"], "
      "env, label), label)"),
+
+    # --- what the second review found ----------------------------------
+    ("scope-merge-honours-exit-code",
+     "    by_output = lambda result: result.returncode != 0 or "
+     "result.stdout.strip()",
+     "    by_output = lambda result: result.stdout.strip()"),
+    ("scope-probe-bound",
+     "            result = run(probe, cwd=path, env=env, "
+     "timeout=DIFF_TIMEOUT)",
+     "            result = run(probe, cwd=path, env=env)"),
+    ('state-sha-drops-only-itself',
+     '                    log("%s: its reviewed_sha in %s is not a commit id, so "\n                        "the whole pull request is reviewed" % (\n                            key, STATE_PATH))\n                    del done["reviewed_sha"]',
+     '                    done["reviewed_sha"] = "0" * 40'),
+    ("whole-flag-needs-pr",
+     "    if args.whole and not args.pr:\n"
+     '        sys.exit("--whole only means something with --pr; the '
+     'daemon\'s own "\n'
+     '                 "scoping is not a command-line choice")',
+     "    pass"),
+    ("repost-keeps-the-scope",
+     '            mark = body.find("\\n%s" % SCOPE_MARK)\n'
+     '            end = body.find("\\n\\n", mark + 1) if mark != -1 else -1\n'
+     "            if end != -1:\n"
+     '                opening += "%s\\n\\n" % body[mark + 1:end]\n'
+     "                body = body[:mark + 1] + body[end + 2:]",
+     "            pass"),
 ]
 
 

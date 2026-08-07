@@ -102,6 +102,10 @@ posted = []
 looked = []
 checked = []
 scoped = []
+# The bound each probe was given, beside the argv. Recording only the
+# command left the check named for the timeout unable to fail when
+# `timeout=` was deleted from the call.
+scoped_bounds = []
 check_envs = []
 last_git_diff = [[], None]
 last_post_timeout = [None]
@@ -155,6 +159,7 @@ def fake_run(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
     # while the section still reported green.
     if cmd[:2] in (["git", "cat-file"], ["git", "merge-base"]):
         scoped.append(cmd)
+        scoped_bounds.append((cmd, timeout))
         return subprocess.CompletedProcess(cmd, fake_run.scope_rc, "", "")
     # The merge probe answers by printing, not by exiting non-zero, so it
     # needs its own slot. Sharing `scope_rc` would have made "the branch
@@ -162,7 +167,9 @@ def fake_run(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
     # and for one full of merges alike.
     if cmd[:2] == ["git", "rev-list"]:
         scoped.append(cmd)
-        return subprocess.CompletedProcess(cmd, 0, fake_run.merges, "")
+        scoped_bounds.append((cmd, timeout))
+        return subprocess.CompletedProcess(cmd, fake_run.merge_rc,
+                                           fake_run.merges, "")
     # Before the posting branch, and not folded into it. A check-run call
     # is `gh api ... --method ...` exactly like a review posting, so
     # without its own branch every indicator landed in `posted` and the
@@ -201,6 +208,7 @@ fake_run.look_rc = 0
 fake_run.look_out = ""
 fake_run.scope_rc = 0
 fake_run.merges = ""
+fake_run.merge_rc = 0
 fake_run.post_err = "HTTP 422"
 GENUINE_RUN = vinegar.run
 vinegar.run = fake_run
@@ -240,6 +248,7 @@ def reset_stubs():
     fake_run.look_out = ""
     fake_run.scope_rc = 0
     fake_run.merges = ""
+    fake_run.merge_rc = 0
     fake_run.post_err = "HTTP 422"
     fake_run.check_rc = 0
     fake_run.check_err = ""
@@ -249,6 +258,7 @@ def reset_stubs():
     del looked[:]
     del checked[:]
     del scoped[:]
+    del scoped_bounds[:]
     del check_envs[:]
 
 
@@ -803,6 +813,12 @@ with open(_tx_path) as _h:
     _tx_body = _h.read()
 check("a narrowed review says so in the transcript, not only in the comment",
       "Scope: only what was added since `0123456`" in _tx_body, _tx_body[:200])
+# It is written at the front and repost() keeps the tail, so the one case
+# it exists for — a narrowed review too big to post — was exactly the case
+# that lost it. repost lifts it into its own opening before the cut.
+check("the scope line is recognisable to the repost that has to keep it",
+      _tx_body[_tx_body.index("---") + 5:].lstrip().startswith(
+          vinegar.SCOPE_MARK), _tx_body[:200])
 _tx_full = GENUINE_SAVE_TRANSCRIPT("o/r", PR, "the words", [], None)
 with open(_tx_full) as _h:
     check("a full review's transcript claims no scope", "Scope:" not in _h.read())
@@ -3169,8 +3185,14 @@ check("an earlier review that resolves and is an ancestor narrows the pass",
 check("the probe asks for a commit rather than any object with that id",
       any("cat-file" in cmd and cmd[-1].endswith("^{commit}")
           for cmd in scoped), scoped)
+# The bound as review_scope actually passed it, not the constant's value.
+# Asserting `DIFF_TIMEOUT == 120` stayed true with `timeout=` deleted from
+# the call, so the check named for the bound could not fail for the reason
+# it exists: a probe against a filesystem that stops answering wedges the
+# one poll thread for ever.
 check("the probes are bounded like every other local git call",
-      vinegar.DIFF_TIMEOUT == 120, vinegar.DIFF_TIMEOUT)
+      scoped and all(timeout == vinegar.DIFF_TIMEOUT
+                     for _cmd, timeout in scoped_bounds), scoped_bounds)
 
 # Each of the three ways an increment stops being safe widens the pass
 # rather than narrowing it. Getting any of these backwards reports a
@@ -3251,6 +3273,14 @@ check("a branch that merged something in widens the pass",
 reset_stubs()
 check("a clean range of commits still narrows the pass",
       vinegar.review_scope(ROOT, PR_SINCE, REVIEWED, None, L) == OLD_SHA,
+      scoped)
+# rev-list can fail having printed nothing. Reading only its output called
+# that "no merges" and narrowed, which is the one direction this function
+# is not allowed to fail in.
+reset_stubs()
+fake_run.merge_rc = 1
+check("a merge probe that fails widens rather than reading silence as safe",
+      vinegar.review_scope(ROOT, PR_SINCE, REVIEWED, None, L) is None,
       scoped)
 
 # Unreachable from the daemon, whose DONE check returns first. Reached
@@ -3890,28 +3920,36 @@ check("a flag that is not a boolean is dropped",
 check("dropping a bad entry does not quarantine the good ones",
       not _quarantined(), _quarantined())
 
-# reviewed_sha is the one string in an entry, and it reaches a git command
-# line. "Is it a str" is the wrong question, because every injection is:
-# `"; rm -rf ~"` is a perfectly good str. Forty lowercase hex characters is
-# the whole of what a resolved commit can be.
+# A bad reviewed_sha loses only itself. It cannot crash a comparison the
+# way the counters above can — run() never uses a shell, so a junk value
+# reaches `git cat-file -e` as one argument and exits non-zero — and
+# taking the entry with it was strictly worse: an operator hand-editing
+# the short sha they read in the comment would have lost `unposted` too,
+# and handle_pr forgets a marker whose entry is gone. That deletes a
+# paid-for review, unsent, and buys it again.
 with open(vinegar.STATE_PATH, "w") as h:
     h.write('{"o/r#12": {"outcome": "reviewed", "sha": "a", '
-            '"reviewed_sha": "a1b2c3d"},'
+            '"unposted": true, "reviewed_sha": "a1b2c3d"},'
             ' "o/r#13": {"outcome": "reviewed", "sha": "a", '
             '"reviewed_sha": 12345},'
             ' "o/r#14": {"outcome": "reviewed", "sha": "a", '
             '"reviewed_sha": "%s"}}' % OLD_SHA)
 _since = vinegar.load_state()
 check("a reviewed_sha that is not a full commit id is dropped",
-      "o/r#12" not in _since and "o/r#13" not in _since
+      "reviewed_sha" not in _since.get("o/r#12", {})
+      and "reviewed_sha" not in _since.get("o/r#13", {})
       and _since.get("o/r#14", {}).get("reviewed_sha") == OLD_SHA, _since)
+check("dropping it does not take the saved review down with it",
+      _since.get("o/r#12", {}).get("unposted") is True
+      and _since.get("o/r#12", {}).get("outcome") == "reviewed", _since)
 # Anchored at both ends. A valid sha with anything after it is the half
 # that matters, and `re.match` alone takes it.
 with open(vinegar.STATE_PATH, "w") as h:
     h.write('{"o/r#12": {"outcome": "reviewed", "sha": "a", '
             '"reviewed_sha": "%s and then some"}}' % OLD_SHA)
 check("a commit id with anything after it is dropped too",
-      vinegar.load_state() == {}, vinegar.load_state())
+      "reviewed_sha" not in vinegar.load_state().get("o/r#12", {}),
+      vinegar.load_state())
 
 # --- where the last review finished --------------------------------------
 # The reader throws away the whole entry, so writing what it would reject
@@ -3931,7 +3969,8 @@ check("a short sha is never written for the reader to reject",
 # poll that needs it — and the failure is invisible, because a pass that
 # forgets simply reads the whole pull request as it always used to.
 check("where the last review finished outlives the head moving",
-      vinegar.carry_pr(REVIEWED).get("reviewed_sha") == OLD_SHA)
+      vinegar.reviewed_through(False, NEW_SHA, REVIEWED)["reviewed_sha"]
+      == OLD_SHA)
 check("the head-scoped counters do not outlive the head moving",
       "reviewed_sha" not in vinegar.carry_forward({}))
 os.remove(vinegar.STATE_PATH)
@@ -3966,6 +4005,42 @@ _cov_dry = vinegar.review(ROOT, "o/r", PR, dict(CONFIG, comment=False),
                           None, {})
 check("a dry run covers nothing, because nobody was shown anything",
       _cov_dry == (vinegar.DONE, False), _cov_dry)
+
+# A note is anything the pull request should be told, which is not the
+# same as being cut short. Reading completeness off it turned the
+# narrowing off for good on any deployment whose pinned model had stopped
+# routing: every review falls back, every note is truthy, nothing ever
+# records where it got to, and no log line says so.
+reset_stubs()
+vinegar.run = claude_run
+vinegar.save_transcript = stub_transcript
+claude_run.stream = _answers(
+    stream(NOT_FOUND), stream(call(FINDINGS[:1]), result_event()))
+_cov_fell_back = vinegar.review(ROOT, "o/r", PR, FALLING_BACK, None, {})
+check("a review that fell back and finished still covered its scope",
+      _cov_fell_back == (vinegar.DONE, True), _cov_fell_back)
+
+# A run can end cleanly having narrated instead of calling the reporting
+# tool. Its prose reaches the pull request; its findings never existed.
+reset_stubs()
+vinegar.run = claude_run
+vinegar.save_transcript = stub_transcript
+claude_run.stream = stream(result_event())
+_cov_no_tool = vinegar.review(ROOT, "o/r", PR, CONFIG, None, {})
+check("a run that reported no findings at all has covered nothing",
+      _cov_no_tool == (vinegar.DONE, False), _cov_no_tool)
+
+# A run that failed holding findings posts them, because they are paid for
+# and real, and is still not a whole reading of the scope. This is the
+# ending that separates `whole` from the note most sharply: both are set
+# here, and only one of them means "cut short".
+reset_stubs()
+vinegar.run = claude_run
+vinegar.save_transcript = stub_transcript
+claude_run.stream = stream(call(FINDINGS[:1]), result_event(is_error=True))
+_cov_err = vinegar.review(ROOT, "o/r", PR, CONFIG, None, {})
+check("a run that failed holding findings posts them but covered nothing",
+      _cov_err == (vinegar.DONE, False), _cov_err)
 
 # finish() has to hand the scope on. The sentence lived only in the review
 # comment, so a refused review that repost() later delivered from the
@@ -4726,6 +4801,29 @@ check("--whole still records where this review got to",
 _hn_seen, _hn_state = _hand_scoped({})
 check("a hand run with nothing reviewed before it reads the whole thing",
       _hn_seen.get("since") is None, _hn_seen)
+
+# Refused rather than ignored. `--whole` is read only by the --pr branch,
+# so as a bare flag it was accepted, did nothing, and said nothing: an
+# operator running it to stop the daemon narrowing had no way to learn
+# every poll went on narrowing exactly as before.
+# `--once` and a stubbed poll, so that breaking the guard fails this check
+# rather than hanging the run. Without them the mutation that removes the
+# guard drops main() into `while True: poll_once(); sleep()`, and the whole
+# suite times out — which mutate.py can only report as a dead run, not as
+# a caught one.
+_bare_whole = {}
+_bw_kept = (sys.argv, vinegar.poll_once)
+vinegar.poll_once = lambda *a, **k: None
+sys.argv = ["vinegar.py", "--whole", "--once"]
+try:
+    vinegar.main()
+except SystemExit as err:
+    _bare_whole["said"] = str(err)
+finally:
+    sys.argv, vinegar.poll_once = _bw_kept
+check("--whole without --pr is refused rather than quietly ignored",
+      "only means something with --pr" in _bare_whole.get("said", ""),
+      _bare_whole)
 vinegar.save_state({})
 
 
@@ -5467,6 +5565,28 @@ check("an oversized saved review keeps its findings, not its narration",
       len(posted[0][1]["body"]) if posted else "nothing posted")
 check("a posted saved review stops arming the directory scan",
       _big_state[_lost_key].get("unposted") is None, _big_state)
+
+# And a narrowed one keeps saying so. The scope line is written at the
+# very front and the cut keeps the tail, so the one case it exists for —
+# a narrowed review too large to post — was exactly the case that lost
+# it, and the review then arrived reading as though it had covered the
+# whole pull request.
+vinegar.save_transcript("o/r", PR_LOST, "narration " * 9000, FINDINGS[:1],
+                        None, "0123456789abcdef0123456789abcdef01234567")
+with open(_lost_marker, "w") as h:
+    h.write("%s\n" % PR_LOST["headRefOid"])
+_narrow_state = {_lost_key: {"outcome": vinegar.DONE,
+                             "sha": PR_LOST["headRefOid"], "attempts": 1,
+                             "unposted": True}}
+fake_run.rc = 0
+del posted[:]
+vinegar.handle_pr("o/r", PR_LOST, CONFIG, _narrow_state, {})
+check("an oversized narrowed review still says what it read",
+      len(posted) == 1
+      and len(posted[0][1]["body"]) <= vinegar.MAX_BODY
+      and "only what was added since `0123456`" in posted[0][1]["body"]
+      and "## Findings" in posted[0][1]["body"],
+      posted[0][1]["body"][:300] if posted else "nothing posted")
 fake_run.rc = 1
 
 check("a repost that raises still spends its attempt and stops",

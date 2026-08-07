@@ -819,11 +819,16 @@ narrowed. A diff read without the code around it produces confident findings
 about calls whose definitions the reviewer never saw.
 
 A pass only narrows when the one before it **covered its scope**: it reached the
-end of what it was asked to read, and its findings landed on the pull request. A
-review killed by `review_timeout` after reporting two findings from the first
-file still posts, and still counts as done, but it does not move the starting
-point. Neither does one GitHub refused, one whose transcript could not be
-written, or a dry run.
+end of what it was asked to read, it reported findings through `ReportFindings`,
+and the review landed on the pull request. A review killed by `review_timeout`
+after reporting two findings from the first file still posts, and still counts
+as done, but it does not move the starting point. Neither does one that failed
+part-way holding findings, one that narrated without ever calling the reporting
+tool, one GitHub refused, or a dry run.
+
+Running on `fallback_model` does **not** stop a pass counting as covered. The
+review says so on the pull request, but a fallback that read the whole scope
+read the whole scope.
 
 Five things widen a pass back to the whole pull request, and all five are
 deliberate:
@@ -864,7 +869,10 @@ decision this made, and it is worth revisiting alongside whatever turns
 
 The narrowing statement goes in the saved transcript as well as in the comment,
 because a refused review is delivered later from the transcript and would
-otherwise arrive reading as though it had covered everything.
+otherwise arrive reading as though it had covered everything. When that
+transcript is too large to post, the statement is lifted into the resend's own
+opening before the trim, since the trim keeps the tail and the statement is at
+the front.
 
 A `--dry-run` never narrows anything and never records a starting point: it
 posts nothing, so there is no author who has seen anything.

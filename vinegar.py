@@ -143,6 +143,12 @@ REVIEW_DIR = os.path.join(HOME, "reviews")
 # anything at all after it, which is the half of the check that matters.
 FULL_SHA = re.compile(r"\A[0-9a-f]{40}\Z")
 
+# How a transcript opens when its review read less than the whole pull
+# request. One definition, because repost() has to recognise it in a file
+# save_transcript() wrote, and a repost that cannot find it sends a
+# narrowed review with nothing saying so.
+SCOPE_MARK = "Scope: "
+
 # Checkouts sit beside HOME rather than inside it, and that is load-bearing
 # rather than tidiness. The reviewer is denied every read under HOME, so a
 # checkout in there is a repository it cannot open: it falls back to fetching
@@ -1193,27 +1199,16 @@ def reviewed_through(covered, head, was):
     `covered` is review()'s own answer and nothing is inferred from it
     here. It is false for a run cut off part-way, for one whose findings
     never reached the pull request, and for a dry run.
+
+    Every rebuild goes through this, not only the two that can advance.
+    A skip, a failed checkout and the marker written before a review all
+    call it with `covered` false, which is what keeps them from being the
+    thing that forgets a finished review: they rebuild the entry from
+    `kept`, which is deliberately empty once the head has moved, and that
+    is precisely when this field is needed. It carried its own helper for
+    a while, which was this function with the flag wired to false.
     """
     return {"reviewed_sha": head if covered else was.get("reviewed_sha")}
-
-
-def carry_pr(done):
-    """The field a rebuilt entry keeps whatever the head is doing.
-
-    Separate from carry_forward() because the two have opposite lifetimes,
-    and folding this into that one would be the bug rather than the tidy-up.
-    Everything carry_forward() holds is scoped to a single commit: three
-    sends and stop, spent at this head, void the moment the branch moves.
-    Its callers pass `kept`, which is deliberately empty when the head has
-    changed.
-
-    `reviewed_sha` is read only *after* the head has moved, because a pass
-    with no new commits has no increment to scope to and never asks. Passing
-    it through `kept` would clear it on exactly the poll that needs it, and
-    the failure would be invisible: every re-review would silently read the
-    whole pull request, which is what this used to do anyway.
-    """
-    return {"reviewed_sha": done.get("reviewed_sha")}
 
 
 def state_entry(head, outcome, attempts=0, reason=None, announced=False,
@@ -1403,19 +1398,34 @@ def load_state():
                    or any(not isinstance(done[field], bool)
                           for field in ("announced", "unposted")
                           if field in done)
-                   # And the one string. It is interpolated into a git
-                   # command, so "is it a str" is the wrong question:
-                   # every injection is. A commit is forty hex characters
-                   # or the entry is not describing one, and an entry that
-                   # cannot say where the last review got to is exactly an
-                   # entry that should be forgotten and reviewed whole.
-                   or ("reviewed_sha" in done
-                       and not (isinstance(done["reviewed_sha"], str)
-                                and FULL_SHA.match(done["reviewed_sha"])))]
+                   ]
             for key in bad:
                 log("%s: its entry in %s cannot be read, so it is forgotten "
                     "and will be reviewed again" % (key, STATE_PATH))
                 del state[key]
+            # The one string, and it loses only itself. The fields above
+            # are counters and flags that crash a comparison, so an entry
+            # carrying a bad one has to go. This one cannot crash
+            # anything: run() never uses a shell, so a junk value reaches
+            # `git cat-file -e` as one argument, exits non-zero, and
+            # widens the pass — which is the outcome dropping it asks for
+            # anyway.
+            #
+            # Dropping the entry for it was strictly worse than dropping
+            # the key. An operator following the give-up log's own advice
+            # and hand-editing the short sha they read in the comment
+            # would have taken `unposted` down with it, and handle_pr
+            # forgets a marker whose entry is gone: a paid-for review,
+            # saved and waiting to be sent, deleted unsent and bought
+            # again.
+            for key, done in state.items():
+                seen = done.get("reviewed_sha")
+                if seen is not None and not (isinstance(seen, str)
+                                             and FULL_SHA.match(seen)):
+                    log("%s: its reviewed_sha in %s is not a commit id, so "
+                        "the whole pull request is reviewed" % (
+                            key, STATE_PATH))
+                    del done["reviewed_sha"]
             return state
         why = "it holds %s, not an object" % type(state).__name__
     except FileNotFoundError:
@@ -1678,8 +1688,8 @@ def save_transcript(repo, pr, text, findings=None, note=None, since=None):
     # hand when every retry is spent, and it said nothing about the scope
     # either.
     if since:
-        body = "Scope: only what was added since `%s`.\n\n%s" % (
-            since[:7], body)
+        body = "%sonly what was added since `%s`.\n\n%s" % (
+            SCOPE_MARK, since[:7], body)
     if findings:
         body += "\n\n## Findings\n\n" + "\n\n".join(
             finding_bullet(finding) for finding in findings)
@@ -1760,14 +1770,29 @@ def review_scope(path, pr, done, env, label):
             "pull request is reviewed" % label)
         return None
 
-    for probe, why in (
+    # Each probe carries how to read it, beside the argv rather than
+    # inferred from it. Two conventions live here: `cat-file` and
+    # `merge-base` answer by exiting non-zero, `rev-list` answers by
+    # printing and exits 0 for a clean range and for one full of merges
+    # alike. Picking between them on `probe[1] == "rev-list"` read the
+    # convention out of the command line, so adding `git -c
+    # core.quotepath=false rev-list ...` — the form diff_lines() already
+    # uses — would have silently reverted every merge to "safe".
+    by_exit = lambda result: result.returncode != 0
+    # Non-zero as well as any output. rev-list can fail having printed
+    # nothing, and reading only stdout called that "no merges" and
+    # narrowed, which is the one direction this function may not fail in.
+    by_output = lambda result: result.returncode != 0 or result.stdout.strip()
+    for probe, why, refused_if in (
             (["git", "cat-file", "-e", since + "^{commit}"],
-             "the commit its last review finished at is not in this clone"),
+             "the commit its last review finished at is not in this clone",
+             by_exit),
             (["git", "merge-base", "--is-ancestor", since, pr["headRefOid"]],
-             "the branch was rewritten since its last review"),
+             "the branch was rewritten since its last review", by_exit),
             (["git", "rev-list", "--max-count=1", "--merges",
               "%s..%s" % (since, pr["headRefOid"])],
-             "the branch has merged something in since its last review")):
+             "the branch has merged something in since its last review",
+             by_output)):
         try:
             result = run(probe, cwd=path, env=env, timeout=DIFF_TIMEOUT)
         except subprocess.TimeoutExpired:
@@ -1778,13 +1803,7 @@ def review_scope(path, pr, done, env, label):
             log("%s: %s could not be run (%s), so the whole pull request is "
                 "reviewed" % (label, " ".join(probe), err))
             return None
-        # `rev-list` reports by printing rather than by exiting non-zero:
-        # it says 0 and nothing at all when the range holds no merge, and
-        # 0 with a sha when it holds one. Reading its exit code the way
-        # the two probes above are read would call every merge safe.
-        refused = (result.stdout.strip() if probe[1] == "rev-list"
-                   else result.returncode != 0)
-        if refused:
+        if refused_if(result):
             log("%s: %s, so the whole pull request is reviewed"
                 % (label, why))
             return None
@@ -3624,6 +3643,21 @@ def repost(key, repo, pr, config, state, tokens, done, marker, sha):
             # and sheared off exactly what the repost exists to deliver.
             cut_said = ("(the beginning was cut to fit GitHub's comment "
                         "limit)\n\n")
+            # Lifted into the opening before the cut can reach it. The
+            # scope line is written at the front of the transcript's body
+            # and the cut keeps the tail, so the one case it exists for —
+            # a narrowed review too big to post — is exactly the case that
+            # lost it, and the review then arrived reading as though it
+            # had covered the whole pull request.
+            #
+            # Found as a line rather than at position zero: what is read
+            # here is the whole file, so the transcript's own heading and
+            # the `---` come first.
+            mark = body.find("\n%s" % SCOPE_MARK)
+            end = body.find("\n\n", mark + 1) if mark != -1 else -1
+            if end != -1:
+                opening += "%s\n\n" % body[mark + 1:end]
+                body = body[:mark + 1] + body[end + 2:]
             # Measured, not a hand-picked slack. The old constant was
             # chosen for the length of the sentence above it, so
             # rewording that sentence longer would have pushed the body
@@ -3862,7 +3896,7 @@ def review(path, repo, pr, config, env, tokens, resent=False, check=None,
     # root-owned by one `sudo` run — left no marker and read as posted.
     covered = []
 
-    def deliver(text, findings, note=None):
+    def deliver(text, findings, note=None, whole=False):
         """Record and post one ending, whichever ending it turned out to be.
 
         Every way this function returns DONE goes through here. The three
@@ -3884,13 +3918,20 @@ def review(path, repo, pr, config, env, tokens, resent=False, check=None,
         if announce(label, lambda: finish(
                 label, repo, pr, path, text, findings, config, env, tokens,
                 note, resent=resent, check=check, since=since)) == POSTED:
-            # All three, and none of them is implied by another. POSTED
-            # says the pull request carries it; `not note` says the
-            # reviewer reached the end of the scope rather than being cut
-            # off part-way through it; `comment` says there was a pull
-            # request to carry it at all, since a dry run answers POSTED
-            # for having correctly posted nothing.
-            if not note and config["comment"]:
+            # Four, and none of them is implied by another. POSTED says the
+            # pull request carries it. `whole` says the reviewer reached the
+            # end of the scope, and it is passed in rather than read off
+            # `note`: a note also carries the fallback-model notice, which
+            # is information about the run and not a statement that it was
+            # cut short, so deriving it there turned the narrowing off for
+            # good on any deployment whose pinned model stopped routing.
+            # `findings is not None` says findings were reported at all,
+            # since a run can end cleanly having narrated instead of
+            # calling the reporting tool, and its prose reaching the pull
+            # request is not its findings reaching it. `comment` says there
+            # was a pull request to carry any of it, because a dry run
+            # answers POSTED for having correctly posted nothing.
+            if whole and findings is not None and config["comment"]:
                 covered.append(True)
             return
         if config["comment"]:
@@ -4124,6 +4165,13 @@ def review(path, repo, pr, config, env, tokens, resent=False, check=None,
     # the one place an operator who only reads pull requests can learn
     # otherwise, and it composes with the partial-run note below rather
     # than replacing it, because a run can both fall back and be cut short.
+    # Tracked apart from `notes`, because the two answer different
+    # questions. A note is anything the pull request should be told; this
+    # is whether the reviewer reached the end of the scope. The
+    # fallback-model notice is the case that separates them, and reading
+    # completeness off the note turned narrowing off for good wherever
+    # the pinned model had stopped routing.
+    whole = True
     notes = []
     if abandoned is not None:
         notes.append(
@@ -4141,6 +4189,7 @@ def review(path, repo, pr, config, env, tokens, resent=False, check=None,
         log("%s: it failed with %d finding(s) already reported, so those are "
             "posted" % (label, len(findings)))
         notes.append(partial_note("failed before it finished"))
+        whole = False
     else:
         # Only when it did not fail. Moving the price above the error
         # handling so a failed run reports it left this line printing a
@@ -4158,7 +4207,7 @@ def review(path, repo, pr, config, env, tokens, resent=False, check=None,
     # None rather than "" when there is nothing to say, because review_body
     # tests the note for truthiness and an empty string would be as silent
     # as None while reading like a value.
-    deliver(text, findings, " ".join(notes) or None)
+    deliver(text, findings, " ".join(notes) or None, whole=whole)
     return DONE, bool(covered)
 
 
@@ -4278,7 +4327,7 @@ def spend_announce(key, config, state, head, attempts, tries, said):
     was = state.get(key, {})
     entry = state_entry(head, FAILED, attempts,
                         announced=said == POSTED or spent, tries=tries,
-                        **dict(carry_forward(was), **carry_pr(was)))
+                        **dict(carry_forward(was), **reviewed_through(False, head, was)))
     state[key] = entry
     save_state(state)
 
@@ -4314,7 +4363,7 @@ def record_once(state, key, done, head, outcome, reason):
     # request would then be read whole on the next pass that does run,
     # silently, with only the bill to show for it.
     state[key] = state_entry(head, outcome, kept.get("attempts", 0), reason,
-                             **dict(carry_forward(kept), **carry_pr(done)))
+                             **dict(carry_forward(kept), **reviewed_through(False, head, done)))
     state[key]["seen"] = seen
     save_state(state)
 
@@ -4542,7 +4591,8 @@ def handle_pr(repo, pr, config, state, tokens):
     kept = done if done.get("sha") == head else {}
     state[key] = state_entry(head, FAILED, attempts,
                              **dict(carry_forward(kept), post_tries=0,
-                                    waivers=0, **carry_pr(done)))
+                                    waivers=0,
+                                    **reviewed_through(False, head, done)))
     save_state(state)
 
     # Worked out before the review, because it is what the review is told,
@@ -4798,6 +4848,16 @@ def main():
         REVIEW_DIR = REVIEW_DIR + ".dry"
         log("posting nothing, so this run remembers in %s and writes its "
             "transcripts to %s" % (STATE_PATH, REVIEW_DIR))
+
+    # Refused rather than ignored, the way load_config refuses a bad value
+    # rather than carrying on with a default. `--whole` is read only by the
+    # `--pr` branch, so as a bare flag it was accepted, did nothing, and
+    # said nothing: an operator running `vinegar.py --whole` to stop the
+    # daemon narrowing its re-reviews would have had no way to learn that
+    # every poll went on narrowing exactly as before.
+    if args.whole and not args.pr:
+        sys.exit("--whole only means something with --pr; the daemon's own "
+                 "scoping is not a command-line choice")
 
     # Both paths take the lock. A manual --pr run shares the daemon's checkout
     # for that repo, so without it the manual run would reset and re-check-out
