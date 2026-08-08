@@ -602,6 +602,29 @@ MAX_BODY = 60000
 STATE_LOCK = threading.RLock()
 LOG_LOCK = threading.Lock()
 
+# Set when a stop has been asked for, so a worker takes no further pull
+# request and no further repository.
+#
+# A thread cannot be interrupted from outside, which is the whole problem
+# this solves. On the serial path Ctrl-C raises inside the review that is
+# running, unwinds through handle_pr's finally so the checks entry is
+# closed, and reaches main(). A worker sees none of that: the signal is
+# delivered to the main thread alone. Without a flag the only ways to end
+# a worker were to let it finish everything it had been given, or to make
+# it a daemon and have the interpreter kill it mid-review, which skips
+# that finally and leaves a checks entry spinning for ever on a pull
+# request nobody can then merge.
+#
+# Asked between pull requests rather than only between repositories,
+# because a repository's pass is every open pull request on it. At a
+# terminal the interrupt reaches the whole process group, so the `claude`
+# that was running dies and its review ends in seconds; a flag read only
+# at the top of a pass would then go on to buy full reviews for that
+# repository's remaining pull requests, which is the opposite of stopping.
+#
+# Never cleared. The one path that sets it is on its way out of main().
+STOPPING = threading.Event()
+
 DEFAULTS = {
     "repos": [],
     "poll_interval": 60,
@@ -884,31 +907,51 @@ def load_config(path):
         # A bare string passes a truthiness check and then iterates as
         # characters, which polls `-R S`, `-R o`, `-R u` once a minute forever.
         sys.exit("%s: repos must be a non-empty list of owner/name" % path)
-    # Named twice is not the same as reviewed twice, and it stopped being
-    # harmless when repositories could be polled at once. A duplicate used
-    # to cost one wasted listing per pass. With `parallel_repos` above one
-    # it puts two passes on the single checkout directory that repository
-    # is given, and the second pass's `git reset --hard` moves the tree
-    # under the first, which then reports findings about a commit nobody
-    # asked about. That is the failure poll_repo's docstring says cannot
-    # happen, reachable by a copy-paste in a config file.
+    # Every entry a string, and stored stripped, the way the model names
+    # further down are. Nothing checked this before: `repos: ["o/a", {}]`
+    # was accepted here and then raised TypeError out of main()'s own
+    # startup line, before a single repository was polled, which under
+    # launchd is a traceback and a restart every 30 seconds for ever. It
+    # has to come before the duplicate check below, which compares these
+    # entries and folds their case.
+    for nth, name in enumerate(config["repos"]):
+        if not isinstance(name, str) or not name.strip():
+            sys.exit("%s: repos must hold owner/name strings, not %r" % (
+                path, name))
+        config["repos"][nth] = name.strip()
+
+    # Named twice is not the same as reviewed twice. A duplicate is one
+    # wasted listing per pass while repositories are polled one at a time,
+    # and above that it puts two passes on the single checkout directory
+    # that repository is given: the second pass's `git reset --hard` moves
+    # the tree under the first, which then reports findings about a commit
+    # nobody asked about.
     #
     # Refused rather than quietly collapsed to one. An operator who wrote a
     # repository twice meant something by it, and a daemon that silently
     # polls a shorter list than the file names is the kind of disagreement
     # nothing later would explain.
     #
-    # Compared with `in` rather than through a set, because `repos` is only
-    # known to be a list here: an entry that is a dict raises TypeError out
-    # of a set comprehension, which turns a bad config into a traceback
-    # where every other line in this function gives a sentence.
-    twice = [name for nth, name in enumerate(config["repos"])
-             if name in config["repos"][:nth]]
+    # Folded, because neither of the things that would collide cares about
+    # case. GitHub resolves a repository name without it, and the default
+    # macOS filesystem does too, so `Sour-Labs/vinegar` beside
+    # `sour-labs/vinegar` is two entries listing the same pull requests
+    # into one clone directory. An exact comparison missed the collision
+    # this check exists to catch.
+    folded = [name.casefold() for name in config["repos"]]
+    twice = []
+    for nth, name in enumerate(config["repos"]):
+        # Each offending spelling once. Recording every repeat printed
+        # "names o/r, o/r more than once" for three copies, which reads as
+        # two separate problems.
+        if folded.index(folded[nth]) != nth and name not in twice:
+            twice.append(name)
     if twice:
-        sys.exit("%s: repos names %s more than once. Each repository is "
-                 "polled once per pass and has one checkout, so the same "
-                 "one cannot have two passes at once" % (
-                     path, ", ".join(str(name) for name in twice)))
+        sys.exit("%s: repos names %s more than once, matched without case. "
+                 "A repository is polled once per pass and has one "
+                 "checkout, so a second copy buys nothing at "
+                 "parallel_repos 1 and two passes over one working tree "
+                 "above it" % (path, ", ".join(twice)))
     if config["effort"] not in EFFORTS:
         sys.exit("%s: effort must be one of %s" % (path, ", ".join(EFFORTS)))
 
@@ -4846,6 +4889,11 @@ def poll_repo(repo, config, state, tokens):
         log("%s: cannot list pull requests: %s" % (repo, err))
         return
     for pr in prs:
+        # Read here, so a stop reaches this pass without it first working
+        # through every pull request the listing returned. STOPPING's own
+        # comment says why between pull requests is the right place.
+        if STOPPING.is_set():
+            return
         try:
             handle_pr(repo, pr, config, state, tokens)
         except Exception as err:
@@ -4873,60 +4921,94 @@ def poll_once(config, state, tokens):
     """Every configured repository, poll_width() of them at a time."""
     # One repository is the default and keeps the whole pass on the thread
     # main() is already on, rather than handing it to a worker. That is not
-    # only tidiness: Ctrl-C is how the README says to stop a run, and a
-    # KeyboardInterrupt raised on the main thread unwinds a review it is
-    # running and does nothing at all to a review a worker is running.
-    # Every install that has not asked for this keeps that behaviour
-    # exactly.
+    # only tidiness: a foreground run is stopped with Ctrl-C, and a
+    # KeyboardInterrupt raised on the main thread unwinds a review that
+    # thread is running while a worker's review carries on. Every install
+    # that has not asked for this keeps that behaviour exactly.
     width = poll_width(config)
     if width <= 1:
         for repo in config["repos"]:
             poll_repo(repo, config, state, tokens)
         return
 
-    # Daemon threads over a queue rather than a ThreadPoolExecutor, and
-    # what that buys is the ability to stop. Since Python 3.9 a pool's
-    # threads are not daemons and an atexit hook drains whatever is still
-    # queued, so Ctrl-C during a parallel pass came out of the pool's
-    # shutdown, main() logged "stopped" and released the lock, and then the
-    # interpreter went on running every pass that had been submitted.
-    # Measured: with three repositories and two workers, the third
-    # repository's pass *started* after the daemon said it had stopped, and
-    # for as long as those passes ran the lock was free, so a `--pr` run
-    # could take it and reset a tree a live review was reading. That is the
-    # race acquire_lock() exists to close, opened by the thing that
-    # announces the daemon is gone.
-    #
     # A queue rather than a thread each, because `parallel_repos` can be
-    # smaller than the number of repositories and the ones over the width
-    # have to wait for a worker rather than for a particular one.
+    # smaller than the number of repositories, and the ones over the width
+    # have to wait for any worker rather than for a particular one.
     todo = queue.Queue()
     for repo in config["repos"]:
         todo.put(repo)
     fell_over = []
 
     def passes():
-        while True:
+        while not STOPPING.is_set():
             try:
                 repo = todo.get_nowait()
             except queue.Empty:
                 return
             try:
                 poll_repo(repo, config, state, tokens)
-            except Exception as err:
+            except BaseException as err:
                 # Kept rather than raised. A raise here ends one worker
                 # silently, and the repositories still in the queue are
                 # then shared out among the others as if nothing had
                 # happened.
+                #
+                # BaseException, not Exception. This replaced a pool, and
+                # a pool's work item catches BaseException and hands it
+                # back on result(), so the narrower catch quietly lost a
+                # class of failure the old shape reported. It is reachable:
+                # review() builds the reviewer's settings through
+                # load_settings(), which sys.exits on a settings file it
+                # cannot use and is re-read on every review precisely so a
+                # mid-run edit is caught. That SystemExit killed one worker
+                # with `fell_over` still empty, so the pass reported every
+                # repository clean and one of them was never reviewed
+                # again, with nothing in the log. KeyboardInterrupt cannot
+                # arrive here, because signals reach the main thread only.
                 fell_over.append((repo, err))
 
-    workers = [threading.Thread(target=passes, daemon=True,
-                                name="vinegar-poll-%d" % nth)
+    # Not daemons, and joined here rather than by the interpreter. Both
+    # halves matter and each was learned from a failure.
+    #
+    # A ThreadPoolExecutor's shutdown ran at interpreter exit, which is
+    # after main() had logged "stopped" and released the lock: measured
+    # with three repositories and two workers, the third repository's pass
+    # *started* after the daemon said it had gone, with the lock free for a
+    # `--pr` run to take and reset a tree a live review was reading. Making
+    # the workers daemons ended that by having the interpreter kill them
+    # instead, which was worse in a quieter way: a daemon thread killed at
+    # finalization runs no finally block, so handle_pr never closed its
+    # checks entry and every in-flight pull request kept a Vinegar check
+    # spinning for ever, blocking a merge wherever that check is required.
+    #
+    # Joining inside the interrupt handler keeps both. The lock is still
+    # held, because main() has not returned from here; the queue is
+    # abandoned, so no repository that had not started starts now; and the
+    # passes still running unwind on their own and close what they opened.
+    workers = [threading.Thread(target=passes, name="vinegar-poll-%d" % nth)
                for nth in range(width)]
-    for worker in workers:
-        worker.start()
-    for worker in workers:
-        worker.join()
+    try:
+        # Starting inside the try, not before it. An interrupt landing
+        # between two start() calls would otherwise leave the workers
+        # already running with nothing joining them, which is the whole
+        # failure this try exists to prevent, in its narrowest window.
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
+    except BaseException:
+        # Ctrl-C, almost always. Re-raised once the workers are done, so
+        # main() says "stopped" and releases the lock at a moment when that
+        # is true.
+        STOPPING.set()
+        for worker in workers:
+            # Only the ones that started. join() on a thread that never
+            # did raises RuntimeError, and losing the interrupt to that
+            # would leave the lock released with passes still running,
+            # which is what this is here to stop.
+            if worker.is_alive():
+                worker.join()
+        raise
 
     # Every pass that fell over is named, and then the first is raised.
     # poll_repo catches the two failures it names and no others, so
@@ -5338,7 +5420,11 @@ def handle_pr(repo, pr, config, state, tokens):
     # line that finishes the indicator cannot be skipped. The end of this
     # function is reachable only when nothing goes wrong: save_state
     # below raises on a full disk, a failure this function already treats
-    # as real, and Ctrl-C is how the README says to stop the daemon.
+    # as real, and a foreground run is stopped with Ctrl-C. Under launchd
+    # there is no interrupt at all: `bootout` is a SIGTERM that Python
+    # installs no handler for, so the process dies here without running
+    # this finally or any other, which is the case the pre-review marker
+    # on disk exists for rather than this try.
     # KeyboardInterrupt is not an Exception, so it walks past every
     # handler here untouched. Either way the pull request was left
     # carrying a Vinegar check that spins for ever, and a stuck run

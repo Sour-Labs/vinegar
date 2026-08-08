@@ -38,6 +38,7 @@ import os
 import atexit
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -2754,6 +2755,14 @@ def _loaded(**over):
         return vinegar.load_config(path)
     except SystemExit as err:
         return str(err)
+    except Exception as err:
+        # A raise is a way of refusing too, and the worst one: this is the
+        # function whose whole job is turning a bad config into a
+        # sentence. Returned rather than let out, so a check that expects
+        # a sentence fails and names itself. Escaping, it ended the run at
+        # whichever check happened to be first, which mutate.py can only
+        # report as coverage voided rather than as a guard caught.
+        return "raised %s: %s" % (type(err).__name__, err)
 
 
 def _config_with(**over):
@@ -2798,13 +2807,40 @@ check("a repository named twice refuses to start",
 check("the refusal names which repository was written twice",
       "o/r" in _config_with(repos=["o/a", "o/r", "o/r"]),
       _config_with(repos=["o/a", "o/r", "o/r"]))
-# Through `in` rather than a set, so a config whose entries are not
-# hashable still gets a sentence from the check below it rather than a
-# TypeError out of this one.
-check("an unhashable entry in repos does not raise out of the check",
-      "started" == _config_with(repos=["o/a", {"name": "o/b"}])
-      or "repos" in _config_with(repos=["o/a", {"name": "o/b"}]),
+# Once per offending spelling, not once per extra copy. Three of one
+# repository read as "names o/r, o/r more than once", which looks like two
+# separate problems.
+check("a repository named three times is named once in the refusal",
+      _config_with(repos=["o/r", "o/r", "o/r"]).count("o/r") == 1,
+      _config_with(repos=["o/r", "o/r", "o/r"]))
+# GitHub resolves a repository name without case and so does the default
+# macOS filesystem, so these two entries list the same pull requests into
+# one clone directory: the collision the check exists to catch, walking
+# straight past an exact comparison.
+check("two spellings of one repository refuse to start too",
+      "more than once" in _config_with(repos=["O/R", "o/r"]),
+      _config_with(repos=["O/R", "o/r"]))
+# Stored stripped, like the model names, so a stray space is not a second
+# repository and does not reach `gh` either.
+check("a repository written with stray spaces is the same repository",
+      "more than once" in _config_with(repos=["o/r", " o/r "]),
+      _config_with(repos=["o/r", " o/r "]))
+check("and the stored name has the spaces taken off",
+      _loaded(repos=[" o/r "])["repos"] == ["o/r"],
+      _loaded(repos=[" o/r "]))
+# An entry that is not a string used to be accepted here and then raise
+# TypeError out of main()'s own startup line before a single repository
+# was polled, which under launchd is a traceback and a restart every 30
+# seconds for ever. One equality, not an `or` across both outcomes: the
+# first version of this check passed whether the entry was refused or
+# silently accepted, so it recorded the crash rather than catching it.
+check("an entry that is not a repository name refuses to start",
+      "must hold owner/name strings" in _config_with(
+          repos=["o/a", {"name": "o/b"}]),
       _config_with(repos=["o/a", {"name": "o/b"}]))
+check("an empty entry refuses to start as well",
+      "must hold owner/name strings" in _config_with(repos=["o/a", "  "]),
+      _config_with(repos=["o/a", "  "]))
 check("distinct repositories still start",
       _config_with(repos=["o/a", "o/b"]) == "started",
       _config_with(repos=["o/a", "o/b"]))
@@ -6515,23 +6551,59 @@ vinegar.poll_once(dict(CONFIG, repos=["o/one", "o/two"], parallel_repos=2),
 check("two repositories are polled at the same time",
       sorted(_met) == ["o/one", "o/two"], _met)
 
-# Daemon threads, which is what lets Ctrl-C end the daemon. A pool's
-# threads have not been daemons since Python 3.9 and an atexit hook drains
-# whatever is still queued, so the interrupt came out of the pool's
-# shutdown, main() logged "stopped" and released the lock, and the process
-# went on buying reviews: measured with three repositories and two workers,
-# the third repository's pass *started* after the daemon said it had
-# stopped, with the lock free for a `--pr` run to take and reset a tree a
-# live review was reading. The signal handling itself cannot be exercised
-# in-process, so what is checked here is the one property the two shapes
-# differ by.
+# Not daemons. A daemon thread killed at interpreter finalization runs no
+# finally block, so handle_pr would never close its checks entry and every
+# in-flight pull request would keep a Vinegar check spinning for ever,
+# blocking a merge wherever that check is required. Measured directly: a
+# daemon thread's finally does not run when the interpreter exits.
 _daemonic = []
 vinegar.handle_pr = lambda repo, pr, config, state, tokens: _daemonic.append(
     threading.current_thread().daemon)
 vinegar.poll_once(dict(CONFIG, repos=["o/one", "o/two"], parallel_repos=2),
                   {}, {})
-check("a parallel pass runs on daemon threads, so Ctrl-C can end it",
-      _daemonic == [True, True], _daemonic)
+check("a parallel pass runs on threads the interpreter will wait for",
+      _daemonic == [False, False], _daemonic)
+
+# The pass does not return while a repository is still being polled. That
+# is the whole bug this shape exists to fix: a pool joined at interpreter
+# exit let main() log "stopped" and release the lock first, and measured
+# with three repositories and two workers the third repository's pass
+# *started* after the daemon said it had gone.
+_released = threading.Event()
+_late = []
+
+
+def _finishes_late(repo, pr, config, state, tokens):
+    _released.wait(10)
+    _late.append(repo)
+
+
+vinegar.handle_pr = _finishes_late
+threading.Timer(0.3, _released.set).start()
+vinegar.poll_once(dict(CONFIG, repos=["o/one", "o/two"], parallel_repos=2),
+                  {}, {})
+check("the pass waits for every repository still being polled",
+      sorted(_late) == ["o/one", "o/two"], _late)
+
+# A worker asked to stop takes no further pull request. Read only at the
+# top of a pass, a stop would go on buying full reviews for that
+# repository's remaining pull requests, which is the opposite of stopping.
+_after_stop = []
+vinegar.open_prs = lambda repo, env: [dict(PR, number=1), dict(PR, number=2)]
+vinegar.handle_pr = lambda repo, pr, config, state, tokens: _after_stop.append(
+    pr["number"])
+vinegar.STOPPING.set()
+try:
+    vinegar.poll_repo("o/one", CONFIG, {}, {})
+finally:
+    vinegar.STOPPING.clear()
+check("a pass asked to stop starts no further pull request",
+      _after_stop == [], _after_stop)
+vinegar.open_prs = lambda repo, env: [dict(PR, number=1)]
+del _after_stop[:]
+vinegar.poll_repo("o/one", CONFIG, {}, {})
+check("and it goes on polling once the stop is cleared",
+      _after_stop == [1], _after_stop)
 
 # Fewer workers than repositories: the ones over the width wait for any
 # worker rather than for a particular one, so all of them still get a pass.
@@ -6614,6 +6686,126 @@ check("every pass that fell over is named, not only the one raised",
       sum("whole pass fell over" in m for m in _both_said) == 2, _both_said)
 check("and one of them is still raised, so the daemon does not carry on",
       isinstance(_both_escaped, ValueError), _both_escaped)
+
+# A SystemExit is not an Exception, and this replaced a pool whose work
+# item caught BaseException and handed it back on result(). It is
+# reachable: review() builds the reviewer's settings through
+# load_settings(), which sys.exits on a settings file it cannot use and is
+# re-read on every review so a mid-run edit is caught. Caught too
+# narrowly, that killed one worker with nothing recorded, so the pass
+# reported every repository clean and one of them was never reviewed again
+# with nothing in the log.
+_exit_said = []
+_kept_log, vinegar.log = vinegar.log, lambda m: _exit_said.append(m)
+
+
+def _exits_rather_than_raises(repo, config, state, tokens):
+    raise SystemExit("review-settings.json cannot be read")
+
+
+vinegar.poll_repo = _exits_rather_than_raises
+try:
+    vinegar.poll_once(dict(CONFIG, repos=["o/one", "o/two"],
+                           parallel_repos=2), {}, {})
+    _exit_escaped = None
+except BaseException as err:
+    _exit_escaped = err
+vinegar.log = _kept_log
+check("a pass that exits rather than raises is still named",
+      sum("whole pass fell over" in m for m in _exit_said) == 2, _exit_said)
+check("and it still reaches the daemon rather than dying in its worker",
+      isinstance(_exit_escaped, SystemExit), _exit_escaped)
+
+# An interrupt during a parallel pass waits for the passes still running
+# before it leaves here, so main() releases the lock at a moment when that
+# is true and no pull request is abandoned mid-review with its checks
+# entry still open.
+# In its own interpreter, and it has to be. The signal goes to the whole
+# process, so if the guard being exercised is broken and poll_once returns
+# straight away, the interrupt lands in whatever this file is doing 200ms
+# later: the run ends with a traceback instead of a failed check, which is
+# coverage voided rather than a guard caught.
+#
+# A real signal, too, which is how Ctrl-C arrives. `_thread.interrupt_main`
+# cannot stand in for it: it leaves the interrupt pending rather than
+# waking the blocked join, so it is delivered when the join finally
+# returns, which on Python 3.9 is between the acquire and the release
+# inside Thread._wait_for_tstate_lock. That lock stays held and the
+# interpreter hangs joining the thread on its way out. Measured, and it
+# hung this suite before the signal was made a real one.
+#
+# Nothing in it is on a timer. Both orderings that matter are forced: the
+# signal comes from a worker, which cannot run before the code under test
+# has started it, and the passes are released by the signal handler, so
+# they cannot finish before the interrupt lands. A first version used two
+# timers and passed here while failing under the load of a mutation run,
+# which is a check that reports on how busy the machine is.
+_int_script = os.path.join(_home, "interrupt_a_pass.py")
+with open(_int_script, "w") as handle:
+    # Substituted rather than %-formatted: the script below does its own
+    # %-formatting, and interpolating the whole thing consumed those.
+    handle.write('''
+import os, signal, sys, threading
+sys.path.insert(0, __HERE__)
+import vinegar
+
+release, done = threading.Event(), []
+# Both workers past their start() before any signal, so the interrupt
+# provably lands on a main thread that is joining two running passes
+# rather than one it has not started yet. Without this the signal beat the
+# second start(), that worker never ran, and the check read as a failure
+# when the behaviour was right.
+both_up = threading.Barrier(2)
+
+
+def stop_waiting(signum, frame):
+    """Let the passes finish, then interrupt the main thread.
+
+    Releasing here rather than on a timer is what makes this a test
+    instead of a race. On a loaded machine a timed release could land
+    first, the passes would end on their own, the join would return
+    normally and the interrupt would arrive with nothing left to wait
+    for -- a green run that exercised none of this.
+    """
+    release.set()
+    raise KeyboardInterrupt
+
+
+signal.signal(signal.SIGINT, stop_waiting)
+
+
+def still_running(repo, config, state, tokens):
+    # Sent from a worker, so the main thread is provably already inside
+    # poll_once: this runs only after start() was called, and start() is
+    # inside the block being exercised. A timer could fire before
+    # poll_once was reached at all.
+    both_up.wait(10)
+    if repo == "o/one":
+        os.kill(os.getpid(), signal.SIGINT)
+    release.wait(10)
+    done.append(repo)
+
+
+vinegar.poll_repo = still_running
+vinegar.log = lambda message: None
+try:
+    vinegar.poll_once({"repos": ["o/one", "o/two"], "parallel_repos": 2},
+                      {}, {})
+    print("RETURNED-WITHOUT-INTERRUPT done=%s" % ",".join(sorted(done)))
+except KeyboardInterrupt:
+    print("INTERRUPTED done=%s" % ",".join(sorted(done)))
+except BaseException as err:
+    print("OTHER %r" % (err,))
+'''.replace("__HERE__", repr(here_dir)))
+_int_out = subprocess.run(
+    [sys.executable, _int_script], capture_output=True, text=True,
+    timeout=60, env=dict(os.environ,
+                         VINEGAR_HOME=os.environ["VINEGAR_HOME"])).stdout
+# One assertion over both halves: the interrupt reached the daemon, and
+# every pass that was still running had finished before it got there. Torn
+# apart they can pass for opposite reasons.
+check("an interrupt waits for the passes still running, then reaches main",
+      "INTERRUPTED done=o/one,o/two" in _int_out, _int_out.strip()[:120])
 vinegar.poll_repo = _real_poll_repo
 vinegar.open_prs, vinegar.handle_pr = _real_listing, _real_handling
 reset_stubs()

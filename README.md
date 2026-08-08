@@ -104,6 +104,13 @@ python3 vinegar.py --once                # one pass, then exit
 python3 vinegar.py                       # poll forever
 ```
 
+**Ctrl-C stops a run in the foreground.** It ends the review that is running
+and closes that pull request's entry in the checks list on the way out, so
+nothing is left spinning. With `parallel_repos` above 1 it also stops any
+repository that had not started, and waits for the ones that had. Under
+launchd there is no interrupt: see "Running it under launchd" for `bootout`,
+which kills the process outright.
+
 Vinegar keeps its own state under `~/.vinegar`: `config.json`, `state.json`
 (the head commit it last handled per pull request), and `reviews/`. A run that
 posts nothing uses `state.json.dry` and `reviews.dry/` instead. A review that

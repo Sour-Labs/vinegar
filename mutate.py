@@ -308,7 +308,7 @@ MUTATIONS = [
     # of them.
     ("parallel-queue-drains",
      "    def passes():\n"
-     "        while True:\n"
+     "        while not STOPPING.is_set():\n"
      "            try:\n"
      "                repo = todo.get_nowait()\n"
      "            except queue.Empty:\n"
@@ -319,12 +319,58 @@ MUTATIONS = [
      "                repo = todo.get_nowait()\n"
      "            except queue.Empty:\n"
      "                return"),
-    # Non-daemon workers are what let a Ctrl-C'd daemon go on reviewing
-    # after it released the lock, with a `--pr` run free to reset a tree a
-    # live review is reading.
+    # Daemon workers are killed at interpreter finalization without
+    # unwinding, so handle_pr's finally never closes the checks entry and
+    # the pull request keeps a Vinegar check spinning for ever.
     ("parallel-daemon-threads",
-     "    workers = [threading.Thread(target=passes, daemon=True,",
-     "    workers = [threading.Thread(target=passes,"),
+     '    workers = [threading.Thread(target=passes, '
+     'name="vinegar-poll-%d" % nth)',
+     '    workers = [threading.Thread(target=passes, daemon=True,\n'
+     '                                name="vinegar-poll-%d" % nth)'),
+    # The one line that keeps poll_once from returning while passes are
+    # still running, which is the shape of the bug this whole change fixes.
+    ("parallel-workers-joined",
+     "        for worker in workers:\n"
+     "            worker.start()\n"
+     "        for worker in workers:\n"
+     "            worker.join()\n"
+     "    except BaseException:",
+     "        for worker in workers:\n"
+     "            worker.start()\n"
+     "    except BaseException:"),
+    # No entry for start() being inside the try rather than before it, and
+    # that is deliberate rather than missed. The window it closes is an
+    # interrupt landing between two start() calls, and the interrupt check
+    # holds both workers at a barrier before signalling so that it lands on
+    # a main thread that is joining rather than starting. Signalling
+    # earlier instead would decide which of the two the mutation exercises
+    # by timing, which is a mutation that reports on the machine. The
+    # hardening is reasoned, not measured, and the commit message says so.
+    # The join inside the interrupt handler: without it the interrupt goes
+    # straight to main(), which releases the lock while passes run on.
+    ("parallel-join-on-interrupt",
+     "        STOPPING.set()\n"
+     "        for worker in workers:",
+     "        STOPPING.set()\n"
+     "        raise\n"
+     "        for worker in workers:"),
+    # A worker's catch as narrow as Exception loses a SystemExit, which
+    # load_settings raises on every review when the settings file is bad.
+    ("parallel-worker-catches-baseexception",
+     "            except BaseException as err:\n"
+     "                # Kept rather than raised.",
+     "            except Exception as err:\n"
+     "                # Kept rather than raised."),
+    # The stop read between pull requests rather than only between
+    # repositories, so an interrupted pass does not buy full reviews for
+    # the rest of that repository's list.
+    ("parallel-stop-between-prs",
+     "        if STOPPING.is_set():\n"
+     "            return\n"
+     "        try:\n"
+     "            handle_pr(repo, pr, config, state, tokens)",
+     "        try:\n"
+     "            handle_pr(repo, pr, config, state, tokens)"),
     ("parallel-every-failure-named",
      "    for repo, err in fell_over:\n"
      '        log("%s: its whole pass fell over: %s" % (repo, err))',
@@ -344,9 +390,31 @@ MUTATIONS = [
     # A repository named twice, which used to cost one wasted listing and
     # now puts two passes on one checkout.
     ("repos-named-twice",
-     "    twice = [name for nth, name in enumerate(config[\"repos\"])\n"
-     '             if name in config["repos"][:nth]]',
-     "    twice = []"),
+     "        if folded.index(folded[nth]) != nth and name not in twice:\n"
+     "            twice.append(name)",
+     "        pass"),
+    # Compared without case, because GitHub resolves a repository name
+    # that way and so does the default macOS filesystem: an exact match
+    # walks straight past the collision this check exists to catch.
+    ("repos-duplicate-folded",
+     '    folded = [name.casefold() for name in config["repos"]]',
+     '    folded = list(config["repos"])'),
+    # Each offending spelling once, rather than once per extra copy.
+    ("repos-twice-named-once",
+     "        if folded.index(folded[nth]) != nth and name not in twice:",
+     "        if folded.index(folded[nth]) != nth:"),
+    # An entry that is not a repository name was accepted here and raised
+    # TypeError out of main()'s startup line, before anything was polled.
+    ("repos-entries-are-strings",
+     '    for nth, name in enumerate(config["repos"]):\n'
+     "        if not isinstance(name, str) or not name.strip():\n"
+     '            sys.exit("%s: repos must hold owner/name strings, not %r" % (\n'
+     "                path, name))\n"
+     '        config["repos"][nth] = name.strip()',
+     "    pass"),
+    ("repos-entries-stripped",
+     '        config["repos"][nth] = name.strip()',
+     '        config["repos"][nth] = name'),
 
     # --- what two repositories polled at once share --------------------
     ("state-lock-save",
