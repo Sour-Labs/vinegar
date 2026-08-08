@@ -130,9 +130,9 @@ MUTATIONS = [
      "                                          good_for=POST_GRACE)",
      "                    post_env = github_env(config, repo, tokens)"),
     ("good-for-listing",
-     "            prs = open_prs(repo, github_env(config, repo, tokens,\n"
-     "                                            good_for=LISTING_GRACE))",
-     "            prs = open_prs(repo, github_env(config, repo, tokens))"),
+     "        prs = open_prs(repo, github_env(config, repo, tokens,\n"
+     "                                        good_for=LISTING_GRACE))",
+     "        prs = open_prs(repo, github_env(config, repo, tokens))"),
 
     # --- anchoring, in diff_lines --------------------------------------
     ("diff-failure-gate",
@@ -269,13 +269,152 @@ MUTATIONS = [
 
     # --- the poll loop surviving one bad thing -------------------------
     ("poll-listing-guard",
-     '            log("%s: cannot list pull requests: %s" % (repo, err))\n'
-     "            continue",
-     "            raise"),
+     '        log("%s: cannot list pull requests: %s" % (repo, err))\n'
+     "        return",
+     "        raise"),
     ("poll-pr-guard",
-     '                log("%s#%s: unhandled error: %s" % (\n'
-     '                    repo, pr.get("number", "?"), err))',
-     "                raise"),
+     '            log("%s#%s: unhandled error: %s" % (\n'
+     '                repo, pr.get("number", "?"), err))',
+     "            raise"),
+
+    # --- polling more than one repository at a time --------------------
+    ("parallel-repos-checked",
+     '    for name in ("poll_interval", "review_timeout", '
+     '"max_changed_lines",\n'
+     '                 "parallel_repos"):',
+     '    for name in ("poll_interval", "review_timeout", '
+     '"max_changed_lines"):'),
+    ("parallel-repos-unit",
+     '    units = {"max_changed_lines": "lines", '
+     '"parallel_repos": "repositories"}',
+     '    units = {"max_changed_lines": "lines"}'),
+    # Carrying the line below it, because main() computes the same width
+    # for the startup line and the bare assignment matches there too.
+    ("parallel-fan-out",
+     "    width = poll_width(config)\n"
+     "    if width <= 1:",
+     "    width = 1\n"
+     "    if width <= 1:"),
+    ("parallel-width-cap",
+     '    return min(config["parallel_repos"], len(config["repos"]))',
+     '    return config["parallel_repos"]'),
+    ("parallel-serial-default",
+     "    if width <= 1:\n"
+     '        for repo in config["repos"]:\n'
+     "            poll_repo(repo, config, state, tokens)\n"
+     "        return",
+     "    pass"),
+    # Every repository has to leave the queue, not just the first `width`
+    # of them.
+    ("parallel-queue-drains",
+     "    def passes():\n"
+     "        while not STOPPING.is_set():\n"
+     "            try:\n"
+     "                repo = todo.get_nowait()\n"
+     "            except queue.Empty:\n"
+     "                return",
+     "    def passes():\n"
+     "        for _ in (1,):\n"
+     "            try:\n"
+     "                repo = todo.get_nowait()\n"
+     "            except queue.Empty:\n"
+     "                return"),
+    # Daemon workers are killed at interpreter finalization without
+    # unwinding, so handle_pr's finally never closes the checks entry and
+    # the pull request keeps a Vinegar check spinning for ever.
+    ("parallel-daemon-threads",
+     '    workers = [threading.Thread(target=passes, '
+     'name="vinegar-poll-%d" % nth)',
+     '    workers = [threading.Thread(target=passes, daemon=True,\n'
+     '                                name="vinegar-poll-%d" % nth)'),
+    # The one line that keeps poll_once from returning while passes are
+    # still running, which is the shape of the bug this whole change fixes.
+    ("parallel-workers-joined",
+     "    try:\n"
+     "        for worker in workers:\n"
+     "            worker.join()\n"
+     "    except BaseException:",
+     "    try:\n"
+     "        pass\n"
+     "    except BaseException:"),
+    # The wait inside the interrupt handler: without it the interrupt goes
+    # straight to main(), which releases the lock while passes run on.
+    ("parallel-join-on-interrupt",
+     "        STOPPING.set()\n"
+     "        # Stopping, the second half of the rule above.",
+     "        STOPPING.set()\n"
+     "        raise\n"
+     "        # Stopping, the second half of the rule above."),
+    # Ctrl-C not dropped while the workers are being started: an
+    # interrupt inside Thread.start() leaves a thread that is running and
+    # says it is not, so the stop skips it and the lock comes free while
+    # it reviews.
+    ("parallel-deaf-while-starting",
+     "    previous = signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
+     "    try:\n"
+     "        for worker in workers:",
+     "    previous = signal.getsignal(signal.SIGINT)\n"
+     "    try:\n"
+     "        for worker in workers:"),
+    # Ctrl-C not dropped while they are being stopped: only the join can
+    # sit in a try, so a signal landing in the log call around it walks
+    # out past the re-raise and drops the lock with reviews still running.
+    ("parallel-deaf-while-stopping",
+     "        previous = signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
+     "        try:\n"
+     "            # Said, because what follows is a silent wait",
+     "        previous = signal.getsignal(signal.SIGINT)\n"
+     "        try:\n"
+     "            # Said, because what follows is a silent wait"),
+    # The line that says what the wait is for, and that killing is how to
+    # force it. Silence reads as a hang.
+    ("parallel-say-what-is-waited-for",
+     '                log("stopping: waiting for %d repositor%s still being "\n'
+     '                    "reviewed. Kill the process to force it"\n'
+     '                    % (alive, "y" if alive == 1 else "ies"))',
+     "                pass"),
+    # No entry for the join being unconditional. Every worker is started
+    # under the deafness above, so testing is_alive() first would skip
+    # only threads that have already finished: the same behaviour, which a
+    # mutation would rightly report as survived. What makes the
+    # unconditional form safe is the deafness, and that has its own entry.
+
+    # --- what two repositories polled at once share --------------------
+    ("state-lock-save",
+     "    with STATE_LOCK:\n"
+     "        os.makedirs(HOME, exist_ok=True)\n"
+     "        write_atomic(STATE_PATH, json.dumps(state, indent=2, "
+     "sort_keys=True))",
+     "    os.makedirs(HOME, exist_ok=True)\n"
+     "    write_atomic(STATE_PATH, json.dumps(state, indent=2, "
+     "sort_keys=True))"),
+    ("state-lock-remember",
+     "    with STATE_LOCK:\n"
+     "        state[key] = entry\n"
+     "        if write:\n"
+     "            save_state(state)",
+     "    state[key] = entry\n"
+     "    if write:\n"
+     "        save_state(state)"),
+    ("remember-write-flag",
+     "        state[key] = entry\n"
+     "        if write:\n"
+     "            save_state(state)",
+     "        state[key] = entry\n"
+     "        save_state(state)"),
+    ("log-lock",
+     "    with LOG_LOCK:\n"
+     '        print("%s %s" % (utc_stamp(), message), flush=True)',
+     '    print("%s %s" % (utc_stamp(), message), flush=True)'),
+    # The stamp read before the lock rather than under it, which is how
+    # two lines end up carrying timestamps in the opposite order to the
+    # order they were written in.
+    ("log-stamp-under-the-lock",
+     "    with LOG_LOCK:\n"
+     '        print("%s %s" % (utc_stamp(), message), flush=True)',
+     '    line = "%s %s" % (utc_stamp(), message)\n'
+     "    with LOG_LOCK:\n"
+     "        print(line, flush=True)"),
     ("acquire-flock",
      "        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)",
      "        pass"),
@@ -1049,11 +1188,11 @@ MUTATIONS = [
     # toggle or one failed clone and the pull request reports everything
     # again.
     ("rounds-survive-a-skip",
-     "                             **dict(carry_forward(kept),\n"
-     "                                    **reviewed_through(False, head, done),\n"
-     "                                    **rounds_done(False, done)))",
-     "                             **dict(carry_forward(kept),\n"
-     "                                    **reviewed_through(False, head, done)))"),
+     "                        **dict(carry_forward(kept),\n"
+     "                               **reviewed_through(False, head, done),\n"
+     "                               **rounds_done(False, done)))",
+     "                        **dict(carry_forward(kept),\n"
+     "                               **reviewed_through(False, head, done)))"),
     # The reviewer told nothing, so the narrowing is a sentence on the pull
     # request about a review that was never asked to hold anything back.
     ("blockers-reach-the-reviewer",
@@ -1141,11 +1280,11 @@ MUTATIONS = [
     # killed mid-review leaves behind. Dropping the carry there hands back
     # every round already spent.
     ("rounds-survive-the-pre-review-marker",
-     "                                    waivers=0,\n"
-     "                                    **reviewed_through(False, head, done),\n"
-     "                                    **rounds_done(False, done)))",
-     "                                    waivers=0,\n"
-     "                                    **reviewed_through(False, head, done)))"),
+     "        **dict(carry_forward(kept), post_tries=0, waivers=0,\n"
+     "               **reviewed_through(False, head, done),\n"
+     "               **rounds_done(False, done))))",
+     "        **dict(carry_forward(kept), post_tries=0, waivers=0,\n"
+     "               **reviewed_through(False, head, done))))"),
     # The give-up rebuild, which rounds_done()'s own docstring names as a
     # case it exists for and which nothing was holding.
     ("rounds-survive-a-give-up",
