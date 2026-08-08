@@ -350,10 +350,29 @@ MUTATIONS = [
     # straight to main(), which releases the lock while passes run on.
     ("parallel-join-on-interrupt",
      "        STOPPING.set()\n"
-     "        for worker in workers:",
+     "        # Only the ones that started.",
      "        STOPPING.set()\n"
      "        raise\n"
-     "        for worker in workers:"),
+     "        # Only the ones that started."),
+    # A second interrupt during the stopping wait, let out rather than
+    # refused: it skips the re-raise, reaches main() and drops the lock
+    # with reviews still reading their checkouts.
+    ("parallel-refuse-second-interrupt",
+     "        for worker in waiting:\n"
+     "            while worker.is_alive():\n"
+     "                try:\n"
+     "                    worker.join()",
+     "        for worker in waiting:\n"
+     "            if worker.is_alive():\n"
+     "                try:\n"
+     "                    worker.join()"),
+    # The line that says what the wait is for. Silence is what provokes
+    # the second interrupt the loop above it then has to refuse.
+    ("parallel-say-what-is-waited-for",
+     '            log("stopping: waiting for %d repositor%s still being '
+     'reviewed"\n'
+     '                % (len(waiting), "y" if len(waiting) == 1 else "ies"))',
+     "            pass"),
     # A worker's catch as narrow as Exception loses a SystemExit, which
     # load_settings raises on every review when the settings file is bad.
     ("parallel-worker-catches-baseexception",

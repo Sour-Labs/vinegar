@@ -5001,13 +5001,40 @@ def poll_once(config, state, tokens):
         # main() says "stopped" and releases the lock at a moment when that
         # is true.
         STOPPING.set()
-        for worker in workers:
-            # Only the ones that started. join() on a thread that never
-            # did raises RuntimeError, and losing the interrupt to that
-            # would leave the lock released with passes still running,
-            # which is what this is here to stop.
-            if worker.is_alive():
-                worker.join()
+        # Only the ones that started. join() on a thread that never did
+        # raises RuntimeError, and losing the interrupt to that would
+        # leave the lock released with passes still running, which is
+        # what this is here to stop.
+        waiting = [worker for worker in workers if worker.is_alive()]
+        if waiting:
+            # Said, because what follows is a silent wait and silence is
+            # exactly what provokes the second interrupt the loop below
+            # then refuses. It is not instant either: each pass still has
+            # handle_pr's finally to run, which closes the checks entry
+            # through `gh`, and a `gh` started after the signal was never
+            # in the process group that signal reached.
+            log("stopping: waiting for %d repositor%s still being reviewed"
+                % (len(waiting), "y" if len(waiting) == 1 else "ies"))
+        for worker in waiting:
+            while worker.is_alive():
+                try:
+                    worker.join()
+                except KeyboardInterrupt:
+                    # Refused, deliberately. A second interrupt let out
+                    # here skips the raise below and reaches main(), which
+                    # logs "stopped" and drops the lock with reviews still
+                    # reading their checkouts: the race this whole block
+                    # closes, reopened by the one thing an operator
+                    # watching a silent wait is most likely to do. Measured
+                    # before this loop existed, with both passes still
+                    # alive at the moment the lock came free.
+                    #
+                    # Killing the process is the way to force it, and it is
+                    # consistent where dropping the lock alone is not: the
+                    # kernel releases the lock when the process dies, and
+                    # the reviews die with it rather than reading a tree
+                    # something else may now reset.
+                    log("still stopping; kill the process to force it")
         raise
 
     # Every pass that fell over is named, and then the first is raised.

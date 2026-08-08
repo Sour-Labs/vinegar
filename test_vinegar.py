@@ -6744,56 +6744,91 @@ _int_script = os.path.join(_home, "interrupt_a_pass.py")
 with open(_int_script, "w") as handle:
     # Substituted rather than %-formatted: the script below does its own
     # %-formatting, and interpolating the whole thing consumed those.
+    #
+    # It is built so that no outcome depends on how fast the machine is.
+    # Exactly one pass is left running when the stop begins, and the
+    # signals are sent from the log lines the stopping block itself
+    # prints, so each lands where it is meant to. What separates a wait
+    # that re-joins from one that gives up after a single refusal is then
+    # a property rather than a race: only a loop can refuse twice for the
+    # same pass, and the pass is held until it has.
     handle.write('''
 import os, signal, sys, threading
 sys.path.insert(0, __HERE__)
 import vinegar
 
-release, done = threading.Event(), []
+hold, done = threading.Event(), []
+refused, said = [], []
 # Both workers past their start() before any signal, so the interrupt
-# provably lands on a main thread that is joining two running passes
-# rather than one it has not started yet. Without this the signal beat the
-# second start(), that worker never ran, and the check read as a failure
-# when the behaviour was right.
+# provably lands on a main thread that is joining rather than one that has
+# not started yet. Without it the signal beat the second start(), that
+# worker never ran, and the check read as a failure when the behaviour was
+# right.
 both_up = threading.Barrier(2)
 
 
-def stop_waiting(signum, frame):
-    """Let the passes finish, then interrupt the main thread.
+def interrupt():
+    os.kill(os.getpid(), signal.SIGINT)
 
-    Releasing here rather than on a timer is what makes this a test
-    instead of a race. On a loaded machine a timed release could land
-    first, the passes would end on their own, the join would return
-    normally and the interrupt would arrive with nothing left to wait
-    for -- a green run that exercised none of this.
-    """
-    release.set()
+
+def stop_waiting(signum, frame):
     raise KeyboardInterrupt
 
 
 signal.signal(signal.SIGINT, stop_waiting)
 
 
-def still_running(repo, config, state, tokens):
+def note(message):
+    """Drive the next interrupt from the line the stop just printed.
+
+    Timers cannot do this. The point of each signal is where it lands,
+    and these lines say exactly where the main thread is: the first is
+    printed immediately before the stopping wait, and each "still
+    stopping" immediately after that wait refused one.
+    """
+    if "waiting for" in message:
+        said.append(message)
+        threading.Timer(0.1, interrupt).start()
+    if "still stopping" in message:
+        refused.append(message)
+        if len(refused) < 2:
+            threading.Timer(0.1, interrupt).start()
+        else:
+            # Only a wait that goes back to the same pass can get here.
+            # One that gives up after a single refusal has already moved
+            # on, so this never fires and the pass stays held, which is
+            # what the check sees.
+            hold.set()
+
+
+vinegar.log = note
+
+
+def one_pass_lingers(repo, config, state, tokens):
+    both_up.wait(10)
+    if repo != "o/one":
+        # Finished before the stop begins, so exactly one pass is left to
+        # wait for and the wait has a single worker to go back to.
+        done.append(repo)
+        return
     # Sent from a worker, so the main thread is provably already inside
     # poll_once: this runs only after start() was called, and start() is
-    # inside the block being exercised. A timer could fire before
-    # poll_once was reached at all.
-    both_up.wait(10)
-    if repo == "o/one":
-        os.kill(os.getpid(), signal.SIGINT)
-    release.wait(10)
+    # inside the block being exercised.
+    threading.Timer(0.2, interrupt).start()
+    hold.wait(10)
     done.append(repo)
 
 
-vinegar.poll_repo = still_running
-vinegar.log = lambda message: None
+vinegar.poll_repo = one_pass_lingers
 try:
     vinegar.poll_once({"repos": ["o/one", "o/two"], "parallel_repos": 2},
                       {}, {})
     print("RETURNED-WITHOUT-INTERRUPT done=%s" % ",".join(sorted(done)))
 except KeyboardInterrupt:
-    print("INTERRUPTED done=%s" % ",".join(sorted(done)))
+    alive = [t for t in threading.enumerate()
+             if t.name.startswith("vinegar-poll")]
+    print("INTERRUPTED done=%s refused=%d said=%d alive=%d"
+          % (",".join(sorted(done)), len(refused), len(said), len(alive)))
 except BaseException as err:
     print("OTHER %r" % (err,))
 '''.replace("__HERE__", repr(here_dir)))
@@ -6801,11 +6836,20 @@ _int_out = subprocess.run(
     [sys.executable, _int_script], capture_output=True, text=True,
     timeout=60, env=dict(os.environ,
                          VINEGAR_HOME=os.environ["VINEGAR_HOME"])).stdout
-# One assertion over both halves: the interrupt reached the daemon, and
-# every pass that was still running had finished before it got there. Torn
-# apart they can pass for opposite reasons.
+# One assertion over three halves: the interrupt reached the daemon, every
+# pass still running had finished before it got there, and a second
+# interrupt arriving during that wait was refused rather than let out.
+# Torn apart they can pass for opposite reasons.
+#
+# The last of those is the one that costs most if it goes: let out, the
+# second interrupt skips the re-raise, reaches main() and drops the lock
+# with reviews still reading their checkouts. Measured that way before
+# this loop existed, both passes alive at the moment the lock came free,
+# and it is the likeliest thing an operator does when a stop looks like
+# it has hung.
 check("an interrupt waits for the passes still running, then reaches main",
-      "INTERRUPTED done=o/one,o/two" in _int_out, _int_out.strip()[:120])
+      "INTERRUPTED done=o/one,o/two refused=2 said=1 alive=0" in _int_out,
+      _int_out.strip()[:120])
 vinegar.poll_repo = _real_poll_repo
 vinegar.open_prs, vinegar.handle_pr = _real_listing, _real_handling
 reset_stubs()
