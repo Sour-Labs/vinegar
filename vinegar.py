@@ -31,6 +31,7 @@ import os
 import queue
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -4987,13 +4988,33 @@ def poll_once(config, state, tokens):
     # passes still running unwind on their own and close what they opened.
     workers = [threading.Thread(target=passes, name="vinegar-poll-%d" % nth)
                for nth in range(width)]
+
+    # Ctrl-C is dropped while the workers are being started, and again
+    # below while they are being stopped. Between the two it works
+    # normally, and that is the whole of the interrupt story here.
+    #
+    # Starting: an interrupt landing inside Thread.start() leaves a thread
+    # that is running but has not set its started flag, and both of the
+    # ways to ask about one read that flag. Measured: is_alive() answers
+    # False, join() refuses with "cannot join thread before it is
+    # started", and half a second later the same thread says it is alive
+    # and has been running the whole time. Any stop worked out from those
+    # answers therefore skips it, and the lock is released while it
+    # reviews. Dropping the signal for the microseconds this loop takes
+    # means no stop can ever be worked out from a half-started thread,
+    # which is a window removed rather than narrowed.
+    #
+    # What it costs: a Ctrl-C pressed inside that window is discarded
+    # rather than queued. It is microseconds of thread creation, and
+    # pressing again works.
+    previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
     try:
-        # Starting inside the try, not before it. An interrupt landing
-        # between two start() calls would otherwise leave the workers
-        # already running with nothing joining them, which is the whole
-        # failure this try exists to prevent, in its narrowest window.
         for worker in workers:
             worker.start()
+    finally:
+        signal.signal(signal.SIGINT, previous)
+
+    try:
         for worker in workers:
             worker.join()
     except BaseException:
@@ -5001,40 +5022,46 @@ def poll_once(config, state, tokens):
         # main() says "stopped" and releases the lock at a moment when that
         # is true.
         STOPPING.set()
-        # Only the ones that started. join() on a thread that never did
-        # raises RuntimeError, and losing the interrupt to that would
-        # leave the lock released with passes still running, which is
-        # what this is here to stop.
-        waiting = [worker for worker in workers if worker.is_alive()]
-        if waiting:
-            # Said, because what follows is a silent wait and silence is
-            # exactly what provokes the second interrupt the loop below
-            # then refuses. It is not instant either: each pass still has
-            # handle_pr's finally to run, which closes the checks entry
-            # through `gh`, and a `gh` started after the signal was never
-            # in the process group that signal reached.
-            log("stopping: waiting for %d repositor%s still being reviewed"
-                % (len(waiting), "y" if len(waiting) == 1 else "ies"))
-        for worker in waiting:
-            while worker.is_alive():
-                try:
-                    worker.join()
-                except KeyboardInterrupt:
-                    # Refused, deliberately. A second interrupt let out
-                    # here skips the raise below and reaches main(), which
-                    # logs "stopped" and drops the lock with reviews still
-                    # reading their checkouts: the race this whole block
-                    # closes, reopened by the one thing an operator
-                    # watching a silent wait is most likely to do. Measured
-                    # before this loop existed, with both passes still
-                    # alive at the moment the lock came free.
-                    #
-                    # Killing the process is the way to force it, and it is
-                    # consistent where dropping the lock alone is not: the
-                    # kernel releases the lock when the process dies, and
-                    # the reviews die with it rather than reading a tree
-                    # something else may now reset.
-                    log("still stopping; kill the process to force it")
+        # Stopping, the second half of the rule above. Every further
+        # Ctrl-C is dropped for as long as this takes.
+        #
+        # Refusing them one at a time was not enough, and the difference
+        # matters. Only the join can be wrapped in a try; the log calls
+        # around it cannot be, and each takes LOG_LOCK and writes, which
+        # is long enough for an auto-repeating Ctrl-C to land in it. That
+        # interrupt then walked out past the raise below and reached
+        # main(), which logs "stopped" and drops the lock with reviews
+        # still reading their checkouts: the race this block exists to
+        # close, reopened by the one thing an operator watching a silent
+        # wait is most likely to do. Deaf for the whole block, there is no
+        # window left to land in.
+        #
+        # So Ctrl-C is not the way to force this. Killing the process is,
+        # and it is consistent where dropping the lock alone is not: the
+        # kernel releases the lock when the process dies, and the reviews
+        # die with it rather than reading a tree something else may now
+        # reset.
+        previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        try:
+            # Said, because what follows is a silent wait that an operator
+            # would otherwise read as a hang. It is not instant: each pass
+            # still has handle_pr's finally to run, which closes the checks
+            # entry through `gh`, and a `gh` started after the signal was
+            # never in the process group that signal reached.
+            alive = sum(1 for worker in workers if worker.is_alive())
+            if alive:
+                log("stopping: waiting for %d repositor%s still being "
+                    "reviewed. Kill the process to force it"
+                    % (alive, "y" if alive == 1 else "ies"))
+            # Every worker, with no test for which ones are running. They
+            # were all started under the deafness above, so none of them
+            # can be in the half-started state that makes both is_alive()
+            # and join() answer wrongly, and joining one that has already
+            # finished costs nothing.
+            for worker in workers:
+                worker.join()
+        finally:
+            signal.signal(signal.SIGINT, previous)
         raise
 
     # Every pass that fell over is named, and then the first is raised.

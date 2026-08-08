@@ -330,110 +330,54 @@ MUTATIONS = [
     # The one line that keeps poll_once from returning while passes are
     # still running, which is the shape of the bug this whole change fixes.
     ("parallel-workers-joined",
-     "        for worker in workers:\n"
-     "            worker.start()\n"
+     "    try:\n"
      "        for worker in workers:\n"
      "            worker.join()\n"
      "    except BaseException:",
-     "        for worker in workers:\n"
-     "            worker.start()\n"
+     "    try:\n"
+     "        pass\n"
      "    except BaseException:"),
-    # No entry for start() being inside the try rather than before it, and
-    # that is deliberate rather than missed. The window it closes is an
-    # interrupt landing between two start() calls, and the interrupt check
-    # holds both workers at a barrier before signalling so that it lands on
-    # a main thread that is joining rather than starting. Signalling
-    # earlier instead would decide which of the two the mutation exercises
-    # by timing, which is a mutation that reports on the machine. The
-    # hardening is reasoned, not measured, and the commit message says so.
-    # The join inside the interrupt handler: without it the interrupt goes
+    # The wait inside the interrupt handler: without it the interrupt goes
     # straight to main(), which releases the lock while passes run on.
     ("parallel-join-on-interrupt",
      "        STOPPING.set()\n"
-     "        # Only the ones that started.",
+     "        # Stopping, the second half of the rule above.",
      "        STOPPING.set()\n"
      "        raise\n"
-     "        # Only the ones that started."),
-    # A second interrupt during the stopping wait, let out rather than
-    # refused: it skips the re-raise, reaches main() and drops the lock
-    # with reviews still reading their checkouts.
-    ("parallel-refuse-second-interrupt",
-     "        for worker in waiting:\n"
-     "            while worker.is_alive():\n"
-     "                try:\n"
-     "                    worker.join()",
-     "        for worker in waiting:\n"
-     "            if worker.is_alive():\n"
-     "                try:\n"
-     "                    worker.join()"),
-    # The line that says what the wait is for. Silence is what provokes
-    # the second interrupt the loop above it then has to refuse.
+     "        # Stopping, the second half of the rule above."),
+    # Ctrl-C not dropped while the workers are being started: an
+    # interrupt inside Thread.start() leaves a thread that is running and
+    # says it is not, so the stop skips it and the lock comes free while
+    # it reviews.
+    ("parallel-deaf-while-starting",
+     "    previous = signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
+     "    try:\n"
+     "        for worker in workers:",
+     "    previous = signal.getsignal(signal.SIGINT)\n"
+     "    try:\n"
+     "        for worker in workers:"),
+    # Ctrl-C not dropped while they are being stopped: only the join can
+    # sit in a try, so a signal landing in the log call around it walks
+    # out past the re-raise and drops the lock with reviews still running.
+    ("parallel-deaf-while-stopping",
+     "        previous = signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
+     "        try:\n"
+     "            # Said, because what follows is a silent wait",
+     "        previous = signal.getsignal(signal.SIGINT)\n"
+     "        try:\n"
+     "            # Said, because what follows is a silent wait"),
+    # The line that says what the wait is for, and that killing is how to
+    # force it. Silence reads as a hang.
     ("parallel-say-what-is-waited-for",
-     '            log("stopping: waiting for %d repositor%s still being '
-     'reviewed"\n'
-     '                % (len(waiting), "y" if len(waiting) == 1 else "ies"))',
-     "            pass"),
-    # A worker's catch as narrow as Exception loses a SystemExit, which
-    # load_settings raises on every review when the settings file is bad.
-    ("parallel-worker-catches-baseexception",
-     "            except BaseException as err:\n"
-     "                # Kept rather than raised.",
-     "            except Exception as err:\n"
-     "                # Kept rather than raised."),
-    # The stop read between pull requests rather than only between
-    # repositories, so an interrupted pass does not buy full reviews for
-    # the rest of that repository's list.
-    ("parallel-stop-between-prs",
-     "        if STOPPING.is_set():\n"
-     "            return\n"
-     "        try:\n"
-     "            handle_pr(repo, pr, config, state, tokens)",
-     "        try:\n"
-     "            handle_pr(repo, pr, config, state, tokens)"),
-    ("parallel-every-failure-named",
-     "    for repo, err in fell_over:\n"
-     '        log("%s: its whole pass fell over: %s" % (repo, err))',
-     "    for repo, err in fell_over[:1]:\n"
-     '        log("%s: its whole pass fell over: %s" % (repo, err))'),
-    ("parallel-failure-raised",
-     "    if fell_over:\n"
-     "        raise fell_over[0][1]",
-     "    pass"),
-    # The one line an operator reads to confirm the config took, saying
-    # what the pass will do rather than what the file says.
-    ("parallel-startup-width",
-     "        width = poll_width(config)\n"
-     '        log("watching %s every %ds%s%s" % (',
-     '        width = config["parallel_repos"]\n'
-     '        log("watching %s every %ds%s%s" % ('),
-    # A repository named twice, which used to cost one wasted listing and
-    # now puts two passes on one checkout.
-    ("repos-named-twice",
-     "        if folded.index(folded[nth]) != nth and name not in twice:\n"
-     "            twice.append(name)",
-     "        pass"),
-    # Compared without case, because GitHub resolves a repository name
-    # that way and so does the default macOS filesystem: an exact match
-    # walks straight past the collision this check exists to catch.
-    ("repos-duplicate-folded",
-     '    folded = [name.casefold() for name in config["repos"]]',
-     '    folded = list(config["repos"])'),
-    # Each offending spelling once, rather than once per extra copy.
-    ("repos-twice-named-once",
-     "        if folded.index(folded[nth]) != nth and name not in twice:",
-     "        if folded.index(folded[nth]) != nth:"),
-    # An entry that is not a repository name was accepted here and raised
-    # TypeError out of main()'s startup line, before anything was polled.
-    ("repos-entries-are-strings",
-     '    for nth, name in enumerate(config["repos"]):\n'
-     "        if not isinstance(name, str) or not name.strip():\n"
-     '            sys.exit("%s: repos must hold owner/name strings, not %r" % (\n'
-     "                path, name))\n"
-     '        config["repos"][nth] = name.strip()',
-     "    pass"),
-    ("repos-entries-stripped",
-     '        config["repos"][nth] = name.strip()',
-     '        config["repos"][nth] = name'),
+     '                log("stopping: waiting for %d repositor%s still being "\n'
+     '                    "reviewed. Kill the process to force it"\n'
+     '                    % (alive, "y" if alive == 1 else "ies"))',
+     "                pass"),
+    # No entry for the join being unconditional. Every worker is started
+    # under the deafness above, so testing is_alive() first would skip
+    # only threads that have already finished: the same behaviour, which a
+    # mutation would rightly report as survived. What makes the
+    # unconditional form safe is the deafness, and that has its own entry.
 
     # --- what two repositories polled at once share --------------------
     ("state-lock-save",
