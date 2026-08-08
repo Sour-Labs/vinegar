@@ -41,6 +41,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 here_dir = os.path.dirname(os.path.abspath(__file__))
@@ -212,6 +213,10 @@ fake_run.merge_rc = 0
 fake_run.post_err = "HTTP 422"
 GENUINE_RUN = vinegar.run
 vinegar.run = fake_run
+# Kept before the silencing, like the two above it. GENUINE holds whatever
+# `log` is on the next line, which is a lambda that prints nothing, so the
+# one check that is about what log() puts on stdout has nothing to call.
+GENUINE_LOG = vinegar.log
 vinegar.log = lambda message: None
 
 fails = []
@@ -2769,6 +2774,21 @@ check("a boolean is not a number here either",
 check("the numbers as numbers still start",
       _config_with(poll_interval=30, review_timeout=900,
                    max_changed_lines=100) == "started")
+# In the same loop, and it needs its own unit in the message: "a whole
+# number of seconds" for a count of repositories tells an operator to fix
+# the wrong thing.
+check("a parallel_repos given as a string refuses to start",
+      "whole number of repositories" in _config_with(parallel_repos="2"),
+      _config_with(parallel_repos="2"))
+# Zero reads as "off", and off here is one. Accepted, it would poll
+# exactly as before while the operator believed they had turned something
+# off, so it is refused rather than quietly rounded up.
+check("a zero parallel_repos refuses to start",
+      "greater than zero" in _config_with(parallel_repos=0),
+      _config_with(parallel_repos=0))
+check("a boolean parallel_repos is not a number either",
+      "whole number of repositories" in _config_with(parallel_repos=True),
+      _config_with(parallel_repos=True))
 # Its own check rather than the loop's, because null is a value here, and
 # the two failures it catches are different. A string raises TypeError
 # inside blockers_only() on every review; a zero parses and compares
@@ -6443,6 +6463,208 @@ check("the listing mints a token with time to finish listing",
       _asked and all(g == vinegar.LISTING_GRACE for g in _asked), _asked)
 vinegar.open_prs, vinegar.handle_pr = _real_listing, _real_handling
 reset_stubs()
+
+# --- polling more than one repository at a time --------------------------
+# `parallel_repos` above one is what stops a twenty-minute review from being
+# twenty minutes the repository behind it in the list is not even listed in.
+# What it costs is that everything shared has to survive two passes at once:
+# the state dict, the one file under it, and the log.
+reset_stubs()
+_real_listing, _real_handling = vinegar.open_prs, vinegar.handle_pr
+vinegar.github_env = recording_env
+vinegar.open_prs = lambda repo, env: [dict(PR, number=1)]
+
+_together = threading.Barrier(2)
+_met = []
+
+
+def _waits_for_the_other(repo, pr, config, state, tokens):
+    try:
+        # Broken rather than hung, so a serial pass fails this in ten
+        # seconds instead of never returning. Polled one at a time, the
+        # first pass here waits alone until the timeout and the second
+        # never joins it, which is exactly the failure being looked for.
+        _together.wait(timeout=10)
+        _met.append(repo)
+    except threading.BrokenBarrierError:
+        pass
+
+
+vinegar.handle_pr = _waits_for_the_other
+vinegar.poll_once(dict(CONFIG, repos=["o/one", "o/two"], parallel_repos=2),
+                  {}, {})
+check("two repositories are polled at the same time",
+      sorted(_met) == ["o/one", "o/two"], _met)
+
+# One at a time is the default, and it stays on the thread main() is
+# already on rather than going to a pool of one. Ctrl-C is how the README
+# says to stop a run: raised on the main thread it unwinds a review that
+# thread is running, and does nothing at all to a review a worker is
+# running.
+_ran_on = []
+vinegar.handle_pr = lambda repo, pr, config, state, tokens: _ran_on.append(
+    threading.current_thread())
+vinegar.poll_once(dict(CONFIG, repos=["o/one", "o/two"]), {}, {})
+check("one repository at a time stays on the thread that polls",
+      len(_ran_on) == 2 and all(t is threading.main_thread() for t in _ran_on),
+      _ran_on)
+# And a width larger than the list is the same case. A single-repository
+# install that raised this setting would otherwise hand its only pass to a
+# worker and lose that Ctrl-C for nothing.
+del _ran_on[:]
+vinegar.poll_once(dict(CONFIG, repos=["o/one"], parallel_repos=4), {}, {})
+check("more workers than repositories does not take the pass off it",
+      _ran_on == [threading.main_thread()], _ran_on)
+
+# A future nobody reads holds its exception and says nothing. poll_repo
+# catches the two failures it names and no others, so anything else has to
+# come back out: under launchd that is a restart and a line in the error
+# log, where swallowing it is a daemon that quietly stops reviewing one
+# repository.
+_real_poll_repo = vinegar.poll_repo
+_second = []
+
+
+def _one_falls_over(repo, config, state, tokens):
+    if repo == "o/one":
+        raise ValueError("the pass fell over")
+    _second.append(repo)
+
+
+vinegar.poll_repo = _one_falls_over
+try:
+    vinegar.poll_once(dict(CONFIG, repos=["o/one", "o/two"],
+                           parallel_repos=2), {}, {})
+    _pass_escaped = None
+except Exception as err:
+    _pass_escaped = err
+check("a pass that falls over is raised, not kept in its future",
+      isinstance(_pass_escaped, ValueError), _pass_escaped)
+check("and the other repository still had its whole pass first",
+      _second == ["o/two"], _second)
+vinegar.poll_repo = _real_poll_repo
+vinegar.open_prs, vinegar.handle_pr = _real_listing, _real_handling
+reset_stubs()
+
+# The state file is one file however many repositories are polled. Two
+# saves landing together write `state.json.tmp` over each other, and
+# os.replace publishes whichever half won: every pull request forgotten,
+# and every one of them reviewed again at full cost.
+_holding = threading.Event()
+_let_go = threading.Event()
+_saved = threading.Event()
+
+
+def _hold_the_lock():
+    with vinegar.STATE_LOCK:
+        _holding.set()
+        _let_go.wait(10)
+
+
+def _save_anyway():
+    vinegar.save_state({})
+    _saved.set()
+
+
+_holder = threading.Thread(target=_hold_the_lock)
+_holder.start()
+_holding.wait(10)
+_saver = threading.Thread(target=_save_anyway)
+_saver.start()
+# Half a second is a wait rather than a scheduling accident, and it is
+# short against the ten the other half below is given: the save writes a
+# two-character file, so the only way it takes this long is a lock.
+_waited_out = not _saved.wait(0.5)
+_let_go.set()
+_holder.join(10)
+check("a save waits for the lock another repository is holding", _waited_out)
+check("and it goes through the moment that lock is free", _saved.wait(10))
+_saver.join(10)
+
+
+class _Counted:
+    """STATE_LOCK, with a note of how deeply one thread held it.
+
+    Two nested holds is the whole assertion: the mutation and the save
+    have to happen inside a single one. Taken separately, another
+    repository's save can land between them and serialise a half-written
+    entry, which is what a lock at one of the two rather than around both
+    would allow.
+    """
+
+    def __init__(self, real):
+        self.real, self.depth, self.deepest = real, 0, 0
+
+    def __enter__(self):
+        self.real.acquire()
+        self.depth += 1
+        self.deepest = max(self.deepest, self.depth)
+        return self
+
+    def __exit__(self, *ended):
+        self.depth -= 1
+        self.real.release()
+        return False
+
+
+_counted = _Counted(vinegar.STATE_LOCK)
+vinegar.STATE_LOCK = _counted
+try:
+    vinegar.remember({}, L, {"outcome": vinegar.DONE})
+finally:
+    vinegar.STATE_LOCK = _counted.real
+check("the entry and the file are written under one hold of the lock",
+      _counted.deepest == 2, _counted.deepest)
+
+# The one caller that deliberately does not pay for a write. record_once
+# counts a repeated skip on every poll and writes on every tenth of them,
+# so a `write` that is ignored is a file rewritten once a minute for every
+# pull request Vinegar is skipping.
+_writes = []
+_real_save = vinegar.save_state
+vinegar.save_state = lambda state: _writes.append(dict(state))
+_kept = {}
+vinegar.remember(_kept, L, {"seen": 3}, write=False)
+vinegar.remember(_kept, L, {"seen": 4})
+vinegar.save_state = _real_save
+check("an entry can be changed without paying for a write",
+      _writes == [{L: {"seen": 4}}] and _kept == {L: {"seen": 4}},
+      (_writes, _kept))
+
+
+class _Sink:
+    """A stdout that notes whether the log lock was held for each write.
+
+    print() writes the message and the newline as two separate calls, so
+    two repositories logging at the same moment can produce one line
+    carrying both messages and one empty line. Finding a runaway round
+    count before the bill arrives is a grep, and a grep does not find a
+    line that was cut in half.
+    """
+
+    def __init__(self, lock):
+        self.lock, self.chunks, self.held = lock, [], []
+
+    def write(self, text):
+        self.chunks.append(text)
+        self.held.append(self.lock.locked())
+        return len(text)
+
+    def flush(self):
+        pass
+
+
+_sink = _Sink(vinegar.LOG_LOCK)
+_quiet, sys.stdout = sys.stdout, _sink
+try:
+    # The genuine one. Everything else in this file wants log() silent, so
+    # both `vinegar.log` and GENUINE's copy of it print nothing and would
+    # pass this check with the lock deleted.
+    GENUINE_LOG("two repositories could have interleaved this")
+finally:
+    sys.stdout = _quiet
+check("every piece of a log line is written under one lock",
+      len(_sink.chunks) > 1 and all(_sink.held), (_sink.chunks, _sink.held))
 
 # --- acquire_lock --------------------------------------------------------
 # Two Vinegars sharing a checkout is what this stops: the second one runs

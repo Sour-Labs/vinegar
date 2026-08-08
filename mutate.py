@@ -130,9 +130,9 @@ MUTATIONS = [
      "                                          good_for=POST_GRACE)",
      "                    post_env = github_env(config, repo, tokens)"),
     ("good-for-listing",
-     "            prs = open_prs(repo, github_env(config, repo, tokens,\n"
-     "                                            good_for=LISTING_GRACE))",
-     "            prs = open_prs(repo, github_env(config, repo, tokens))"),
+     "        prs = open_prs(repo, github_env(config, repo, tokens,\n"
+     "                                        good_for=LISTING_GRACE))",
+     "        prs = open_prs(repo, github_env(config, repo, tokens))"),
 
     # --- anchoring, in diff_lines --------------------------------------
     ("diff-failure-gate",
@@ -269,13 +269,69 @@ MUTATIONS = [
 
     # --- the poll loop surviving one bad thing -------------------------
     ("poll-listing-guard",
-     '            log("%s: cannot list pull requests: %s" % (repo, err))\n'
-     "            continue",
-     "            raise"),
+     '        log("%s: cannot list pull requests: %s" % (repo, err))\n'
+     "        return",
+     "        raise"),
     ("poll-pr-guard",
-     '                log("%s#%s: unhandled error: %s" % (\n'
-     '                    repo, pr.get("number", "?"), err))',
-     "                raise"),
+     '            log("%s#%s: unhandled error: %s" % (\n'
+     '                repo, pr.get("number", "?"), err))',
+     "            raise"),
+
+    # --- polling more than one repository at a time --------------------
+    ("parallel-repos-checked",
+     '    for name in ("poll_interval", "review_timeout", '
+     '"max_changed_lines",\n'
+     '                 "parallel_repos"):',
+     '    for name in ("poll_interval", "review_timeout", '
+     '"max_changed_lines"):'),
+    ("parallel-repos-unit",
+     '    units = {"max_changed_lines": "lines", '
+     '"parallel_repos": "repositories"}',
+     '    units = {"max_changed_lines": "lines"}'),
+    ("parallel-fan-out",
+     '    width = min(config["parallel_repos"], len(config["repos"]))',
+     "    width = 1"),
+    ("parallel-width-cap",
+     '    width = min(config["parallel_repos"], len(config["repos"]))',
+     '    width = config["parallel_repos"]'),
+    ("parallel-serial-default",
+     "    if width <= 1:\n"
+     '        for repo in config["repos"]:\n'
+     "            poll_repo(repo, config, state, tokens)\n"
+     "        return",
+     "    pass"),
+    ("parallel-future-read",
+     "    for finished in passes:\n"
+     "        finished.result()",
+     "    pass"),
+
+    # --- what two repositories polled at once share --------------------
+    ("state-lock-save",
+     "    with STATE_LOCK:\n"
+     "        os.makedirs(HOME, exist_ok=True)\n"
+     "        write_atomic(STATE_PATH, json.dumps(state, indent=2, "
+     "sort_keys=True))",
+     "    os.makedirs(HOME, exist_ok=True)\n"
+     "    write_atomic(STATE_PATH, json.dumps(state, indent=2, "
+     "sort_keys=True))"),
+    ("state-lock-remember",
+     "    with STATE_LOCK:\n"
+     "        state[key] = entry\n"
+     "        if write:\n"
+     "            save_state(state)",
+     "    state[key] = entry\n"
+     "    if write:\n"
+     "        save_state(state)"),
+    ("remember-write-flag",
+     "        state[key] = entry\n"
+     "        if write:\n"
+     "            save_state(state)",
+     "        state[key] = entry\n"
+     "        save_state(state)"),
+    ("log-lock",
+     "    with LOG_LOCK:\n"
+     "        print(line, flush=True)",
+     "    print(line, flush=True)"),
     ("acquire-flock",
      "        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)",
      "        pass"),
@@ -1049,11 +1105,11 @@ MUTATIONS = [
     # toggle or one failed clone and the pull request reports everything
     # again.
     ("rounds-survive-a-skip",
-     "                             **dict(carry_forward(kept),\n"
-     "                                    **reviewed_through(False, head, done),\n"
-     "                                    **rounds_done(False, done)))",
-     "                             **dict(carry_forward(kept),\n"
-     "                                    **reviewed_through(False, head, done)))"),
+     "                        **dict(carry_forward(kept),\n"
+     "                               **reviewed_through(False, head, done),\n"
+     "                               **rounds_done(False, done)))",
+     "                        **dict(carry_forward(kept),\n"
+     "                               **reviewed_through(False, head, done)))"),
     # The reviewer told nothing, so the narrowing is a sentence on the pull
     # request about a review that was never asked to hold anything back.
     ("blockers-reach-the-reviewer",
@@ -1141,11 +1197,11 @@ MUTATIONS = [
     # killed mid-review leaves behind. Dropping the carry there hands back
     # every round already spent.
     ("rounds-survive-the-pre-review-marker",
-     "                                    waivers=0,\n"
-     "                                    **reviewed_through(False, head, done),\n"
-     "                                    **rounds_done(False, done)))",
-     "                                    waivers=0,\n"
-     "                                    **reviewed_through(False, head, done)))"),
+     "        **dict(carry_forward(kept), post_tries=0, waivers=0,\n"
+     "               **reviewed_through(False, head, done),\n"
+     "               **rounds_done(False, done))))",
+     "        **dict(carry_forward(kept), post_tries=0, waivers=0,\n"
+     "               **reviewed_through(False, head, done))))"),
     # The give-up rebuild, which rounds_done()'s own docstring names as a
     # case it exists for and which nothing was holding.
     ("rounds-survive-a-give-up",
