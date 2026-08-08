@@ -270,6 +270,18 @@ tree under the first, which would then report findings about a commit nobody
 asked about. That is the same race the process lock exists to prevent, and it
 is why this setting counts repositories rather than reviews.
 
+For the same reason **Vinegar refuses to start if `repos` names a repository
+twice.** Before this setting existed a duplicate cost one wasted listing per
+pass; polled at once it is the race above, reachable by a copy-paste.
+
+**A repository waits out the slowest repository's whole pass, not one review.**
+The fan-out is per pass: every repository is polled, and only when the last
+worker finishes does Vinegar sleep for `poll_interval`. Five open pull requests
+on one repository at twenty minutes each is a hundred minutes before the other
+repository is listed again. Size `poll_interval` knowing that, and read this
+setting as "several repositories per pass" rather than as a queue that never
+makes anyone wait.
+
 **It buys latency, not money.** The same reviews are paid for, closer together.
 Concentrating them is what makes a rate limit more likely to refuse one, and a
 refused review comes back failed and spends one of its three attempts. Set it

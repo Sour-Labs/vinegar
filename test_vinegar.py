@@ -2789,6 +2789,25 @@ check("a zero parallel_repos refuses to start",
 check("a boolean parallel_repos is not a number either",
       "whole number of repositories" in _config_with(parallel_repos=True),
       _config_with(parallel_repos=True))
+# A repository named twice used to cost one wasted listing per pass. Polled
+# at once it puts two passes on the one checkout that repository has, and
+# the second pass's `git reset --hard` moves the tree under the first.
+check("a repository named twice refuses to start",
+      "more than once" in _config_with(repos=["o/r", "o/r"]),
+      _config_with(repos=["o/r", "o/r"]))
+check("the refusal names which repository was written twice",
+      "o/r" in _config_with(repos=["o/a", "o/r", "o/r"]),
+      _config_with(repos=["o/a", "o/r", "o/r"]))
+# Through `in` rather than a set, so a config whose entries are not
+# hashable still gets a sentence from the check below it rather than a
+# TypeError out of this one.
+check("an unhashable entry in repos does not raise out of the check",
+      "started" == _config_with(repos=["o/a", {"name": "o/b"}])
+      or "repos" in _config_with(repos=["o/a", {"name": "o/b"}]),
+      _config_with(repos=["o/a", {"name": "o/b"}]))
+check("distinct repositories still start",
+      _config_with(repos=["o/a", "o/b"]) == "started",
+      _config_with(repos=["o/a", "o/b"]))
 # Its own check rather than the loop's, because null is a value here, and
 # the two failures it catches are different. A string raises TypeError
 # inside blockers_only() on every review; a zero parses and compares
@@ -6496,6 +6515,34 @@ vinegar.poll_once(dict(CONFIG, repos=["o/one", "o/two"], parallel_repos=2),
 check("two repositories are polled at the same time",
       sorted(_met) == ["o/one", "o/two"], _met)
 
+# Daemon threads, which is what lets Ctrl-C end the daemon. A pool's
+# threads have not been daemons since Python 3.9 and an atexit hook drains
+# whatever is still queued, so the interrupt came out of the pool's
+# shutdown, main() logged "stopped" and released the lock, and the process
+# went on buying reviews: measured with three repositories and two workers,
+# the third repository's pass *started* after the daemon said it had
+# stopped, with the lock free for a `--pr` run to take and reset a tree a
+# live review was reading. The signal handling itself cannot be exercised
+# in-process, so what is checked here is the one property the two shapes
+# differ by.
+_daemonic = []
+vinegar.handle_pr = lambda repo, pr, config, state, tokens: _daemonic.append(
+    threading.current_thread().daemon)
+vinegar.poll_once(dict(CONFIG, repos=["o/one", "o/two"], parallel_repos=2),
+                  {}, {})
+check("a parallel pass runs on daemon threads, so Ctrl-C can end it",
+      _daemonic == [True, True], _daemonic)
+
+# Fewer workers than repositories: the ones over the width wait for any
+# worker rather than for a particular one, so all of them still get a pass.
+_worked = []
+vinegar.handle_pr = lambda repo, pr, config, state, tokens: _worked.append(
+    repo)
+vinegar.poll_once(dict(CONFIG, repos=["o/one", "o/two", "o/three"],
+                       parallel_repos=2), {}, {})
+check("a width below the repository count still polls every one of them",
+      sorted(_worked) == ["o/one", "o/three", "o/two"], _worked)
+
 # One at a time is the default, and it stays on the thread main() is
 # already on rather than going to a pool of one. Ctrl-C is how the README
 # says to stop a run: raised on the main thread it unwinds a review that
@@ -6538,10 +6585,35 @@ try:
     _pass_escaped = None
 except Exception as err:
     _pass_escaped = err
-check("a pass that falls over is raised, not kept in its future",
+check("a pass that falls over is raised, not swallowed by its thread",
       isinstance(_pass_escaped, ValueError), _pass_escaped)
 check("and the other repository still had its whole pass first",
       _second == ["o/two"], _second)
+
+# Both of them, not only the one raised. Reading one result at a time
+# raised on the first and never looked at the rest, so a second repository
+# failing in the same round was discarded and the traceback named one
+# repository where two had failed.
+_both_said = []
+_kept_log, vinegar.log = vinegar.log, lambda m: _both_said.append(m)
+
+
+def _both_fall_over(repo, config, state, tokens):
+    raise ValueError("%s fell over" % repo)
+
+
+vinegar.poll_repo = _both_fall_over
+try:
+    vinegar.poll_once(dict(CONFIG, repos=["o/one", "o/two"],
+                           parallel_repos=2), {}, {})
+    _both_escaped = None
+except Exception as err:
+    _both_escaped = err
+vinegar.log = _kept_log
+check("every pass that fell over is named, not only the one raised",
+      sum("whole pass fell over" in m for m in _both_said) == 2, _both_said)
+check("and one of them is still raised, so the daemon does not carry on",
+      isinstance(_both_escaped, ValueError), _both_escaped)
 vinegar.poll_repo = _real_poll_repo
 vinegar.open_prs, vinegar.handle_pr = _real_listing, _real_handling
 reset_stubs()
@@ -6665,6 +6737,66 @@ finally:
     sys.stdout = _quiet
 check("every piece of a log line is written under one lock",
       len(_sink.chunks) > 1 and all(_sink.held), (_sink.chunks, _sink.held))
+
+# The stamp too, not only the printing. Read before the lock is taken, a
+# thread preempted in between prints a line stamped earlier below one
+# stamped later, and a log whose timestamps disagree with its own order
+# cannot be sliced by time or sorted.
+_stamped_under = []
+_real_stamp = vinegar.utc_stamp
+vinegar.utc_stamp = lambda: (_stamped_under.append(vinegar.LOG_LOCK.locked())
+                             or _real_stamp())
+_stamp_sink = _Sink(vinegar.LOG_LOCK)
+_quiet, sys.stdout = sys.stdout, _stamp_sink
+try:
+    GENUINE_LOG("a line whose stamp must agree with where it lands")
+finally:
+    sys.stdout = _quiet
+    vinegar.utc_stamp = _real_stamp
+check("the timestamp is read under that same lock",
+      _stamped_under == [True], _stamped_under)
+
+# The startup line names the width the pass will run at, not the number in
+# the file. They differ whenever `parallel_repos` is larger than `repos`,
+# and this line is the one thing an operator reads to confirm the config
+# they just edited took.
+def _startup_line(**over):
+    """What main() says at startup for this config, with polling stubbed."""
+    kept = (sys.argv, vinegar.poll_once, vinegar.log)
+    said = []
+    with open(os.path.join(os.environ["VINEGAR_HOME"], "config.json"),
+              "w") as handle:
+        json.dump(dict({"repos": ["o/one"]}, **over), handle)
+    # Stubbed and `--once`, so breaking the guard fails this check rather
+    # than dropping the run into `while True: poll_once(); sleep()`.
+    vinegar.poll_once = lambda *a, **k: None
+    vinegar.log = lambda message: said.append(message)
+    sys.argv = ["vinegar.py", "--once"]
+    try:
+        vinegar.main()
+    except SystemExit as err:
+        # Caught, or a refusal to start ends the whole run here rather
+        # than failing the checks below. Every other main() harness in
+        # this file does the same, and the one mutation that makes
+        # startup refuse came back ABORTED until this line existed:
+        # eight checks voided instead of one caught.
+        said.append("refused to start: %s" % err)
+    finally:
+        sys.argv, vinegar.poll_once, vinegar.log = kept
+    return " | ".join(m for m in said if m.startswith(("watching",
+                                                       "refused")))
+
+
+_wide_setting = _startup_line(parallel_repos=4)
+_real_width = _startup_line(repos=["o/one", "o/two"], parallel_repos=2)
+# The line has to be there, not merely free of the phrase. Asserting only
+# the absence passed against a run that said nothing at all, which is what
+# every refusal at startup produces.
+check("a width larger than the list is not announced as one",
+      _wide_setting.startswith("watching") and "at a time" not in
+      _wide_setting, _wide_setting)
+check("and a width the pass will really use is announced",
+      "2 at a time" in _real_width, _real_width)
 
 # --- acquire_lock --------------------------------------------------------
 # Two Vinegars sharing a checkout is what this stops: the second one runs

@@ -288,22 +288,65 @@ MUTATIONS = [
      '    units = {"max_changed_lines": "lines", '
      '"parallel_repos": "repositories"}',
      '    units = {"max_changed_lines": "lines"}'),
+    # Carrying the line below it, because main() computes the same width
+    # for the startup line and the bare assignment matches there too.
     ("parallel-fan-out",
-     '    width = min(config["parallel_repos"], len(config["repos"]))',
-     "    width = 1"),
+     "    width = poll_width(config)\n"
+     "    if width <= 1:",
+     "    width = 1\n"
+     "    if width <= 1:"),
     ("parallel-width-cap",
-     '    width = min(config["parallel_repos"], len(config["repos"]))',
-     '    width = config["parallel_repos"]'),
+     '    return min(config["parallel_repos"], len(config["repos"]))',
+     '    return config["parallel_repos"]'),
     ("parallel-serial-default",
      "    if width <= 1:\n"
      '        for repo in config["repos"]:\n'
      "            poll_repo(repo, config, state, tokens)\n"
      "        return",
      "    pass"),
-    ("parallel-future-read",
-     "    for finished in passes:\n"
-     "        finished.result()",
+    # Every repository has to leave the queue, not just the first `width`
+    # of them.
+    ("parallel-queue-drains",
+     "    def passes():\n"
+     "        while True:\n"
+     "            try:\n"
+     "                repo = todo.get_nowait()\n"
+     "            except queue.Empty:\n"
+     "                return",
+     "    def passes():\n"
+     "        for _ in (1,):\n"
+     "            try:\n"
+     "                repo = todo.get_nowait()\n"
+     "            except queue.Empty:\n"
+     "                return"),
+    # Non-daemon workers are what let a Ctrl-C'd daemon go on reviewing
+    # after it released the lock, with a `--pr` run free to reset a tree a
+    # live review is reading.
+    ("parallel-daemon-threads",
+     "    workers = [threading.Thread(target=passes, daemon=True,",
+     "    workers = [threading.Thread(target=passes,"),
+    ("parallel-every-failure-named",
+     "    for repo, err in fell_over:\n"
+     '        log("%s: its whole pass fell over: %s" % (repo, err))',
+     "    for repo, err in fell_over[:1]:\n"
+     '        log("%s: its whole pass fell over: %s" % (repo, err))'),
+    ("parallel-failure-raised",
+     "    if fell_over:\n"
+     "        raise fell_over[0][1]",
      "    pass"),
+    # The one line an operator reads to confirm the config took, saying
+    # what the pass will do rather than what the file says.
+    ("parallel-startup-width",
+     "        width = poll_width(config)\n"
+     '        log("watching %s every %ds%s%s" % (',
+     '        width = config["parallel_repos"]\n'
+     '        log("watching %s every %ds%s%s" % ('),
+    # A repository named twice, which used to cost one wasted listing and
+    # now puts two passes on one checkout.
+    ("repos-named-twice",
+     "    twice = [name for nth, name in enumerate(config[\"repos\"])\n"
+     '             if name in config["repos"][:nth]]',
+     "    twice = []"),
 
     # --- what two repositories polled at once share --------------------
     ("state-lock-save",
@@ -330,8 +373,17 @@ MUTATIONS = [
      "        save_state(state)"),
     ("log-lock",
      "    with LOG_LOCK:\n"
-     "        print(line, flush=True)",
-     "    print(line, flush=True)"),
+     '        print("%s %s" % (utc_stamp(), message), flush=True)',
+     '    print("%s %s" % (utc_stamp(), message), flush=True)'),
+    # The stamp read before the lock rather than under it, which is how
+    # two lines end up carrying timestamps in the opposite order to the
+    # order they were written in.
+    ("log-stamp-under-the-lock",
+     "    with LOG_LOCK:\n"
+     '        print("%s %s" % (utc_stamp(), message), flush=True)',
+     '    line = "%s %s" % (utc_stamp(), message)\n'
+     "    with LOG_LOCK:\n"
+     "        print(line, flush=True)"),
     ("acquire-flock",
      "        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)",
      "        pass"),

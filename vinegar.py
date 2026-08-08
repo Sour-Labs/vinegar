@@ -28,6 +28,7 @@ import errno
 import fcntl
 import json
 import os
+import queue
 import re
 import shutil
 import subprocess
@@ -36,7 +37,6 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 # The path component review-settings.json denies the reviewer every read
@@ -324,7 +324,7 @@ CLONE_TIMEOUT = 1800
 
 # Seconds `git diff` may take before the poll loop gives up on it. Local
 # work, so generous is already absurd; the point is that a checkout on a
-# filesystem that stops answering cannot hold the one poll thread for ever.
+# filesystem that stops answering cannot hold a poll thread for ever.
 DIFF_TIMEOUT = 120
 
 # Seconds `gh pr list` may take. One HTTP call, made once a minute per
@@ -690,12 +690,14 @@ def utc_stamp():
 
 
 def log(message):
-    # Built outside the lock, printed inside it. LOG_LOCK's comment says
-    # what the two writes print() makes do to each other when two
-    # repositories are polled at once.
-    line = "%s %s" % (utc_stamp(), message)
+    # Stamped inside the lock, not before taking it. LOG_LOCK's comment
+    # says why the printing has to be one write; the stamp has to be under
+    # the same hold for a duller reason. Built outside, a thread preempted
+    # between reading the clock and acquiring prints a line stamped earlier
+    # below one stamped later, and a log whose timestamps disagree with its
+    # own order cannot be sliced by time or sorted.
     with LOG_LOCK:
-        print(line, flush=True)
+        print("%s %s" % (utc_stamp(), message), flush=True)
 
 
 def run(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
@@ -769,9 +771,9 @@ def app_jwt(app_id, key_path):
     # through run(): it needs bytes rather than text, because a signature is
     # not UTF-8. Signing is milliseconds of local CPU, so the bound is only
     # against the key sitting on a mount that stops answering, which parks
-    # openssl in the kernel and with it the one poll thread, while the
-    # watchdog reads a live pid as healthy. Same argument as DIFF_TIMEOUT,
-    # and the same number.
+    # openssl in the kernel and with it that repository's poll thread, while
+    # the watchdog reads a live pid as healthy. Same argument as
+    # DIFF_TIMEOUT, and the same number.
     try:
         signed = subprocess.run(
             ["openssl", "dgst", "-sha256", "-sign", key_path],
@@ -882,6 +884,31 @@ def load_config(path):
         # A bare string passes a truthiness check and then iterates as
         # characters, which polls `-R S`, `-R o`, `-R u` once a minute forever.
         sys.exit("%s: repos must be a non-empty list of owner/name" % path)
+    # Named twice is not the same as reviewed twice, and it stopped being
+    # harmless when repositories could be polled at once. A duplicate used
+    # to cost one wasted listing per pass. With `parallel_repos` above one
+    # it puts two passes on the single checkout directory that repository
+    # is given, and the second pass's `git reset --hard` moves the tree
+    # under the first, which then reports findings about a commit nobody
+    # asked about. That is the failure poll_repo's docstring says cannot
+    # happen, reachable by a copy-paste in a config file.
+    #
+    # Refused rather than quietly collapsed to one. An operator who wrote a
+    # repository twice meant something by it, and a daemon that silently
+    # polls a shorter list than the file names is the kind of disagreement
+    # nothing later would explain.
+    #
+    # Compared with `in` rather than through a set, because `repos` is only
+    # known to be a list here: an entry that is a dict raises TypeError out
+    # of a set comprehension, which turns a bad config into a traceback
+    # where every other line in this function gives a sentence.
+    twice = [name for nth, name in enumerate(config["repos"])
+             if name in config["repos"][:nth]]
+    if twice:
+        sys.exit("%s: repos names %s more than once. Each repository is "
+                 "polled once per pass and has one checkout, so the same "
+                 "one cannot have two passes at once" % (
+                     path, ", ".join(str(name) for name in twice)))
     if config["effort"] not in EFFORTS:
         sys.exit("%s: effort must be one of %s" % (path, ", ".join(EFFORTS)))
 
@@ -1679,8 +1706,8 @@ def remember(state, key, entry, write=True):
 
 def open_prs(repo, env):
     # Bounded because this is the poll loop's heartbeat, once a minute per
-    # repository, on the only thread there is. A socket that is open but
-    # never answers would otherwise park the daemon indefinitely, polling
+    # repository, on the one thread that repository gets. A socket that is
+    # open but never answers would otherwise park it indefinitely, polling
     # nothing, while the watchdog sees a live pid and calls it healthy.
     try:
         result = run(["gh", "pr", "list", "-R", repo, "--state", "open",
@@ -1865,9 +1892,9 @@ def checkout(repo, pr, env):
     # Bounded like the steps above it, and more so: this one goes to the
     # network, which is the call most likely to hang. A remote that
     # accepts and never answers — a dropped VPN, a proxy holding the
-    # connection — would park the one poll thread here for ever while the
-    # watchdog saw a live pid and called it healthy. Non-fatal either
-    # way: a stale base widens the diff, it does not lose the review.
+    # connection — would park that repository's poll thread here for ever
+    # while the watchdog saw a live pid and called it healthy. Non-fatal
+    # either way: a stale base widens the diff, it does not lose the review.
     try:
         result = run(["git", "fetch", "--quiet", "--force", "origin",
                       "%s:%s" % (base, base)], cwd=path, env=env,
@@ -3192,7 +3219,7 @@ def review_body(label, pr, config, inline, general, raw=None,
         #
         # Measured by arithmetic rather than by re-joining the body on
         # every pop: thirty long findings trimmed twenty times copied
-        # megabytes of string on the one poll thread to learn a length.
+        # megabytes of string on a poll thread to learn a length.
         fixed = len("\n".join(lines + ["", heading, ""]))
         running = sum(len(bullet) + 1 for bullet in bullets)
         dropped = 0
@@ -3228,9 +3255,9 @@ def check_api(label, repo, path, method, payload, env):
     worse pull request, not a broken one.
 
     Bounded on POST_TIMEOUT, which is the same shape of call for the same
-    reason: one request on the single poll thread, with a finished review
-    waiting behind it, and a socket that never answers is not an error
-    anyone raises.
+    reason: one request on the repository's poll thread, with a finished
+    review waiting behind it, and a socket that never answers is not an
+    error anyone raises.
     """
     # One condition for both, because they are one decision. Written as
     # `is not None` for the flag and truthiness for the body, a caller
@@ -4803,6 +4830,14 @@ def poll_repo(repo, config, state, tokens):
     which then reports findings about a commit nobody asked about.
     `parallel_repos` buys concurrency between repositories and not inside
     one.
+
+    So a repository waits out the slowest repository's *whole pass*, not
+    one review: the fan-out is per pass, and main() sleeps for
+    `poll_interval` only once every worker has finished. Five open pull
+    requests on one repository, twenty minutes each, is a hundred minutes
+    before the other repository is listed again. Worth knowing when sizing
+    `poll_interval`, and the reason giving each repository its own loop
+    would be a different change rather than a bigger number.
     """
     try:
         prs = open_prs(repo, github_env(config, repo, tokens,
@@ -4821,38 +4856,90 @@ def poll_repo(repo, config, state, tokens):
                 repo, pr.get("number", "?"), err))
 
 
+def poll_width(config):
+    """How many repositories this pass will really run at once.
+
+    Both poll_once and the line main() prints at startup need this, and as
+    two expressions they disagreed: the startup line announced
+    `parallel_repos` while the pass ran at the clamped number, so a
+    one-repository install told to run four at a time said so and then
+    polled serially. That line exists to confirm the config took, which is
+    the one job it cannot do while it names a width nothing uses.
+    """
+    return min(config["parallel_repos"], len(config["repos"]))
+
+
 def poll_once(config, state, tokens):
-    """Every configured repository, `parallel_repos` of them at a time."""
+    """Every configured repository, poll_width() of them at a time."""
     # One repository is the default and keeps the whole pass on the thread
-    # main() is already on, rather than handing it to a pool of one. That
-    # is not only tidiness: Ctrl-C is how the README says to stop a run, and
-    # a KeyboardInterrupt raised on the main thread unwinds a review it is
+    # main() is already on, rather than handing it to a worker. That is not
+    # only tidiness: Ctrl-C is how the README says to stop a run, and a
+    # KeyboardInterrupt raised on the main thread unwinds a review it is
     # running and does nothing at all to a review a worker is running.
     # Every install that has not asked for this keeps that behaviour
     # exactly.
-    width = min(config["parallel_repos"], len(config["repos"]))
+    width = poll_width(config)
     if width <= 1:
         for repo in config["repos"]:
             poll_repo(repo, config, state, tokens)
         return
 
-    # The pass ends when the slowest repository does, and only then does
-    # main() sleep for `poll_interval`. A repository that finishes early
-    # waits, which is the price of leaving the loop above it alone; it
-    # still starts its next pass having waited for one review rather than
-    # for every review in front of it.
-    with ThreadPoolExecutor(max_workers=width,
-                            thread_name_prefix="vinegar") as pool:
-        passes = [pool.submit(poll_repo, repo, config, state, tokens)
-                  for repo in config["repos"]]
-    # Read, so that nothing is swallowed. A future nobody asks holds its
-    # exception and says nothing, and poll_repo catches only the two
-    # failures it names: anything else used to end the process, which under
-    # launchd is a restart and a line in the error log rather than silence.
-    # Raised after every repository has had its pass, because the pool is
-    # already joined by here.
-    for finished in passes:
-        finished.result()
+    # Daemon threads over a queue rather than a ThreadPoolExecutor, and
+    # what that buys is the ability to stop. Since Python 3.9 a pool's
+    # threads are not daemons and an atexit hook drains whatever is still
+    # queued, so Ctrl-C during a parallel pass came out of the pool's
+    # shutdown, main() logged "stopped" and released the lock, and then the
+    # interpreter went on running every pass that had been submitted.
+    # Measured: with three repositories and two workers, the third
+    # repository's pass *started* after the daemon said it had stopped, and
+    # for as long as those passes ran the lock was free, so a `--pr` run
+    # could take it and reset a tree a live review was reading. That is the
+    # race acquire_lock() exists to close, opened by the thing that
+    # announces the daemon is gone.
+    #
+    # A queue rather than a thread each, because `parallel_repos` can be
+    # smaller than the number of repositories and the ones over the width
+    # have to wait for a worker rather than for a particular one.
+    todo = queue.Queue()
+    for repo in config["repos"]:
+        todo.put(repo)
+    fell_over = []
+
+    def passes():
+        while True:
+            try:
+                repo = todo.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                poll_repo(repo, config, state, tokens)
+            except Exception as err:
+                # Kept rather than raised. A raise here ends one worker
+                # silently, and the repositories still in the queue are
+                # then shared out among the others as if nothing had
+                # happened.
+                fell_over.append((repo, err))
+
+    workers = [threading.Thread(target=passes, daemon=True,
+                                name="vinegar-poll-%d" % nth)
+               for nth in range(width)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join()
+
+    # Every pass that fell over is named, and then the first is raised.
+    # poll_repo catches the two failures it names and no others, so
+    # anything reaching here ended the process before this existed, which
+    # under launchd is a restart and a line in the error log rather than a
+    # repository that quietly stops being reviewed. Reading one result at a
+    # time raised on the first and never looked at the rest, so a second
+    # repository failing in the same round was discarded and the traceback
+    # named one repository where two had failed.
+    for repo, err in fell_over:
+        log("%s: its whole pass fell over: %s" % (repo, err))
+    if fell_over:
+        raise fell_over[0][1]
 
 
 def give_up(key, repo, pr, config, attempts, tokens, path=None, env=None,
@@ -5687,10 +5774,16 @@ def main():
         # config they just edited took, and a daemon reviewing two
         # repositories at once is the fact about this run that most
         # changes what the log below it will look like.
+        #
+        # The width the pass will use, not the number in the file. They
+        # differ whenever `parallel_repos` is larger than `repos`, and this
+        # line said "4 at a time" over a single-repository install that
+        # then polled serially: the one reading that could not be more
+        # wrong on the one question it is printed to answer.
+        width = poll_width(config)
         log("watching %s every %ds%s%s" % (
             ", ".join(config["repos"]), config["poll_interval"],
-            ", %d at a time" % config["parallel_repos"]
-            if config["parallel_repos"] > 1 else "",
+            ", %d at a time" % width if width > 1 else "",
             " as the GitHub App" if config.get("github_app") else ""))
         while True:
             poll_once(config, state, tokens)
