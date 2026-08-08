@@ -1541,6 +1541,21 @@ check("a retry repeats the first attempt's title, not the backstop's",
       _tries == ["first try", "first try"], _tries)
 check("a close that lands marks the handle closed", _stuck["closed"] is True,
       _stuck)
+# The conclusion travels with the title, for the same reason. The backstop
+# brings the ordinary grey one, so without this a clean review whose first
+# PATCH was refused would end up grey under a title still saying it found
+# nothing.
+_green = {"repo": "o/r", "id": 9, "closed": False}
+fake_run.check_rc = 1
+del checked[:]
+vinegar.close_check(L, _green, "No findings", CHK_ENV, "", "success")
+fake_run.check_rc = 0
+vinegar.close_check(L, _green, "The review ran but nothing reached the "
+                    "pull request", CHK_ENV)
+_green_tries = [(a["conclusion"], a["output"]["title"])
+                for h, _, a in checked if h == "PATCH"]
+check("a retry repeats the first attempt's conclusion, not the backstop's",
+      _green_tries == [("success", "No findings")] * 2, _green_tries)
 # The reuse branch needs the id guard the create branch has, or every
 # close on the handle sends `PATCH check-runs/None`.
 check("a reusable run with no id is not adopted",
@@ -4225,6 +4240,25 @@ _cov_fell_back = vinegar.review(ROOT, "o/r", PR, FALLING_BACK, None, {})
 check("a review that fell back and finished still covered its scope",
       _cov_fell_back == (vinegar.DONE, True, True), _cov_fell_back)
 
+# The same ending, one field over. `whole` has to reach finish() as well as
+# `covered`, and it is forwarded rather than read off the note there for
+# the same reason it is here. Driven through review() and not finish(),
+# because the forwarding is the guard: every other check on the closed
+# indicator calls finish() directly and would pass with the argument
+# dropped, which is how the mutation found this gap.
+reset_stubs()
+vinegar.run = claude_run
+vinegar.save_transcript = stub_transcript
+claude_run.stream = _answers(
+    stream(NOT_FOUND), stream(call([]), result_event()))
+_fb_check = {"repo": "o/r", "id": 11, "closed": False}
+del checked[:]
+vinegar.review(ROOT, "o/r", PR, FALLING_BACK, None, {}, check=_fb_check)
+_fb_patch = [asked for how, _, asked in checked if how == "PATCH"]
+check("a clean review that fell back closes as a pass, not as unfinished",
+      len(_fb_patch) == 1 and _fb_patch[0]["conclusion"] == "success"
+      and _fb_patch[0]["output"]["title"] == "No findings", _fb_patch)
+
 # A run can end cleanly having narrated instead of calling the reporting
 # tool. Its prose reaches the pull request; its findings never existed.
 reset_stubs()
@@ -5610,21 +5644,41 @@ vinegar.forget(vinegar.unposted_path("o/r", PR_TIER))
 # request. The checks list is what people look at before the comment, so
 # what it says has to be true on its own.
 _titles = []
+_conclusions = []
+_closed = []
 
 
-def _titled(findings, note=None, sha="d0d0d0d0d0d0", blockers=False):
-    handle = {"repo": "o/r", "id": 7, "closed": False}
+def _titled(findings, note=None, sha="d0d0d0d0d0d0", blockers=False,
+            posts=True, whole=True, resent=False, since=None):
+    # An id of its own per call, because GitHub gives each reviewed commit
+    # its own run and the checks entry a pull request shows is the one
+    # belonging to its head. One shared id made the sequencing check below
+    # unable to see that at all: two closes on one handle would have
+    # looked the same as two runs.
+    _titled.runs += 1
+    handle = {"repo": "o/r", "id": _titled.runs, "closed": False}
     del checked[:]
     at = dict(PR_LIVE, headRefOid=sha)
-    fake_run.rc, fake_run.post_err = 0, ""
+    # `rc` is the review posting and `check_rc` is the indicator, so a
+    # refused post still leaves a PATCH to read the conclusion off.
+    fake_run.rc, fake_run.post_err = (0, "") if posts else (1, "HTTP 500")
     vinegar.run = _run_and_tier
     vinegar.finish(L, "o/r", at, ROOT, "words", findings, CONFIG, None, {},
-                   note, check=handle, blockers=blockers)
+                   note, check=handle, blockers=blockers, whole=whole,
+                   resent=resent, since=since)
     vinegar.run = fake_run
+    fake_run.rc, fake_run.post_err = 0, ""
     vinegar.forget(vinegar.unposted_path("o/r", at))
-    said = [asked for how, _, asked in checked if how == "PATCH"]
+    said = [asked for how, where, asked in checked if how == "PATCH"]
+    where = [w for how, w, _ in checked if how == "PATCH"]
     _titles.append(said[0]["output"]["title"] if said else "(never closed)")
+    _conclusions.append(said[0]["conclusion"] if said else "(never closed)")
+    _closed.append((where[0], said[0]["conclusion"]) if said
+                   else ("(never closed)", ""))
     return _titles[-1]
+
+
+_titled.runs = 100
 
 
 check("a clean review says so in the checks list",
@@ -5639,7 +5693,16 @@ check("an unreadable review is not reported as a clean one",
       _titles[-1])
 check("a review that did not finish says so in the checks list",
       "did not finish" in _titled(_tier_found, note="killed at 30 minutes",
-                                  sha="dd00dd00dd00"), _titles[-1])
+                                  sha="dd00dd00dd00", whole=False),
+      _titles[-1])
+# Off `whole` and not off the note, which is the distinction review() keeps
+# the two apart for: a note also carries the fallback-model notice, so a
+# review that ran to the end on the fallback model was titled as one that
+# was cut short, on every deployment whose pinned model had stopped
+# routing.
+check("a review that finished on the fallback model is not called unfinished",
+      _titled([], note="ran on the fallback model", sha="dc00dc00dc00")
+      == "No findings", _titles[-1])
 check("one finding is not reported as 1 findings",
       _titled(_tier_found[:1], sha="ee00ee00ee00").startswith("1 finding ("),
       _titles[-1])
@@ -5658,7 +5721,64 @@ check("an ordinary review's finished check claims no narrowing",
 # rest of the title reads.
 check("a narrowed run that was killed still says it was killed, last",
       _titled(_tier_found, note="killed at 30 minutes", sha="ac00ac00ac00",
-              blockers=True).endswith("did not finish"), _titles[-1])
+              blockers=True, whole=False).endswith("did not finish"),
+      _titles[-1])
+# The other narrowing, which had never reached the closed title at all, so
+# a scoped fifth round that found nothing was byte-identical to a first
+# review that read the whole pull request. That mattered less while both
+# were grey.
+check("a scoped review says what it read in the finished check too",
+      _titled([], sha="ad00ad00ad00", since="0123456789abcdef")
+      == "No findings in what was added since `0123456`", _titles[-1])
+check("an ordinary review's finished check claims no scope",
+      "added since" not in _titled([], sha="ae00ae00ae00"), _titles[-1])
+
+# The conclusion, which is a second thing the closed indicator says and the
+# one people read before any title. Green is the exception and every other
+# ending is the grey mark that cannot block a merge.
+_titled([], sha="ad00ad00ad00")
+check("a review that found nothing is a pass in the checks list",
+      _conclusions[-1] == "success", _conclusions[-1])
+_titled(_tier_found, sha="ae00ae00ae00")
+check("a review that found something is not a pass",
+      _conclusions[-1] == "neutral", _conclusions[-1])
+# The four endings that report nothing without being clean. Each is the
+# false all-clear a green tick would be, and each reaches this line by a
+# different route, so each is asked separately.
+_titled(None, sha="af00af00af00")
+check("a review whose output could not be read is not a pass",
+      _conclusions[-1] == "neutral", _conclusions[-1])
+_titled([], note="killed at 30 minutes", sha="ba00ba00ba00", whole=False)
+check("a review that found nothing before it was killed is not a pass",
+      _conclusions[-1] == "neutral", _conclusions[-1])
+# post_review answers POSTED without posting when a retry finds the review
+# already up, so the review on that commit is the earlier attempt's. A
+# retry that itself reports nothing would tick a commit whose visible
+# review is full of findings.
+_titled([], sha="bb00bb00bb00", resent=True)
+check("a retry that posted nothing new is not a pass",
+      _conclusions[-1] == "neutral", _conclusions[-1])
+# The fallback-model notice again, on the conclusion this time: the tick
+# would have been denied to every clean review wherever the pinned model
+# had stopped routing.
+_titled([], note="ran on the fallback model", sha="bd00bd00bd00")
+check("a clean review that finished on the fallback model is a pass",
+      _conclusions[-1] == "success", _conclusions[-1])
+# Green belongs to a commit and not to a pull request, which the README
+# states as a rule and this is the check for it. Each review closes the
+# entry on the head it reviewed, so a clean pass and a later one that
+# finds something are two runs with two conclusions, and the pull request
+# shows the one belonging to the commit it sits on. The two conclusions
+# alone are checked above; what this adds is that they land on different
+# runs, which is the half that makes them independent.
+_titled([], sha="be00be00be00")
+_titled(_tier_found, sha="bf00bf00bf00")
+check("a later pass closes its own run, so green does not carry over",
+      [c for _, c in _closed[-2:]] == ["success", "neutral"]
+      and _closed[-2][0] != _closed[-1][0], _closed[-2:])
+_titled([], sha="bc00bc00bc00", posts=False)
+check("a clean review that never reached the pull request is not a pass",
+      _conclusions[-1] == "neutral", _conclusions[-1])
 
 fake_run.rc, fake_run.post_err = 1, "HTTP 403 Resource not accessible"
 # This block's ambiguous post consulted the landed-review read; the
