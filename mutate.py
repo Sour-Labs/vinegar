@@ -82,7 +82,10 @@ EXPECT = {
     "deleted-file": "SURVIVED",
 }
 
-# name, the text that implements a guard in vinegar.py, what breaks it
+# The condition that five entries below take apart, a term at a time.
+# Hoisted because writing it out five times is five anchors to repair the
+# next time one of its terms moves, and threading `whole` through this
+# file already broke six.
 CLEAN = "    clean = findings == [] and whole and landed and not resent"
 
 # name, the text that implements a guard in vinegar.py, what breaks it
@@ -581,10 +584,10 @@ MUTATIONS = [
     ("check-conclusion-is-used",
      '"status": "completed", "conclusion": conclusion,',
      '"status": "completed", "conclusion": "success",'),
-    # Green is the one ending that is a pass, and the four ways it can be
-    # claimed wrongly are four entries: nothing found is the only one that
-    # earns it, and an unreadable answer, a killed run and a review that
-    # never landed each report nothing without being clean.
+    # Green is the one ending that is a pass. Six entries: one for the
+    # constant, one for claiming it always, and one per term of `clean`,
+    # which is an unreadable answer, a killed run, a review that never
+    # landed, and a retry whose posting was an earlier attempt's.
     ("check-clean-is-a-pass",
      'CHECK_CLEAN = "success"', 'CHECK_CLEAN = "neutral"'),
     ("check-green-only-when-nothing-was-found",
@@ -600,6 +603,12 @@ MUTATIONS = [
     # review already up, and that earlier review is the one on the commit.
     ("check-green-not-for-a-retry-that-posted-nothing",
      CLEAN, "    clean = findings == [] and whole and landed"),
+    # Each reviewed commit gets its own run, and the entry a pull request
+    # shows is the one on its head. Closing anything but the run it was
+    # handed would let one review's conclusion stand for another's.
+    ("check-closes-the-run-it-was-handed",
+     '        label, check["repo"], "check-runs/%s" % check["id"], "PATCH", {',
+     '        label, check["repo"], "check-runs/1", "PATCH", {'),
     # A refused PATCH is retried by a backstop carrying the grey
     # conclusion, so without this a clean review ends grey under a title
     # still saying it found nothing.

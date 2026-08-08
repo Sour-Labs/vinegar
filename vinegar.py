@@ -3801,16 +3801,22 @@ def finish(label, repo, pr, path, text, findings, config, env, tokens,
         # to mean the attempts left words worth keeping, and an append
         # that dies half-way would hand the next reader a file that
         # passes that test and ends mid-note.
+        # Not `whole`, which is this function's parameter and means
+        # something else entirely. Nothing here reads it, so the shadow
+        # cost nothing; the line that would have paid is the obvious one
+        # to add next, an ending that says whether the preserved run
+        # finished, which would have got this file's text instead and
+        # never raised.
         with open(path_kept, encoding="utf-8", errors="replace") as handle:
-            whole = handle.read()
+            saved = handle.read()
         # Once, however many times the announcement is retried. The
         # give-up is attempted on up to MAX_ATTEMPTS polls while the
         # posting keeps failing, and each attempt used to append another
         # identical ending to the file that is a dry run's only artifact.
-        if note in whole:
+        if note in saved:
             log("%s: the transcript already records this ending" % label)
         else:
-            write_atomic(path_kept, whole + "\n\n---\n\n%s\n" % note)
+            write_atomic(path_kept, saved + "\n\n---\n\n%s\n" % note)
             log("%s: the ending is appended to the transcript the attempts "
                 "left" % label)
 
@@ -3888,15 +3894,17 @@ def finish(label, repo, pr, path, text, findings, config, env, tokens,
         title = "%d finding%s%s" % (
             len(findings), "" if len(findings) == 1 else "s",
             " (%s)" % tally if tally else "")
-    # And what the pass was asked for, both narrowings, which the title has
-    # to carry or they reach the checks list only while the review is
-    # running. open_check() puts them in the in_progress title, this
-    # overwrites that title on the way out, and the one it leaves behind is
-    # the one that stands for the rest of the pull request's life. Without
-    # this, "No findings" from a narrowed fifth round is the same six
-    # characters as "No findings" from a first review that read
-    # everything, and `gh pr checks` is where an agent reads it. It matters
-    # more now than it did: that fifth round closes green.
+    # And what the pass was asked for, both narrowings, because the title
+    # this leaves behind is the one that stands for the rest of the pull
+    # request's life. Without them, "No findings" from a narrowed fifth
+    # round is the same six characters as "No findings" from a first review
+    # that read everything, and `gh pr checks` is where an agent reads it.
+    # It matters more now than it did: that fifth round closes green.
+    #
+    # open_check() takes only `blockers`, so while a review is running its
+    # scope is still invisible and a scoped round reads like a first one
+    # for the nine to twenty-two minutes it takes. That is a smaller
+    # window than this one and it is not closed here.
     if since:
         title = "%s in what was added since `%s`" % (title, since[:7])
     if blockers:
@@ -3924,14 +3932,22 @@ def finish(label, repo, pr, path, text, findings, config, env, tokens,
     # the tick to every clean review on a deployment whose pinned model
     # stopped routing.
     #
-    # `not resent`, because post_review answers POSTED without posting
-    # when a retry finds the review already up, and that earlier review is
-    # the one on the pull request. A retry that itself reports nothing
-    # would otherwise tick a commit whose visible review is full of
-    # findings. It costs a clean resend its tick, which is the safe
-    # direction and the reason this is a term rather than a new answer
-    # from post_review: telling "I posted" from "someone posted" reaches
-    # the `covered` logic that decides narrowing.
+    # `not resent`, and it is deliberately broader than the case it
+    # defends. post_review answers POSTED without posting when a retry
+    # finds the review already up, and that earlier review is the one on
+    # the commit, so a retry reporting nothing would tick a commit whose
+    # visible review is full of findings. Nothing here can tell that retry
+    # from one that did its own posting, because both answers are POSTED,
+    # so every retry loses the tick rather than the one that should.
+    #
+    # `resent` is `attempts > 1`, so what that costs is the tick on a
+    # clean review whose first attempt failed before posting anything. A
+    # grey mark beside "No findings" is what every clean review looked
+    # like before this existed, so the cost is a tick withheld and never a
+    # claim that is false. Issue #27 is the answer that would narrow it:
+    # post_review saying which of the two happened, which reaches the
+    # `covered` logic that decides narrowing and is why it is not done
+    # here.
     clean = findings == [] and whole and landed and not resent
     close_check(label, check, title, sending or env,
                 "The review is on the pull request." if landed

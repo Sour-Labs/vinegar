@@ -1031,16 +1031,25 @@ tick on a pull request carrying twelve findings is a statement nobody made and
 the tick is what people read.
 
 A review that reported nothing is the one ending where a tick says what the
-reviewer said, so that one is `success`. Four endings that also report nothing
+reviewer said, so that one is `success`. Three endings that also report nothing
 are not it: a review whose output Vinegar could not read, one killed part way,
-one that never reached the pull request, and a retry that posted nothing because
-an earlier attempt's review was already up, whose findings are the ones on that
-commit. A review that ran to the end on the fallback model is not one of them,
-and says so: it carries a note, and a note is not the same as being cut short.
+and one that never reached the pull request. A review that ran to the end on the
+fallback model is not one of them, and says so: it carries a note, and a note is
+not the same as being cut short.
 
-The closed entry carries both narrowings, so `No findings in what was added
-since \`0123456\`, reporting blockers only` is not the same six characters as a
-first review that read everything.
+**A retried review never gets the tick**, whether or not it deserved one.
+`post_review` answers the same thing when it posts and when it finds an earlier
+attempt's review already up, and in the second case the findings on that commit
+are the earlier attempt's, so a retry reporting nothing would tick a commit
+carrying a review full of them. Nothing can tell the two apart today, so both
+lose the tick. The cost is a grey mark on a clean review whose first attempt
+failed before posting, which is what every clean review looked like until now.
+Issue #27 is the narrower answer.
+
+The closed entry carries both narrowings, so ``No findings in what was added
+since `0123456`, reporting blockers only`` is not the same six characters as a
+first review that read everything. While a review is *running* its scope is
+still invisible: the in-progress title carries the blockers narrowing only.
 
 **Green belongs to a commit, not to a pull request.** Each review closes the
 entry on the head it reviewed, so a clean first pass is green and a later pass

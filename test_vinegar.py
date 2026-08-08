@@ -5645,11 +5645,18 @@ vinegar.forget(vinegar.unposted_path("o/r", PR_TIER))
 # what it says has to be true on its own.
 _titles = []
 _conclusions = []
+_closed = []
 
 
 def _titled(findings, note=None, sha="d0d0d0d0d0d0", blockers=False,
             posts=True, whole=True, resent=False, since=None):
-    handle = {"repo": "o/r", "id": 7, "closed": False}
+    # An id of its own per call, because GitHub gives each reviewed commit
+    # its own run and the checks entry a pull request shows is the one
+    # belonging to its head. One shared id made the sequencing check below
+    # unable to see that at all: two closes on one handle would have
+    # looked the same as two runs.
+    _titled.runs += 1
+    handle = {"repo": "o/r", "id": _titled.runs, "closed": False}
     del checked[:]
     at = dict(PR_LIVE, headRefOid=sha)
     # `rc` is the review posting and `check_rc` is the indicator, so a
@@ -5662,10 +5669,16 @@ def _titled(findings, note=None, sha="d0d0d0d0d0d0", blockers=False,
     vinegar.run = fake_run
     fake_run.rc, fake_run.post_err = 0, ""
     vinegar.forget(vinegar.unposted_path("o/r", at))
-    said = [asked for how, _, asked in checked if how == "PATCH"]
+    said = [asked for how, where, asked in checked if how == "PATCH"]
+    where = [w for how, w, _ in checked if how == "PATCH"]
     _titles.append(said[0]["output"]["title"] if said else "(never closed)")
     _conclusions.append(said[0]["conclusion"] if said else "(never closed)")
+    _closed.append((where[0], said[0]["conclusion"]) if said
+                   else ("(never closed)", ""))
     return _titles[-1]
+
+
+_titled.runs = 100
 
 
 check("a clean review says so in the checks list",
@@ -5729,9 +5742,9 @@ check("a review that found nothing is a pass in the checks list",
 _titled(_tier_found, sha="ae00ae00ae00")
 check("a review that found something is not a pass",
       _conclusions[-1] == "neutral", _conclusions[-1])
-# The three endings that report nothing because little was read. Each is
-# the false all-clear a green tick would be, and each reaches this line by
-# a different route, so each is asked separately.
+# The four endings that report nothing without being clean. Each is the
+# false all-clear a green tick would be, and each reaches this line by a
+# different route, so each is asked separately.
 _titled(None, sha="af00af00af00")
 check("a review whose output could not be read is not a pass",
       _conclusions[-1] == "neutral", _conclusions[-1])
@@ -5751,6 +5764,18 @@ check("a retry that posted nothing new is not a pass",
 _titled([], note="ran on the fallback model", sha="bd00bd00bd00")
 check("a clean review that finished on the fallback model is a pass",
       _conclusions[-1] == "success", _conclusions[-1])
+# Green belongs to a commit and not to a pull request, which the README
+# states as a rule and this is the check for it. Each review closes the
+# entry on the head it reviewed, so a clean pass and a later one that
+# finds something are two runs with two conclusions, and the pull request
+# shows the one belonging to the commit it sits on. The two conclusions
+# alone are checked above; what this adds is that they land on different
+# runs, which is the half that makes them independent.
+_titled([], sha="be00be00be00")
+_titled(_tier_found, sha="bf00bf00bf00")
+check("a later pass closes its own run, so green does not carry over",
+      [c for _, c in _closed[-2:]] == ["success", "neutral"]
+      and _closed[-2][0] != _closed[-1][0], _closed[-2:])
 _titled([], sha="bc00bc00bc00", posts=False)
 check("a clean review that never reached the pull request is not a pass",
       _conclusions[-1] == "neutral", _conclusions[-1])
