@@ -31,7 +31,6 @@ import os
 import queue
 import re
 import shutil
-import signal
 import subprocess
 import sys
 import threading
@@ -625,6 +624,11 @@ LOG_LOCK = threading.Lock()
 #
 # Never cleared. The one path that sets it is on its way out of main().
 STOPPING = threading.Event()
+
+# What a poll worker's thread is called. release_lock() finds them by
+# this and declines while any is alive, so the two have to agree
+# exactly and a literal in either place is a silent way to disagree.
+POLL_WORKER = "vinegar-poll-"
 
 DEFAULTS = {
     "repos": [],
@@ -4986,82 +4990,47 @@ def poll_once(config, state, tokens):
     # held, because main() has not returned from here; the queue is
     # abandoned, so no repository that had not started starts now; and the
     # passes still running unwind on their own and close what they opened.
-    workers = [threading.Thread(target=passes, name="vinegar-poll-%d" % nth)
+    workers = [threading.Thread(target=passes,
+                                name=POLL_WORKER + str(nth))
                for nth in range(width)]
 
-    # Ctrl-C is dropped while the workers are being started, and again
-    # below while they are being stopped. Between the two it works
-    # normally, and that is the whole of the interrupt story here.
+    # No signal handling here at all, deliberately, and the paragraph is
+    # worth reading before adding some back. Four attempts at making a
+    # stop correct by guarding it were each reopened by the next
+    # interrupt: a pool joined at interpreter exit, daemon threads that
+    # skipped handle_pr's finally, a refusal that could not cover the log
+    # calls around it, and a deafness installed a few hundred bytecodes
+    # too late. Every one of them ended the same way, with main()'s
+    # finally freeing the lock while a worker was still reading its
+    # checkout.
     #
-    # Starting: an interrupt landing inside Thread.start() leaves a thread
-    # that is running but has not set its started flag, and both of the
-    # ways to ask about one read that flag. Measured: is_alive() answers
-    # False, join() refuses with "cannot join thread before it is
-    # started", and half a second later the same thread says it is alive
-    # and has been running the whole time. Any stop worked out from those
-    # answers therefore skips it, and the lock is released while it
-    # reviews. Dropping the signal for the microseconds this loop takes
-    # means no stop can ever be worked out from a half-started thread,
-    # which is a window removed rather than narrowed.
+    # So the lock is what changed, not the signal handling. release_lock()
+    # declines while a pass is alive, and the kernel drops the lock when
+    # the process dies, which cannot happen first because these threads
+    # are not daemons. That holds however the interrupt arrives and
+    # whatever it interrupts, so nothing here has to be timed correctly.
     #
-    # What it costs: a Ctrl-C pressed inside that window is discarded
-    # rather than queued. It is microseconds of thread creation, and
-    # pressing again works.
-    previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    # What is left is best effort and is allowed to be. An interrupt that
+    # lands before STOPPING is set costs the early stop: the passes drain
+    # the queue and the poll is paid for in full. That is a bill, not a
+    # review of the wrong commit, and it is the only thing at stake now.
     try:
         for worker in workers:
             worker.start()
-    finally:
-        signal.signal(signal.SIGINT, previous)
-
-    try:
         for worker in workers:
             worker.join()
     except BaseException:
-        # Ctrl-C, almost always. Re-raised once the workers are done, so
-        # main() says "stopped" and releases the lock at a moment when that
-        # is true.
+        # One try over both loops. Split in two, a RuntimeError out of
+        # start() -- thread creation refused under an RLIMIT_NPROC ceiling
+        # -- left STOPPING clear and the workers that had started draining
+        # the whole queue. Measured: one failed start, and the surviving
+        # worker went on to review every remaining repository.
         STOPPING.set()
-        # Stopping, the second half of the rule above. Every further
-        # Ctrl-C is dropped for as long as this takes.
-        #
-        # Refusing them one at a time was not enough, and the difference
-        # matters. Only the join can be wrapped in a try; the log calls
-        # around it cannot be, and each takes LOG_LOCK and writes, which
-        # is long enough for an auto-repeating Ctrl-C to land in it. That
-        # interrupt then walked out past the raise below and reached
-        # main(), which logs "stopped" and drops the lock with reviews
-        # still reading their checkouts: the race this block exists to
-        # close, reopened by the one thing an operator watching a silent
-        # wait is most likely to do. Deaf for the whole block, there is no
-        # window left to land in.
-        #
-        # So Ctrl-C is not the way to force this. Killing the process is,
-        # and it is consistent where dropping the lock alone is not: the
-        # kernel releases the lock when the process dies, and the reviews
-        # die with it rather than reading a tree something else may now
-        # reset.
-        previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
-        try:
-            # Said, because what follows is a silent wait that an operator
-            # would otherwise read as a hang. It is not instant: each pass
-            # still has handle_pr's finally to run, which closes the checks
-            # entry through `gh`, and a `gh` started after the signal was
-            # never in the process group that signal reached.
-            alive = sum(1 for worker in workers if worker.is_alive())
-            if alive:
-                log("stopping: waiting for %d repositor%s still being "
-                    "reviewed. Kill the process to force it"
-                    % (alive, "y" if alive == 1 else "ies"))
-            # Every worker, with no test for which ones are running. They
-            # were all started under the deafness above, so none of them
-            # can be in the half-started state that makes both is_alive()
-            # and join() answer wrongly, and joining one that has already
-            # finished costs nothing.
-            for worker in workers:
-                worker.join()
-        finally:
-            signal.signal(signal.SIGINT, previous)
+        # Said so the wait that follows is not read as a hang. The process
+        # does not exit until the passes finish, and the lock is theirs
+        # until it does.
+        log("stopping: the passes already running keep the lock until they "
+            "finish; kill the process to force it")
         raise
 
     # Every pass that fell over is named, and then the first is raised.
@@ -5663,8 +5632,40 @@ def locked_by():
 
 
 def release_lock():
-    """Drop the lock. Exiting would do it too; this just makes it explicit."""
+    """Drop the lock, unless a pass is still running under it.
+
+    Exiting would drop it too, and that is now the point rather than an
+    aside. The kernel releases an flock when the process dies, and the
+    process cannot die before the poll workers finish because they are
+    not daemons, so "held for as long as a pass is running" is true by
+    construction. Releasing here while one is alive is the only way it
+    ever comes free early.
+
+    Which is how every stop on the parallel path went wrong, four times
+    over: whatever escaped poll_once -- a second Ctrl-C, an interrupt in a
+    log call, a thread that could not be started -- main()'s finally freed
+    the lock, and a `--pr` run could then take it and `git reset --hard` a
+    tree a live review was reading, which reports findings about a commit
+    nobody asked about. Guarding each of those in turn reopened the next.
+    This declines to release instead, so none of them has to be caught.
+
+    threading.enumerate() rather than is_alive(), and the difference is
+    the case that is hardest to see: a thread whose start() was
+    interrupted is running and answers False to is_alive() until it sets
+    its started flag. enumerate() lists it anyway, because start() puts it
+    in threading's limbo before the OS thread exists and enumerate()
+    reports limbo as well as the active set.
+
+    Declining rather than waiting: this runs on the way out, and the
+    interpreter is about to wait for those threads on its own.
+    """
     global _lock_handle
+    running = [thread for thread in threading.enumerate()
+               if thread.name.startswith(POLL_WORKER)]
+    if running:
+        log("%d pass(es) still finishing, so the lock stays until this "
+            "process exits" % len(running))
+        return
     if _lock_handle is not None:
         os.close(_lock_handle)
         _lock_handle = None

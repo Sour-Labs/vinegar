@@ -323,61 +323,69 @@ MUTATIONS = [
     # unwinding, so handle_pr's finally never closes the checks entry and
     # the pull request keeps a Vinegar check spinning for ever.
     ("parallel-daemon-threads",
-     '    workers = [threading.Thread(target=passes, '
-     'name="vinegar-poll-%d" % nth)',
-     '    workers = [threading.Thread(target=passes, daemon=True,\n'
-     '                                name="vinegar-poll-%d" % nth)'),
+     "    workers = [threading.Thread(target=passes,\n"
+     "                                name=POLL_WORKER + str(nth))",
+     "    workers = [threading.Thread(target=passes, daemon=True,\n"
+     "                                name=POLL_WORKER + str(nth))"),
     # The one line that keeps poll_once from returning while passes are
     # still running, which is the shape of the bug this whole change fixes.
     ("parallel-workers-joined",
-     "    try:\n"
+     "        for worker in workers:\n"
+     "            worker.start()\n"
      "        for worker in workers:\n"
      "            worker.join()\n"
      "    except BaseException:",
-     "    try:\n"
-     "        pass\n"
+     "        for worker in workers:\n"
+     "            worker.start()\n"
      "    except BaseException:"),
-    # The wait inside the interrupt handler: without it the interrupt goes
-    # straight to main(), which releases the lock while passes run on.
-    ("parallel-join-on-interrupt",
+    # The stop asked for on the way out. Best effort by design, but
+    # without it an interrupted pass drains the whole queue and the poll
+    # is paid for in full.
+    ("parallel-stopping-set-on-escape",
      "        STOPPING.set()\n"
-     "        # Stopping, the second half of the rule above.",
-     "        STOPPING.set()\n"
-     "        raise\n"
-     "        # Stopping, the second half of the rule above."),
-    # Ctrl-C not dropped while the workers are being started: an
-    # interrupt inside Thread.start() leaves a thread that is running and
-    # says it is not, so the stop skips it and the lock comes free while
-    # it reviews.
-    ("parallel-deaf-while-starting",
-     "    previous = signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
+     "        # Said so the wait that follows is not read as a hang.",
+     "        # Said so the wait that follows is not read as a hang."),
+    # One try over both loops. Split in two, a start() that fails left
+    # STOPPING clear and the workers already running drained the queue.
+    ("parallel-one-try-over-both-loops",
      "    try:\n"
-     "        for worker in workers:",
-     "    previous = signal.getsignal(signal.SIGINT)\n"
+     "        for worker in workers:\n"
+     "            worker.start()\n"
+     "        for worker in workers:\n"
+     "            worker.join()",
+     "    for worker in workers:\n"
+     "        worker.start()\n"
      "    try:\n"
-     "        for worker in workers:"),
-    # Ctrl-C not dropped while they are being stopped: only the join can
-    # sit in a try, so a signal landing in the log call around it walks
-    # out past the re-raise and drops the lock with reviews still running.
-    ("parallel-deaf-while-stopping",
-     "        previous = signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
-     "        try:\n"
-     "            # Said, because what follows is a silent wait",
-     "        previous = signal.getsignal(signal.SIGINT)\n"
-     "        try:\n"
-     "            # Said, because what follows is a silent wait"),
-    # The line that says what the wait is for, and that killing is how to
-    # force it. Silence reads as a hang.
-    ("parallel-say-what-is-waited-for",
-     '                log("stopping: waiting for %d repositor%s still being "\n'
-     '                    "reviewed. Kill the process to force it"\n'
-     '                    % (alive, "y" if alive == 1 else "ies"))',
-     "                pass"),
-    # No entry for the join being unconditional. Every worker is started
-    # under the deafness above, so testing is_alive() first would skip
-    # only threads that have already finished: the same behaviour, which a
-    # mutation would rightly report as survived. What makes the
-    # unconditional form safe is the deafness, and that has its own entry.
+     "        for worker in workers:\n"
+     "            worker.join()"),
+    # The line that says why the process has not exited yet.
+    ("parallel-say-the-lock-is-held",
+     '        log("stopping: the passes already running keep the lock until '
+     'they "\n'
+     '            "finish; kill the process to force it")',
+     "        pass"),
+
+    # --- the lock outliving the passes under it ------------------------
+    # What the whole parallel path rests on. Released while a pass is
+    # alive, a `--pr` run takes it and resets a tree a live review is
+    # reading.
+    ("lock-held-while-a-pass-runs",
+     "    running = [thread for thread in threading.enumerate()\n"
+     "               if thread.name.startswith(POLL_WORKER)]\n"
+     "    if running:",
+     "    running = []\n"
+     "    if running:"),
+    # No entry for enumerate() being used rather than is_alive(), and it
+    # is missing on purpose. The two differ only for a thread whose
+    # start() was interrupted, which is running, answers False to
+    # is_alive() until it sets its started flag, and is listed by
+    # enumerate() anyway because start() puts it in limbo first. Reaching
+    # that state needs a signal landing inside Thread.start(), which no
+    # check here can arrange without deciding the outcome by timing.
+    # Measured directly instead, with a probe that delayed the bootstrap
+    # and interrupted the start: is_alive() said False and enumerate()
+    # listed it. The commit message says the same, so the choice is
+    # recorded rather than looking arbitrary.
 
     # --- what two repositories polled at once share --------------------
     ("state-lock-save",

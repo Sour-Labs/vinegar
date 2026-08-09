@@ -6720,88 +6720,55 @@ check("and it still reaches the daemon rather than dying in its worker",
 # before it leaves here, so main() releases the lock at a moment when that
 # is true and no pull request is abandoned mid-review with its checks
 # entry still open.
-# In its own interpreter, and it has to be. The signal goes to the whole
-# process, so if the guard being exercised is broken and poll_once returns
-# straight away, the interrupt lands in whatever this file is doing 200ms
-# later: the run ends with a traceback instead of a failed check, which is
-# coverage voided rather than a guard caught.
+# An interrupt during a parallel pass asks the passes to stop and reaches
+# the daemon. Nothing here is timed: the signal is sent from a worker,
+# which cannot run before the code under test has started it.
 #
-# A real signal, too, which is how Ctrl-C arrives. `_thread.interrupt_main`
-# cannot stand in for it: it leaves the interrupt pending rather than
-# waking the blocked join, so it is delivered when the join finally
-# returns, which on Python 3.9 is between the acquire and the release
-# inside Thread._wait_for_tstate_lock. That lock stays held and the
-# interpreter hangs joining the thread on its way out. Measured, and it
-# hung this suite before the signal was made a real one.
+# In its own interpreter, because a signal reaches the whole process, so a
+# broken guard would end this suite with a traceback rather than fail a
+# check.
 #
-# Nothing in it is on a timer. Both orderings that matter are forced: the
-# signal comes from a worker, which cannot run before the code under test
-# has started it, and the passes are released by the signal handler, so
-# they cannot finish before the interrupt lands. A first version used two
-# timers and passed here while failing under the load of a mutation run,
-# which is a check that reports on how busy the machine is.
+# What is deliberately *not* asserted is where the interrupt lands. Four
+# rounds of this branch tried to make that exact, and each guard was
+# reopened by the next interrupt. The lock is what keeps a stop safe now,
+# and release_lock() has its own checks below; this one only pins that a
+# stop is asked for and that the interrupt is not swallowed.
 _int_script = os.path.join(_home, "interrupt_a_pass.py")
 with open(_int_script, "w") as handle:
     # Substituted rather than %-formatted: the script below does its own
     # %-formatting, and interpolating the whole thing consumed those.
-    #
-    # Two runs out of one script, one per window Ctrl-C is deaf in. Nothing
-    # in either depends on how fast the machine is: every signal is sent
-    # from a point that can only be reached once the code under test is in
-    # the region being exercised, and the pass that has to be waited for is
-    # released from the line the stop itself prints.
     handle.write('''
 import os, signal, sys, threading
 sys.path.insert(0, __HERE__)
 import vinegar
 
-when = sys.argv[1]
-hold, done, said = threading.Event(), [], []
+done, said = [], []
 both_up = threading.Barrier(2)
-
-
-def interrupt():
-    os.kill(os.getpid(), signal.SIGINT)
+settle = threading.Event()
+vinegar.log = lambda message: said.append(message)
 
 
 def stop_waiting(signum, frame):
+    # Releasing the passes from the handler, so the join cannot return on
+    # its own at the instant the signal is processed. That is the window
+    # in Thread._wait_for_tstate_lock where an interrupt between the
+    # acquire and the release leaves the lock held and hangs the
+    # interpreter on its way out, and letting the passes finish
+    # immediately walked straight into it.
+    settle.set()
     raise KeyboardInterrupt
 
 
 signal.signal(signal.SIGINT, stop_waiting)
 
 
-def note(message):
-    """Interrupt from inside the log call the stop is making.
-
-    This is the window a per-join refusal could not cover: log() takes a
-    lock and writes, and a signal arriving in it walked out past the
-    re-raise. Sent from here it lands there every time, with no timer to
-    be wrong about.
-    """
-    if "waiting for" in message:
-        said.append(message)
-        for _ in range(3):
-            interrupt()
-        hold.set()
-
-
-vinegar.log = note
-
-
 def one_pass(repo, config, state, tokens):
-    if when == "starting":
-        # The main thread is still inside the loop that starts workers,
-        # because this code cannot run until it started one.
-        interrupt()
-        done.append(repo)
-        return
+    # Both workers up first, so the interrupt provably lands on a main
+    # thread that is joining rather than one still starting them.
     both_up.wait(10)
-    if repo != "o/one":
-        done.append(repo)
-        return
-    interrupt()
-    hold.wait(10)
+    if repo == "o/one":
+        os.kill(os.getpid(), signal.SIGINT)
+    settle.wait(10)
     done.append(repo)
 
 
@@ -6809,45 +6776,54 @@ vinegar.poll_repo = one_pass
 try:
     vinegar.poll_once({"repos": ["o/one", "o/two"], "parallel_repos": 2},
                       {}, {})
-    print("RETURNED done=%s said=%d" % (",".join(sorted(done)), len(said)))
+    print("RETURNED stopping=%s" % vinegar.STOPPING.is_set())
 except KeyboardInterrupt:
-    alive = [t for t in threading.enumerate()
-             if t.name.startswith("vinegar-poll")]
-    print("INTERRUPTED done=%s said=%d alive=%d"
-          % (",".join(sorted(done)), len(said), len(alive)))
+    print("INTERRUPTED stopping=%s held=%d"
+          % (vinegar.STOPPING.is_set(),
+             sum("keep the lock" in m for m in said)))
 except BaseException as err:
     print("OTHER %r" % (err,))
 '''.replace("__HERE__", repr(here_dir)))
-
-
-def _interrupt_run(when):
-    return subprocess.run(
-        [sys.executable, _int_script, when], capture_output=True, text=True,
-        timeout=60, env=dict(os.environ,
-                             VINEGAR_HOME=os.environ["VINEGAR_HOME"])).stdout
-
-
-_int_out = _interrupt_run("joining")
-_start_out = _interrupt_run("starting")
-# One assertion over four things, because torn apart they pass for
-# opposite reasons: the interrupt reached the daemon, the stop said what
-# it was waiting for, every pass had finished before the interrupt got
-# there, and no worker outlived the call. The three signals sent from
-# inside that log line are the part that matters most. Let through, one of
-# them walks out past the re-raise, reaches main() and drops the lock with
-# reviews still reading their checkouts, which was measured with both
-# passes alive at the moment the lock came free.
-check("an interrupt waits for the passes still running, then reaches main",
-      "INTERRUPTED done=o/one,o/two said=1 alive=0" in _int_out,
+_int_out = subprocess.run(
+    [sys.executable, _int_script], capture_output=True, text=True,
+    timeout=60, env=dict(os.environ,
+                         VINEGAR_HOME=os.environ["VINEGAR_HOME"])).stdout
+check("an interrupt asks the passes to stop and still reaches the daemon",
+      "INTERRUPTED stopping=True held=1" in _int_out,
       _int_out.strip()[:120])
-# And the other window. A signal arriving while the workers are being
-# started is dropped, so the pass runs to completion rather than being
-# worked out from a thread that is running and says it is not: is_alive()
-# answers False for one whose start() was interrupted, join() refuses it,
-# and it reviews anyway with the lock released.
-check("an interrupt while the workers are starting is dropped",
-      "RETURNED done=o/one,o/two said=0" in _start_out,
-      _start_out.strip()[:120])
+
+# A start() that fails is the same ending, and it was not before: split
+# into its own try, a RuntimeError left STOPPING clear and the workers
+# that had started drained the whole queue. Measured that way, with one
+# failed start and the surviving worker reviewing every remaining
+# repository.
+_started_repos = []
+
+
+class _WillNotStart(threading.Thread):
+    def start(self):
+        raise RuntimeError("can't start new thread")
+
+
+_real_thread = threading.Thread
+vinegar.STOPPING.clear()
+vinegar.handle_pr = lambda repo, pr, config, state, tokens: (
+    _started_repos.append(repo))
+threading.Thread = _WillNotStart
+try:
+    vinegar.poll_once(dict(CONFIG, repos=["o/one", "o/two", "o/three"],
+                           parallel_repos=2), {}, {})
+    _start_failed = None
+except BaseException as err:
+    _start_failed = err
+finally:
+    threading.Thread = _real_thread
+    _stopping_after = vinegar.STOPPING.is_set()
+    vinegar.STOPPING.clear()
+check("a pass that cannot start a worker still asks the rest to stop",
+      isinstance(_start_failed, RuntimeError) and _stopping_after,
+      (_start_failed, _stopping_after))
+
 vinegar.poll_repo = _real_poll_repo
 vinegar.open_prs, vinegar.handle_pr = _real_listing, _real_handling
 reset_stubs()
@@ -7083,6 +7059,63 @@ vinegar.release_lock()
 # other.
 check("releasing the lock leaves the file where it was",
       os.path.exists(vinegar.LOCK_PATH), vinegar.LOCK_PATH)
+
+# The lock is not released while a pass is still running under it, and
+# this is what the whole parallel path now rests on rather than on
+# catching interrupts in the right place. Four attempts at guarding the
+# stop were each reopened by the next interrupt, and every one of them
+# ended the same way: something escaped poll_once, main()'s finally freed
+# the lock, and a `--pr` run could take it and reset a tree a live review
+# was reading.
+#
+# Asked of the caller that matters. main() releases in a finally, so the
+# check is that a release attempted with a pass alive leaves the lock
+# held, which is asked by trying to take it again: the kernel decides,
+# not a flag.
+_pass_running = threading.Event()
+_fake_pass = threading.Thread(target=lambda: _pass_running.wait(10),
+                              name=vinegar.POLL_WORKER + "0")
+# Wrapped, like every other acquire_lock() call in this file. A refusal
+# is a SystemExit, so an unwrapped one ends the run rather than failing
+# these checks: the mutation that makes startup refuse came back ABORTED
+# until this existed, with four checks voided instead of one caught.
+try:
+    vinegar.acquire_lock()
+    _took_lock = "started"
+except SystemExit as err:
+    _took_lock = str(err)
+_fake_pass.start()
+_said_held = []
+_kept_log, vinegar.log = vinegar.log, lambda m: _said_held.append(m)
+vinegar.release_lock()
+vinegar.log = _kept_log
+try:
+    vinegar.acquire_lock()
+    _while_running = "started"
+except SystemExit as err:
+    _while_running = str(err)
+# Both halves: the lock was taken, and it was still held afterwards.
+# Asserting only the second passes against a run that never held it.
+check("the lock is not released while a pass is still running",
+      _took_lock == "started" and "already running" in _while_running,
+      (_took_lock, _while_running))
+check("and the log says why it is still held",
+      any("still finishing" in m for m in _said_held), _said_held)
+# And it comes free once that pass is gone, or a daemon that stopped
+# cleanly would leave a lock nothing could take until the file was
+# hand-edited.
+_pass_running.set()
+_fake_pass.join(10)
+vinegar.release_lock()
+try:
+    vinegar.acquire_lock()
+    _after_pass = "started"
+except SystemExit as err:
+    _after_pass = str(err)
+check("and it is released once the pass has finished",
+      _took_lock == "started" and _after_pass == "started",
+      (_took_lock, _after_pass))
+vinegar.release_lock()
 
 # A settings file whose allow list is present-and-null must produce the
 # sentence that says what to add, not a traceback every 30 seconds.
