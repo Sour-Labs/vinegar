@@ -390,12 +390,15 @@ Three things are worth knowing before you turn it on.
 **The installation is still the boundary.** Discovery does not widen what a
 review can reach: each review is handed a token scoped to the one repository
 it is reviewing, exactly as before. Listing needs a broader token, so Vinegar
-mints an installation-wide one for that single call and revokes it before the
-listing returns. It is never cached and never reaches a review. Revoking
-matters because GitHub honours an installation token for an hour after it is
-minted, so dropping the reference alone would leave the broadest credential
-Vinegar holds usable for that whole hour. What discovery changes is how many
-repositories get polled, not what any one review can touch.
+mints an installation-wide one per installation and revokes each as soon as
+its listing is done, whether or not that listing succeeded. It is never cached
+and never reaches a review. Revoking matters because GitHub honours an
+installation token for an hour after it is minted, so dropping the reference
+alone would leave the broadest credential Vinegar holds usable for that whole
+hour. The one case it does not revoke is an interrupt: Ctrl-C during a listing
+stops immediately rather than spending a network round trip on cleanup, and
+the token expires on its own. What discovery changes is how many repositories
+get polled, not what any one review can touch.
 
 **Archived repositories are left out.** GitHub refuses every write to one, so
 reviewing a pull request on an archived repository means paying for the review

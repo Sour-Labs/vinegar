@@ -3639,13 +3639,13 @@ _disco_boom = []
 def _disco_api(path, token, scheme="Bearer", payload=None, method=None):
     _disco_calls.append((path, token, scheme, payload, method))
     if path.startswith("/app/installations?"):
-        return [{"id": 7}]
+        return [{"id": 7}, {"id": 8}]
     if path.endswith("/access_tokens"):
         return {"token": "installation-wide"}
     if path == "/installation/token":
         return None
     if _disco_boom:
-        raise RuntimeError("GitHub said 502 for /installation/repositories")
+        raise _disco_boom[0]
     return {"repositories": _disco_pages.pop(0) if _disco_pages else []}
 
 
@@ -3691,13 +3691,18 @@ _full = [_repo("o/r%03d" % nth) for nth in range(100)]
 _paged = _discovered(_full, [_repo("o/zlast")])
 check("a full page is followed by the one after it",
       "o/zlast" in _paged[0] and len(_paged[0]) == 101, len(_paged[0]))
-check("a full page is asked about again, and the short one after it is not",
-      len(_called("/installation/repositories")) == 2,
+# By page number rather than by call count, because every installation
+# asks for its own page one and the count cannot tell those apart from a
+# second page of the same installation.
+check("a full page is asked about again",
+      any("page=2" in call[0] for call in
+          _called("/installation/repositories")),
       _called("/installation/repositories"))
 
 _discovered([_repo("o/a")])
 check("a listing that comes back short is not asked about again",
-      len(_called("/installation/repositories")) == 1,
+      not any("page=2" in call[0] for call in
+              _called("/installation/repositories")),
       _called("/installation/repositories"))
 _mint = _called("/access_tokens")[0]
 # The verb by name and no `repositories` restriction: the second is what
@@ -3722,28 +3727,80 @@ check("and discovery is not given the cache a reviewer's environment "
 # an installation token for an hour from minting, and DISCOVERY_INTERVAL
 # is also an hour, so unrevoked the broadest credential Vinegar holds is
 # live essentially all of the time.
-_discovered([_repo("o/a")])
+_both = _discovered([_repo("o/a")], [_repo("o/b")])
+check("every installation is walked, not just the last one",
+      _both[0] == ["o/a", "o/b"], _both)
 _revoked = _called("/installation/token")
-check("the token that listed the repositories is revoked, not just dropped",
-      len(_revoked) == 1 and _revoked[0][4] == "DELETE"
-      and _revoked[0][1] == "installation-wide", _revoked)
-# The case the revoke is most needed in, so it lives in a `finally`: a
-# listing that fails halfway would otherwise leave the token it failed
-# with usable for the rest of its hour.
-del _disco_calls[:]
-_disco_boom[:] = [True]
-vinegar.app_jwt, vinegar.github_api = stub_app_jwt, _disco_api
-try:
-    vinegar.discover_repos(APP)
-    _boomed = "returned"
-except RuntimeError as err:
-    _boomed = str(err)
-finally:
-    vinegar.app_jwt, vinegar.github_api = _real_jwt, _real_api
-    del _disco_boom[:]
+# One revoke per token minted, which is what puts it inside the loop. Read
+# outside it, `token` at the revoke is the last installation's, and every
+# earlier one stays usable for the rest of its hour: the exact
+# credential-lifetime hole this exists to close.
+check("each installation's token is revoked, not just the last one",
+      len(_revoked) == 2 and all(call[4] == "DELETE" for call in _revoked)
+      and all(call[1] == "installation-wide" for call in _revoked), _revoked)
+
+
+def _boom(err):
+    """discover_repos against a listing that raises that."""
+    del _disco_calls[:]
+    _disco_boom[:] = [err]
+    vinegar.app_jwt, vinegar.github_api = stub_app_jwt, _disco_api
+    try:
+        vinegar.discover_repos(APP)
+        return "returned"
+    except BaseException as caught:
+        return "%s: %s" % (type(caught).__name__, caught)
+    finally:
+        vinegar.app_jwt, vinegar.github_api = _real_jwt, _real_api
+        del _disco_boom[:]
+
+
+# The case the revoke matters in most: a listing that failed halfway would
+# otherwise leave the token it failed with usable for the rest of its hour.
+_boomed = _boom(RuntimeError("GitHub said 502 for the listing"))
 check("a listing that fails still revokes the token it failed with",
       len(_called("/installation/token")) == 1 and "502" in _boomed,
       (_called("/installation/token"), _boomed))
+# And a stop has to stop. Written as a `finally` this ran on the way out of
+# a KeyboardInterrupt too, and it is a fresh HTTPS call with a thirty
+# second timeout, so Ctrl-C inside a listing took up to thirty further
+# seconds to reach main()'s handler with nothing saying why.
+_stopped = _boom(KeyboardInterrupt())
+check("an interrupted listing is not held up by a revoke on the way out",
+      not _called("/installation/token") and "KeyboardInterrupt" in _stopped,
+      (_called("/installation/token"), _stopped))
+
+
+# The swallow, which nothing reached: a revoke that fails must not turn a
+# listing that worked into a discovery failure, and where the listing had
+# failed too its error must not replace the listing's.
+_revoke_died = []
+_rd_kept = vinegar.github_api
+
+
+def _api_whose_revoke_fails(path, token, scheme="Bearer", payload=None,
+                            method=None):
+    if path == "/installation/token":
+        raise RuntimeError("GitHub said 500 for the revoke")
+    return _disco_api(path, token, scheme, payload, method)
+
+
+del _disco_calls[:]
+_disco_pages[:] = [[_repo("o/a")]]
+_rl_kept = vinegar.log
+vinegar.app_jwt, vinegar.github_api = stub_app_jwt, _api_whose_revoke_fails
+vinegar.log = lambda message: _revoke_died.append(message)
+try:
+    _survived = vinegar.discover_repos(APP)
+except Exception as err:
+    _survived = "raised %s" % type(err).__name__
+finally:
+    vinegar.app_jwt, vinegar.github_api = _real_jwt, _rd_kept
+    vinegar.log = _rl_kept
+check("a revoke that fails does not lose the listing that worked",
+      _survived == (["o/a"], []), _survived)
+check("and it says the token stays usable until it expires",
+      any("until it expires" in said for said in _revoke_died), _revoke_died)
 
 _refresh_log = []
 
@@ -3765,6 +3822,8 @@ def _refreshed(repos, asked_at, *pages, fails=False):
         vinegar.discover_repos = blows_up
     try:
         asked = vinegar.refresh_repos(config, asked_at)
+    except Exception as err:
+        asked = "raised %s: %s" % (type(err).__name__, err)
     finally:
         vinegar.discover_repos, vinegar.log = was_discover, was_log
         vinegar.app_jwt, vinegar.github_api = _real_jwt, _real_api
@@ -3801,6 +3860,17 @@ check("the archived ones are counted where the change is announced",
 # Listing genuinely fails on a real network: 96 times in the three days to
 # 2026-08-19 on this deployment, about 1.1% of attempts. Read as "the App
 # covers nothing", one of those stops every repository being reviewed.
+# Zero is a time, and compared as one it made the very first ask depend on
+# the clock: on a host whose clock has not been set `time.time()` is inside
+# the first hour of the epoch, so the interval branch was taken at startup
+# and the App was never asked at all. None is not a time.
+_first = _refreshed([], None, [_repo("o/a")])
+check("the first ask happens whatever the clock says",
+      _first[0] == ["o/a"], _first)
+check("and an ask that has never answered is None, not a time",
+      _refreshed(["o/a"], None, fails=True)[1] is None,
+      _refreshed(["o/a"], None, fails=True))
+
 _blew = _refreshed(["o/a", "o/b"], 0, fails=True)
 check("an ask that fails keeps the repositories already being polled",
       _blew[0] == ["o/a", "o/b"], _blew)
@@ -6026,11 +6096,11 @@ def _discovery_config(**over):
                        **over), handle)
 
 
-def _wired(name, ask):
+def _wired(ask):
     """One daemon run against that ask, and the order it did things in."""
     order = []
     kept = (sys.argv, vinegar.poll_once, vinegar.sweep_checks,
-            vinegar.refresh_repos)
+            vinegar.refresh_repos, vinegar.time.sleep)
 
     def poll(config, *unused, **unused_kw):
         order.append("poll:" + ",".join(config["repos"]))
@@ -6045,6 +6115,11 @@ def _wired(name, ask):
         order.append("ask") or ask(config, asked_at))
     vinegar.poll_once = poll
     vinegar.sweep_checks = lambda *a, **k: order.append("sweep")
+    # This is the only test that lets main() reach its own
+    # time.sleep(poll_interval), and `poll_interval` cannot go below one.
+    # Left real it slept a second per run, which is nothing here and ten
+    # minutes across the 294 suite runs a full mutate.py pass makes.
+    vinegar.time.sleep = lambda seconds: None
     sys.argv = ["vinegar.py"]
     try:
         vinegar.main()
@@ -6052,16 +6127,16 @@ def _wired(name, ask):
         pass
     finally:
         (sys.argv, vinegar.poll_once, vinegar.sweep_checks,
-         vinegar.refresh_repos) = kept
+         vinegar.refresh_repos, vinegar.time.sleep) = kept
     return order
 
 
 def _answers(config, asked_at):
     config["repos"] = ["o/found"]
-    return asked_at + 1
+    return time.time()
 
 
-_dwire = _wired("answers", _answers)
+_dwire = _wired(_answers)
 check("the daemon asks the App before it polls, and again every pass",
       _dwire == ["ask", "sweep", "poll:o/found", "ask", "poll:o/found"],
       _dwire)
@@ -6071,7 +6146,7 @@ def _fails_once(config, asked_at):
     # The first ask fails, so the list stays empty; the second answers.
     if config.get("_asked"):
         config["repos"] = ["o/late"]
-        return asked_at + 1
+        return time.time()
     config["_asked"] = True
     return asked_at
 
@@ -6081,7 +6156,7 @@ def _fails_once(config, asked_at):
 # again, because it only ever ran once. A check run a killed predecessor
 # left `in_progress` then stayed that way for the life of the process,
 # which is the single harm sweep_checks() is there to bound.
-_swire = _wired("fails once", _fails_once)
+_swire = _wired(_fails_once)
 check("a sweep waits for a list rather than sweeping an empty one",
       _swire == ["ask", "poll:", "ask", "sweep", "poll:o/late"], _swire)
 
@@ -6113,7 +6188,7 @@ check("a one-shot run whose only ask failed says so in its exit code",
       "polled nothing" in _once_failed, _once_failed)
 # An ask that answered "no repositories" is a true answer about an App
 # installed nowhere, and is not a failure.
-_once_empty = _one_shot(lambda config, asked_at: asked_at + 1)
+_once_empty = _one_shot(lambda config, asked_at: time.time())
 check("and an App that genuinely covers nothing is not a failure",
       _once_empty == "returned", _once_empty)
 vinegar.save_state({})

@@ -1103,28 +1103,52 @@ def discover_repos(app):
                 if len(covered) < per_page:
                     break
                 page += 1
-        finally:
-            # In a `finally`, so a listing that fails halfway does not
-            # leave the token it failed with alive for the rest of its
-            # hour. That is the case the revoke is most needed in.
-            #
-            # Best effort, and it has to be. A revoke that fails leaves a
-            # token expiring on its own within the hour, which is exactly
-            # where this started, so failing discovery over the cleanup
-            # would trade a working listing for nothing at all.
-            try:
-                github_api("/installation/token", token, scheme="token",
-                           method="DELETE")
-            except Exception as err:
-                log("could not revoke the token that listed the App's "
-                    "repositories, so it stays usable until it expires "
-                    "within the hour: %s" % err)
+        except Exception:
+            # Revoked here too, and this is the case it matters in most: a
+            # listing that failed halfway leaves a token that would
+            # otherwise stay usable for the rest of its hour.
+            revoke_discovery_token(token)
+            raise
+        else:
+            revoke_discovery_token(token)
+        # Deliberately not a `finally`, which is what this was first
+        # written as. A `finally` also runs on the way out of a
+        # KeyboardInterrupt, and this one makes a fresh HTTPS call with a
+        # thirty-second timeout: Ctrl-C landing inside a listing then took
+        # up to thirty further seconds to reach main()'s handler, with
+        # nothing in the log saying why, and a second Ctrl-C was the only
+        # way out because `except Exception` does not catch that one
+        # either. A stop has to stop.
+        #
+        # What that costs is a token left alive on an interrupt. It
+        # expires within the hour on its own, and the process asking to
+        # die now is not the moment to spend a network round trip on
+        # tidiness.
     # Sorted, so neither the poll order nor the line naming them depends on
     # the order GitHub answered in. Below a width of one worker per
     # repository that order decides which repositories are reviewed first,
     # and an order that moves between passes is one nobody can reason about
     # from the log.
     return sorted(found), sorted(archived)
+
+
+def revoke_discovery_token(token):
+    """End the installation-wide token discover_repos() borrowed.
+
+    Best effort, and it has to be. A revoke that fails leaves a token
+    expiring on its own within the hour, which is where this started, so
+    failing discovery over the cleanup would trade a working listing for
+    nothing at all. Where the listing itself failed it would be worse than
+    nothing: the revoke's error would replace the listing's, and the log
+    would name the cleanup where the operator needs the cause.
+    """
+    try:
+        github_api("/installation/token", token, scheme="token",
+                   method="DELETE")
+    except Exception as err:
+        log("could not revoke the token that listed the App's "
+            "repositories, so it stays usable until it expires within "
+            "the hour: %s" % err)
 
 
 def refresh_repos(config, asked_at):
@@ -1138,7 +1162,9 @@ def refresh_repos(config, asked_at):
 
     At most hourly, and an ask that failed does not count as one. A
     failure returns `asked_at` untouched, so the next pass asks again a
-    minute later rather than an hour later. That matters most where it is
+    minute later rather than an hour later. `asked_at` is None until an ask
+    answers, and that is the only thing that means "no ask has ever
+    answered": it cannot be reached by an ask that did not happen. That matters most where it is
     least visible: at startup there is no previous list at all, so an ask
     that failed is a daemon watching nothing, and counting it would turn
     one bad minute into a bad hour of reviewing no repository.
@@ -1157,7 +1183,15 @@ def refresh_repos(config, asked_at):
     in a web UI on another machine, so the log is the only place those two
     facts ever meet.
     """
-    if time.time() - asked_at < DISCOVERY_INTERVAL:
+    # None, not zero, for "nothing has been asked yet". Zero is a time,
+    # and compared as one it made the first ask conditional on the wall
+    # clock: on a host whose clock has not been set, `time.time()` is
+    # within an hour of the epoch, this branch was taken at startup, and
+    # the App was never asked at all. The daemon then waited a full hour
+    # in silence and `--once` reported that the ask had failed, for an ask
+    # that was never made. The first call always asks now, because None is
+    # not a time and there is nothing to compare.
+    if asked_at is not None and time.time() - asked_at < DISCOVERY_INTERVAL:
         return asked_at
     try:
         found, archived = discover_repos(config["github_app"])
@@ -6624,7 +6658,7 @@ def main():
         # returns above, so a config with an App and no `repos` reviews a
         # named pull request without asking GitHub anything extra.
         discovering = not config["repos"]
-        asked_at = 0
+        asked_at = None
         if discovering:
             asked_at = refresh_repos(config, asked_at)
         # The width is said only when it is not one, for the same reason
@@ -6690,13 +6724,14 @@ def main():
                 # entry reads as "the pull requests are reviewed". The
                 # loop's retry a minute later does not exist on this path.
                 #
-                # `asked_at` is the signal and needs nothing new:
-                # refresh_repos() hands back the time of an ask that
-                # answered and the untouched value of one that did not, so
-                # zero here means the only ask there was failed. An ask
-                # that answered "no repositories" is a true answer about
-                # an App installed nowhere, and still exits 0.
-                if discovering and not asked_at:
+                # `asked_at` is the signal: refresh_repos() hands back
+                # the time of an ask that answered and leaves it None
+                # otherwise, and the first call cannot skip the ask,
+                # because None is not a time it can compare. So None here
+                # means the only ask there was ran and failed. An ask that
+                # answered "no repositories" is a true answer about an App
+                # installed nowhere, and still exits 0.
+                if discovering and asked_at is None:
                     sys.exit("could not ask the App which repositories it "
                              "covers, so this run polled nothing")
                 return

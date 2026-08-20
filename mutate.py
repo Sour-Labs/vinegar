@@ -1700,8 +1700,8 @@ MUTATIONS = [
      "def discover_repos(app, cache=None):"),
     # Asking every minute for an answer that changes monthly.
     ("discovery-interval",
-     "    if time.time() - asked_at < DISCOVERY_INTERVAL:",
-     "    if time.time() - asked_at < 0:"),
+     "    if asked_at is not None and time.time() - asked_at < DISCOVERY_INTERVAL:",
+     "    if asked_at is not None and time.time() - asked_at < 0:"),
     # One failed listing read as "the App covers nothing" stops every
     # repository being reviewed. Measured 1.1% of attempts on this network.
     ("discovery-failure-keeps-list",
@@ -1746,16 +1746,16 @@ MUTATIONS = [
     # hour, and DISCOVERY_INTERVAL is an hour, so the broadest credential
     # Vinegar holds would be live essentially always.
     ("discovery-token-revoked",
-     '                github_api("/installation/token", token, scheme="token",\n'
-     '                           method="DELETE")',
-     "                pass"),
+     '        github_api("/installation/token", token, scheme="token",\n'
+     '                   method="DELETE")',
+     "        pass"),
     # The return nothing asserted. main() reassigns `asked_at` from it every
     # pass, so a fresh clock here restarts the hour once a minute and the
     # App is asked at startup and never again.
     ("discovery-interval-clock",
-     "    if time.time() - asked_at < DISCOVERY_INTERVAL:\n"
+     "    if asked_at is not None and time.time() - asked_at < DISCOVERY_INTERVAL:\n"
      "        return asked_at",
-     "    if time.time() - asked_at < DISCOVERY_INTERVAL:\n"
+     "    if asked_at is not None and time.time() - asked_at < DISCOVERY_INTERVAL:\n"
      "        return time.time()"),
     # Swept an empty list after a failed first ask and never ran again, so
     # a killed predecessor's check stayed in_progress for the life of the
@@ -1766,22 +1766,56 @@ MUTATIONS = [
     # A one-shot run that polled nothing exiting 0, which a cron entry
     # reads as every pull request reviewed.
     ("once-fails-when-unasked",
-     "                if discovering and not asked_at:\n"
+     "                if discovering and asked_at is None:\n"
      '                    sys.exit("could not ask the App which repositories it "\n'
      '                             "covers, so this run polled nothing")',
      "                pass"),
     # The wire itself, which every check on refresh_repos is blind to.
     ("discovery-asks-at-startup",
      "        discovering = not config[\"repos\"]\n"
-     "        asked_at = 0\n"
+     "        asked_at = None\n"
      "        if discovering:\n"
      "            asked_at = refresh_repos(config, asked_at)",
      "        discovering = not config[\"repos\"]\n"
-     "        asked_at = 0"),
+     "        asked_at = None"),
     ("discovery-asks-every-pass",
      "            if discovering:\n"
      "                asked_at = refresh_repos(config, asked_at)",
      "            pass"),
+
+    # --- what the second review round of PR #33 found -------------------
+    # Back to a `finally`, which also runs on the way out of a
+    # KeyboardInterrupt: a fresh thirty-second HTTPS call between Ctrl-C and
+    # main()'s handler, with nothing in the log saying why.
+    ("discovery-revoke-not-on-interrupt",
+     "        else:\n"
+     "            revoke_discovery_token(token)",
+     "        finally:\n"
+     "            revoke_discovery_token(token)"),
+    # A revoke that fails turning a listing that worked into a discovery
+    # failure, and replacing a failed listing's error with its own.
+    ("discovery-revoke-swallow",
+     "    try:\n"
+     '        github_api("/installation/token", token, scheme="token",\n'
+     '                   method="DELETE")\n'
+     "    except Exception as err:\n"
+     '        log("could not revoke the token that listed the App\'s "\n'
+     '            "repositories, so it stays usable until it expires within "\n'
+     '            "the hour: %s" % err)',
+     '    github_api("/installation/token", token, scheme="token",\n'
+     '               method="DELETE")'),
+    # Only the first installation walked, so on an App installed on two
+    # accounts the second one's repositories are never reviewed.
+    ("discovery-walks-every-installation",
+     '    for install in github_api("/app/installations?per_page=%d" % per_page,\n'
+     "                              jwt):",
+     '    for install in github_api("/app/installations?per_page=%d" % per_page,\n'
+     "                              jwt)[:1]:"),
+    # Zero compared as a time made the very first ask conditional on the
+    # wall clock, so a host whose clock is near the epoch never asked at all.
+    ("discovery-first-ask-unconditional",
+     "    if asked_at is not None and time.time() - asked_at < DISCOVERY_INTERVAL:",
+     "    if asked_at != 0 and time.time() - asked_at < DISCOVERY_INTERVAL:"),
 ]
 
 
