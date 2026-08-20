@@ -958,14 +958,28 @@ sat directly above a tally reading `1 finding (1 advisory)`.
 When the two do disagree, the comment says so, rather than leaving the tag to
 read as a promise broken:
 
-> The tier tags below are set after the review, by a separate pass that reads
-> each finding's summary and never the code. A tag under blocker is that pass
+> The tier tag on each finding is set after the review, by a separate pass that
+> reads only its summary and never the code. A tag under blocker is that pass
 > disagreeing with the reviewer, not a smaller finding shown here anyway.
+
+"On each finding" and not "below", because an anchored finding's tag is rendered
+into its inline comment on the diff rather than into this body. That is the
+common case, and the one `wonky-flow#107` took: the body ended `1 finding
+(1 advisory), 1 posted inline.` with no bullet under the paragraph at all.
 
 Only then. On the ordinary narrowed round, which reports nothing or reports
 blockers, that paragraph answers a question nobody has. A reader of the pull
 request has no way to know a second pass exists, so it is worth the four lines
 on the round where a blue dot would otherwise contradict the paragraph above it.
+
+**The transcript carries both of these itself**, because `repost()` delivers
+that file rather than building a body, so a review that reaches a pull request
+from disk days later gets none of `review_body`. Its narrowing line is
+`Asked for: blockers only.` for the reason the comment and the check title say
+"asked for", and a third line explains a tier under blocker when there is one.
+That route is the one this was originally got wrong on: the line read `Reported:
+blockers only.` and `wonky-flow#107`'s transcript still has it fourteen lines
+above a blue advisory dot.
 
 The checks list says it too, since that is the half of this an agent polling
 `gh pr checks` can read: `Reviewing at high effort, blockers only` while it runs,

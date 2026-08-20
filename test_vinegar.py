@@ -856,6 +856,47 @@ check("a blockers-only pass that read everything still marks itself",
           vinegar.BLOCKERS_MARK), _tx_bl_body[:300])
 check("an ordinary review's transcript claims neither",
       vinegar.BLOCKERS_MARK not in _tx_full_body, _tx_full_body[:200])
+# The mark says what the pass was asked for, never what came back, for the
+# reason the review comment does: the bullets under it carry the severity
+# pass's tier dots, and nothing filters what the reviewer hands back. It
+# read "Reported: blockers only." until `wonky-flow#107`, whose transcript
+# has that line fourteen above a blue advisory dot.
+check("the transcript mark claims no more than the instruction it gave",
+      "Reported" not in vinegar.BLOCKERS_MARK, vinegar.BLOCKERS_MARK)
+# And the paragraph the comment carries when the two disagree, which no
+# review delivered from disk would otherwise get: repost() sends this file
+# instead of building a body.
+_tx_split = GENUINE_SAVE_TRANSCRIPT(
+    "o/r", PR, "the words", [dict(FINDINGS[0], tier="advisory")], None,
+    None, True)
+with open(_tx_split) as _h:
+    _tx_split_body = _h.read()
+check("a transcript whose finding came back smaller explains the tag",
+      vinegar.DISAGREED_MARK in _tx_split_body, _tx_split_body[:400])
+# In the lifted block, like the mark above it, and never opening it: that
+# block is found by matching its first line.
+_tx_split_block = _tx_split_body.partition("---")[2].lstrip()
+check("the explanation is inside the block the repost lifts",
+      vinegar.DISAGREED_MARK in _tx_split_block.partition("\n\n")[0]
+      and _tx_split_block.startswith(vinegar.BLOCKERS_MARK),
+      _tx_split_block[:400])
+_tx_agreed = GENUINE_SAVE_TRANSCRIPT(
+    "o/r", PR, "the words", [dict(FINDINGS[0], tier="blocker")], None,
+    None, True)
+with open(_tx_agreed) as _h:
+    _tx_agreed_body = _h.read()
+check("a narrowed transcript the severity pass agreed with explains nothing",
+      vinegar.DISAGREED_MARK not in _tx_agreed_body, _tx_agreed_body[:400])
+# Nested under the narrowing there as in the comment. An ordinary review's
+# transcript carries tiers on every bullet and no claim about blockers for
+# them to contradict.
+_tx_full_tier = GENUINE_SAVE_TRANSCRIPT(
+    "o/r", PR, "the words", [dict(FINDINGS[0], tier="advisory")], None)
+with open(_tx_full_tier) as _h:
+    _tx_full_tier_body = _h.read()
+check("an ordinary transcript explains nothing whatever its tiers say",
+      vinegar.DISAGREED_MARK not in _tx_full_tier_body,
+      _tx_full_tier_body[:400])
 shutil.rmtree(vinegar.REVIEW_DIR, True)
 vinegar.REVIEW_DIR = _saved_dir
 
@@ -4661,6 +4702,39 @@ check("a finding tiered under blocker is what raises the explanation",
 check("blockers alone raise nothing, nor does an untiered or empty review",
       not any(map(vinegar.below_blocker,
                   ([{"tier": "blocker"}], [{"summary": "none"}], [], None))))
+# "Under blocker" read off the name rather than off position 0. A literal
+# `TIERS[1:]` is the same set today and stops being it the day a tier is
+# added above `blocker`, which is a one-word edit to TIERS that no other
+# check here would notice: the slice would take in `blocker` itself and
+# every narrowed round the two passes agreed on would explain a
+# disagreement over a row of red dots.
+_saved_tiers = vinegar.TIERS
+vinegar.TIERS = ("critical", "blocker", "advisory", "note")
+check("under blocker stays under blocker when a tier is added above it",
+      not vinegar.below_blocker([{"tier": "blocker"}])
+      and not vinegar.below_blocker([{"tier": "critical"}])
+      and vinegar.below_blocker([{"tier": "advisory"}]))
+vinegar.TIERS = _saved_tiers
+# The paragraph says "on each finding" and not "below", because an
+# anchored finding's tag is rendered into its inline comment on the diff
+# rather than into this body. That is the common case, and the one
+# `wonky-flow#107` took: the body ended "1 finding (1 advisory), 1 posted
+# inline." with no bullet under the paragraph at all.
+check("the explanation points at the tags wherever they are rendered",
+      "tags below" not in _bl_split
+      and "tier tag on each finding" in _bl_split, _bl_split)
+_bl_inline = vinegar.review_body(
+    L, PR, CONFIG, [{"path": "v.py", "line": 1, "body": "x"}], [],
+    tally="1 advisory", blockers=True, disagreed=True)
+# No indexing on a phrase this file's own mutations delete: `.split(...)[1]`
+# on a body missing the narrowing raises, and a check that raises ends the
+# run where it stands instead of failing, so every check below it is
+# skipped and the mutation comes back ABORTED saying nothing. That is what
+# `blockers-said-on-the-pull-request` did to the first draft of this.
+check("and it is true of a body whose only finding went inline",
+      "tier tag on each finding" in _bl_inline
+      and "tags below" not in _bl_inline
+      and "1 posted inline." in _bl_inline, _bl_inline)
 
 (vinegar.review, vinegar.checkout, vinegar.github_env, vinegar.save_state,
  vinegar.run) = _ag_real
@@ -6310,6 +6384,30 @@ check("an oversized blockers-only review that read it all says so too",
       and vinegar.BLOCKERS_MARK in posted[0][1]["body"]
       and "## Findings" in posted[0][1]["body"],
       posted[0][1]["body"][:400] if posted else "nothing posted")
+
+# The route the whole contradiction reached a pull request by. repost()
+# sends this file rather than building a body, so review_body()'s
+# paragraph never runs here and the transcript has to carry its own. The
+# finding is tiered under blocker and its bullet renders a blue dot, so
+# without the mark this arrives as a narrowing statement above a tag that
+# contradicts it, days after the review it belongs to.
+vinegar.save_transcript("o/r", PR_LOST, "narration " * 9000,
+                        [dict(FINDINGS[0], tier="advisory")], None, None,
+                        True)
+with open(_lost_marker, "w") as h:
+    h.write("%s\n" % PR_LOST["headRefOid"])
+_bl_split_state = {_lost_key: {"outcome": vinegar.DONE,
+                               "sha": PR_LOST["headRefOid"], "attempts": 1,
+                               "unposted": True}}
+fake_run.rc = 0
+del posted[:]
+vinegar.handle_pr("o/r", PR_LOST, CONFIG, _bl_split_state, {})
+check("a review delivered from disk explains a tier under blocker too",
+      len(posted) == 1
+      and len(posted[0][1]["body"]) <= vinegar.MAX_BODY
+      and vinegar.BLOCKERS_MARK in posted[0][1]["body"]
+      and vinegar.DISAGREED_MARK in posted[0][1]["body"],
+      posted[0][1]["body"][:500] if posted else "nothing posted")
 
 # The reviewer writes its own summary and it goes into the transcript
 # verbatim, so a paragraph of it beginning "Scope: " must not be mistaken

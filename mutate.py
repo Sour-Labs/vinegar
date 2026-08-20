@@ -1099,16 +1099,66 @@ MUTATIONS = [
     # reader has no second pass to explain.
     ("disagreement-never-explained",
      "        if disagreed:\n"
-     '            lines += ["", "The tier tags below are set after the review, by "',
+     '            # "on each finding", not "below". An anchored finding\'s tag is',
      "        if False:\n"
-     '            lines += ["", "The tier tags below are set after the review, by "'),
+     '            # "on each finding", not "below". An anchored finding\'s tag is'),
     # And said on every narrowed round, including the ordinary one that
     # found nothing, where it answers a question nobody asked.
     ("disagreement-explained-unasked",
      "        if disagreed:",
      "        if True:"),
+    # Lifted out of the narrowing entirely, which is the regression the
+    # two entries above cannot reach: both keep the block nested, so an
+    # ordinary first-round review is unaffected by either and the check
+    # for that stayed green under the whole run. Dedented here, so every
+    # review carries a paragraph about a severity pass nobody narrowed.
+    ("disagreement-explained-off-a-full-review",
+     "        if disagreed:\n"
+     "            # \"on each finding\", not \"below\". An anchored finding's tag is",
+     "    if disagreed:\n"
+     "            # \"on each finding\", not \"below\". An anchored finding's tag is"),
+    # The wording that points at tags rendered somewhere else. An anchored
+    # finding's tag goes into its inline comment on the diff, so on the
+    # common case a paragraph promising tags below it points at nothing.
+    ("disagreement-points-below-itself",
+     '            lines += ["", "The tier tag on each finding is set after the "\n'
+     '                          "review, by a separate pass that reads only its "',
+     '            lines += ["", "The tier tags below are set after the "\n'
+     '                          "review, by a separate pass that reads only its "'),
     # Written outside the block the repost lifts, so the mark survives on
     # disk and is lost from every review delivered from a transcript.
+    # The mark going back to claiming what came back. It is the transcript's
+    # half of the same sentence the comment and the check title dropped,
+    # and repost() lifts it into the opening of a review delivered days
+    # later, above bullets carrying the severity pass's tier dots.
+    ("transcript-mark-claims-the-output",
+     'BLOCKERS_MARK = "Asked for: blockers only."',
+     'BLOCKERS_MARK = "Reported: blockers only."'),
+    # The transcript's copy of the disagreement paragraph, which is the
+    # only copy a review delivered from disk can carry.
+    ("transcript-never-explains-the-disagreement",
+     "        if below_blocker(findings):\n"
+     "            marks.append(DISAGREED_MARK)",
+     "        pass"),
+    ("transcript-explains-it-unasked",
+     "        if below_blocker(findings):\n"
+     "            marks.append(DISAGREED_MARK)",
+     "        marks.append(DISAGREED_MARK)"),
+    # Lifted out of the narrowing, where it opens the block on an ordinary
+    # review and repost() then matches nothing.
+    ("transcript-explanation-outside-the-narrowing",
+     "    if blockers:\n"
+     "        marks.append(BLOCKERS_MARK)\n"
+     "        # Nested, not a third `if`, because DISAGREED_MARK explains the\n"
+     "        # line above it and must never be the block's first line: repost()\n"
+     "        # finds the block by matching that first line and would leave a\n"
+     "        # block opening with this one in the body, unlifted.\n"
+     "        if below_blocker(findings):\n"
+     "            marks.append(DISAGREED_MARK)",
+     "    if blockers:\n"
+     "        marks.append(BLOCKERS_MARK)\n"
+     "    if below_blocker(findings):\n"
+     "        marks.append(DISAGREED_MARK)"),
     ("blockers-mark-inside-the-lifted-block",
      '    if marks:\n'
      '        body = "%s\\n\\n%s" % ("\\n".join(marks), body)',
@@ -1140,14 +1190,26 @@ MUTATIONS = [
     # `note` is as much under the bar as `advisory`, and reading only the
     # one word leaves the commonest smallest tier unexplained.
     ("below-blocker-forgets-the-smallest-tier",
-     '    return any(finding.get("tier") in TIERS[1:] for finding in findings or ())',
+     '    return any(finding.get("tier") in TIERS[TIERS.index("blocker") + 1:]\n'
+     "               for finding in findings or ())",
      '    return any(finding.get("tier") == "advisory"\n'
      "               for finding in findings or ())"),
     # And counting `blocker` itself, which explains a disagreement on
     # every narrowed round that agreed.
     ("below-blocker-counts-blockers-too",
-     '    return any(finding.get("tier") in TIERS[1:] for finding in findings or ())',
-     '    return any(finding.get("tier") in TIERS for finding in findings or ())'),
+     '    return any(finding.get("tier") in TIERS[TIERS.index("blocker") + 1:]\n'
+     "               for finding in findings or ())",
+     '    return any(finding.get("tier") in TIERS\n'
+     "               for finding in findings or ())"),
+    # "Everything but the most severe" rather than "under blocker". The
+    # same set today, which is why only the check that reorders TIERS
+    # notices, and the day a tier is added above `blocker` the slice takes
+    # in `blocker` itself.
+    ("below-blocker-reads-position-not-name",
+     '    return any(finding.get("tier") in TIERS[TIERS.index("blocker") + 1:]\n'
+     "               for finding in findings or ())",
+     '    return any(finding.get("tier") in TIERS[1:]\n'
+     "               for finding in findings or ())"),
     # Counting a round for a review whose findings never reached the pull
     # request. Two refused postings and the third round tells the author
     # that the first two "reported everything they found, and those
@@ -1203,8 +1265,9 @@ MUTATIONS = [
      "        pass"),
     # And the verb in it. "reporting blockers only" is a claim about what
     # came back, beside a tally that can say `1 advisory`; "asked for" is
-    # the claim the title can keep. Anchored on the word rather than on
-    # the line, because the line is what the entry above already covers.
+    # the claim the title can keep. Deliberately the same anchor as the
+    # entry above: an edit to that line takes both out at once, and two
+    # ANCHOR lines naming the same string is the clearest thing to repair.
     ("finished-check-claims-the-output",
      '        title = "%s, asked for blockers only" % title',
      '        title = "%s, reporting blockers only" % title'),

@@ -161,10 +161,29 @@ SCOPE_MARK = "Scope: only what was added since "
 # that is written but not matched is a review delivered from disk reading
 # as though it had reported everything it found.
 #
+# "Asked for", not "Reported", for the reason review_body() gives at
+# length: nothing filters what the reviewer hands back, and the bullets
+# below this line carry the severity pass's tier dots. It read "Reported:
+# blockers only." on every narrowed transcript, `wonky-flow#107` included,
+# where it sits fourteen lines above a blue advisory dot, and repost()
+# lifts that line into the opening of a review delivered days later.
+#
 # No number in it, unlike the scope line's commit. What the reader needs
-# is that findings were held back, and the configured round count is not
-# something a transcript posted days later can still speak for.
-BLOCKERS_MARK = "Reported: blockers only."
+# is which way the pass was narrowed, and the configured round count is
+# not something a transcript posted days later can still speak for.
+BLOCKERS_MARK = "Asked for: blockers only."
+
+# The third line, and the transcript's copy of the paragraph review_body()
+# adds when the two passes disagree. It needs its own because repost()
+# delivers this file rather than building a body, so a review that reaches
+# the pull request from disk gets none of that paragraph.
+#
+# Written under BLOCKERS_MARK and never alone, which is what keeps it
+# inside the block repost() lifts: that block is found by matching its
+# first line, and this is never the first line.
+DISAGREED_MARK = ("A tag under blocker is the severity pass disagreeing "
+                  "with the reviewer: it reads each finding's summary and "
+                  "never the code.")
 
 # Between a transcript's heading and its body. Named because both the
 # writer and repost()'s reader have to agree on it, and because reading
@@ -1847,6 +1866,12 @@ def save_transcript(repo, pr, text, findings=None, note=None, since=None,
         marks.append("%s`%s`." % (SCOPE_MARK, since[:7]))
     if blockers:
         marks.append(BLOCKERS_MARK)
+        # Nested, not a third `if`, because DISAGREED_MARK explains the
+        # line above it and must never be the block's first line: repost()
+        # finds the block by matching that first line and would leave a
+        # block opening with this one in the body, unlifted.
+        if below_blocker(findings):
+            marks.append(DISAGREED_MARK)
     if marks:
         body = "%s\n\n%s" % ("\n".join(marks), body)
     if findings:
@@ -2932,16 +2957,24 @@ def below_blocker(findings):
     `Sour-Labs/wonky-flow#107` round three, which reported one finding and
     had it tiered `advisory`.
 
-    `TIERS[1:]` rather than the two words, because TIERS is ordered most
-    severe first and is the one place that ordering is written down. A
-    tier added below `blocker` is then covered here without this being the
-    place someone has to remember.
+    Read off TIERS rather than from the two tier names, because TIERS is
+    ordered most severe first and is the one place that ordering is
+    written down, so a tier added at either end is covered without this
+    being a site someone has to remember.
+
+    From `blocker`'s own index and not a literal 1. `TIERS[1:]` means
+    "everything but the most severe", which is the same set today and
+    stops being it the day a tier is added above `blocker`: the slice
+    would then include `blocker` itself, and every narrowed round where
+    the two passes agreed would explain a disagreement over a row of red
+    dots. A check reorders TIERS and holds this to the name.
 
     Off the findings for severity_tally()'s reason: half of them are
     GitHub comment payloads by the time the comment is built, and those
     carry no tier.
     """
-    return any(finding.get("tier") in TIERS[1:] for finding in findings or ())
+    return any(finding.get("tier") in TIERS[TIERS.index("blocker") + 1:]
+               for finding in findings or ())
 
 
 def pr_key(repo, pr):
@@ -3091,11 +3124,17 @@ def review_body(label, pr, config, inline, general, raw=None,
         # because on the ordinary narrowed round, nothing found or
         # everything tiered `blocker`, it answers a question nobody has.
         if disagreed:
-            lines += ["", "The tier tags below are set after the review, by "
-                          "a separate pass that reads each finding's summary "
-                          "and never the code. A tag under blocker is that "
-                          "pass disagreeing with the reviewer, not a smaller "
-                          "finding shown here anyway."]
+            # "on each finding", not "below". An anchored finding's tag is
+            # rendered into its inline comment on the diff rather than
+            # into this body, which is the common case and the one
+            # `wonky-flow#107` took: the body then ends "1 finding
+            # (1 advisory), 1 posted inline." and a paragraph promising
+            # tags below it points at nothing.
+            lines += ["", "The tier tag on each finding is set after the "
+                          "review, by a separate pass that reads only its "
+                          "summary and never the code. A tag under blocker "
+                          "is that pass disagreeing with the reviewer, not a "
+                          "smaller finding shown here anyway."]
 
     # A run that was killed or that errored still reports whatever it had
     # got to, and without this that is indistinguishable from a finished
