@@ -1551,12 +1551,14 @@ MUTATIONS = [
     # indicator that poll just opened: the pull request then shows a
     # review running under a neutral entry saying it was interrupted.
     ("sweep-before-the-first-poll",
-     "        sweep_checks(config, tokens)\n"
-     "        while True:\n"
+     '            if not swept and config["repos"]:\n'
+     "                sweep_checks(config, tokens)\n"
+     "                swept = True\n"
      "            poll_once(config, state, tokens)",
-     "        while True:\n"
      "            poll_once(config, state, tokens)\n"
-     "            sweep_checks(config, tokens)"),
+     '            if not swept and config["repos"]:\n'
+     "                sweep_checks(config, tokens)\n"
+     "                swept = True"),
     # `pr_key` back above the per-pull-request try, where a listing that
     # answers 0 with entries carrying no `number` raises out of
     # sweep_checks and past main()'s KeyboardInterrupt-only handler: the
@@ -1664,6 +1666,156 @@ MUTATIONS = [
      "            continue",
      "        except Exception:\n"
      "            raise"),
+
+    # --- discovering repositories from the App -------------------------
+    # The verb github_api() used to guess. A bodyless POST inferred as a
+    # GET 404s on a path whose 404 means "not installed on this
+    # repository", so the guess accused the wrong thing.
+    ("api-explicit-method",
+     '        method=method or ("POST" if body else "GET"))',
+     '        method="POST" if body else "GET")'),
+    ("discovery-mint-verb",
+     '            jwt, method="POST")["token"]',
+     '            jwt)["token"]'),
+    # An archived repository is a review paid for in full and then a 403
+    # where the comment would go, on every push, silently.
+    ("discovery-skips-archived",
+     '                    (archived if repo.get("archived") else found).append(\n'
+     '                        repo["full_name"])',
+     '                    found.append(repo["full_name"])'),
+    # A hundred-and-first repository never read is one never reviewed.
+    ("discovery-pages",
+     "            if len(covered) < per_page:",
+     "            if len(covered) <= per_page:"),
+    ("discovery-order",
+     "    return sorted(found), sorted(archived)",
+     "    return found, sorted(archived)"),
+    # The token that lists an installation is broader than any the
+    # reviewer may hold, so it is spent and dropped.
+    ("discovery-token-escapes",
+     "    return sorted(found), sorted(archived)",
+     "    return sorted(found), [token]"),
+    ("discovery-takes-no-cache",
+     "def discover_repos(app):",
+     "def discover_repos(app, cache=None):"),
+    # Asking every minute for an answer that changes monthly.
+    ("discovery-interval",
+     "    if asked_at is not None and time.time() - asked_at < DISCOVERY_INTERVAL:",
+     "    if asked_at is not None and time.time() - asked_at < 0:"),
+    # One failed listing read as "the App covers nothing" stops every
+    # repository being reviewed. Measured 1.1% of attempts on this network.
+    ("discovery-failure-keeps-list",
+     '        log("cannot ask the App which repositories it covers, so the %d "\n'
+     '            "already being polled stay: %s" % (len(config["repos"]), err))\n'
+     "        return asked_at",
+     '        config["repos"] = []\n'
+     "        return asked_at"),
+    # A failed ask counted as an ask is an hour of watching nothing, and
+    # at startup there is no previous list to fall back to.
+    ("discovery-failure-retries-soon",
+     '            "already being polled stay: %s" % (len(config["repos"]), err))\n'
+     "        return asked_at",
+     '            "already being polled stay: %s" % (len(config["repos"]), err))\n'
+     "        return time.time()"),
+    # A repository that starts or stops being reviewed with nothing saying
+    # why. The cause is a checkbox on another machine.
+    ("discovery-announces-change",
+     "    if new or gone:",
+     "    if not (new or gone):"),
+    ("discovery-counts-archived",
+     '            changed.append("%d archived and left out" % len(archived))',
+     "            pass"),
+    # A daemon that comes up, polls an empty list once a minute for ever,
+    # and says nothing.
+    ("config-empty-repos-needs-app",
+     '    if not config["repos"] and not config["github_app"]:',
+     '    if not config["repos"] and config["github_app"]:'),
+    # "there are 0 repositories to poll", printed at a daemon about to
+    # discover seventeen.
+    ("config-width-skips-undiscovered",
+     '    if watched and config["parallel_repos"] > watched:',
+     '    if config["parallel_repos"] > watched:'),
+
+    # --- what the first review round of PR #33 found -------------------
+    # A 204 has no body. Decoded as JSON it raises, and the revoke below
+    # reads as a failure while having already happened.
+    ("api-empty-body",
+     "            return json.loads(body) if body else None",
+     "            return json.loads(body)"),
+    # Dropping the reference ends nothing: GitHub honours the token for an
+    # hour, and DISCOVERY_INTERVAL is an hour, so the broadest credential
+    # Vinegar holds would be live essentially always.
+    ("discovery-token-revoked",
+     '        github_api("/installation/token", token, scheme="token",\n'
+     '                   method="DELETE")',
+     "        pass"),
+    # The return nothing asserted. main() reassigns `asked_at` from it every
+    # pass, so a fresh clock here restarts the hour once a minute and the
+    # App is asked at startup and never again.
+    ("discovery-interval-clock",
+     "    if asked_at is not None and time.time() - asked_at < DISCOVERY_INTERVAL:\n"
+     "        return asked_at",
+     "    if asked_at is not None and time.time() - asked_at < DISCOVERY_INTERVAL:\n"
+     "        return time.time()"),
+    # Swept an empty list after a failed first ask and never ran again, so
+    # a killed predecessor's check stayed in_progress for the life of the
+    # process.
+    ("sweep-waits-for-a-list",
+     '            if not swept and config["repos"]:',
+     "            if not swept:"),
+    # A one-shot run that polled nothing exiting 0, which a cron entry
+    # reads as every pull request reviewed.
+    ("once-fails-when-unasked",
+     "                if discovering and asked_at is None:\n"
+     '                    sys.exit("could not ask the App which repositories it "\n'
+     '                             "covers, so this run polled nothing")',
+     "                pass"),
+    # The wire itself, which every check on refresh_repos is blind to.
+    ("discovery-asks-at-startup",
+     "        discovering = not config[\"repos\"]\n"
+     "        asked_at = None\n"
+     "        if discovering:\n"
+     "            asked_at = refresh_repos(config, asked_at)",
+     "        discovering = not config[\"repos\"]\n"
+     "        asked_at = None"),
+    ("discovery-asks-every-pass",
+     "            if discovering:\n"
+     "                asked_at = refresh_repos(config, asked_at)",
+     "            pass"),
+
+    # --- what the second review round of PR #33 found -------------------
+    # Back to a `finally`, which also runs on the way out of a
+    # KeyboardInterrupt: a fresh thirty-second HTTPS call between Ctrl-C and
+    # main()'s handler, with nothing in the log saying why.
+    ("discovery-revoke-not-on-interrupt",
+     "        else:\n"
+     "            revoke_discovery_token(token)",
+     "        finally:\n"
+     "            revoke_discovery_token(token)"),
+    # A revoke that fails turning a listing that worked into a discovery
+    # failure, and replacing a failed listing's error with its own.
+    ("discovery-revoke-swallow",
+     "    try:\n"
+     '        github_api("/installation/token", token, scheme="token",\n'
+     '                   method="DELETE")\n'
+     "    except Exception as err:\n"
+     '        log("could not revoke the token that listed the App\'s "\n'
+     '            "repositories, so it stays usable until it expires within "\n'
+     '            "the hour: %s" % err)',
+     '    github_api("/installation/token", token, scheme="token",\n'
+     '               method="DELETE")'),
+    # Only the first installation walked, so on an App installed on two
+    # accounts the second one's repositories are never reviewed.
+    ("discovery-walks-every-installation",
+     '    for install in github_api("/app/installations?per_page=%d" % per_page,\n'
+     "                              jwt):",
+     '    for install in github_api("/app/installations?per_page=%d" % per_page,\n'
+     "                              jwt)[:1]:"),
+    # Zero compared as a time made the very first ask conditional on the
+    # wall clock, so a host whose clock is near the epoch never asked at all.
+    ("discovery-first-ask-unconditional",
+     "    if asked_at is not None and time.time() - asked_at < DISCOVERY_INTERVAL:",
+     "    if asked_at != 0 and time.time() - asked_at < DISCOVERY_INTERVAL:"),
 ]
 
 

@@ -2927,6 +2927,34 @@ check("a repository written with stray spaces is the same repository",
 check("and the stored name has the spaces taken off",
       _loaded(repos=[" o/r "])["repos"] == ["o/r"],
       _loaded(repos=[" o/r "]))
+
+# An empty `repos` is a request to be told, not a mistake, but only where
+# there is an App to ask. Discovery cannot replace the setting outright:
+# config.example.json ships `"github_app": null`, so an install that
+# followed the example has no installation to ask and has to name them.
+_app_key = {"app_id": 1, "private_key": _covered_key}
+check("an empty repos with an App is a request to discover them",
+      _config_with(repos=[], github_app=_app_key) == "started",
+      _config_with(repos=[], github_app=_app_key))
+# Refused rather than started and left silent. Without this the daemon
+# comes up, polls an empty list once a minute for ever, reviews nothing
+# and says nothing, which is the silent-stop class every other check in
+# this function exists for.
+check("an empty repos with no App refuses, and names both ways out",
+      "nothing to poll" in _config_with(repos=[])
+      and "github_app" in _config_with(repos=[]),
+      _config_with(repos=[]))
+# The width warning reads `repos`, which under discovery is empty here and
+# says nothing about what will be polled. Printed anyway it told an
+# operator "there are 0 repositories to poll" about a daemon that was
+# about to discover seventeen and poll every one of them.
+check("the width is not compared against a list nothing has discovered yet",
+      "parallel_repos is" not in _dupe_said(
+          repos=[], parallel_repos=4, github_app=_app_key),
+      _dupe_said(repos=[], parallel_repos=4, github_app=_app_key))
+check("and it is still compared against a list the file did name",
+      "parallel_repos is" in _dupe_said(repos=["o/r"], parallel_repos=4),
+      _dupe_said(repos=["o/r"], parallel_repos=4))
 # The shape the message beside it always promised. A dropped owner started
 # the daemon perfectly and then failed on every poll for ever: `gh pr list
 # -R web` fails on the format, poll_repo swallows it, one line a minute,
@@ -3541,6 +3569,318 @@ check("an expired token is replaced whatever the caller asked for",
       vinegar.installation_token(
           APP, "o/r", {"o/r": ("stale", time.time() - 1)}) == "fresh")
 vinegar.app_jwt, vinegar.github_api = _real_jwt, _real_api
+
+# Discovery: which repositories the App is installed on, asked of GitHub
+# rather than read out of the config. Everything below runs against stubs,
+# so it costs nothing and touches nothing.
+#
+# The verb first, because github_api() used to guess it. A POST with a
+# payload was the only POST there was, so the guess held until discovery
+# needed a bodyless one, and inferred that call went out as a GET against
+# a path whose 404 reads as "the App is not installed on this repository".
+_built = []
+_fake_body = [b"{}"]
+
+
+class _FakeResponse:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *unused):
+        return False
+
+    def read(self):
+        return _fake_body[0]
+
+
+def _fake_urlopen(request, timeout=None):
+    _built.append(request)
+    return _FakeResponse()
+
+
+_real_urlopen = vinegar.urllib.request.urlopen
+vinegar.urllib.request.urlopen = _fake_urlopen
+try:
+    vinegar.github_api("/app/installations/7/access_tokens", "jwt",
+                       method="POST")
+    vinegar.github_api("/app", "jwt")
+    vinegar.github_api("/x", "jwt", payload={"repositories": ["r"]})
+finally:
+    vinegar.urllib.request.urlopen = _real_urlopen
+
+check("a POST asked for by name goes out as a POST with no body",
+      _built[0].get_method() == "POST" and _built[0].data is None,
+      (_built[0].get_method(), _built[0].data))
+check("a call with neither a payload nor a verb is still a GET",
+      _built[1].get_method() == "GET", _built[1].get_method())
+check("a payload still means a POST, for the calls that always had one",
+      _built[2].get_method() == "POST", _built[2].get_method())
+
+_fake_body[0] = b""
+vinegar.urllib.request.urlopen = _fake_urlopen
+try:
+    _empty = vinegar.github_api("/installation/token", "t", method="DELETE")
+except Exception as err:
+    # Caught rather than raised through: an exception at module level ends
+    # the run where it stands and reports the checks below as never run,
+    # which mutate.py can only call coverage voided.
+    _empty = "raised %s" % type(err).__name__
+finally:
+    vinegar.urllib.request.urlopen = _real_urlopen
+    _fake_body[0] = b"{}"
+check("a 204 with no body is not read as broken JSON",
+      _empty is None, _empty)
+
+_disco_calls = []
+_disco_pages = []
+_disco_boom = []
+
+
+def _disco_api(path, token, scheme="Bearer", payload=None, method=None):
+    _disco_calls.append((path, token, scheme, payload, method))
+    if path.startswith("/app/installations?"):
+        return [{"id": 7}, {"id": 8}]
+    if path.endswith("/access_tokens"):
+        return {"token": "installation-wide"}
+    if path == "/installation/token":
+        return None
+    if _disco_boom:
+        raise _disco_boom[0]
+    return {"repositories": _disco_pages.pop(0) if _disco_pages else []}
+
+
+def _repo(name, archived=False):
+    return {"full_name": name, "archived": archived}
+
+
+def _discovered(*pages):
+    """What discover_repos makes of those pages, with the calls recorded."""
+    del _disco_calls[:]
+    _disco_pages[:] = [list(page) for page in pages]
+    vinegar.app_jwt, vinegar.github_api = stub_app_jwt, _disco_api
+    try:
+        return vinegar.discover_repos(APP)
+    finally:
+        vinegar.app_jwt, vinegar.github_api = _real_jwt, _real_api
+
+
+def _called(fragment):
+    """The recorded calls whose path holds that."""
+    return [call for call in _disco_calls if fragment in call[0]]
+
+
+_two = _discovered([_repo("o/b"), _repo("o/a")])
+check("what the installations cover is what gets watched, in a fixed order",
+      _two[0] == ["o/a", "o/b"], _two)
+# Not tidiness. Below one worker per repository the order decides which
+# repositories are reviewed first, and GitHub's own order is not promised
+# to be the same twice.
+_arch = _discovered([_repo("o/a"), _repo("o/gone", archived=True)])
+check("an archived repository is not watched",
+      _arch[0] == ["o/a"], _arch)
+# GitHub refuses every write to an archived repository, so watching one is
+# a review paid for in full and then a 403 where the comment would go, on
+# every push, with nothing on the pull request able to say why.
+check("and it is handed back separately rather than only dropped",
+      _arch[1] == ["o/gone"], _arch)
+
+# Paging, because this is the list that grows with the organisation. A
+# hundred-and-first entry silently unread is a repository that is simply
+# never reviewed, and nothing anywhere would say so.
+_full = [_repo("o/r%03d" % nth) for nth in range(100)]
+_paged = _discovered(_full, [_repo("o/zlast")])
+check("a full page is followed by the one after it",
+      "o/zlast" in _paged[0] and len(_paged[0]) == 101, len(_paged[0]))
+# By page number rather than by call count, because every installation
+# asks for its own page one and the count cannot tell those apart from a
+# second page of the same installation.
+check("a full page is asked about again",
+      any("page=2" in call[0] for call in
+          _called("/installation/repositories")),
+      _called("/installation/repositories"))
+
+_discovered([_repo("o/a")])
+check("a listing that comes back short is not asked about again",
+      not any("page=2" in call[0] for call in
+              _called("/installation/repositories")),
+      _called("/installation/repositories"))
+_mint = _called("/access_tokens")[0]
+# The verb by name and no `repositories` restriction: the second is what
+# makes this token installation-wide, which is what listing needs and is
+# broader than anything else here holds.
+check("the discovery token is minted by an explicit POST, not a guessed one",
+      _mint[4] == "POST" and _mint[3] is None, _mint)
+check("the listing is made with that token rather than with the App's JWT",
+      _called("/installation/repositories")[0][1] == "installation-wide",
+      _called("/installation/repositories")[0][1])
+# The security property the whole sandbox argument rests on:
+# installation_token() is narrow because a diff that talks the reviewer
+# into running `gh` must reach nothing but the repository under review.
+# This token is broader than that one, so it is spent and dropped.
+check("the installation-wide token is no part of what discovery hands back",
+      "installation-wide" not in repr(_discovered([_repo("o/a")])))
+check("and discovery is not given the cache a reviewer's environment "
+      "comes from",
+      list(inspect.signature(vinegar.discover_repos).parameters) == ["app"],
+      list(inspect.signature(vinegar.discover_repos).parameters))
+# Dropping the last reference to the string ends nothing: GitHub honours
+# an installation token for an hour from minting, and DISCOVERY_INTERVAL
+# is also an hour, so unrevoked the broadest credential Vinegar holds is
+# live essentially all of the time.
+_both = _discovered([_repo("o/a")], [_repo("o/b")])
+check("every installation is walked, not just the last one",
+      _both[0] == ["o/a", "o/b"], _both)
+_revoked = _called("/installation/token")
+# One revoke per token minted, which is what puts it inside the loop. Read
+# outside it, `token` at the revoke is the last installation's, and every
+# earlier one stays usable for the rest of its hour: the exact
+# credential-lifetime hole this exists to close.
+check("each installation's token is revoked, not just the last one",
+      len(_revoked) == 2 and all(call[4] == "DELETE" for call in _revoked)
+      and all(call[1] == "installation-wide" for call in _revoked), _revoked)
+
+
+def _boom(err):
+    """discover_repos against a listing that raises that."""
+    del _disco_calls[:]
+    _disco_boom[:] = [err]
+    vinegar.app_jwt, vinegar.github_api = stub_app_jwt, _disco_api
+    try:
+        vinegar.discover_repos(APP)
+        return "returned"
+    except BaseException as caught:
+        return "%s: %s" % (type(caught).__name__, caught)
+    finally:
+        vinegar.app_jwt, vinegar.github_api = _real_jwt, _real_api
+        del _disco_boom[:]
+
+
+# The case the revoke matters in most: a listing that failed halfway would
+# otherwise leave the token it failed with usable for the rest of its hour.
+_boomed = _boom(RuntimeError("GitHub said 502 for the listing"))
+check("a listing that fails still revokes the token it failed with",
+      len(_called("/installation/token")) == 1 and "502" in _boomed,
+      (_called("/installation/token"), _boomed))
+# And a stop has to stop. Written as a `finally` this ran on the way out of
+# a KeyboardInterrupt too, and it is a fresh HTTPS call with a thirty
+# second timeout, so Ctrl-C inside a listing took up to thirty further
+# seconds to reach main()'s handler with nothing saying why.
+_stopped = _boom(KeyboardInterrupt())
+check("an interrupted listing is not held up by a revoke on the way out",
+      not _called("/installation/token") and "KeyboardInterrupt" in _stopped,
+      (_called("/installation/token"), _stopped))
+
+
+# The swallow, which nothing reached: a revoke that fails must not turn a
+# listing that worked into a discovery failure, and where the listing had
+# failed too its error must not replace the listing's.
+_revoke_died = []
+_rd_kept = vinegar.github_api
+
+
+def _api_whose_revoke_fails(path, token, scheme="Bearer", payload=None,
+                            method=None):
+    if path == "/installation/token":
+        raise RuntimeError("GitHub said 500 for the revoke")
+    return _disco_api(path, token, scheme, payload, method)
+
+
+del _disco_calls[:]
+_disco_pages[:] = [[_repo("o/a")]]
+_rl_kept = vinegar.log
+vinegar.app_jwt, vinegar.github_api = stub_app_jwt, _api_whose_revoke_fails
+vinegar.log = lambda message: _revoke_died.append(message)
+try:
+    _survived = vinegar.discover_repos(APP)
+except Exception as err:
+    _survived = "raised %s" % type(err).__name__
+finally:
+    vinegar.app_jwt, vinegar.github_api = _real_jwt, _rd_kept
+    vinegar.log = _rl_kept
+check("a revoke that fails does not lose the listing that worked",
+      _survived == (["o/a"], []), _survived)
+check("and it says the token stays usable until it expires",
+      any("until it expires" in said for said in _revoke_died), _revoke_died)
+
+_refresh_log = []
+
+
+def _refreshed(repos, asked_at, *pages, fails=False):
+    """What refresh_repos does to that list, when, and what it said."""
+    config = {"repos": list(repos), "github_app": APP}
+    del _refresh_log[:]
+    del _disco_calls[:]
+    _disco_pages[:] = [list(page) for page in pages]
+
+    def blows_up(app):
+        raise RuntimeError("GitHub said 502 for /app/installations")
+
+    was_discover, was_log = vinegar.discover_repos, vinegar.log
+    vinegar.app_jwt, vinegar.github_api = stub_app_jwt, _disco_api
+    vinegar.log = lambda message: _refresh_log.append(message)
+    if fails:
+        vinegar.discover_repos = blows_up
+    try:
+        asked = vinegar.refresh_repos(config, asked_at)
+    except Exception as err:
+        asked = "raised %s: %s" % (type(err).__name__, err)
+    finally:
+        vinegar.discover_repos, vinegar.log = was_discover, was_log
+        vinegar.app_jwt, vinegar.github_api = _real_jwt, _real_api
+    return config["repos"], asked, " ".join(_refresh_log)
+
+
+_an_hour = time.time()
+_fresh = _refreshed(["o/a"], _an_hour, [_repo("o/b")])
+check("the App is not asked again inside the hour",
+      _fresh[0] == ["o/a"] and not _disco_calls, _fresh)
+# main() reassigns `asked_at` from this on every pass, so handing back a
+# fresh clock here restarts the hour once a minute and the hour never
+# ends: the App is asked at startup and never again, silently.
+check("and the clock it hands back is the one it was given",
+      _fresh[1] == _an_hour, (_fresh[1], _an_hour))
+_due = _refreshed(["o/a"], 0, [_repo("o/b")])
+check("an hour on, the watched list becomes what the App now covers",
+      _due[0] == ["o/b"], _due)
+# The cause of a change here is a checkbox in a web UI on another machine,
+# so this line is the only place the change and the effect ever meet. Both
+# halves, because a repository that stopped being reviewed is the half
+# nobody thinks to look for.
+check("a repository that appeared and one that went are both named",
+      "added o/b" in _due[2] and "removed o/a" in _due[2], _due[2])
+check("an ask that answered starts the hour again",
+      _due[1] > 0, _due[1])
+_same = _refreshed(["o/a"], 0, [_repo("o/a")])
+check("an unchanged list says nothing, so the log holds only changes",
+      _same[2] == "", _same[2])
+_counted = _refreshed([], 0, [_repo("o/a"), _repo("o/old", archived=True)])
+check("the archived ones are counted where the change is announced",
+      "1 archived and left out" in _counted[2], _counted[2])
+
+# Listing genuinely fails on a real network: 96 times in the three days to
+# 2026-08-19 on this deployment, about 1.1% of attempts. Read as "the App
+# covers nothing", one of those stops every repository being reviewed.
+# Zero is a time, and compared as one it made the very first ask depend on
+# the clock: on a host whose clock has not been set `time.time()` is inside
+# the first hour of the epoch, so the interval branch was taken at startup
+# and the App was never asked at all. None is not a time.
+_first = _refreshed([], None, [_repo("o/a")])
+check("the first ask happens whatever the clock says",
+      _first[0] == ["o/a"], _first)
+check("and an ask that has never answered is None, not a time",
+      _refreshed(["o/a"], None, fails=True)[1] is None,
+      _refreshed(["o/a"], None, fails=True))
+
+_blew = _refreshed(["o/a", "o/b"], 0, fails=True)
+check("an ask that fails keeps the repositories already being polled",
+      _blew[0] == ["o/a", "o/b"], _blew)
+# And is retried on the next pass rather than in an hour. At startup there
+# is no previous list, so a failed first ask is a daemon watching nothing,
+# and counting it as an ask would make one bad minute a bad hour.
+check("a failed ask is not counted, so the next pass asks again",
+      _blew[1] == 0, _blew[1])
+check("and the log says the list being polled is the one it kept",
+      "already being polled stay" in _blew[2], _blew[2])
 
 _asked = []
 _real_env = vinegar.github_env
@@ -5739,6 +6079,118 @@ finally:
     sys.argv, vinegar.poll_once, vinegar.sweep_checks = _oo_kept
 check("a one-shot run sweeps on the same rule the daemon does",
       _once_order == ["sweep", "poll"], _once_order)
+
+# The wire again, for discovery, and it carries the same argument the
+# sweep's does: every check on refresh_repos() calls it directly, so a
+# main() that never calls it leaves all of them green while no deployment
+# ever learns that a repository was onboarded.
+
+
+def _discovery_config(**over):
+    """A config that names no repositories and has an App to ask."""
+    with open(os.path.join(os.environ["VINEGAR_HOME"], "config.json"),
+              "w") as handle:
+        json.dump(dict({"repos": [], "poll_interval": 1,
+                        "github_app": {"app_id": 77,
+                                       "private_key": _covered_key}},
+                       **over), handle)
+
+
+def _wired(ask):
+    """One daemon run against that ask, and the order it did things in."""
+    order = []
+    kept = (sys.argv, vinegar.poll_once, vinegar.sweep_checks,
+            vinegar.refresh_repos, vinegar.time.sleep)
+
+    def poll(config, *unused, **unused_kw):
+        order.append("poll:" + ",".join(config["repos"]))
+        # Bounded on polls rather than on asks. Bounded on asks, a
+        # mutation that removes an ask never reaches the bound and the
+        # run hangs instead of failing, which reports nothing.
+        if len([done for done in order if done.startswith("poll")]) >= 2:
+            raise KeyboardInterrupt
+
+    _discovery_config()
+    vinegar.refresh_repos = lambda config, asked_at: (
+        order.append("ask") or ask(config, asked_at))
+    vinegar.poll_once = poll
+    vinegar.sweep_checks = lambda *a, **k: order.append("sweep")
+    # This is the only test that lets main() reach its own
+    # time.sleep(poll_interval), and `poll_interval` cannot go below one.
+    # Left real it slept a second per run, which is nothing here and ten
+    # minutes across the 294 suite runs a full mutate.py pass makes.
+    vinegar.time.sleep = lambda seconds: None
+    sys.argv = ["vinegar.py"]
+    try:
+        vinegar.main()
+    except SystemExit:
+        pass
+    finally:
+        (sys.argv, vinegar.poll_once, vinegar.sweep_checks,
+         vinegar.refresh_repos, vinegar.time.sleep) = kept
+    return order
+
+
+def _answers(config, asked_at):
+    config["repos"] = ["o/found"]
+    return time.time()
+
+
+_dwire = _wired(_answers)
+check("the daemon asks the App before it polls, and again every pass",
+      _dwire == ["ask", "sweep", "poll:o/found", "ask", "poll:o/found"],
+      _dwire)
+
+
+def _fails_once(config, asked_at):
+    # The first ask fails, so the list stays empty; the second answers.
+    if config.get("_asked"):
+        config["repos"] = ["o/late"]
+        return time.time()
+    config["_asked"] = True
+    return asked_at
+
+
+# The blocker the `swept` flag exists for. Run above the loop, a sweep met
+# an empty list after a failed first ask, swept nothing, and never ran
+# again, because it only ever ran once. A check run a killed predecessor
+# left `in_progress` then stayed that way for the life of the process,
+# which is the single harm sweep_checks() is there to bound.
+_swire = _wired(_fails_once)
+check("a sweep waits for a list rather than sweeping an empty one",
+      _swire == ["ask", "poll:", "ask", "sweep", "poll:o/late"], _swire)
+
+
+def _one_shot(ask):
+    """What a `--once` run exits with, against that ask."""
+    kept = (sys.argv, vinegar.poll_once, vinegar.sweep_checks,
+            vinegar.refresh_repos)
+    _discovery_config()
+    vinegar.refresh_repos = ask
+    vinegar.poll_once = lambda *a, **k: None
+    vinegar.sweep_checks = lambda *a, **k: None
+    sys.argv = ["vinegar.py", "--once"]
+    try:
+        vinegar.main()
+        return "returned"
+    except SystemExit as err:
+        return str(err.code)
+    finally:
+        (sys.argv, vinegar.poll_once, vinegar.sweep_checks,
+         vinegar.refresh_repos) = kept
+
+
+# Exiting 0 having polled nothing is the one answer a cron entry reads as
+# "every pull request is reviewed". The loop's retry a minute later does
+# not exist on this path, so the exit code is all there is.
+_once_failed = _one_shot(lambda config, asked_at: asked_at)
+check("a one-shot run whose only ask failed says so in its exit code",
+      "polled nothing" in _once_failed, _once_failed)
+# An ask that answered "no repositories" is a true answer about an App
+# installed nowhere, and is not a failure.
+_once_empty = _one_shot(lambda config, asked_at: time.time())
+check("and an App that genuinely covers nothing is not a failure",
+      _once_empty == "returned", _once_empty)
 vinegar.save_state({})
 
 

@@ -189,7 +189,7 @@ Every key in `config.example.json`:
 
 | Key | Default | What it does |
 | --- | --- | --- |
-| `repos` | none | Repositories to poll, as `owner/name`. Required. |
+| `repos` | none | Repositories to poll, as `owner/name`. Required, unless `github_app` is set: an empty list then means every repository the App is installed on. See below. |
 | `poll_interval` | `60` | Seconds between polls. |
 | `effort` | `"high"` | Effort passed to `/code-review`: `low`, `medium`, `high`, `xhigh`, `max`. `ultra` is rejected. Read the note below before pairing it with `model`. |
 | `comment` | `true` | Post findings on the pull request. False runs the review and writes only to `~/.vinegar/reviews.dry/`, remembering what it did in `state.json.dry`. |
@@ -363,6 +363,70 @@ token is never written to disk and never appears on a command line.
 
 Leave `github_app` as `null` and everything works exactly as before, posting
 under your own account.
+
+#### Letting the App choose the repositories
+
+With an App configured, an empty `repos` means "every repository this App is
+installed on":
+
+```json
+"repos": [],
+"github_app": { "app_id": 123456, "private_key": "~/.vinegar/key.pem" }
+```
+
+Onboarding a repository is then a checkbox on the App's installation page
+rather than an edit to this file and a restart. Vinegar asks GitHub what the
+installation covers at startup and about once an hour after that, so a
+repository ticked now is polled within the hour.
+
+A `repos` that names anything wins. Discovery fills the list, it does not
+override one, and there is no way to say "these two and whatever else the App
+can see". Discovery also needs an App, which is why the setting cannot simply
+be dropped: `config.example.json` ships `"github_app": null`, and an install
+that follows it has no installation to ask.
+
+Three things are worth knowing before you turn it on.
+
+**The installation is still the boundary.** Discovery does not widen what a
+review can reach: each review is handed a token scoped to the one repository
+it is reviewing, exactly as before. Listing needs a broader token, so Vinegar
+mints an installation-wide one per installation and revokes each as soon as
+its listing is done, whether or not that listing succeeded. It is never cached
+and never reaches a review. Revoking matters because GitHub honours an
+installation token for an hour after it is minted, so dropping the reference
+alone would leave the broadest credential Vinegar holds usable for that whole
+hour. The one case it does not revoke is an interrupt: Ctrl-C during a listing
+stops immediately rather than spending a network round trip on cleanup, and
+the token expires on its own. What discovery changes is how many repositories
+get polled, not what any one review can touch.
+
+**Archived repositories are left out.** GitHub refuses every write to one, so
+reviewing a pull request on an archived repository means paying for the review
+in full and then failing to post it, on every push, with nothing on the pull
+request able to say why. They only show up where the installation covers every
+repository rather than a chosen list.
+
+**A failed listing keeps the previous set.** Listing fails occasionally on any
+real network, and treating one failure as "the App covers nothing" would stop
+every repository being reviewed. Vinegar keeps polling what it was already
+polling, says so in the log, and asks again on the next poll rather than in an
+hour. At startup there is no previous set, so a first listing that fails means
+one poll that watches nothing and a retry a minute later. The startup sweep of
+stale check runs waits for a list rather than sweeping an empty one, so it
+still happens on the first poll that knows what to sweep.
+
+`--once` has no next poll, so a one-shot run whose only listing failed exits
+non-zero and says why, rather than reporting success for a run that polled
+nothing. An App that genuinely covers no repositories is a true answer and
+still exits 0.
+
+Every change to the set is logged, both what was added and what was removed.
+The cause of a change is a checkbox in a browser on some other machine, so the
+log is the only place the two facts ever meet.
+
+Watching many repositories at once is what `parallel_repos` is for; it is
+capped at 8 and defaults to 1, so discovering seventeen repositories still
+polls them one at a time until you raise it.
 
 ### Running it under launchd
 
