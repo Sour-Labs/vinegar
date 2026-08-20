@@ -313,8 +313,9 @@ MUTATIONS = [
     # the setting does nothing and the startup line reads exactly as it
     # did before the operator edited the file.
     ("clamped-width-said-nothing",
-     '        log("%s: parallel_repos is %d and there are %d repositories to "',
-     '        _ = ("%s: parallel_repos is %d and there are %d repositories to "'),
+     '        log("%s: parallel_repos is %d and there %s %d repositor%s to poll, "',
+     '        (lambda *a, **k: None)('
+     '"%s: parallel_repos is %d and there %s %d repositor%s to poll, "'),
     # The stop reaching a pass that is already listing. Without it a
     # repository works through every pull request the listing returned
     # before it notices, which is the whole interrupt window again.
@@ -327,7 +328,7 @@ MUTATIONS = [
     # starts the daemon and then fails on every poll for ever, with
     # nothing at startup saying the name is wrong.
     ("repos-entry-shape-unchecked",
-     '        if name.count("/") != 1 or not all(name.split("/")):\n'
+     "        if not REPO_NAME.match(name):\n"
      '            sys.exit("%s: repos wants owner/name, got %r" % (path, name))',
      "        pass"),
     # A duplicate left in the list, which above one repository is two
@@ -342,7 +343,35 @@ MUTATIONS = [
     # names, with nothing explaining it.
     ("repos-duplicate-dropped-in-silence",
      '        log("%s: repos names %s more than once, matched without case. A "',
-     '        _ = ("%s: repos names %s more than once, matched without case. A "'),
+     '        (lambda *a, **k: None)('
+     '"%s: repos names %s more than once, matched without case. A "'),
+    # The pattern back to counting the slash and testing both halves,
+    # which is well-formed and unusable: an organisation's display name
+    # starts the daemon and then fails on every poll for ever.
+    ("repo-name-shape-only-counts-the-slash",
+     r'REPO_NAME = re.compile(r"\A[A-Za-z0-9._-]+/[A-Za-z0-9._-]+\Z")',
+     r'REPO_NAME = re.compile(r"\A[^/]+/[^/]+\Z")'),
+    # The ceiling, without which one file asks a laptop for twenty-four
+    # reviewers and twenty-four clones at once.
+    ("parallel-repos-has-no-ceiling",
+     '    if config["parallel_repos"] > MAX_PARALLEL_REPOS:',
+     "    if False:"),
+    # And applied only when there are that many repositories, so the same
+    # file means something different as repositories are added.
+    ("parallel-repos-ceiling-follows-the-repo-count",
+     '    if config["parallel_repos"] > MAX_PARALLEL_REPOS:',
+     '    if config["parallel_repos"] > max(MAX_PARALLEL_REPOS,\n'
+     '                                      len(config["repos"])):'),
+    # No entry for the clamp notice reading poll_width() rather than
+    # re-deriving `min()`, and it was measured rather than missed. The
+    # notice only runs when `parallel_repos` is above the repository
+    # count, and poll_width() is `min()` of the two, so inside that branch
+    # the call and the count are the same number: a mutation swapping one
+    # for the other changes no behaviour and cannot be killed. The reason
+    # to call poll_width() there is that a future clamp which is not a
+    # `min()` would leave the message naming a width nothing uses, which
+    # is the bug poll_width() was extracted to end. That is a property of
+    # the next change, not of this code, so no check can hold it.
     # Matched exactly, which walks past `Sour-Labs/vinegar` beside
     # `sour-labs/vinegar`: two entries listing the same pull requests into
     # one clone directory.

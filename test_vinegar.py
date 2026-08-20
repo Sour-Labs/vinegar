@@ -2944,6 +2944,47 @@ check("and so does one with an empty half or an extra slash",
 check("a well-formed name it cannot vouch for still starts",
       _loaded(repos=["o/nope"])["repos"] == ["o/nope"],
       _loaded(repos=["o/nope"]))
+# Counting the slash and testing both halves truthy was the first version
+# and let through everything that is well-formed and unusable. An
+# organisation's display name pasted instead of its slug has one slash and
+# two non-empty halves, so the daemon started and then failed on every
+# poll for ever: the failure the check was added to stop, walking straight
+# past it. A NUL is worse than an error, because subprocess raises on it.
+check("a name with a space in it is refused, not started and left to fail",
+      "wants owner/name" in _config_with(repos=["Sour Labs/vinegar"]),
+      _config_with(repos=["Sour Labs/vinegar"]))
+check("and so is one carrying a NUL, which subprocess raises on",
+      "wants owner/name" in _config_with(repos=["o\x00/r"]),
+      _config_with(repos=["o\x00/r"]))
+# One pattern for the two places that take an owner/name, because they are
+# meant to be the same rule and were a copied line apart: tighten one and
+# `--pr o/r#1` and `"repos": ["o/r"]` start disagreeing about the string.
+check("--pr refuses the names repos refuses, from the same pattern",
+      all(not vinegar.REPO_NAME.match(name)
+          for name in ("Sour Labs/vinegar", "web", "/r", "o/", "o/r/x"))
+      and vinegar.REPO_NAME.match("o/r"))
+# Each unit of parallel_repos is a whole reviewer with its own clone, so
+# the number is what one machine can run rather than how many
+# repositories are watched. Every other runaway here has a ceiling and
+# this one multiplies all of them.
+check("a parallel_repos above the ceiling refuses to start",
+      "at most 8" in _config_with(parallel_repos=9),
+      _config_with(parallel_repos=9))
+check("and the ceiling itself starts",
+      _loaded(parallel_repos=8, repos=["o/r"])["parallel_repos"] == 8,
+      _loaded(parallel_repos=8, repos=["o/r"]))
+# Refused whatever `repos` holds, rather than clamped. Clamped, twenty-four
+# would mean two on a two-repository install and eight on a twenty-
+# repository one, so the same file would behave differently as
+# repositories were added, at the moment the machine could least afford it.
+# More repositories than the ceiling, which is the case that tells the two
+# rules apart: with two repositories a ceiling that followed the count
+# would still refuse twenty-four, so the first spelling of this check
+# passed against exactly the mutation it names.
+_ten = ["o/r%d" % nth for nth in range(10)]
+check("the ceiling does not depend on how many repositories are watched",
+      "at most 8" in _config_with(parallel_repos=10, repos=_ten),
+      _config_with(parallel_repos=10, repos=_ten))
 # Said, not refused, like the token-life warning. A width above the number
 # of repositories is clamped, and the startup line stays silent at one, so
 # a single-repository install that set 4 read a line byte-identical to the
@@ -2956,6 +2997,22 @@ check("and a width the repositories can use says nothing",
       "run at once" not in _dupe_said(repos=["o/a", "o/b"],
                                       parallel_repos=2),
       _dupe_said(repos=["o/a", "o/b"], parallel_repos=2))
+# The single-repository install is the case this line exists for, per its
+# own comment, and it was the one call that read "there are 1
+# repositories". release_lock() writes "%d pass(es)" for the same reason,
+# so the file has a house form and these are the lines an operator reads
+# to confirm an edit took.
+check("the line the single-repository install reads is written for one",
+      "there is 1 repository to poll" in _dupe_said(repos=["o/r"],
+                                                    parallel_repos=4),
+      _dupe_said(repos=["o/r"], parallel_repos=4))
+check("and the duplicate line agrees with itself when one is left",
+      "1 repository is watched" in _dupe_said(repos=["o/r", "o/r"]),
+      _dupe_said(repos=["o/r", "o/r"]))
+check("both still read correctly above one",
+      "2 repositories are watched" in _dupe_said(
+          repos=["o/a", "o/b", "o/b"]),
+      _dupe_said(repos=["o/a", "o/b", "o/b"]))
 # An entry that is not a string used to be accepted here and then raise
 # TypeError out of main()'s own startup line before a single repository
 # was polled, which under launchd is a traceback and a restart every 30

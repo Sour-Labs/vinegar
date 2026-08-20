@@ -147,6 +147,27 @@ REVIEW_DIR = os.path.join(HOME, "reviews")
 # anything at all after it, which is the half of the check that matters.
 FULL_SHA = re.compile(r"\A[0-9a-f]{40}\Z")
 
+# What `owner/name` is allowed to be, for the two places that take one: a
+# `repos` entry and the argument to `--pr`. One pattern, because the two
+# are meant to be the same rule and were a copied line apart; tighten one
+# copy and `--pr o/r#1` and `"repos": ["o/r"]` start disagreeing about the
+# same string.
+#
+# Counting the slash and testing both halves truthy was the first version
+# and let through everything that is well-formed and unusable.
+# `"Sour Labs/vinegar"`, an organisation's display name pasted instead of
+# its slug, has one slash and two non-empty halves, so the daemon started
+# and then failed on every poll for ever, with one swallowed line a
+# minute and nothing at startup saying why: verbatim the failure the
+# check was added to stop. `"o /r"` is worse, because a NUL or a space
+# reaches subprocess, which raises rather than returning an error.
+#
+# The character class is what GitHub accepts in either half, so this
+# refuses what cannot resolve and nothing else. A well-formed name that
+# does not exist still starts, because the alternative is a network call
+# before the daemon can run.
+REPO_NAME = re.compile(r"\A[A-Za-z0-9._-]+/[A-Za-z0-9._-]+\Z")
+
 # How a transcript opens when its review read less than the whole pull
 # request. One definition, because repost() has to recognise it in a file
 # save_transcript() wrote, and a repost that cannot find it sends a
@@ -322,6 +343,27 @@ TOKEN_LIFE = 3600
 # 300: the number is a typo detector, not a budget, and the argument for
 # 7200 is unchanged by five minutes.
 MAX_REVIEW_TIMEOUT = 7200
+
+# The most repositories one machine will review at once, whatever the file
+# asks for. A typo detector, like MAX_REVIEW_TIMEOUT, rather than a budget.
+#
+# The setting multiplies the one cost nothing else here bounds. Every
+# other runaway has a ceiling: MAX_ATTEMPTS bounds retries, PR_LIMIT
+# bounds a listing, MAX_REVIEW_TIMEOUT bounds how long the daemon can go
+# quiet. `parallel_repos` bounds none of those and multiplies all of them,
+# because each unit of it is a full `claude` agentic review with its own
+# clone beside it. At twenty-four that is twenty-four reviewers and
+# twenty-four `git clone`s on one machine, which is memory exhaustion or
+# the thread-creation refusal poll_once already handles, and against
+# GitHub it is the secondary-rate-limit burst the README warns about,
+# where each refusal comes back FAILED and spends one of three attempts.
+#
+# Refused rather than clamped, and refused whatever `repos` holds. A
+# clamp would make twenty-four mean two on a two-repository install and
+# eight on a twenty-repository one, so the same file would behave
+# differently as repositories were added, quietly, at the moment the
+# machine could least afford it.
+MAX_PARALLEL_REPOS = 8
 
 # Enough life for `gh pr list`, which is one call. This is not zero because the
 # cache serves a token right up to its recorded expiry, and that expiry is
@@ -997,11 +1039,10 @@ def load_config(path):
         # never reviewed again and nothing at startup said why. With an
         # App it also mints a token against a repository named "".
         #
-        # The same test main()'s `--pr` branch runs on its argument, and
-        # deliberately no more: this refuses what GitHub cannot parse, not
-        # what it might 404 on. A name that is well-formed and wrong is a
-        # listing failure the log already reports every poll.
-        if name.count("/") != 1 or not all(name.split("/")):
+        # The same rule main()'s `--pr` branch runs on its argument, from
+        # the one pattern rather than a second copy of the test. REPO_NAME
+        # says what it refuses and why the first spelling was not enough.
+        if not REPO_NAME.match(name):
             sys.exit("%s: repos wants owner/name, got %r" % (path, name))
 
     # Named twice is not the same as reviewed twice. A duplicate is one
@@ -1051,8 +1092,9 @@ def load_config(path):
         config["repos"] = kept
         log("%s: repos names %s more than once, matched without case. A "
             "repository is polled once per pass and has one checkout, so "
-            "the extra copies are dropped and %d repositories are watched"
-            % (path, ", ".join(twice), len(kept)))
+            "the extra copies are dropped and %d repositor%s watched"
+            % (path, ", ".join(twice), len(kept),
+               "y is" if len(kept) == 1 else "ies are"))
     if config["effort"] not in EFFORTS:
         sys.exit("%s: effort must be one of %s" % (path, ", ".join(EFFORTS)))
 
@@ -1063,25 +1105,6 @@ def load_config(path):
     # reached, no give-up posted, and the pull requests silent. This is
     # the file operators actually edit, and load_state guards the same
     # class for the one they are only told to edit.
-    # Said, not refused, like the token-life warning below. A width above
-    # the number of repositories is clamped by poll_width(), and the
-    # startup line prints the clamped number and stays silent at one, so a
-    # single-repository install that set `parallel_repos: 4` read a line
-    # byte-identical to the one it printed before the edit and had no way
-    # to learn the setting did nothing. Every other setting here that
-    # cannot do what it says either refuses or says so; this one did
-    # neither.
-    #
-    # After the numeric loop below would be the tidier place, and it is
-    # wrong: that loop exits on a non-number, and this reads both values.
-    if (isinstance(config["parallel_repos"], int)
-            and not isinstance(config["parallel_repos"], bool)
-            and config["parallel_repos"] > len(config["repos"])):
-        log("%s: parallel_repos is %d and there are %d repositories to "
-            "poll, so %d of them run at once" % (
-                path, config["parallel_repos"], len(config["repos"]),
-                len(config["repos"])))
-
     units = {"max_changed_lines": "lines", "parallel_repos": "repositories"}
     for name in ("poll_interval", "review_timeout", "max_changed_lines",
                  "parallel_repos"):
@@ -1091,6 +1114,42 @@ def load_config(path):
                 path, name, units.get(name, "seconds"), value))
         if value <= 0:
             sys.exit("%s: %s must be greater than zero" % (path, name))
+
+    # Below the loop, not above it, and the first draft was above with two
+    # isinstance guards of its own. The reason given for that placement
+    # was that the loop exits on a non-number, which is exactly what makes
+    # here correct: `"parallel_repos": "4"` never reaches this line, so
+    # the guards were three lines defending a state the loop had already
+    # refused. The token-life warning below reads `review_timeout` after
+    # the same loop with no guard at all, for the same reason.
+    if config["parallel_repos"] > MAX_PARALLEL_REPOS:
+        sys.exit("%s: parallel_repos must be at most %d. Each one is a "
+                 "whole reviewer with its own clone beside it, so the "
+                 "number is what a machine can run at once rather than "
+                 "how many repositories are watched: the ones over the "
+                 "width wait for a worker" % (path, MAX_PARALLEL_REPOS))
+
+    # Said, not refused, like the token-life warning. A width above the
+    # number of repositories is clamped by poll_width(), and the startup
+    # line prints the clamped number and stays silent at one, so a
+    # single-repository install that set `parallel_repos: 4` read a line
+    # byte-identical to the one it printed before the edit and had no way
+    # to learn the setting did nothing. Every other setting here that
+    # cannot do what it says either refuses or says so; this one did
+    # neither.
+    #
+    # Through poll_width() rather than a `min()` written out again. Its
+    # docstring records that this same rule expressed twice already
+    # shipped as a bug, with the startup line naming a width the pass did
+    # not use, and this line exists only to tell an operator the width
+    # that will really be used.
+    watched = len(config["repos"])
+    if config["parallel_repos"] > watched:
+        log("%s: parallel_repos is %d and there %s %d repositor%s to poll, "
+            "so %d of them run at once" % (
+                path, config["parallel_repos"],
+                "is" if watched == 1 else "are", watched,
+                "y" if watched == 1 else "ies", poll_width(config)))
 
     # Its own check rather than the loop above, because null is a value
     # here and that loop refuses one.
@@ -5328,7 +5387,20 @@ def poll_once(config, state, tokens):
     todo = queue.Queue()
     for repo in config["repos"]:
         todo.put(repo)
-    fell_over = []
+    # Text for every failure, and the exception object once. `first` is a
+    # list because a worker assigns it and a closure cannot rebind a name
+    # it did not define, and `hurt` is what makes the pair atomic: the
+    # first spelling of this bound tested `not fell_over` and then
+    # appended, two separate bytecodes, so four workers failing in the
+    # same instant all read the list empty and all four stored their
+    # exception. That is the exact case the bound exists for, a settings
+    # file the reviewer cannot use putting every repository in here at
+    # once, and the guard did nothing there.
+    #
+    # Homogeneous, which the raise below now depends on less rather than
+    # more: a mixed list of exceptions and strings made `fell_over[0][1]`
+    # correct only while index 0 was never a string.
+    fell_over, first, hurt = [], [], threading.Lock()
 
     def passes():
         while not STOPPING.is_set():
@@ -5367,7 +5439,10 @@ def poll_once(config, state, tokens):
                 # reviewer cannot use puts every repository in here at
                 # once. Only the first is ever re-raised; the rest exist
                 # for the `%s` below.
-                fell_over.append((repo, err if not fell_over else str(err)))
+                with hurt:
+                    if not first:
+                        first.append(err)
+                    fell_over.append((repo, str(err)))
 
     # Not daemons, and joined here rather than by the interpreter. Both
     # halves matter and each was learned from a failure.
@@ -5451,10 +5526,10 @@ def poll_once(config, state, tokens):
     # time raised on the first and never looked at the rest, so a second
     # repository failing in the same round was discarded and the traceback
     # named one repository where two had failed.
-    for repo, err in fell_over:
-        log("%s: its whole pass fell over: %s" % (repo, err))
-    if fell_over:
-        raise fell_over[0][1]
+    for repo, said in fell_over:
+        log("%s: its whole pass fell over: %s" % (repo, said))
+    if first:
+        raise first[0]
 
 
 def give_up(key, repo, pr, config, attempts, tokens, path=None, env=None,
@@ -6160,7 +6235,7 @@ def main():
             # and either would sail past this to fail on the gh call the
             # guard exists to run before.
             if (not number.isascii() or not number.isdigit()
-                    or repo.count("/") != 1 or not all(repo.split("/"))):
+                    or not REPO_NAME.match(repo)):
                 sys.exit("--pr wants owner/repo#number, got %s" % args.pr)
             # The same sum handle_pr() asks for, and for the same reason: one
             # token covers the checkout and the review that follows it. The

@@ -277,9 +277,24 @@ tree under the first, which would then report findings about a commit nobody
 asked about. That is the same race the process lock exists to prevent, and it
 is why this setting counts repositories rather than reviews.
 
-For the same reason **Vinegar refuses to start if `repos` names a repository
-twice.** Before this setting existed a duplicate cost one wasted listing per
-pass; polled at once it is the race above, reachable by a copy-paste.
+For the same reason **a repository named twice in `repos` is polled once**, and
+Vinegar says so at startup naming the entry it dropped. Before this setting
+existed a duplicate cost one wasted listing per pass; polled at once it is the
+race above, reachable by a copy-paste.
+
+It is collapsed rather than refused, and an earlier version did refuse. A
+duplicate was harmless until `parallel_repos` existed, so refusing met every
+operator who upgraded with one already in the file: the daemon exited at
+startup and launchd relaunched it every ten seconds, polling nothing at all.
+Turning a working install into an outage is the worse of the two answers, and
+the log line is what keeps the collapse from being silent.
+
+**`parallel_repos` is capped at 8**, whatever the file asks for. Each unit of it
+is a whole reviewer with its own clone beside it, so the number is what one
+machine can run at once rather than how many repositories are watched: the ones
+over the width wait for a worker. It is the one setting that multiplies every
+other runaway this program bounds, and a cap that followed the repository count
+would make the same file mean something different as repositories were added.
 
 **A repository waits out the slowest repository's whole pass, not one review.**
 The fan-out is per pass: every repository is polled, and only when the last
