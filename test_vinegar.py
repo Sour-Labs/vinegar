@@ -1662,6 +1662,20 @@ check("the anchor-refused retry still says how the pass was scoped",
       len(posted) == 2 and "asked for blockers only" in posted[1][1]["body"]
       and "only what was added since" in posted[1][1]["body"],
       posted[1][1]["body"][:400] if len(posted) > 1 else posted)
+# The paragraph explaining a tier under blocker rides the same wire and
+# needs its own findings to be raised at all: the check above passes
+# untiered ones, so below_blocker() answers False there whether the retry
+# is handed the flag or not. Written after that check rather than folded
+# into it, because a mutation dropping the flag from this call survived a
+# full run against it.
+del posted[:]
+vinegar.post_review(L, "o/r", PR, ROOT, text,
+                    [dict(FINDINGS[0], tier="advisory")], CONFIG, None,
+                    blockers=True)
+check("the anchor-refused retry explains a tier under blocker too",
+      len(posted) == 2
+      and "disagreeing with the reviewer" in posted[1][1]["body"],
+      posted[1][1]["body"][:400] if len(posted) > 1 else posted)
 fake_run.rc = 0
 
 try:
@@ -4614,6 +4628,39 @@ check("what was read is said before what was reported from it",
                 "asked for blockers only"), _bl_body)
 check("an ordinary review says none of it",
       "blockers" not in vinegar.review_body(L, PR, CONFIG, [], []))
+# The one claim this comment cannot keep. Nothing filters what the
+# reviewer hands back, deliberately, so a sentence saying the smaller
+# findings are not listed is contradicted by the tally directly under it
+# the moment the severity pass disagrees. `wonky-flow#107` round three
+# posted "1 finding (1 advisory)" under exactly that promise.
+check("the narrowed comment promises nothing about what came back",
+      "is not listed here" not in _bl_body, _bl_body)
+check("it still says the reviewer was told to leave the smaller ones out",
+      "it was told to leave out" in _bl_body, _bl_body)
+# And when the two do disagree, the tag is explained rather than left to
+# read as a broken promise. Nothing on the pull request tells a reader
+# that a second pass exists, so a blue dot under a paragraph about
+# blockers reads as Vinegar showing what it just said it would not.
+_bl_split = vinegar.review_body(L, PR, CONFIG, [], [], since=OLD_SHA,
+                                blockers=True, disagreed=True)
+check("a tier under blocker on a narrowed round is explained",
+      "disagreeing with the reviewer" in _bl_split, _bl_split)
+check("and nothing is explained when the two agree",
+      "disagreeing with the reviewer" not in _bl_body, _bl_body)
+# Nested under the narrowing, because off a narrowed round the tiers are
+# the whole point of the tally and explaining them away is noise.
+check("an ordinary review explains nothing whatever its tiers say",
+      "disagreeing" not in vinegar.review_body(L, PR, CONFIG, [], [],
+                                               disagreed=True))
+# What raises that paragraph and what must not. `note` counts as much as
+# `advisory`: both are the severity pass putting a finding under the bar
+# the reviewer was told to report against.
+check("a finding tiered under blocker is what raises the explanation",
+      vinegar.below_blocker([{"tier": "advisory"}])
+      and vinegar.below_blocker([{"tier": "note"}]))
+check("blockers alone raise nothing, nor does an untiered or empty review",
+      not any(map(vinegar.below_blocker,
+                  ([{"tier": "blocker"}], [{"summary": "none"}], [], None))))
 
 (vinegar.review, vinegar.checkout, vinegar.github_env, vinegar.save_state,
  vinegar.run) = _ag_real
@@ -5639,6 +5686,33 @@ check("the worse finding is listed above the smaller one",
       _tier_file[-400:])
 vinegar.forget(vinegar.unposted_path("o/r", PR_TIER))
 
+
+# The wire rather than the wording, which the checks beside review_body
+# cannot reach. `disagreed` is computed in the poster from the findings
+# triage() has already tiered, and threaded the way `since` and `blockers`
+# were before it. Both of those reached the comment under fewer guards
+# than the path had, and a flag dropped on this wire is a paragraph that
+# never appears on any real review while every direct check on
+# review_body stays green.
+def _run_advisory(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
+    if cmd[0] == "claude":
+        return subprocess.CompletedProcess(cmd, 0, json.dumps(
+            {"is_error": False, "result": "0 advisory"}), "")
+    return fake_run(cmd, cwd, timeout, env, stdin_text)
+
+
+PR_SPLIT = dict(PR_LIVE, headRefOid="5e175e175e17")
+vinegar.run = _run_advisory
+del posted[:]
+vinegar.finish(L, "o/r", PR_SPLIT, ROOT, "words", _tier_found[:1], CONFIG,
+               None, {}, blockers=True)
+vinegar.run = fake_run
+_split_said = " ".join(post[1]["body"] for post in posted)
+check("a narrowed round whose finding came back smaller explains the tag",
+      "(1 advisory)" in _split_said
+      and "disagreeing with the reviewer" in _split_said, _split_said[:400])
+vinegar.forget(vinegar.unposted_path("o/r", PR_SPLIT))
+
 # The indicator's title is written in finish(), because that is the only
 # place that knows both what was found and whether it reached the pull
 # request. The checks list is what people look at before the comment, so
@@ -5714,7 +5788,7 @@ check("one finding is not reported as 1 findings",
 # checks` is where an agent reads it.
 check("a blockers-only review says so in the finished check too",
       _titled([], sha="ff00ff00ff00", blockers=True)
-      == "No findings, reporting blockers only", _titles[-1])
+      == "No findings, asked for blockers only", _titles[-1])
 check("an ordinary review's finished check claims no narrowing",
       "blockers" not in _titled([], sha="ab00ab00ab00"), _titles[-1])
 # The note stays last, because it is the caveat that most changes how the

@@ -2921,6 +2921,29 @@ def severity_tally(findings):
                      for tier, count in counted if count)
 
 
+def below_blocker(findings):
+    """Whether anything here is tiered under `blocker`.
+
+    Only the narrowed comment asks, and only to explain a tag the reader
+    would otherwise read as a broken promise. A pass told to report
+    blockers only hands back what it judged to be blockers; the severity
+    pass then tiers those findings on its own, from one summary line with
+    no code in front of it. Measured disagreeing on
+    `Sour-Labs/wonky-flow#107` round three, which reported one finding and
+    had it tiered `advisory`.
+
+    `TIERS[1:]` rather than the two words, because TIERS is ordered most
+    severe first and is the one place that ordering is written down. A
+    tier added below `blocker` is then covered here without this being the
+    place someone has to remember.
+
+    Off the findings for severity_tally()'s reason: half of them are
+    GitHub comment payloads by the time the comment is built, and those
+    carry no tier.
+    """
+    return any(finding.get("tier") in TIERS[1:] for finding in findings or ())
+
+
 def pr_key(repo, pr):
     """How one pull request is named in the state file and the log."""
     return "%s#%s" % (repo, pr["number"])
@@ -2990,7 +3013,8 @@ def overflow_note(dropped):
 
 def review_body(label, pr, config, inline, general, raw=None,
                 heading="These could not be anchored in the diff:", note=None,
-                verb="reviewed", tally="", since=None, blockers=False):
+                verb="reviewed", tally="", since=None, blockers=False,
+                disagreed=False):
     """The review's top-level comment.
 
     Always present, and not only because the endpoint requires one for a
@@ -3031,27 +3055,47 @@ def review_body(label, pr, config, inline, general, raw=None,
     # author can tell whether this is Vinegar's rule or something someone
     # configured for this repository, without reading the daemon's config.
     if blockers:
-        # Written as what the pass was asked for, not as what came back.
-        # The severity pass runs afterwards and is independent, so it can
-        # tier a finding this review reported as `note`, and the tally a
-        # few lines below would then read "1 finding (1 note)" under a
-        # sentence claiming only blockers are shown: the pull request told
-        # it is seeing blockers, above what Vinegar itself calls the
-        # smallest thing there is. Saying what was asked for is true
-        # whatever the tier comes back as, and the disagreement between
-        # the two is then visible rather than contradictory.
+        # Every clause here is what the pass was asked for, and none of it
+        # is what came back. The severity pass runs afterwards and is
+        # independent, so it can tier a finding this review reported as
+        # `advisory` or `note`, and the tally a few lines below then reads
+        # "1 finding (1 advisory)" under this paragraph.
+        #
+        # The last sentence used to be "Anything smaller it found is not
+        # listed here", which is the one claim on this comment that
+        # Vinegar cannot keep. Nothing filters what the reviewer hands
+        # back, deliberately, because the reviewer read the code and the
+        # pass that tiers it did not. What is listed here is whatever
+        # came back, and on `Sour-Labs/wonky-flow#107` round three that
+        # was one finding tiered `advisory` under a sentence promising
+        # none. Saying what the reviewer was told is true whatever comes
+        # back.
+        #
         # Number agreement, because `blockers_only_after: 1` is a valid
         # setting and nothing else in this program prints "1 findings".
         after = config["blockers_only_after"]
         lines += ["", "The first %s of a pull request %s everything %s "
                       "find%s. This is a later one, so it was asked for "
                       "blockers only: findings where something goes wrong "
-                      "at runtime. Anything smaller it found is not listed "
-                      "here." % (
+                      "at runtime. Anything smaller it found, it was told "
+                      "to leave out." % (
                           "review" if after == 1 else "%d reviews" % after,
                           "reports" if after == 1 else "report",
                           "it" if after == 1 else "they",
                           "s" if after == 1 else "")]
+
+        # Only when there is a tag to explain. A reader who sees a blue
+        # dot under the paragraph above has no way to know a second pass
+        # exists, so the tag reads as Vinegar showing what it just said it
+        # would not. Said whenever the two disagree and never otherwise,
+        # because on the ordinary narrowed round, nothing found or
+        # everything tiered `blocker`, it answers a question nobody has.
+        if disagreed:
+            lines += ["", "The tier tags below are set after the review, by "
+                          "a separate pass that reads each finding's summary "
+                          "and never the code. A tag under blocker is that "
+                          "pass disagreeing with the reviewer, not a smaller "
+                          "finding shown here anyway."]
 
     # A run that was killed or that errored still reports whatever it had
     # got to, and without this that is indistinguishable from a finished
@@ -3585,7 +3629,8 @@ def post_review(label, repo, pr, path, text, findings, config, env,
                "body": review_body(label, pr, config, inline, general, raw,
                                    note=note, verb=verb,
                                    tally=severity_tally(findings),
-                                   since=since, blockers=blockers)}
+                                   since=since, blockers=blockers,
+                                   disagreed=below_blocker(findings))}
     if inline:
         payload["comments"] = inline
 
@@ -3672,6 +3717,7 @@ def post_review(label, repo, pr, path, text, findings, config, env,
         payload["body"] = review_body(
             label, pr, config, [], findings, note=note, verb=verb,
             tally=severity_tally(findings), since=since, blockers=blockers,
+            disagreed=below_blocker(findings),
             heading="GitHub refused the inline comments, so all of it is "
                     "here:")
     else:
@@ -3908,7 +3954,13 @@ def finish(label, repo, pr, path, text, findings, config, env, tokens,
     if since:
         title = "%s in what was added since `%s`" % (title, since[:7])
     if blockers:
-        title = "%s, reporting blockers only" % title
+        # "asked for", not "reporting", for the reason review_body() gives
+        # at length: nothing filters what the reviewer hands back, so a
+        # title claiming this review reported blockers only sits beside a
+        # tally that can say `1 advisory`. The title has no room to
+        # explain the disagreement the comment explains, so it stops at
+        # the claim it can keep.
+        title = "%s, asked for blockers only" % title
     # A partial run says so in the title rather than only in the comment.
     # "3 findings" from a review killed at minute thirty reads as the
     # whole answer, and the checks list is what people look at first.

@@ -943,23 +943,37 @@ The pull request is told, because "no findings" means a different thing here:
 >
 > The first 2 reviews of a pull request report everything they find. This is a
 > later one, so it was asked for blockers only: findings where something goes
-> wrong at runtime. Anything smaller it found is not listed here.
+> wrong at runtime. Anything smaller it found, it was told to leave out.
 >
 > No findings.
 
-That says what the pass was *asked for* rather than what came back, and the
-distinction is not pedantry. The severity pass runs afterwards and is
-independent, so it can tier a finding this review reported as `note`. Claiming
-"it reports only blockers" above a tally reading "1 finding (1 note)" would tell
-the pull request it is seeing blockers above what Vinegar itself calls the
-smallest thing there is. Saying what was asked for stays true whatever the tier
-comes back as, and leaves the disagreement visible instead of contradictory.
+Every clause there says what the pass was *asked for* rather than what came
+back, and the distinction is not pedantry. The severity pass runs afterwards and
+is independent, so it can tier a finding this review reported as `advisory` or
+`note`. That sentence used to end "Anything smaller it found is not listed
+here", which is the one claim on this comment Vinegar cannot keep, because
+nothing filters what the reviewer hands back. On `wonky-flow#107` round three it
+sat directly above a tally reading `1 finding (1 advisory)`.
+
+When the two do disagree, the comment says so, rather than leaving the tag to
+read as a promise broken:
+
+> The tier tags below are set after the review, by a separate pass that reads
+> each finding's summary and never the code. A tag under blocker is that pass
+> disagreeing with the reviewer, not a smaller finding shown here anyway.
+
+Only then. On the ordinary narrowed round, which reports nothing or reports
+blockers, that paragraph answers a question nobody has. A reader of the pull
+request has no way to know a second pass exists, so it is worth the four lines
+on the round where a blue dot would otherwise contradict the paragraph above it.
 
 The checks list says it too, since that is the half of this an agent polling
 `gh pr checks` can read: `Reviewing at high effort, blockers only` while it runs,
-and `No findings, reporting blockers only` once it finishes. Both matter, and the
-second one more, because the finished title is what stands for the rest of the
-pull request's life. So does the transcript, for the same reason the narrowing
+and `No findings, asked for blockers only` once it finishes. It says "asked for"
+for the reason the comment does: the title has no room to explain a
+disagreement, so it stops at the claim it can keep. Both matter, and the second
+one more, because the finished title is what stands for the rest of the pull
+request's life. So does the transcript, for the same reason the narrowing
 statement is written there.
 
 The count is per pull request and it survives everything: the head moving, a
@@ -1047,7 +1061,7 @@ failed before posting, which is what every clean review looked like until now.
 Issue #27 is the narrower answer.
 
 The closed entry carries both narrowings, so ``No findings in what was added
-since `0123456`, reporting blockers only`` is not the same six characters as a
+since `0123456`, asked for blockers only`` is not the same six characters as a
 first review that read everything. While a review is *running* its scope is
 still invisible: the in-progress title carries the blockers narrowing only.
 

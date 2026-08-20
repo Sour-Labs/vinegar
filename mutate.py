@@ -459,9 +459,9 @@ MUTATIONS = [
     ("severity-tally-passed-to-the-body",
      "                                   note=note, verb=verb,\n"
      "                                   tally=severity_tally(findings),\n"
-     "                                   since=since, blockers=blockers)}",
+     "                                   since=since, blockers=blockers,",
      "                                   note=note, verb=verb,\n"
-     "                                   since=since, blockers=blockers)}"),
+     "                                   since=since, blockers=blockers,"),
 
     # What a findings prompt can carry into argv. One entry per condition
     # exec imposes, plus the choice the code argues for at length: a NUL
@@ -1085,6 +1085,28 @@ MUTATIONS = [
      '        lines += ["", "The first %s of a pull request %s everything %s "\n'
      '                      "find%s. This is a later one, so it was asked for "',
      '        lines += ["", "" if True else "%s%s%s%s"'),
+    # The sentence going back to promising an output Vinegar never
+    # filters. This is what `wonky-flow#107` round three posted: one
+    # finding tiered `advisory` directly under a claim that nothing
+    # smaller was listed.
+    ("narrowed-comment-promises-the-output",
+     '                      "at runtime. Anything smaller it found, it was told "\n'
+     '                      "to leave out." % (',
+     '                      "at runtime. Anything smaller it found is not listed "\n'
+     '                      "here." % ('),
+    # The paragraph that explains a tier under blocker, gone. The tag then
+    # stands alone under a paragraph about blockers, which is what a
+    # reader has no second pass to explain.
+    ("disagreement-never-explained",
+     "        if disagreed:\n"
+     '            lines += ["", "The tier tags below are set after the review, by "',
+     "        if False:\n"
+     '            lines += ["", "The tier tags below are set after the review, by "'),
+    # And said on every narrowed round, including the ordinary one that
+    # found nothing, where it answers a question nobody asked.
+    ("disagreement-explained-unasked",
+     "        if disagreed:",
+     "        if True:"),
     # Written outside the block the repost lifts, so the mark survives on
     # disk and is lost from every review delivered from a transcript.
     ("blockers-mark-inside-the-lifted-block",
@@ -1105,6 +1127,27 @@ MUTATIONS = [
      "            tally=severity_tally(findings), since=since, "
      "blockers=blockers,",
      "            tally=severity_tally(findings), since=since,"),
+    # The wire the paragraph rides. Dropped on either posting path it is a
+    # paragraph no real review ever carries, while every direct check on
+    # review_body stays green, which is how `since` and `blockers` each
+    # shipped uncovered on this same code.
+    ("disagreement-passed-to-the-body",
+     "                                   disagreed=below_blocker(findings))}",
+     "                                   disagreed=False)}"),
+    ("disagreement-survives-the-anchor-retry",
+     "            disagreed=below_blocker(findings),\n",
+     ""),
+    # `note` is as much under the bar as `advisory`, and reading only the
+    # one word leaves the commonest smallest tier unexplained.
+    ("below-blocker-forgets-the-smallest-tier",
+     '    return any(finding.get("tier") in TIERS[1:] for finding in findings or ())',
+     '    return any(finding.get("tier") == "advisory"\n'
+     "               for finding in findings or ())"),
+    # And counting `blocker` itself, which explains a disagreement on
+    # every narrowed round that agreed.
+    ("below-blocker-counts-blockers-too",
+     '    return any(finding.get("tier") in TIERS[1:] for finding in findings or ())',
+     '    return any(finding.get("tier") in TIERS for finding in findings or ())'),
     # Counting a round for a review whose findings never reached the pull
     # request. Two refused postings and the third round tells the author
     # that the first two "reported everything they found, and those
@@ -1156,9 +1199,15 @@ MUTATIONS = [
     # close_check overwrites the in_progress title on the way out, and the
     # one it leaves behind stands for the rest of the pull request's life.
     ("blockers-in-the-finished-check",
-     '    if blockers:\n'
-     '        title = "%s, reporting blockers only" % title',
-     "    pass"),
+     '        title = "%s, asked for blockers only" % title',
+     "        pass"),
+    # And the verb in it. "reporting blockers only" is a claim about what
+    # came back, beside a tally that can say `1 advisory`; "asked for" is
+    # the claim the title can keep. Anchored on the word rather than on
+    # the line, because the line is what the entry above already covers.
+    ("finished-check-claims-the-output",
+     '        title = "%s, asked for blockers only" % title',
+     '        title = "%s, reporting blockers only" % title'),
     # The hand-run path's own wire, which shipped uncovered once before on
     # this same code and did again here.
     ("hand-run-blockers",
