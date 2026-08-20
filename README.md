@@ -1103,9 +1103,43 @@ call that was refused. Without a configured GitHub App there is no entry at
 all, because no user token can own a check run.
 
 A retried review adds a second entry rather than reusing the first. An entry a
-killed review left running *is* reused, so a daemon stopped mid-review does not
-leave a check spinning for ever, but a completed one cannot be reopened:
+killed review left running *is* reused, but a completed one cannot be reopened:
 measured, that PATCH returns 200 and changes nothing.
+
+### Closing what a stopped Vinegar left running
+
+`launchctl bootout` sends SIGTERM and Vinegar installs no handler, so a review
+in flight dies where it stands and its entry keeps saying a review is running.
+Reuse repairs most of that by itself: the pull request is recorded failed at that
+head, the next poll reviews it again, and the same entry is picked up and closed.
+What reuse cannot reach is a pull request closed, merged or newly skipped before
+that retry, and what it cannot do is close the entry *now* rather than at the end
+of the next review, which is nine to twenty-two minutes later. Until then a
+required check is stuck, which is the one thing `neutral` exists to prevent.
+
+**So on startup Vinegar closes every check run of its own that it finds still
+running**, before its first poll:
+
+> **Vinegar** · The review was interrupted
+
+The lock is what makes that safe to do. `main()` holds it before the sweep runs,
+so no other Vinegar of this deployment is polling, and an entry still marked
+running is one an abandoned process left rather than one being written to. Only
+its own App's runs are touched, and only at the head commits of open pull
+requests: check runs are read per commit and no endpoint lists a repository's, so
+an entry stranded at a commit the branch has since moved past is left alone. The
+pull request shows its head commit's checks, and nothing shows the others.
+
+It closes entries even at heads a retry would have reused. Sparing those keeps
+one tidy entry per pull request and gives back the window this exists to close,
+so what you see after a restart is a neutral "interrupted" entry above a fresh
+running one. That is the same honest history a retried review already leaves.
+
+A hand `--pr` run never sweeps, because it can be one of several Vinegars: under
+its own `VINEGAR_HOME` it holds a different lock, and sweeping from there would
+be one operator's manual review closing another's indicator. The reverse is not
+guarded. A daemon starting during a hand run closes that run's entry, and the
+hand run still writes its own conclusion when it finishes.
 
 ## Severity
 

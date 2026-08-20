@@ -627,7 +627,7 @@ MUTATIONS = [
      "    if mine:\n"
      '        log("%s: reusing the check run an earlier attempt left running"\n'
      "            % label)\n"
-     '        return {"repo": repo, "id": mine[0].get("id"), "closed": False}',
+     '        return {"repo": repo, "id": mine[0], "closed": False}',
      "    if False:\n        pass"),
     ("check-ignores-another-apps",
      '            if str((was.get("app") or {}).get("id"))\n'
@@ -641,8 +641,8 @@ MUTATIONS = [
      '            "closed": False}'),
     # A handle holding a token is one log line from publishing it.
     ("check-handle-holds-no-credential",
-     '        return {"repo": repo, "id": mine[0].get("id"), "closed": False}',
-     '        return {"repo": repo, "id": mine[0].get("id"), "env": env,\n'
+     '        return {"repo": repo, "id": mine[0], "closed": False}',
+     '        return {"repo": repo, "id": mine[0], "env": env,\n'
      '                "closed": False}'),
     ("check-closes-once",
      '    if not check or check["closed"]:\n        return',
@@ -1310,6 +1310,68 @@ MUTATIONS = [
      "    if rounds is not None and (not isinstance(rounds, int)\n"
      "                               or isinstance(rounds, bool) or rounds <= 0):",
      "    if rounds is not None and not isinstance(rounds, int):"),
+
+    # --- closing the checks a stopped Vinegar left spinning -------------
+    # The wire, which every check on sweep_checks() itself is blind to:
+    # they call it directly, so this shipped uncovered would leave all of
+    # them green and no deployment sweeping anything.
+    ("sweep-reaches-the-daemon",
+     "        sweep_checks(config, tokens)",
+     "        pass"),
+    # And after the first poll rather than before it, where it closes the
+    # indicator that poll just opened: the pull request then shows a
+    # review running under a neutral entry saying it was interrupted.
+    ("sweep-before-the-first-poll",
+     "        sweep_checks(config, tokens)\n"
+     "        while True:\n"
+     "            poll_once(config, state, tokens)",
+     "        while True:\n"
+     "            poll_once(config, state, tokens)\n"
+     "            sweep_checks(config, tokens)"),
+    # Closing runs this App does not own. A check run belongs to the App
+    # that made it, and the sweep is only allowed to touch its own.
+    ("sweep-closes-another-apps-run",
+     '    return [was.get("id") for was in (said or {}).get("check_runs") or []\n'
+     '            if str((was.get("app") or {}).get("id"))\n'
+     '            == str(config["github_app"].get("app_id")) and was.get("id")]',
+     '    return [was.get("id") for was in (said or {}).get("check_runs") or []]'),
+    # The id guard, without which a truncated reply sends
+    # `PATCH check-runs/None`.
+    ("sweep-patches-a-run-with-no-id",
+     '            == str(config["github_app"].get("app_id")) and was.get("id")]',
+     '            == str(config["github_app"].get("app_id"))]'),
+    # `failure` makes the stuck merge the outcome rather than the thing
+    # being repaired, on a check that read nothing and reported nothing.
+    ("sweep-closes-as-a-failure",
+     '                                "review, the next poll starts one.")',
+     '                                "review, the next poll starts one.",\n'
+     '                                "failure")'),
+    # And the title going back to claiming the review said something,
+    # on a run that read nothing and reported nothing.
+    ("sweep-title-claims-a-result",
+     '                                "The review was interrupted", env,',
+     '                                "No findings", env,'),
+    # Sweeping where open_check refuses to open: a dry run has nothing on
+    # the pull request to close, and without an App these runs are not
+    # Vinegar's to PATCH.
+    ("sweep-runs-without-an-app-or-a-post",
+     '    if not config["comment"] or not config.get("github_app"):\n'
+     "        return\n"
+     '    for repo in config["repos"]:\n'
+     "        try:\n"
+     "            env = github_env(config, repo, tokens, good_for=LISTING_GRACE)",
+     '    for repo in config["repos"]:\n'
+     "        try:\n"
+     "            env = github_env(config, repo, tokens, good_for=LISTING_GRACE)"),
+    # One repository's failed listing ending the sweep, which is a daemon
+    # that never reaches its loop and polls nothing at all.
+    ("sweep-listing-failure-escapes",
+     "        except Exception as err:\n"
+     '            log("%s: cannot list pull requests to close old checks: %s"\n'
+     "                % (repo, err))\n"
+     "            continue",
+     "        except Exception:\n"
+     "            raise"),
 ]
 
 

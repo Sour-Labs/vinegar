@@ -5467,6 +5467,26 @@ finally:
 check("--whole without --pr is refused rather than quietly ignored",
       "only means something with --pr" in _bare_whole.get("said", ""),
       _bare_whole)
+
+# The wire, which every check on sweep_checks itself is blind to: those
+# call it directly, so a main() that never calls it leaves all of them
+# green while no deployment closes anything. Ordered rather than merely
+# counted, because a sweep after the first poll closes the indicator that
+# poll just opened, and the pull request then shows a review running with
+# a neutral entry claiming it was interrupted.
+_start_order = []
+_so_kept = (sys.argv, vinegar.poll_once, vinegar.sweep_checks)
+vinegar.poll_once = lambda *a, **k: _start_order.append("poll")
+vinegar.sweep_checks = lambda *a, **k: _start_order.append("sweep")
+sys.argv = ["vinegar.py", "--once"]
+try:
+    vinegar.main()
+except SystemExit:
+    pass
+finally:
+    sys.argv, vinegar.poll_once, vinegar.sweep_checks = _so_kept
+check("the daemon closes old checks before its first poll",
+      _start_order == ["sweep", "poll"], _start_order)
 vinegar.save_state({})
 
 
@@ -6671,6 +6691,101 @@ check("one pull request that raises does not stop the ones after it",
 check("the listing mints a token with time to finish listing",
       _asked and all(g == vinegar.LISTING_GRACE for g in _asked), _asked)
 vinegar.open_prs, vinegar.handle_pr = _real_listing, _real_handling
+reset_stubs()
+
+# --- the startup sweep ---------------------------------------------------
+# A check run left `in_progress` says a review is running. After a kill
+# there is none, and a run stuck that way blocks a merge anywhere Vinegar
+# is a required check. The lock is what makes closing it sound: main()
+# holds it, so nothing else of this deployment is polling and an open run
+# is one an abandoned process left.
+reset_stubs()
+vinegar.run = fake_run
+_sweep_real_listing = vinegar.open_prs
+_sweep_env = vinegar.github_env
+vinegar.github_env = lambda *a, **k: CHK_ENV
+
+
+def _swept(config=None, prs=None, **stub):
+    """One sweep, answering the check-run calls it made."""
+    for name, value in stub.items():
+        setattr(fake_run, name, value)
+    del checked[:]
+    vinegar.open_prs = lambda repo, env: (
+        prs if prs is not None else [dict(PR, number=4)])
+    vinegar.sweep_checks(config or dict(CHK_CONFIG, repos=["o/r"]), {})
+    return checked[:]
+
+
+# One run of ours, spinning at the head of an open pull request.
+_MINE = {"check_runs": [{"id": 909, "app": {"id": 77}}]}
+_sweep_did = _swept(check_open=_MINE)
+_sweep_shut = [(where, asked) for how, where, asked in _sweep_did
+               if how == "PATCH"]
+check("a check left spinning by a stopped Vinegar is closed at startup",
+      len(_sweep_shut) == 1 and _sweep_shut[0][0].endswith("check-runs/909"),
+      _sweep_did)
+# Never `failure`, which would make a stuck merge the outcome rather than
+# the thing being repaired, and never a title claiming the review said
+# anything: nothing was read and nothing was reported.
+check("it closes neutral and says the review was interrupted",
+      _sweep_shut and _sweep_shut[0][1]["conclusion"]
+      == vinegar.CHECK_CONCLUSION
+      and _sweep_shut[0][1]["output"]["title"] == "The review was interrupted",
+      _sweep_shut)
+# The whole reason it is allowed to close anything. Another App's run at
+# the same commit is not Vinegar's to touch, and `app_id` is compared as a
+# string because a quoted one in config.json mints tokens perfectly.
+check("another App's check run at the same commit is left alone",
+      not [1 for how, _, _ in _swept(
+          check_open={"check_runs": [{"id": 5, "app": {"id": 999}}]})
+          if how == "PATCH"])
+check("an app_id written as a string still matches its own runs",
+      [1 for how, _, _ in _swept(
+          config=dict(CONFIG, repos=["o/r"],
+                      github_app={"app_id": "77", "private_key": "/k.pem"}),
+          check_open={"check_runs": [{"id": 8, "app": {"id": 77}}]})
+       if how == "PATCH"])
+# A run with no id would send `PATCH check-runs/None`, which is the guard
+# open_check's create branch already carries and running_checks now holds
+# for both callers.
+check("a reply with no id closes nothing rather than patching None",
+      not [1 for how, _, _ in _swept(
+          check_open={"check_runs": [{"app": {"id": 77}}]}) if how == "PATCH"])
+check("a completed check run is not reopened or touched",
+      not [1 for how, _, _ in _swept(check_open={"check_runs": []})
+           if how == "PATCH"])
+# The pair open_check refuses on. A dry run puts nothing on a pull request
+# so it has nothing to close, and without an App these runs belong to
+# someone Vinegar cannot PATCH.
+check("a dry run sweeps nothing and makes no call",
+      not _swept(config=dict(CHK_CONFIG, repos=["o/r"], comment=False),
+                 check_open=_MINE))
+check("no GitHub App means no sweep and no call",
+      not _swept(config=dict(CONFIG, repos=["o/r"]), check_open=_MINE))
+
+
+def _sweep_listing_fails(repo, env):
+    if repo == "o/down":
+        raise RuntimeError("GitHub said 502")
+    return [dict(PR, number=4)]
+
+
+# The daemon has to reach its loop whatever the sweep meets. A repository
+# whose listing fails is swept on the next start; a sweep that raised here
+# would leave a working deployment polling nothing at all.
+del checked[:]
+fake_run.check_open = _MINE
+vinegar.open_prs = _sweep_listing_fails
+try:
+    vinegar.sweep_checks(dict(CHK_CONFIG, repos=["o/down", "o/r"]), {})
+    _sweep_escaped = None
+except Exception as err:
+    _sweep_escaped = err
+check("a repository whose listing fails does not stop the sweep",
+      _sweep_escaped is None
+      and [1 for how, _, _ in checked if how == "PATCH"], _sweep_escaped)
+vinegar.open_prs, vinegar.github_env = _sweep_real_listing, _sweep_env
 reset_stubs()
 
 # --- acquire_lock --------------------------------------------------------

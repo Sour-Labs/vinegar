@@ -3300,6 +3300,39 @@ def check_api(label, repo, path, method, payload, env):
         return {}
 
 
+def running_checks(label, repo, sha, config, env):
+    """The ids of every check run this App has spinning at `sha`.
+
+    Two callers ask the same question for opposite reasons, which is why
+    it is one function. open_check() asks so that a retry reuses the
+    indicator an earlier attempt left rather than adding a second one;
+    sweep_checks() asks so that a startup closes the ones nobody is coming
+    back for. Written out twice they could disagree about which runs are
+    Vinegar's, and the way that shows is a sweep closing another App's
+    check run.
+
+    `.get("id")` as well as the app, not just membership. A reply with no
+    id, from a truncated body or one check_api answered as `{}`, would
+    otherwise build a handle whose every close sends
+    `PATCH check-runs/None`. open_check()'s create branch refuses exactly
+    that, and this was the one place the guard was missing.
+
+    Compared as strings, because app_jwt() already establishes that this
+    value need not be an int: it signs with `str(app_id)`, and load_config
+    type-checks only the three numeric settings. A quoted
+    `"app_id": "123456"` therefore mints tokens perfectly and matched
+    nothing here, so reuse silently stopped and the spinning duplicates it
+    exists to prevent came back with nothing logged.
+    """
+    said = check_api(
+        label, repo,
+        "commits/%s/check-runs?check_name=%s&status=in_progress"
+        % (sha, CHECK_NAME), "GET", None, env)
+    return [was.get("id") for was in (said or {}).get("check_runs") or []
+            if str((was.get("app") or {}).get("id"))
+            == str(config["github_app"].get("app_id")) and was.get("id")]
+
+
 def open_check(label, repo, pr, config, env, blockers=False):
     """Say in the pull request's checks that a review is running.
 
@@ -3332,28 +3365,11 @@ def open_check(label, repo, pr, config, env, blockers=False):
     # review fails twice before succeeding lists three. That is honest
     # history rather than a defect, and trying to collapse it is the
     # thing that silently does not work.
-    open_already = check_api(
-        label, repo,
-        "commits/%s/check-runs?check_name=%s&status=in_progress"
-        % (sha, CHECK_NAME), "GET", None, env)
-    # `.get("id")` as well as the app, not just membership. A reply with
-    # no id, from a truncated body or one check_api answered as `{}`,
-    # would otherwise build a handle whose every close sends
-    # `PATCH check-runs/None`. The create branch below refuses exactly
-    # that, and this branch was the one place the guard was missing.
-    # Compared as strings, because app_jwt() already establishes that
-    # this value need not be an int: it signs with `str(app_id)`, and
-    # load_config type-checks only the three numeric settings. A quoted
-    # `"app_id": "123456"` therefore mints tokens perfectly and matched
-    # nothing here, so reuse silently stopped and the spinning duplicates
-    # it exists to prevent came back with nothing logged.
-    mine = [was for was in (open_already or {}).get("check_runs") or []
-            if str((was.get("app") or {}).get("id"))
-            == str(config["github_app"].get("app_id")) and was.get("id")]
+    mine = running_checks(label, repo, sha, config, env)
     if mine:
         log("%s: reusing the check run an earlier attempt left running"
             % label)
-        return {"repo": repo, "id": mine[0].get("id"), "closed": False}
+        return {"repo": repo, "id": mine[0], "closed": False}
 
     # The narrowing is in the title as well as in the comment, because the
     # checks list is the half of this an agent reads. `gh pr checks`
@@ -4835,6 +4851,85 @@ def review(path, repo, pr, config, env, tokens, resent=False, check=None,
     return DONE, bool(covered), bool(reached)
 
 
+def sweep_checks(config, tokens):
+    """Close the indicators an earlier process left spinning.
+
+    A check run says a review is running. Nothing here can make that true
+    again, so what this fixes is the lie: after a kill there is no review,
+    and a run left `in_progress` blocks a merge anywhere Vinegar is a
+    required check, which is the outcome CHECK_CONCLUSION exists to make
+    impossible.
+
+    The lock is the whole argument for closing them. main() holds it
+    before this runs, so no other Vinegar of this deployment is polling,
+    so an `in_progress` run is one an abandoned process left behind rather
+    than one being written to. Nothing else here has to be inferred.
+
+    What strands one is a kill with no `finally`: `launchctl bootout`
+    sends SIGTERM and this program installs no handler, so an in-flight
+    review dies where it stands. On the serial code that mostly heals
+    itself on the next poll, because the entry is FAILED at that head and
+    open_check() reuses the spinner. This is not for that case. It is for
+    the ones reuse never reaches, a pull request closed, merged or newly
+    skipped before the retry, and for bounding the window on the ones it
+    does: reuse leaves the run spinning through the whole next review,
+    nine to twenty-two minutes, where this closes it seconds after the
+    daemon comes back. That bound is what lets a parallel fan-out choose
+    the simplest stop it can rather than a perfect one, which is the
+    question six review rounds of PR #29 never settled.
+
+    Open pull requests only, and their heads only. Check runs are per-ref
+    and there is no endpoint that lists a repository's, so a run stranded
+    at a commit the head has since moved past cannot be found without
+    walking every commit of every pull request. Those are left, which is
+    defensible because the pull request shows its head commit's checks and
+    nothing shows the others.
+
+    Closed rather than spared, including at heads a retry would reuse.
+    Sparing them keeps one tidy entry per pull request and costs the
+    window this exists to bound, and it would mean deciding here whether
+    handle_pr is going to review something, which is a decision written
+    once already. The cost taken instead is a pull request listing a
+    neutral entry above a fresh running one, which open_check() argues at
+    length is honest history rather than a defect.
+
+    Every failure swallowed, per repository and per pull request, for
+    check_api()'s reason: an indicator is not worth a poll. A repository
+    whose listing fails is swept on the next start, and the daemon must
+    reach its loop either way.
+    """
+    # A dry run puts nothing on a pull request, so it has nothing to
+    # close; without an App these runs belong to no one Vinegar can PATCH.
+    # open_check() refuses on the same pair, and a sweep that ran where
+    # the opener cannot would be closing another App's check runs.
+    if not config["comment"] or not config.get("github_app"):
+        return
+    for repo in config["repos"]:
+        try:
+            env = github_env(config, repo, tokens, good_for=LISTING_GRACE)
+            prs = open_prs(repo, env)
+        except Exception as err:
+            log("%s: cannot list pull requests to close old checks: %s"
+                % (repo, err))
+            continue
+        for pr in prs:
+            label = pr_key(repo, pr)
+            try:
+                for was in running_checks(label, repo, pr["headRefOid"],
+                                          config, env):
+                    log("%s: closing the check run left spinning by a "
+                        "Vinegar that stopped" % label)
+                    close_check(label, {"repo": repo, "id": was,
+                                        "closed": False},
+                                "The review was interrupted", env,
+                                "A Vinegar stopped while this review was "
+                                "running. Nothing is reviewing this commit "
+                                "now. If the pull request is still due a "
+                                "review, the next poll starts one.")
+            except Exception as err:
+                log("%s: could not close its old checks: %s" % (label, err))
+
+
 def poll_once(config, state, tokens):
     for repo in config["repos"]:
         try:
@@ -5684,6 +5779,19 @@ def main():
         log("watching %s every %ds%s" % (
             ", ".join(config["repos"]), config["poll_interval"],
             " as the GitHub App" if config.get("github_app") else ""))
+        # After the line that says this Vinegar is up, because the sweep
+        # logs per pull request and those lines are about the last run
+        # rather than this one: read above the identity line they look
+        # like the new daemon's own work.
+        #
+        # Not on the `--pr` path, which returns above this. A hand run
+        # under its own VINEGAR_HOME holds a different lock and can be
+        # reviewing while the daemon starts, so sweeping from there would
+        # be one operator's manual review closing another's indicator.
+        # The reverse is not guarded: a daemon starting during a hand run
+        # closes that run's check, and the hand run's own close_check
+        # still writes the conclusion when it finishes.
+        sweep_checks(config, tokens)
         while True:
             poll_once(config, state, tokens)
             if args.once:
