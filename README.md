@@ -1112,10 +1112,12 @@ measured, that PATCH returns 200 and changes nothing.
 in flight dies where it stands and its entry keeps saying a review is running.
 Reuse repairs most of that by itself: the pull request is recorded failed at that
 head, the next poll reviews it again, and the same entry is picked up and closed.
-What reuse cannot reach is a pull request closed, merged or newly skipped before
-that retry, and what it cannot do is close the entry *now* rather than at the end
-of the next review, which is nine to twenty-two minutes later. Until then a
-required check is stuck, which is the one thing `neutral` exists to prevent.
+What reuse cannot do is close the entry *now* rather than at the end of the next
+review, which is nine to twenty-two minutes later. Until then a required check is
+stuck, which is the one thing `neutral` exists to prevent. That window is most of
+what this closes. The one case reuse never reaches at all is a pull request newly
+skipped before the retry, a draft toggled or a branch grown past
+`max_changed_lines`, which is then never reviewed again and never adopted.
 
 **So on startup Vinegar closes every check run of its own that it finds still
 running**, before its first poll:
@@ -1125,21 +1127,36 @@ running**, before its first poll:
 The lock is what makes that safe to do. `main()` holds it before the sweep runs,
 so no other Vinegar of this deployment is polling, and an entry still marked
 running is one an abandoned process left rather than one being written to. Only
-its own App's runs are touched, and only at the head commits of open pull
-requests: check runs are read per commit and no endpoint lists a repository's, so
-an entry stranded at a commit the branch has since moved past is left alone. The
-pull request shows its head commit's checks, and nothing shows the others.
+its own App's runs are touched.
 
-It closes entries even at heads a retry would have reused. Sparing those keeps
-one tidy entry per pull request and gives back the window this exists to close,
-so what you see after a restart is a neutral "interrupted" entry above a fresh
-running one. That is the same honest history a retried review already leaves.
+**Only the head commits of open pull requests**, and both halves of that are
+limits worth stating. An entry stranded at a commit the branch has moved past is
+left alone: check runs are read per commit, no endpoint lists a repository's, and
+finding those means walking every commit of every pull request. An entry on a
+pull request since closed or merged is left alone too, because the listing asks
+for open ones. That second one reads worse than it is. The harm being repaired is
+a stuck required check blocking a merge, and nothing blocks a merge that has
+already happened or been abandoned.
 
-A hand `--pr` run never sweeps, because it can be one of several Vinegars: under
-its own `VINEGAR_HOME` it holds a different lock, and sweeping from there would
-be one operator's manual review closing another's indicator. The reverse is not
-guarded. A daemon starting during a hand run closes that run's entry, and the
-hand run still writes its own conclusion when it finishes.
+It closes entries even at heads a retry would have reused. Sparing those would
+keep one tidy entry per pull request and give back the window this exists to
+close, so they are closed instead, and the cost of that is what you see after a
+restart: a neutral "interrupted" entry above a fresh running one. That is the
+same honest history a retried review already leaves.
+
+**Only the daemon sweeps.** Neither `--pr` nor `--once` does, and the line is not
+one-shot versus loop: closing an entry asserts that nothing else is reviewing,
+and only a process that means to keep polling has any business asserting it. The
+lock cannot establish it, because it is per `VINEGAR_HOME`. The second-instance
+recipe above is `VINEGAR_HOME=... vinegar.py --once`, and that process holds its
+own lock and is invisible to the daemon's. Swept from there, a diagnostic run
+would close the production daemon's live entry while the review it belongs to is
+still running and about to post. Nothing is lost by refusing it: under the
+deployment's own home a one-shot run can only start while the daemon is stopped,
+and the daemon sweeps when it comes back.
+
+The reverse is still not guarded. A daemon starting during a hand run closes that
+run's entry, and the hand run still writes its own conclusion when it finishes.
 
 ## Severity
 

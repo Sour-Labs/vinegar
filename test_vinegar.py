@@ -5474,11 +5474,23 @@ check("--whole without --pr is refused rather than quietly ignored",
 # counted, because a sweep after the first poll closes the indicator that
 # poll just opened, and the pull request then shows a review running with
 # a neutral entry claiming it was interrupted.
+#
+# Driven through the real loop rather than through `--once`, which no
+# longer sweeps. The first poll raises KeyboardInterrupt, which main()
+# catches on its way to releasing the lock, so this ends without the
+# `while True` and without a timer deciding when.
 _start_order = []
 _so_kept = (sys.argv, vinegar.poll_once, vinegar.sweep_checks)
-vinegar.poll_once = lambda *a, **k: _start_order.append("poll")
+
+
+def _stop_after_first_poll(*a, **k):
+    _start_order.append("poll")
+    raise KeyboardInterrupt
+
+
+vinegar.poll_once = _stop_after_first_poll
 vinegar.sweep_checks = lambda *a, **k: _start_order.append("sweep")
-sys.argv = ["vinegar.py", "--once"]
+sys.argv = ["vinegar.py"]
 try:
     vinegar.main()
 except SystemExit:
@@ -5487,6 +5499,25 @@ finally:
     sys.argv, vinegar.poll_once, vinegar.sweep_checks = _so_kept
 check("the daemon closes old checks before its first poll",
       _start_order == ["sweep", "poll"], _start_order)
+
+# And a one-shot run does not, which is the hole the `--pr` carve-out
+# missed. The README's own recipe for a second instance is
+# `VINEGAR_HOME=... vinegar.py --once`; that process holds its own lock,
+# is invisible to the daemon's, and swept from there it closes the live
+# indicator of a review that is still running.
+_once_order = []
+_oo_kept = (sys.argv, vinegar.poll_once, vinegar.sweep_checks)
+vinegar.poll_once = lambda *a, **k: _once_order.append("poll")
+vinegar.sweep_checks = lambda *a, **k: _once_order.append("sweep")
+sys.argv = ["vinegar.py", "--once"]
+try:
+    vinegar.main()
+except SystemExit:
+    pass
+finally:
+    sys.argv, vinegar.poll_once, vinegar.sweep_checks = _oo_kept
+check("a one-shot run polls without closing anyone else's checks",
+      _once_order == ["poll"], _once_order)
 vinegar.save_state({})
 
 
@@ -6785,6 +6816,42 @@ except Exception as err:
 check("a repository whose listing fails does not stop the sweep",
       _sweep_escaped is None
       and [1 for how, _, _ in checked if how == "PATCH"], _sweep_escaped)
+
+# A listing that answers 0 with entries open_prs lets through: it
+# establishes only that each is a dict. `pr_key` subscripts `number`, so
+# read above the per-pull-request try this raised out of sweep_checks,
+# past a per-repository handler already exited, and main() catches only
+# KeyboardInterrupt. The daemon then died at startup and launchd restarted
+# it into the same line every thirty seconds, polling nothing at all.
+del checked[:]
+fake_run.check_open = _MINE
+vinegar.open_prs = lambda repo, env: [{"headRefOid": "a" * 40},
+                                      dict(PR, number=4)]
+try:
+    vinegar.sweep_checks(dict(CHK_CONFIG, repos=["o/r"]), {})
+    _numberless = None
+except Exception as err:
+    _numberless = err
+check("a pull request with no number does not stop the daemon starting",
+      _numberless is None, _numberless)
+# And the pull requests after it are still swept, which is what makes the
+# guard a `continue` rather than a wider try.
+check("the pull requests after a bad one are still swept",
+      [1 for how, _, _ in checked if how == "PATCH"], checked)
+
+# The permission paragraph check_api logs when `checks` is granted but not
+# accepted is three lines long. Asked once per open pull request, on every
+# start, under launchd's thirty-second restart, it buries the line saying
+# which Vinegar is up. So a repository whose first read answers nothing is
+# dropped rather than asked again.
+del checked[:]
+fake_run.check_open = None
+fake_run.check_rc = 1
+vinegar.open_prs = lambda repo, env: [dict(PR, number=n) for n in (1, 2, 3)]
+vinegar.sweep_checks(dict(CHK_CONFIG, repos=["o/r"]), {})
+check("a repository whose checks cannot be read is asked once, not per PR",
+      len([1 for how, _, _ in checked if how == "GET"]) == 1, checked)
+fake_run.check_rc = 0
 vinegar.open_prs, vinegar.github_env = _sweep_real_listing, _sweep_env
 reset_stubs()
 

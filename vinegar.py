@@ -3328,7 +3328,16 @@ def running_checks(label, repo, sha, config, env):
         label, repo,
         "commits/%s/check-runs?check_name=%s&status=in_progress"
         % (sha, CHECK_NAME), "GET", None, env)
-    return [was.get("id") for was in (said or {}).get("check_runs") or []
+    # None for a call that did not answer, an empty list for one that
+    # answered nothing. open_check() cannot tell them apart and does not
+    # need to, because both mean "no run to adopt" and it creates one
+    # either way. sweep_checks() does: a repository whose first read
+    # failed is one it stops asking about, and read as "no runs" that is
+    # the check_api permission paragraph logged once per open pull
+    # request on every start.
+    if said is None:
+        return None
+    return [was.get("id") for was in said.get("check_runs") or []
             if str((was.get("app") or {}).get("id"))
             == str(config["github_app"].get("app_id")) and was.get("id")]
 
@@ -4869,21 +4878,35 @@ def sweep_checks(config, tokens):
     sends SIGTERM and this program installs no handler, so an in-flight
     review dies where it stands. On the serial code that mostly heals
     itself on the next poll, because the entry is FAILED at that head and
-    open_check() reuses the spinner. This is not for that case. It is for
-    the ones reuse never reaches, a pull request closed, merged or newly
-    skipped before the retry, and for bounding the window on the ones it
-    does: reuse leaves the run spinning through the whole next review,
-    nine to twenty-two minutes, where this closes it seconds after the
-    daemon comes back. That bound is what lets a parallel fan-out choose
-    the simplest stop it can rather than a perfect one, which is the
-    question six review rounds of PR #29 never settled.
+    open_check() reuses the spinner.
 
-    Open pull requests only, and their heads only. Check runs are per-ref
-    and there is no endpoint that lists a repository's, so a run stranded
-    at a commit the head has since moved past cannot be found without
-    walking every commit of every pull request. Those are left, which is
-    defensible because the pull request shows its head commit's checks and
-    nothing shows the others.
+    So what this delivers is mostly the *bound*, and the claim should not
+    be made larger than that. Reuse leaves the run spinning through the
+    whole next review, nine to twenty-two minutes, where this closes it
+    seconds after the daemon comes back; a required check is stuck for
+    that whole window otherwise. The one case reuse never reaches at all
+    is a pull request newly skipped before the retry, a draft toggled or
+    a branch grown past `max_changed_lines`, which is then never reviewed
+    again and never adopted. That bound is what lets a parallel fan-out
+    choose the simplest stop it can rather than a perfect one, which is
+    the question six review rounds of PR #29 never settled.
+
+    Open pull requests only, and their heads only. Two limits, and both
+    are real rather than tidy:
+
+    A run stranded at a commit the head has moved past is not found.
+    Check runs are read per commit and no endpoint lists a repository's,
+    so finding those means walking every commit of every pull request.
+    The pull request shows its head commit's checks and nothing shows the
+    others, so what is left is invisible.
+
+    A run stranded on a pull request since closed or merged is not found
+    either, because open_prs() asks for open ones. That is not the loss
+    it first reads as: the harm being repaired is a stuck required check
+    blocking a merge, and nothing blocks a merge that has already
+    happened or been abandoned. Do not widen the listing to `--state all`
+    to reach them; that is every pull request the repository has ever had,
+    for a check nobody is waiting on.
 
     Closed rather than spared, including at heads a retry would reuse.
     Sparing them keeps one tidy entry per pull request and costs the
@@ -4913,10 +4936,39 @@ def sweep_checks(config, tokens):
                 % (repo, err))
             continue
         for pr in prs:
-            label = pr_key(repo, pr)
+            # Inside the try, not above it. `pr_key` subscripts `number`,
+            # and open_prs only establishes that each entry is a dict, so
+            # a listing answering 0 with error objects raised KeyError
+            # from here, past the per-repository handler already exited
+            # and out of sweep_checks entirely. main() catches only
+            # KeyboardInterrupt, so that killed the process before it
+            # reached the poll loop, and launchd restarted it into the
+            # same line every thirty seconds: a working deployment
+            # polling nothing at all. poll_once survives the same input
+            # because its pr_key call is inside its own try.
             try:
-                for was in running_checks(label, repo, pr["headRefOid"],
-                                          config, env):
+                label = pr_key(repo, pr)
+                found = running_checks(label, repo, pr["headRefOid"],
+                                       config, env)
+            except Exception as err:
+                log("%s#%s: could not read its old checks: %s"
+                    % (repo, pr.get("number", "?"), err))
+                continue
+            # A repository whose first read answers nothing is dropped
+            # rather than asked once per pull request. check_api logs a
+            # three-line paragraph naming the permission when `checks`
+            # is granted but not yet accepted on the installation, and
+            # unbounded that is one paragraph per open pull request per
+            # start, repeated every thirty seconds by launchd's restart,
+            # burying the line that says which Vinegar is up. The cost of
+            # being wrong is a sweep deferred to the next start, which is
+            # what a failed listing already costs.
+            if found is None:
+                log("%s: cannot read its check runs, so the rest of this "
+                    "repository is swept on a later start" % repo)
+                break
+            try:
+                for was in found:
                     log("%s: closing the check run left spinning by a "
                         "Vinegar that stopped" % label)
                     close_check(label, {"repo": repo, "id": was,
@@ -5784,14 +5836,28 @@ def main():
         # rather than this one: read above the identity line they look
         # like the new daemon's own work.
         #
-        # Not on the `--pr` path, which returns above this. A hand run
-        # under its own VINEGAR_HOME holds a different lock and can be
-        # reviewing while the daemon starts, so sweeping from there would
-        # be one operator's manual review closing another's indicator.
-        # The reverse is not guarded: a daemon starting during a hand run
-        # closes that run's check, and the hand run's own close_check
-        # still writes the conclusion when it finishes.
-        sweep_checks(config, tokens)
+        # Only the daemon sweeps. `--pr` returns above this, and `--once`
+        # is refused here, and the axis is not one-shot versus loop: it is
+        # that closing a run asserts nothing else is reviewing, and only a
+        # process that means to keep polling has any business asserting
+        # it. The lock cannot establish that, because it is per
+        # VINEGAR_HOME. A second instance under its own home holds its own
+        # lock and is invisible to this one, and that is a documented
+        # command rather than a hypothetical: the README's own recipe for
+        # running one is `VINEGAR_HOME=... vinegar.py --once`. Swept from
+        # there, a diagnostic run PATCHes the production daemon's live
+        # indicator to "The review was interrupted" while that review is
+        # still running and about to post.
+        #
+        # Nothing is lost by refusing it. Under the deployment's own home
+        # a `--once` run can only start while the daemon is stopped, and
+        # the daemon sweeps when it comes back.
+        #
+        # The reverse is still not guarded: a daemon starting during a
+        # hand run closes that run's check, and the hand run's own
+        # close_check writes its conclusion when it finishes.
+        if not args.once:
+            sweep_checks(config, tokens)
         while True:
             poll_once(config, state, tokens)
             if args.once:
