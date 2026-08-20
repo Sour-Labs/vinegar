@@ -2868,33 +2868,94 @@ check("a boolean parallel_repos is not a number either",
 # A repository named twice used to cost one wasted listing per pass. Polled
 # at once it puts two passes on the one checkout that repository has, and
 # the second pass's `git reset --hard` moves the tree under the first.
-check("a repository named twice refuses to start",
-      "more than once" in _config_with(repos=["o/r", "o/r"]),
-      _config_with(repos=["o/r", "o/r"]))
-check("the refusal names which repository was written twice",
-      "o/r" in _config_with(repos=["o/a", "o/r", "o/r"]),
-      _config_with(repos=["o/a", "o/r", "o/r"]))
+#
+# Collapsed and said, not refused, and the first draft of this refused.
+# A duplicate was harmless before `parallel_repos` existed, so refusing
+# met every operator upgrading with one already in the file: the daemon
+# exited at startup and launchd relaunched it every ten seconds, polling
+# nothing at all. Turning a working install into an outage is the worse
+# answer, and it is the failure load_state()'s docstring argues against
+# for the file beside this one.
+def _dupe_said(**over):
+    """What load_config logged while loading those overrides."""
+    heard = []
+    was, vinegar.log = vinegar.log, lambda m: heard.append(m)
+    try:
+        _loaded(**over)
+    finally:
+        vinegar.log = was
+    return " ".join(heard)
+
+
+check("a repository named twice still starts, with one copy of it",
+      _loaded(repos=["o/r", "o/r"])["repos"] == ["o/r"],
+      _loaded(repos=["o/r", "o/r"]))
+# Said, because a daemon polling a shorter list than the file names is
+# the disagreement refusing was meant to prevent. The line is what
+# answers it, so it names the entry rather than only a count.
+check("dropping the copy is said out loud, and names which repository",
+      "more than once" in _dupe_said(repos=["o/a", "o/r", "o/r"])
+      and "o/r" in _dupe_said(repos=["o/a", "o/r", "o/r"]),
+      _dupe_said(repos=["o/a", "o/r", "o/r"]))
+check("the repositories that were not duplicated are all still watched",
+      _loaded(repos=["o/a", "o/r", "o/r"])["repos"] == ["o/a", "o/r"],
+      _loaded(repos=["o/a", "o/r", "o/r"]))
 # Once per offending spelling, not once per extra copy. Three of one
 # repository read as "names o/r, o/r more than once", which looks like two
 # separate problems.
-check("a repository named three times is named once in the refusal",
-      _config_with(repos=["o/r", "o/r", "o/r"]).count("o/r") == 1,
-      _config_with(repos=["o/r", "o/r", "o/r"]))
+check("a repository named three times is named once in the line",
+      _dupe_said(repos=["o/r", "o/r", "o/r"]).count("o/r") == 1,
+      _dupe_said(repos=["o/r", "o/r", "o/r"]))
 # GitHub resolves a repository name without case and so does the default
 # macOS filesystem, so these two entries list the same pull requests into
 # one clone directory: the collision the check exists to catch, walking
 # straight past an exact comparison.
-check("two spellings of one repository refuse to start too",
-      "more than once" in _config_with(repos=["O/R", "o/r"]),
-      _config_with(repos=["O/R", "o/r"]))
+# Both orderings, because only one of them catches a lookup that folds one
+# side and not the other: with `seen` holding folded names and the test
+# comparing the raw one, ["O/R", "o/r"] still collapses by luck and
+# ["o/r", "O/R"] keeps both. Measured, as a mutation that survived the
+# first spelling of this check.
+check("two spellings of one repository collapse to the first spelling",
+      _loaded(repos=["O/R", "o/r"])["repos"] == ["O/R"]
+      and _loaded(repos=["o/r", "O/R"])["repos"] == ["o/r"],
+      [_loaded(repos=["O/R", "o/r"]), _loaded(repos=["o/r", "O/R"])])
 # Stored stripped, like the model names, so a stray space is not a second
 # repository and does not reach `gh` either.
 check("a repository written with stray spaces is the same repository",
-      "more than once" in _config_with(repos=["o/r", " o/r "]),
-      _config_with(repos=["o/r", " o/r "]))
+      _loaded(repos=["o/r", " o/r "])["repos"] == ["o/r"],
+      _loaded(repos=["o/r", " o/r "]))
 check("and the stored name has the spaces taken off",
       _loaded(repos=[" o/r "])["repos"] == ["o/r"],
       _loaded(repos=[" o/r "]))
+# The shape the message beside it always promised. A dropped owner started
+# the daemon perfectly and then failed on every poll for ever: `gh pr list
+# -R web` fails on the format, poll_repo swallows it, one line a minute,
+# and that repository is never reviewed with nothing at startup saying so.
+check("a repository name with no owner refuses to start",
+      "wants owner/name" in _config_with(repos=["o/a", "web"]),
+      _config_with(repos=["o/a", "web"]))
+check("and so does one with an empty half or an extra slash",
+      all("wants owner/name" in _config_with(repos=[name])
+          for name in ("/r", "o/", "o/r/x")),
+      [_config_with(repos=[name]) for name in ("/r", "o/", "o/r/x")])
+# Refuses what GitHub cannot parse, and no more. A well-formed name that
+# does not exist is a listing failure the log already reports every poll,
+# and guessing at existence here would need a network call to start.
+check("a well-formed name it cannot vouch for still starts",
+      _loaded(repos=["o/nope"])["repos"] == ["o/nope"],
+      _loaded(repos=["o/nope"]))
+# Said, not refused, like the token-life warning. A width above the number
+# of repositories is clamped, and the startup line stays silent at one, so
+# a single-repository install that set 4 read a line byte-identical to the
+# one before the edit and had no way to learn the setting did nothing.
+check("a parallel_repos above the repository count says what will happen",
+      "so 1 of them run at once" in _dupe_said(repos=["o/r"],
+                                               parallel_repos=4),
+      _dupe_said(repos=["o/r"], parallel_repos=4))
+check("and a width the repositories can use says nothing",
+      "run at once" not in _dupe_said(repos=["o/a", "o/b"],
+                                      parallel_repos=2),
+      _dupe_said(repos=["o/a", "o/b"], parallel_repos=2))
 # An entry that is not a string used to be accepted here and then raise
 # TypeError out of main()'s own startup line before a single repository
 # was polled, which under launchd is a traceback and a restart every 30
@@ -5575,6 +5636,33 @@ finally:
 check("the daemon closes old checks before its first poll",
       _start_order == ["sweep", "poll"], _start_order)
 
+# "stopping", not "stopped". Above one repository an interrupt is not the
+# end of anything: the passes keep reviewing and release_lock() keeps the
+# lock, and says so on the line after this one. Between those two lines
+# the one word that has always meant the daemon is gone sent an operator
+# to run `--pr`, which was refused by a live pid for up to a
+# review_timeout per pass still in flight.
+_stop_said = []
+_st_kept = (sys.argv, vinegar.poll_once, vinegar.sweep_checks, vinegar.log)
+
+
+def _interrupt_the_poll(*a, **k):
+    raise KeyboardInterrupt
+
+
+vinegar.poll_once = _interrupt_the_poll
+vinegar.sweep_checks = lambda *a, **k: None
+vinegar.log = lambda m: _stop_said.append(m)
+sys.argv = ["vinegar.py"]
+try:
+    vinegar.main()
+except SystemExit:
+    pass
+finally:
+    sys.argv, vinegar.poll_once, vinegar.sweep_checks, vinegar.log = _st_kept
+check("an interrupted daemon says it is stopping, not that it has stopped",
+      "stopping" in _stop_said and "stopped" not in _stop_said, _stop_said)
+
 # A one-shot run sweeps too, and that is deliberate rather than an
 # oversight. The first version of this guarded on `--once`, which keys on
 # one-shot versus loop when the thing that separates two Vinegars is the
@@ -7169,6 +7257,18 @@ check("every pass that fell over is named, not only the one raised",
       sum("whole pass fell over" in m for m in _both_said) == 2, _both_said)
 check("and one of them is still raised, so the daemon does not carry on",
       isinstance(_both_escaped, ValueError), _both_escaped)
+# Only the first entry keeps its exception object; the rest keep their
+# text. Every stored exception pins its `__traceback__` and through it
+# every frame and local of the pass that failed, which for handle_pr and
+# review() is the transcript, the findings and the review body.
+#
+# Deliberately unchecked, and recorded here rather than left to look like
+# an oversight, the way mutate.py records the omission for enumerate()
+# over is_alive(). The retention exists only *while* the pass runs, and by
+# the time poll_once has returned for a check to look, the list is
+# garbage either way: both shapes are indistinguishable from outside. A
+# check that could not tell them apart would be the kind that passes
+# against the very thing it names, which the two above it are not.
 
 # A SystemExit is not an Exception, and this replaced a pool whose work
 # item caught BaseException and handed it back on result(). It is

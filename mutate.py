@@ -304,6 +304,54 @@ MUTATIONS = [
      "            poll_repo(repo, config, state, tokens)\n"
      "        return",
      "    pass"),
+    # The word that told an operator the daemon was gone while its passes
+    # were still reviewing and still holding the lock.
+    ("stop-claims-it-has-stopped",
+     '        log("stopping")',
+     '        log("stopped")'),
+    # A width the repositories cannot use, clamped and never mentioned, so
+    # the setting does nothing and the startup line reads exactly as it
+    # did before the operator edited the file.
+    ("clamped-width-said-nothing",
+     '        log("%s: parallel_repos is %d and there are %d repositories to "',
+     '        _ = ("%s: parallel_repos is %d and there are %d repositories to "'),
+    # The stop reaching a pass that is already listing. Without it a
+    # repository works through every pull request the listing returned
+    # before it notices, which is the whole interrupt window again.
+    ("parallel-stop-between-pull-requests",
+     "        if STOPPING.is_set():\n"
+     "            return",
+     "        if False:\n"
+     "            return"),
+    # The shape the entry guard's own message promises. A dropped owner
+    # starts the daemon and then fails on every poll for ever, with
+    # nothing at startup saying the name is wrong.
+    ("repos-entry-shape-unchecked",
+     '        if name.count("/") != 1 or not all(name.split("/")):\n'
+     '            sys.exit("%s: repos wants owner/name, got %r" % (path, name))',
+     "        pass"),
+    # A duplicate left in the list, which above one repository is two
+    # passes on the one checkout that repository has.
+    ("repos-duplicate-kept",
+     "    if twice:\n"
+     '        config["repos"] = kept',
+     "    if False:\n"
+     '        config["repos"] = kept'),
+    # And collapsed without saying so, which is the disagreement refusing
+    # was meant to prevent: a daemon polling a shorter list than the file
+    # names, with nothing explaining it.
+    ("repos-duplicate-dropped-in-silence",
+     '        log("%s: repos names %s more than once, matched without case. A "',
+     '        _ = ("%s: repos names %s more than once, matched without case. A "'),
+    # Matched exactly, which walks past `Sour-Labs/vinegar` beside
+    # `sour-labs/vinegar`: two entries listing the same pull requests into
+    # one clone directory.
+    ("repos-duplicates-matched-with-case",
+     "        if name.casefold() in seen:",
+     "        if name in seen:"),
+    ("repos-duplicate-seen-not-folded",
+     "        seen.add(name.casefold())",
+     "        seen.add(name)"),
     # Every repository has to leave the queue, not just the first `width`
     # of them.
     ("parallel-queue-drains",

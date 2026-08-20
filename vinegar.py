@@ -988,7 +988,21 @@ def load_config(path):
         if not isinstance(name, str) or not name.strip():
             sys.exit("%s: repos must hold owner/name strings, not %r" % (
                 path, name))
-        config["repos"][nth] = name.strip()
+        name = config["repos"][nth] = name.strip()
+        # The shape too, which the sentence above promised and nothing
+        # checked. `"repos": ["o/api", "web"]` is one dropped owner, and
+        # it started the daemon perfectly: every poll then ran
+        # `gh pr list -R web`, which fails on the format, is swallowed by
+        # poll_repo's handler, and logs one line. That repository was
+        # never reviewed again and nothing at startup said why. With an
+        # App it also mints a token against a repository named "".
+        #
+        # The same test main()'s `--pr` branch runs on its argument, and
+        # deliberately no more: this refuses what GitHub cannot parse, not
+        # what it might 404 on. A name that is well-formed and wrong is a
+        # listing failure the log already reports every poll.
+        if name.count("/") != 1 or not all(name.split("/")):
+            sys.exit("%s: repos wants owner/name, got %r" % (path, name))
 
     # Named twice is not the same as reviewed twice. A duplicate is one
     # wasted listing per pass while repositories are polled one at a time,
@@ -997,10 +1011,24 @@ def load_config(path):
     # the tree under the first, which then reports findings about a commit
     # nobody asked about.
     #
-    # Refused rather than quietly collapsed to one. An operator who wrote a
-    # repository twice meant something by it, and a daemon that silently
-    # polls a shorter list than the file names is the kind of disagreement
-    # nothing later would explain.
+    # Collapsed and said, not refused, and the first draft of this refused.
+    # That was wrong in the one direction load_state()'s docstring argues
+    # against for the file next to this one: a duplicate was harmless
+    # before this setting existed, so an operator upgrading with
+    # `["o/api", "o/api"]` already on disk met a daemon that exited at
+    # startup, and launchd relaunched it every ten seconds reviewing
+    # nothing at all. Turning a working install into an outage is a worse
+    # answer than the wasted listing it was correcting.
+    #
+    # The argument for refusing was that a daemon polling a shorter list
+    # than the file names is a disagreement nothing explains. The log line
+    # is what answers that, so it names the entry rather than only the
+    # count.
+    #
+    # Collapsed at every width rather than only above one. The hazard is
+    # real only when two passes run at once, but a rule that makes the
+    # same file valid or invalid depending on `parallel_repos` is one an
+    # operator has to hold two settings in mind to predict.
     #
     # Folded, because neither of the things that would collide cares about
     # case. GitHub resolves a repository name without it, and the default
@@ -1008,20 +1036,23 @@ def load_config(path):
     # `sour-labs/vinegar` is two entries listing the same pull requests
     # into one clone directory. An exact comparison missed the collision
     # this check exists to catch.
-    folded = [name.casefold() for name in config["repos"]]
-    twice = []
-    for nth, name in enumerate(config["repos"]):
-        # Each offending spelling once. Recording every repeat printed
-        # "names o/r, o/r more than once" for three copies, which reads as
-        # two separate problems.
-        if folded.index(folded[nth]) != nth and name not in twice:
-            twice.append(name)
+    seen, kept, twice = set(), [], []
+    for name in config["repos"]:
+        if name.casefold() in seen:
+            # Each offending spelling once. Recording every repeat printed
+            # "names o/r, o/r more than once" for three copies, which
+            # reads as two separate problems.
+            if name not in twice:
+                twice.append(name)
+            continue
+        seen.add(name.casefold())
+        kept.append(name)
     if twice:
-        sys.exit("%s: repos names %s more than once, matched without case. "
-                 "A repository is polled once per pass and has one "
-                 "checkout, so a second copy buys nothing at "
-                 "parallel_repos 1 and two passes over one working tree "
-                 "above it" % (path, ", ".join(twice)))
+        config["repos"] = kept
+        log("%s: repos names %s more than once, matched without case. A "
+            "repository is polled once per pass and has one checkout, so "
+            "the extra copies are dropped and %d repositories are watched"
+            % (path, ", ".join(twice), len(kept)))
     if config["effort"] not in EFFORTS:
         sys.exit("%s: effort must be one of %s" % (path, ", ".join(EFFORTS)))
 
@@ -1032,6 +1063,25 @@ def load_config(path):
     # reached, no give-up posted, and the pull requests silent. This is
     # the file operators actually edit, and load_state guards the same
     # class for the one they are only told to edit.
+    # Said, not refused, like the token-life warning below. A width above
+    # the number of repositories is clamped by poll_width(), and the
+    # startup line prints the clamped number and stays silent at one, so a
+    # single-repository install that set `parallel_repos: 4` read a line
+    # byte-identical to the one it printed before the edit and had no way
+    # to learn the setting did nothing. Every other setting here that
+    # cannot do what it says either refuses or says so; this one did
+    # neither.
+    #
+    # After the numeric loop below would be the tidier place, and it is
+    # wrong: that loop exits on a non-number, and this reads both values.
+    if (isinstance(config["parallel_repos"], int)
+            and not isinstance(config["parallel_repos"], bool)
+            and config["parallel_repos"] > len(config["repos"])):
+        log("%s: parallel_repos is %d and there are %d repositories to "
+            "poll, so %d of them run at once" % (
+                path, config["parallel_repos"], len(config["repos"]),
+                len(config["repos"])))
+
     units = {"max_changed_lines": "lines", "parallel_repos": "repositories"}
     for name in ("poll_interval", "review_timeout", "max_changed_lines",
                  "parallel_repos"):
@@ -5306,7 +5356,18 @@ def poll_once(config, state, tokens):
                 # repository clean and one of them was never reviewed
                 # again, with nothing in the log. KeyboardInterrupt cannot
                 # arrive here, because signals reach the main thread only.
-                fell_over.append((repo, err))
+                # The text for every one, the exception itself for the
+                # first only. Each stored exception pins its
+                # `__traceback__`, and through it every frame and local of
+                # the pass that failed: handle_pr's and review()'s frames
+                # hold the reviewer's transcript, the findings list and
+                # the review body, megabytes per repository, kept alive
+                # until this pass returns. The worker loop takes the next
+                # repository after each catch, so a settings file the
+                # reviewer cannot use puts every repository in here at
+                # once. Only the first is ever re-raised; the rest exist
+                # for the `%s` below.
+                fell_over.append((repo, err if not fell_over else str(err)))
 
     # Not daemons, and joined here rather than by the interpreter. Both
     # halves matter and each was learned from a failure.
@@ -6297,7 +6358,20 @@ def main():
                 return
             time.sleep(config["poll_interval"])
     except KeyboardInterrupt:
-        log("stopped")
+        # "stopping", not "stopped", because above one repository this is
+        # not the end of anything. The passes still running keep the lock
+        # and keep reviewing, and release_lock() says so on the line after
+        # this one. Written as "stopped" it sat between two lines that
+        # contradicted it, and the operator who read the one word that has
+        # always meant the daemon is gone then ran `--pr` and was refused
+        # by a live pid, for up to `review_timeout` per pass in flight.
+        #
+        # Unconditional, rather than asking whether a pass is alive. At
+        # one repository the process exits immediately after this, so
+        # "stopping" is true and momentary; deciding between the two words
+        # would mean consulting the same thread-name match release_lock()
+        # uses, for a word.
+        log("stopping")
     finally:
         release_lock()
 
