@@ -104,6 +104,13 @@ python3 vinegar.py --once                # one pass, then exit
 python3 vinegar.py                       # poll forever
 ```
 
+**Ctrl-C stops a run in the foreground.** It ends the review that is running
+and closes that pull request's entry in the checks list on the way out, so
+nothing is left spinning. With `parallel_repos` above 1 it also stops any
+repository that had not started, and waits for the ones that had. Under
+launchd there is no interrupt: see "Running it under launchd" for `bootout`,
+which kills the process outright.
+
 Vinegar keeps its own state under `~/.vinegar`: `config.json`, `state.json`
 (the head commit it last handled per pull request), and `reviews/`. A run that
 posts nothing uses `state.json.dry` and `reviews.dry/` instead. A review that
@@ -191,6 +198,7 @@ Every key in `config.example.json`:
 | `review_on_push` | `false` | Review again when the head commit changes. A second review reads only what was added since the last one that posted. See "The review". |
 | `blockers_only_after` | `2` | After this many reviews of one pull request, later reviews of it report only blockers. Nothing stops them running. Reached on every push with `review_on_push` on, and through repeated `--pr` runs without it. Null reports everything, every time. See below. |
 | `max_changed_lines` | `3000` | Skip pull requests larger than this. |
+| `parallel_repos` | `1` | How many repositories to poll and review at the same time. Reviews of one repository stay one at a time whatever this says. See below. |
 | `skip_drafts` | `true` | Skip drafts. |
 | `skip_bots` | `true` | Skip pull requests opened by bots. |
 | `skip_forks` | `true` | Skip pull requests whose head branch lives in a fork. Read the next section before you turn this off. |
@@ -235,17 +243,72 @@ Those still fail and retry as before. The fallback is an availability switch,
 not a general retry.
 
 **The two attempts divide one `review_timeout` between them**, rather than
-getting one each. A pull request holds the only poll thread for as long as its
-review runs, which is what the `review_timeout` ceiling exists to bound, and a
-fallback given its own fresh timeout would double that. The fallback inherits
-whatever the first attempt did not use, so budget `review_timeout` for the
-review, not for each attempt.
+getting one each. A pull request holds its repository's poll thread for as
+long as its review runs, which is what the `review_timeout` ceiling exists to
+bound, and a fallback given its own fresh timeout would double that. The
+fallback inherits whatever the first attempt did not use, so budget
+`review_timeout` for the review, not for each attempt.
 
 When a review does fall back, it says so on the pull request as well as in the
 log. A fallback that works quietly is a pinned model that stays dead: the
 reviews keep arriving and read exactly like the configured model's.
 
 Vinegar refuses to start if `fallback_model` names the same model as `model`.
+
+**`parallel_repos` is a latency setting, and it is off by default.** At `1`,
+which is what Vinegar did before this existed, a review holds the only thread
+there is for nine to twenty-two minutes, and the next repository in `repos` is
+not listed, let alone reviewed, until it finishes. Two repositories with one
+pull request each meant the second one waited out the first one's review before
+anybody looked at it.
+
+Raise it and that many repositories are polled and reviewed at once. Each gets
+its own thread and each already has its own checkout, so they do not touch:
+
+```json
+"repos": ["you/api", "you/web"],
+"parallel_repos": 2
+```
+
+**Reviews of one repository are still one at a time**, whatever this is set to.
+Two concurrent reviews of the same repository would share the one checkout
+directory it is given, and the second one's `git reset --hard` would move the
+tree under the first, which would then report findings about a commit nobody
+asked about. That is the same race the process lock exists to prevent, and it
+is why this setting counts repositories rather than reviews.
+
+For the same reason **a repository named twice in `repos` is polled once**, and
+Vinegar says so at startup naming the entry it dropped. Before this setting
+existed a duplicate cost one wasted listing per pass; polled at once it is the
+race above, reachable by a copy-paste.
+
+It is collapsed rather than refused, and an earlier version did refuse. A
+duplicate was harmless until `parallel_repos` existed, so refusing met every
+operator who upgraded with one already in the file: the daemon exited at
+startup and launchd relaunched it every ten seconds, polling nothing at all.
+Turning a working install into an outage is the worse of the two answers, and
+the log line is what keeps the collapse from being silent.
+
+**`parallel_repos` is capped at 8**, whatever the file asks for. Each unit of it
+is a whole reviewer with its own clone beside it, so the number is what one
+machine can run at once rather than how many repositories are watched: the ones
+over the width wait for a worker. It is the one setting that multiplies every
+other runaway this program bounds, and a cap that followed the repository count
+would make the same file mean something different as repositories were added.
+
+**A repository waits out the slowest repository's whole pass, not one review.**
+The fan-out is per pass: every repository is polled, and only when the last
+worker finishes does Vinegar sleep for `poll_interval`. Five open pull requests
+on one repository at twenty minutes each is a hundred minutes before the other
+repository is listed again. Size `poll_interval` knowing that, and read this
+setting as "several repositories per pass" rather than as a queue that never
+makes anyone wait.
+
+**It buys latency, not money.** The same reviews are paid for, closer together.
+Concentrating them is what makes a rate limit more likely to refuse one, and a
+refused review comes back failed and spends one of its three attempts. Set it
+to the number of repositories you actually want reviewed in parallel rather
+than to the length of `repos`.
 
 ### Posting as Vinegar instead of as you
 
@@ -1027,8 +1090,9 @@ withholds anything smaller than a blocker is not the whole review the flag's nam
 promises.
 
 **What this does not bound is spend.** A branch pushed to fifteen times buys
-fifteen reviews, and each one parks the single poll thread for nine to
-twenty-two minutes while nothing else is listed or reviewed. That is deliberate:
+fifteen reviews, and each one parks its repository's poll thread for nine to
+twenty-two minutes while nothing else in that repository is listed or reviewed.
+`parallel_repos` frees the other repositories, not this one. That is deliberate:
 going quiet on the most-reworked code in the repository is the worse failure.
 The round is in the log line for every narrowed review, which is where a runaway
 shows up before the bill does.
