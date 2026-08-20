@@ -459,9 +459,9 @@ MUTATIONS = [
     ("severity-tally-passed-to-the-body",
      "                                   note=note, verb=verb,\n"
      "                                   tally=severity_tally(findings),\n"
-     "                                   since=since, blockers=blockers)}",
+     "                                   since=since, blockers=blockers,",
      "                                   note=note, verb=verb,\n"
-     "                                   since=since, blockers=blockers)}"),
+     "                                   since=since, blockers=blockers,"),
 
     # What a findings prompt can carry into argv. One entry per condition
     # exec imposes, plus the choice the code argues for at length: a NUL
@@ -993,8 +993,7 @@ MUTATIONS = [
      "            sep = body.find(TRANSCRIPT_SEP)\n"
      "            starts = sep + len(TRANSCRIPT_SEP) if sep != -1 else -1\n"
      '            end = (body.find("\\n\\n", starts)\n'
-     "                   if starts != -1 and body.startswith(\n"
-     "                       (SCOPE_MARK, BLOCKERS_MARK), starts)\n"
+     "                   if starts != -1 and body.startswith(LIFTED_MARKS, starts)\n"
      "                   else -1)\n"
      "            if end != -1:\n"
      '                opening += "%s\\n\\n" % body[starts:end]\n'
@@ -1005,8 +1004,7 @@ MUTATIONS = [
     # the resend's opening and cut out of the review.
     ("repost-scope-read-unanchored",
      '            end = (body.find("\\n\\n", starts)\n'
-     "                   if starts != -1 and body.startswith(\n"
-     "                       (SCOPE_MARK, BLOCKERS_MARK), starts)\n"
+     "                   if starts != -1 and body.startswith(LIFTED_MARKS, starts)\n"
      "                   else -1)",
      "            starts = body.find(SCOPE_MARK)\n"
      '            end = body.find("\\n\\n", starts) if starts != -1 else -1'),
@@ -1018,8 +1016,7 @@ MUTATIONS = [
     # cut to take, and a review that reported only what breaks at runtime
     # arrives days later as a review that found one thing.
     ("repost-lifts-only-the-scope-mark",
-     "                   if starts != -1 and body.startswith(\n"
-     "                       (SCOPE_MARK, BLOCKERS_MARK), starts)",
+     "                   if starts != -1 and body.startswith(LIFTED_MARKS, starts)",
      "                   if starts != -1 and body.startswith(SCOPE_MARK, starts)"),
 
     # --- a later review reports only blockers ---------------------------
@@ -1085,6 +1082,95 @@ MUTATIONS = [
      '        lines += ["", "The first %s of a pull request %s everything %s "\n'
      '                      "find%s. This is a later one, so it was asked for "',
      '        lines += ["", "" if True else "%s%s%s%s"'),
+    # The sentence going back to promising an output Vinegar never
+    # filters. This is what `wonky-flow#107` round three posted: one
+    # finding tiered `advisory` directly under a claim that nothing
+    # smaller was listed.
+    ("narrowed-comment-promises-the-output",
+     '                      "at runtime. Anything smaller it found, it was told "\n'
+     '                      "to leave out." % (',
+     '                      "at runtime. Anything smaller it found is not listed "\n'
+     '                      "here." % ('),
+    # The paragraph that explains a tier under blocker, gone. The tag then
+    # stands alone under a paragraph about blockers, which is what a
+    # reader has no second pass to explain.
+    ("disagreement-never-explained",
+     "        if disagreed:\n"
+     "            # The constant, not a copy: save_transcript() writes the same",
+     "        if False:\n"
+     "            # The constant, not a copy: save_transcript() writes the same"),
+    # And said on every narrowed round, including the ordinary one that
+    # found nothing, where it answers a question nobody asked.
+    ("disagreement-explained-unasked",
+     "        if disagreed:",
+     "        if True:"),
+    # Lifted out of the narrowing entirely, which is the regression the
+    # two entries above cannot reach: both keep the block nested, so an
+    # ordinary first-round review is unaffected by either and the check
+    # for that stayed green under the whole run. Dedented here, so every
+    # review carries a paragraph about a severity pass nobody narrowed.
+    ("disagreement-explained-off-a-full-review",
+     "        if disagreed:\n"
+     "            # The constant, not a copy: save_transcript() writes the same",
+     "    if disagreed:\n"
+     "            # The constant, not a copy: save_transcript() writes the same"),
+    # The wording that points at tags rendered somewhere else. An anchored
+    # finding's tag goes into its inline comment on the diff, so on the
+    # common case a paragraph promising tags below it points at nothing.
+    ("disagreement-points-below-itself",
+     '    "The tier tag on each finding is set after the review, by a separate "',
+     '    "The tier tags below are set after the review, by a separate "'),
+    # The comment building its own copy of the sentence again, which is
+    # the drift this pull request is about: one sentence, two spellings,
+    # and the next wording fix reaching only one of them.
+    ("disagreement-said-twice",
+     '            lines += ["", DISAGREED_SAID]',
+     '            lines += ["", "The tier tag on each finding is set '
+     'afterwards by a separate pass."]'),
+    # The mark going back to claiming what came back. It is the transcript's
+    # half of the same sentence the comment and the check title dropped,
+    # and repost() lifts it into the opening of a review delivered days
+    # later, above bullets carrying the severity pass's tier dots.
+    ("transcript-mark-claims-the-output",
+     'BLOCKERS_MARK = "Asked for: blockers only."',
+     'BLOCKERS_MARK = "Reported: blockers only."'),
+    # And any other verb making that claim, which is what the check caught
+    # only by forbidding one word before it was written both ways.
+    ("transcript-mark-claims-it-in-another-word",
+     'BLOCKERS_MARK = "Asked for: blockers only."',
+     'BLOCKERS_MARK = "Returned: blockers only."'),
+    # The lift left knowing only the spelling this version writes. Every
+    # transcript written by an older one is then unmatched, and for the
+    # oversized transcript the lift exists for the cut shears the
+    # narrowing off the front.
+    ("lift-forgets-the-spelling-already-on-disk",
+     'LIFTED_MARKS = (SCOPE_MARK, BLOCKERS_MARK, "Reported: blockers only.")',
+     "LIFTED_MARKS = (SCOPE_MARK, BLOCKERS_MARK)"),
+    # The transcript's copy of the disagreement paragraph, which is the
+    # only copy a review delivered from disk can carry.
+    ("transcript-never-explains-the-disagreement",
+     "        if below_blocker(findings):\n"
+     "            marks.append(DISAGREED_SAID)",
+     "        pass"),
+    ("transcript-explains-it-unasked",
+     "        if below_blocker(findings):\n"
+     "            marks.append(DISAGREED_SAID)",
+     "        marks.append(DISAGREED_SAID)"),
+    # Lifted out of the narrowing, where it opens the block on an ordinary
+    # review and repost() then matches nothing.
+    ("transcript-explanation-outside-the-narrowing",
+     "    if blockers:\n"
+     "        marks.append(BLOCKERS_MARK)\n"
+     "        # Nested, not a third `if`, because DISAGREED_SAID explains the\n"
+     "        # line above it and must never open the block: repost() finds the\n"
+     "        # block by matching its first line and would leave a block opening\n"
+     "        # with this one in the body, unlifted.\n"
+     "        if below_blocker(findings):\n"
+     "            marks.append(DISAGREED_SAID)",
+     "    if blockers:\n"
+     "        marks.append(BLOCKERS_MARK)\n"
+     "    if below_blocker(findings):\n"
+     "        marks.append(DISAGREED_SAID)"),
     # Written outside the block the repost lifts, so the mark survives on
     # disk and is lost from every review delivered from a transcript.
     ("blockers-mark-inside-the-lifted-block",
@@ -1105,6 +1191,41 @@ MUTATIONS = [
      "            tally=severity_tally(findings), since=since, "
      "blockers=blockers,",
      "            tally=severity_tally(findings), since=since,"),
+    # The wire the paragraph rides. Dropped on either posting path it is a
+    # paragraph no real review ever carries, while every direct check on
+    # review_body stays green, which is how `since` and `blockers` each
+    # shipped uncovered on this same code.
+    ("disagreement-passed-to-the-body",
+     "                                   disagreed=below_blocker(findings))}",
+     "                                   disagreed=False)}"),
+    ("disagreement-survives-the-anchor-retry",
+     "            disagreed=below_blocker(findings),\n",
+     ""),
+    # `note` is as much under the bar as `advisory`, and reading only the
+    # one word leaves the commonest smallest tier unexplained.
+    ("below-blocker-forgets-the-smallest-tier",
+     '    return any(finding.get("tier") in under for finding in findings or ())',
+     '    return any(finding.get("tier") == "advisory"\n'
+     "               for finding in findings or ())"),
+    # And counting `blocker` itself, which explains a disagreement on
+    # every narrowed round that agreed.
+    ("below-blocker-counts-blockers-too",
+     '    under = TIERS[TIERS.index("blocker") + 1:] if "blocker" in TIERS else ()',
+     "    under = TIERS"),
+    # "Everything but the most severe" rather than "under blocker". The
+    # same set today, which is why only the check that reorders TIERS
+    # notices, and the day a tier is added above `blocker` the slice takes
+    # in `blocker` itself.
+    ("below-blocker-reads-position-not-name",
+     '    under = TIERS[TIERS.index("blocker") + 1:] if "blocker" in TIERS else ()',
+     "    under = TIERS[1:]"),
+    # And raising when the name is gone, on the path that saves the
+    # transcript and posts the review: a ValueError there is a finished
+    # review that reaches neither disk nor the pull request while the
+    # outcome is recorded DONE.
+    ("below-blocker-raises-without-the-name",
+     '    under = TIERS[TIERS.index("blocker") + 1:] if "blocker" in TIERS else ()',
+     '    under = TIERS[TIERS.index("blocker") + 1:]'),
     # Counting a round for a review whose findings never reached the pull
     # request. Two refused postings and the third round tells the author
     # that the first two "reported everything they found, and those
@@ -1156,9 +1277,16 @@ MUTATIONS = [
     # close_check overwrites the in_progress title on the way out, and the
     # one it leaves behind stands for the rest of the pull request's life.
     ("blockers-in-the-finished-check",
-     '    if blockers:\n'
-     '        title = "%s, reporting blockers only" % title',
-     "    pass"),
+     '        title = "%s, asked for blockers only" % title',
+     "        pass"),
+    # And the verb in it. "reporting blockers only" is a claim about what
+    # came back, beside a tally that can say `1 advisory`; "asked for" is
+    # the claim the title can keep. Deliberately the same anchor as the
+    # entry above: an edit to that line takes both out at once, and two
+    # ANCHOR lines naming the same string is the clearest thing to repair.
+    ("finished-check-claims-the-output",
+     '        title = "%s, asked for blockers only" % title',
+     '        title = "%s, reporting blockers only" % title'),
     # The hand-run path's own wire, which shipped uncovered once before on
     # this same code and did again here.
     ("hand-run-blockers",
