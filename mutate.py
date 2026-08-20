@@ -631,7 +631,8 @@ MUTATIONS = [
      "    if False:\n        pass"),
     ("check-ignores-another-apps",
      '            if str((was.get("app") or {}).get("id"))\n'
-     '            == str(config["github_app"].get("app_id")) and was.get("id")]',
+     '            == str(config["github_app"].get("app_id")) and was.get("id")\n'
+     '            and str(was.get("external_id") or DEPLOYMENT) == DEPLOYMENT]',
      "            if was.get(\"id\")]"),
     # A handle with no id would PATCH `check-runs/None` on every ending.
     ("check-handle-needs-an-id",
@@ -698,8 +699,10 @@ MUTATIONS = [
      '    check["closed"] = settled is not None',
      '    check["closed"] = True'),
     ("check-reuse-needs-an-id",
-     '            == str(config["github_app"].get("app_id")) and was.get("id")]',
-     '            == str(config["github_app"].get("app_id"))]'),
+     '            == str(config["github_app"].get("app_id")) and was.get("id")\n'
+     '            and str(was.get("external_id") or DEPLOYMENT) == DEPLOYMENT]',
+     '            == str(config["github_app"].get("app_id"))\n'
+     '            and str(was.get("external_id") or DEPLOYMENT) == DEPLOYMENT]'),
     ("check-body-matches-the-flag",
      "    body = json.dumps(payload) if payload is not None else None",
      "    body = json.dumps(payload) if payload else None"),
@@ -734,9 +737,11 @@ MUTATIONS = [
     # nothing here.
     ("check-app-id-compared-as-strings",
      '            if str((was.get("app") or {}).get("id"))\n'
-     '            == str(config["github_app"].get("app_id")) and was.get("id")]',
+     '            == str(config["github_app"].get("app_id")) and was.get("id")\n'
+     '            and str(was.get("external_id") or DEPLOYMENT) == DEPLOYMENT]',
      '            if (was.get("app") or {}).get("id")\n'
-     '            == config["github_app"].get("app_id") and was.get("id")]'),
+     '            == config["github_app"].get("app_id") and was.get("id")\n'
+     '            and str(was.get("external_id") or DEPLOYMENT) == DEPLOYMENT]'),
     # Opening it is the one call here that parses a reply GitHub sent.
     ("check-opened-inside-the-try",
      "        check = open_check(key, repo, pr, config, env, blockers)\n"
@@ -1316,27 +1321,18 @@ MUTATIONS = [
     # they call it directly, so this shipped uncovered would leave all of
     # them green and no deployment sweeping anything.
     ("sweep-reaches-the-daemon",
-     "        if not args.once:\n"
-     "            sweep_checks(config, tokens)",
+     "        sweep_checks(config, tokens)",
      "        pass"),
     # And after the first poll rather than before it, where it closes the
     # indicator that poll just opened: the pull request then shows a
     # review running under a neutral entry saying it was interrupted.
     ("sweep-before-the-first-poll",
-     "        if not args.once:\n"
-     "            sweep_checks(config, tokens)\n"
+     "        sweep_checks(config, tokens)\n"
      "        while True:\n"
      "            poll_once(config, state, tokens)",
      "        while True:\n"
      "            poll_once(config, state, tokens)\n"
      "            sweep_checks(config, tokens)"),
-    # The one-shot exemption, without which the README's own recipe for a
-    # second instance closes the production daemon's live indicator while
-    # the review it belongs to is still running.
-    ("sweep-runs-from-a-one-shot-run",
-     "        if not args.once:\n"
-     "            sweep_checks(config, tokens)",
-     "        sweep_checks(config, tokens)"),
     # `pr_key` back above the per-pull-request try, where a listing that
     # answers 0 with entries carrying no `number` raises out of
     # sweep_checks and past main()'s KeyboardInterrupt-only handler: the
@@ -1363,11 +1359,49 @@ MUTATIONS = [
     # the number of them, on every start, every thirty seconds.
     ("sweep-asks-an-unreadable-repo-once-per-pr",
      "            if found is None:\n"
+     "                if answered:\n"
+     "                    continue\n"
      "                log(\"%s: cannot read its check runs, so the rest of this \"\n"
      "                    \"repository is swept on a later start\" % repo)\n"
      "                break",
      "            if found is None:\n"
      "                found = []"),
+    # The bound applied to the whole sweep rather than to one repository,
+    # so a deployment whose first repository has not accepted the
+    # permission never sweeps the others at all, on every start.
+    ("sweep-drops-every-later-repo-too",
+     "                    \"repository is swept on a later start\" % repo)\n"
+     "                break",
+     "                    \"repository is swept on a later start\" % repo)\n"
+     "                return"),
+    # And read as "any failure ends the repository", where one 502 on the
+    # twentieth of thirty pull requests abandons the last ten.
+    ("sweep-ends-a-repo-on-a-transient-failure",
+     "            if found is None:\n"
+     "                if answered:\n"
+     "                    continue",
+     "            if found is None:\n"
+     "                if False:\n"
+     "                    continue"),
+    ("sweep-never-marks-a-repo-answered",
+     "            answered = True",
+     "            answered = False"),
+    # Which Vinegar a run belongs to, unstamped at creation, so every
+    # instance on the machine reads every run as its own.
+    ("check-run-carries-no-deployment",
+     '             "external_id": DEPLOYMENT,\n',
+     ""),
+    # And matched on the App alone, which two instances share: the sweep
+    # then closes the other one's live indicator and reuse adopts a run
+    # it is still writing to.
+    ("check-run-deployment-not-matched",
+     '            and str(was.get("external_id") or DEPLOYMENT) == DEPLOYMENT]',
+     "            ]"),
+    # A run with no stamp refused rather than adopted, which strands
+    # every run open at the moment of the upgrade.
+    ("check-run-legacy-stamp-refused",
+     '            and str(was.get("external_id") or DEPLOYMENT) == DEPLOYMENT]',
+     '            and str(was.get("external_id")) == DEPLOYMENT]'),
     # And the answer that makes that distinction possible at all.
     ("running-checks-hides-a-failed-read",
      "    if said is None:\n"
@@ -1377,14 +1411,14 @@ MUTATIONS = [
     # `failure` makes the stuck merge the outcome rather than the thing
     # being repaired, on a check that read nothing and reported nothing.
     ("sweep-closes-as-a-failure",
-     '                                "review, the next poll starts one.")',
-     '                                "review, the next poll starts one.",\n'
-     '                                "failure")'),
+     '                            "review, the next poll starts one.")',
+     '                            "review, the next poll starts one.",\n'
+     '                            "failure")'),
     # And the title going back to claiming the review said something,
     # on a run that read nothing and reported nothing.
     ("sweep-title-claims-a-result",
-     '                                "The review was interrupted", env,',
-     '                                "No findings", env,'),
+     '                            "The review was interrupted", env,',
+     '                            "No findings", env,'),
     # Sweeping where open_check refuses to open: a dry run has nothing on
     # the pull request to close, and without an App these runs are not
     # Vinegar's to PATCH.

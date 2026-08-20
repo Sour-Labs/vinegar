@@ -1116,8 +1116,11 @@ What reuse cannot do is close the entry *now* rather than at the end of the next
 review, which is nine to twenty-two minutes later. Until then a required check is
 stuck, which is the one thing `neutral` exists to prevent. That window is most of
 what this closes. The one case reuse never reaches at all is a pull request newly
-skipped before the retry, a draft toggled or a branch grown past
-`max_changed_lines`, which is then never reviewed again and never adopted.
+skipped before the retry *and still at the head the killed review ran on*: a
+draft toggled, because toggling one moves nothing. A branch grown past
+`max_changed_lines` reads like the same case and is not, because growing it
+pushes commits and the head moves away from the stranded entry, into the blind
+spot below.
 
 **So on startup Vinegar closes every check run of its own that it finds still
 running**, before its first poll:
@@ -1144,19 +1147,32 @@ close, so they are closed instead, and the cost of that is what you see after a
 restart: a neutral "interrupted" entry above a fresh running one. That is the
 same honest history a retried review already leaves.
 
-**Only the daemon sweeps.** Neither `--pr` nor `--once` does, and the line is not
-one-shot versus loop: closing an entry asserts that nothing else is reviewing,
-and only a process that means to keep polling has any business asserting it. The
-lock cannot establish it, because it is per `VINEGAR_HOME`. The second-instance
-recipe above is `VINEGAR_HOME=... vinegar.py --once`, and that process holds its
-own lock and is invisible to the daemon's. Swept from there, a diagnostic run
-would close the production daemon's live entry while the review it belongs to is
-still running and about to post. Nothing is lost by refusing it: under the
-deployment's own home a one-shot run can only start while the daemon is stopped,
-and the daemon sweeps when it comes back.
+A third limit, and the one an operator meets first: **a repository that answers
+nothing at all stops being asked after one pull request.** That is the `checks`
+permission granted on the App and not yet accepted on the installation, which
+logs a paragraph on every call. Unbounded that is one paragraph per open pull
+request per start, every thirty seconds under launchd, burying the line saying
+which Vinegar is up. Once anything has answered, a later failure is transient by
+demonstration, so only that pull request is skipped and the rest are still swept.
 
-The reverse is still not guarded. A daemon starting during a hand run closes that
-run's entry, and the hand run still writes its own conclusion when it finishes.
+**Each entry records which Vinegar made it**, in the check run's `external_id`,
+and only entries carrying this deployment's own are adopted or closed. That is
+what makes running two instances on one machine safe. Both authenticate as the
+same App, so the App and the name together cannot tell their entries apart, and
+the lock cannot either because each instance holds its own under its own
+`VINEGAR_HOME`. Without the stamp, the test instance from the recipe above closes
+the production daemon's live entry and adopts entries it is still writing to.
+
+An entry carrying no `external_id` is treated as this deployment's, because that
+is every entry written before the stamp existed, and refusing them would strand
+whatever was open at the moment of the upgrade: never adopted, never swept.
+
+`--pr` still never sweeps, because a hand review of one pull request is not a
+statement about every other one. `--once` does sweep: it is the same daemon doing
+one pass, and the stamp, not the flag, is what decides whose entries it may
+touch. What is still not guarded is the other direction. A daemon starting during
+a hand run closes that run's entry, since both carry the same stamp, and the hand
+run writes its own conclusion when it finishes.
 
 ## Severity
 

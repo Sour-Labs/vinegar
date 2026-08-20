@@ -5500,11 +5500,12 @@ finally:
 check("the daemon closes old checks before its first poll",
       _start_order == ["sweep", "poll"], _start_order)
 
-# And a one-shot run does not, which is the hole the `--pr` carve-out
-# missed. The README's own recipe for a second instance is
-# `VINEGAR_HOME=... vinegar.py --once`; that process holds its own lock,
-# is invisible to the daemon's, and swept from there it closes the live
-# indicator of a review that is still running.
+# A one-shot run sweeps too, and that is deliberate rather than an
+# oversight. The first version of this guarded on `--once`, which keys on
+# one-shot versus loop when the thing that separates two Vinegars is the
+# home: a second instance run as a loop passed that guard and closed the
+# production daemon's live indicator anyway. DEPLOYMENT is the predicate
+# now, so how either process was started stops mattering.
 _once_order = []
 _oo_kept = (sys.argv, vinegar.poll_once, vinegar.sweep_checks)
 vinegar.poll_once = lambda *a, **k: _once_order.append("poll")
@@ -5516,8 +5517,8 @@ except SystemExit:
     pass
 finally:
     sys.argv, vinegar.poll_once, vinegar.sweep_checks = _oo_kept
-check("a one-shot run polls without closing anyone else's checks",
-      _once_order == ["poll"], _once_order)
+check("a one-shot run sweeps on the same rule the daemon does",
+      _once_order == ["sweep", "poll"], _once_order)
 vinegar.save_state({})
 
 
@@ -6842,17 +6843,87 @@ check("the pull requests after a bad one are still swept",
 # The permission paragraph check_api logs when `checks` is granted but not
 # accepted is three lines long. Asked once per open pull request, on every
 # start, under launchd's thirty-second restart, it buries the line saying
-# which Vinegar is up. So a repository whose first read answers nothing is
+# which Vinegar is up. So a repository that answers nothing at all is
 # dropped rather than asked again.
-del checked[:]
-fake_run.check_open = None
-fake_run.check_rc = 1
-vinegar.open_prs = lambda repo, env: [dict(PR, number=n) for n in (1, 2, 3)]
-vinegar.sweep_checks(dict(CHK_CONFIG, repos=["o/r"]), {})
+_unreadable = _swept(prs=[dict(PR, number=n) for n in (1, 2, 3)],
+                     check_open=None, check_rc=1)
 check("a repository whose checks cannot be read is asked once, not per PR",
-      len([1 for how, _, _ in checked if how == "GET"]) == 1, checked)
+      len([1 for how, _, _ in _unreadable if how == "GET"]) == 1, _unreadable)
 fake_run.check_rc = 0
+# Per repository, not for the whole sweep. A `return` there passes every
+# check above, and in production a deployment whose first repository has
+# not accepted the permission would then never sweep the others at all,
+# on every start, for ever.
+del checked[:]
+fake_run.check_open, fake_run.check_rc = None, 1
+
+
+def _second_repo_reads(repo, env):
+    fake_run.check_rc = 0 if repo == "o/second" else 1
+    fake_run.check_open = _MINE if repo == "o/second" else None
+    return [dict(PR, number=4)]
+
+
+vinegar.open_prs = _second_repo_reads
+vinegar.sweep_checks(dict(CHK_CONFIG, repos=["o/first", "o/second"]), {})
+check("a repository nobody can read does not stop the ones after it",
+      [1 for how, _, _ in checked if how == "PATCH"], checked)
+fake_run.check_rc = 0
+# And a failure once something has answered is transient by demonstration,
+# so it skips that pull request rather than abandoning the rest. Read the
+# other way, one 502 on the twentieth of thirty leaves the last ten stuck
+# for the whole window this exists to bound.
+_reads = []
+
+
+def _fails_on_the_second(label, repo, sha, config, env):
+    _reads.append(sha)
+    return None if len(_reads) == 2 else [909]
+
+
+_rc_real = vinegar.running_checks
+vinegar.running_checks = _fails_on_the_second
+del checked[:]
+vinegar.open_prs = lambda repo, env: [dict(PR, number=n, headRefOid="%d" % n)
+                                      for n in (1, 2, 3)]
+vinegar.sweep_checks(dict(CHK_CONFIG, repos=["o/r"]), {})
+vinegar.running_checks = _rc_real
+check("one failed read after a good one skips that PR, not the rest",
+      _reads == ["1", "2", "3"]
+      and len([1 for how, _, _ in checked if how == "PATCH"]) == 2, _reads)
 vinegar.open_prs, vinegar.github_env = _sweep_real_listing, _sweep_env
+reset_stubs()
+
+# --- which Vinegar a check run belongs to --------------------------------
+# Two instances on one machine authenticate as the same App, so App and
+# name together cannot tell their runs apart, and the lock cannot either
+# because each holds its own. Closing the other one's live indicator, or
+# adopting a run it is still writing to, is what that costs. HOME is what
+# separates them, so open_check stamps it and running_checks matches it.
+reset_stubs()
+vinegar.run = fake_run
+_made_stamp = _opened()
+_stamp_post = [asked for how, _, asked in checked if how == "POST"]
+check("the run records which Vinegar made it",
+      _stamp_post and _stamp_post[0].get("external_id") == vinegar.DEPLOYMENT,
+      _stamp_post)
+_theirs = {"check_runs": [{"id": 41, "app": {"id": 77},
+                           "external_id": "/somewhere/else/.vinegar"}]}
+# Installed, not merely named. Written without this line the call read
+# whatever the previous stub left behind and the check passed for a
+# reason that had nothing to do with the stamp.
+fake_run.check_open = _theirs
+check("another instance's run is neither adopted nor closed",
+      vinegar.running_checks(L, "o/r", PR["headRefOid"], CHK_CONFIG,
+                             CHK_ENV) == [],
+      _theirs)
+# Written before the stamp existed. Refusing those would strand every run
+# open at the moment of the upgrade: never adopted, never swept.
+_legacy = {"check_runs": [{"id": 42, "app": {"id": 77}}]}
+fake_run.check_open = _legacy
+check("a run made before the stamp is still this deployment's",
+      vinegar.running_checks(L, "o/r", PR["headRefOid"], CHK_CONFIG,
+                             CHK_ENV) == [42])
 reset_stubs()
 
 # --- acquire_lock --------------------------------------------------------
