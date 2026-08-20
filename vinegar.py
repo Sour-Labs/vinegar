@@ -28,10 +28,12 @@ import errno
 import fcntl
 import json
 import os
+import queue
 import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -369,7 +371,7 @@ CLONE_TIMEOUT = 1800
 
 # Seconds `git diff` may take before the poll loop gives up on it. Local
 # work, so generous is already absurd; the point is that a checkout on a
-# filesystem that stops answering cannot hold the one poll thread for ever.
+# filesystem that stops answering cannot hold a poll thread for ever.
 DIFF_TIMEOUT = 120
 
 # Seconds `gh pr list` may take. One HTTP call, made once a minute per
@@ -645,6 +647,54 @@ CHECK_CLEAN = "success"
 # decides that message's length, not Vinegar, so it is cut to fit.
 MAX_BODY = 60000
 
+# Everything two repositories polled at once would otherwise share.
+#
+# STATE_LOCK covers the `state` dict and the file behind it together,
+# because the two hazards are one hazard. save_state() serialises the whole
+# dict, and json.dumps calls back into Python between entries, so a thread
+# adding a pull request it has never seen raises "dictionary changed size
+# during iteration" out of the other thread's save. And write_atomic() names
+# its temporary file after the target, so two saves landing together write
+# `state.json.tmp` over each other and os.replace publishes whichever half
+# won: every pull request forgotten, and every one of them reviewed again at
+# full cost.
+#
+# LOG_LOCK is smaller and not cosmetic. print() writes the message and the
+# newline as two calls on sys.stdout, so two repositories logging at the
+# same moment can produce one line carrying both and one empty line. The log
+# is where a runaway round count is found before the bill arrives, and that
+# is a grep.
+STATE_LOCK = threading.RLock()
+LOG_LOCK = threading.Lock()
+
+# Set when a stop has been asked for, so a worker takes no further pull
+# request and no further repository.
+#
+# A thread cannot be interrupted from outside, which is the whole problem
+# this solves. On the serial path Ctrl-C raises inside the review that is
+# running, unwinds through handle_pr's finally so the checks entry is
+# closed, and reaches main(). A worker sees none of that: the signal is
+# delivered to the main thread alone. Without a flag the only ways to end
+# a worker were to let it finish everything it had been given, or to make
+# it a daemon and have the interpreter kill it mid-review, which skips
+# that finally and leaves a checks entry spinning for ever on a pull
+# request nobody can then merge.
+#
+# Asked between pull requests rather than only between repositories,
+# because a repository's pass is every open pull request on it. At a
+# terminal the interrupt reaches the whole process group, so the `claude`
+# that was running dies and its review ends in seconds; a flag read only
+# at the top of a pass would then go on to buy full reviews for that
+# repository's remaining pull requests, which is the opposite of stopping.
+#
+# Never cleared. The one path that sets it is on its way out of main().
+STOPPING = threading.Event()
+
+# What a poll worker's thread is called. release_lock() finds them by
+# this and declines while any is alive, so the two have to agree
+# exactly and a literal in either place is a silent way to disagree.
+POLL_WORKER = "vinegar-poll-"
+
 DEFAULTS = {
     "repos": [],
     "poll_interval": 60,
@@ -677,6 +727,24 @@ DEFAULTS = {
     # `--whole` is how an operator asks for all of it back.
     "blockers_only_after": 2,
     "max_changed_lines": 3000,
+    # How many repositories are polled and reviewed at the same time. One
+    # is what Vinegar did before this existed: a review parks the only
+    # thread there is for nine to twenty-two minutes, and the repository
+    # behind it in the list waits that out before it is even listed.
+    #
+    # Reviews of one repository stay one at a time whatever this says.
+    # checkout() gives each repository its own tree and nothing more, so two
+    # concurrent reviews of the same one would share a directory and the
+    # second one's `git reset --hard` would pull the tree out from under the
+    # first. That is the race acquire_lock() exists to prevent, reappearing
+    # inside one process.
+    #
+    # Default one, and deliberately. This buys latency, not money: the same
+    # reviews are paid for, closer together, which is what makes a rate
+    # limit more likely to refuse one, and a refused review comes back
+    # FAILED and spends an attempt. An operator raising it is choosing that
+    # trade for their own repositories.
+    "parallel_repos": 1,
     "skip_drafts": True,
     "skip_bots": True,
     "skip_forks": True,
@@ -715,7 +783,14 @@ def utc_stamp():
 
 
 def log(message):
-    print("%s %s" % (utc_stamp(), message), flush=True)
+    # Stamped inside the lock, not before taking it. LOG_LOCK's comment
+    # says why the printing has to be one write; the stamp has to be under
+    # the same hold for a duller reason. Built outside, a thread preempted
+    # between reading the clock and acquiring prints a line stamped earlier
+    # below one stamped later, and a log whose timestamps disagree with its
+    # own order cannot be sliced by time or sorted.
+    with LOG_LOCK:
+        print("%s %s" % (utc_stamp(), message), flush=True)
 
 
 def run(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
@@ -789,9 +864,9 @@ def app_jwt(app_id, key_path):
     # through run(): it needs bytes rather than text, because a signature is
     # not UTF-8. Signing is milliseconds of local CPU, so the bound is only
     # against the key sitting on a mount that stops answering, which parks
-    # openssl in the kernel and with it the one poll thread, while the
-    # watchdog reads a live pid as healthy. Same argument as DIFF_TIMEOUT,
-    # and the same number.
+    # openssl in the kernel and with it that repository's poll thread, while
+    # the watchdog reads a live pid as healthy. Same argument as
+    # DIFF_TIMEOUT, and the same number.
     try:
         signed = subprocess.run(
             ["openssl", "dgst", "-sha256", "-sign", key_path],
@@ -840,6 +915,13 @@ def installation_token(app, repo, cache, good_for=0):
     `good_for` is how many seconds of life the caller needs. A token with less
     than that left is replaced now rather than expiring mid-review and losing
     the comments the review was about to post.
+
+    The cache needs no lock, which is worth saying because `state` next door
+    does. It is keyed by repository and `parallel_repos` gives each
+    repository one thread, so no two threads ever read or write the same
+    entry. A lock here would be worse than nothing: the mint below is two
+    HTTPS calls, and holding one across them would stop the repository that
+    does not need it.
     """
     token, expires = cache.get(repo, (None, 0))
     if token and time.time() + good_for < expires:
@@ -895,6 +977,51 @@ def load_config(path):
         # A bare string passes a truthiness check and then iterates as
         # characters, which polls `-R S`, `-R o`, `-R u` once a minute forever.
         sys.exit("%s: repos must be a non-empty list of owner/name" % path)
+    # Every entry a string, and stored stripped, the way the model names
+    # further down are. Nothing checked this before: `repos: ["o/a", {}]`
+    # was accepted here and then raised TypeError out of main()'s own
+    # startup line, before a single repository was polled, which under
+    # launchd is a traceback and a restart every 30 seconds for ever. It
+    # has to come before the duplicate check below, which compares these
+    # entries and folds their case.
+    for nth, name in enumerate(config["repos"]):
+        if not isinstance(name, str) or not name.strip():
+            sys.exit("%s: repos must hold owner/name strings, not %r" % (
+                path, name))
+        config["repos"][nth] = name.strip()
+
+    # Named twice is not the same as reviewed twice. A duplicate is one
+    # wasted listing per pass while repositories are polled one at a time,
+    # and above that it puts two passes on the single checkout directory
+    # that repository is given: the second pass's `git reset --hard` moves
+    # the tree under the first, which then reports findings about a commit
+    # nobody asked about.
+    #
+    # Refused rather than quietly collapsed to one. An operator who wrote a
+    # repository twice meant something by it, and a daemon that silently
+    # polls a shorter list than the file names is the kind of disagreement
+    # nothing later would explain.
+    #
+    # Folded, because neither of the things that would collide cares about
+    # case. GitHub resolves a repository name without it, and the default
+    # macOS filesystem does too, so `Sour-Labs/vinegar` beside
+    # `sour-labs/vinegar` is two entries listing the same pull requests
+    # into one clone directory. An exact comparison missed the collision
+    # this check exists to catch.
+    folded = [name.casefold() for name in config["repos"]]
+    twice = []
+    for nth, name in enumerate(config["repos"]):
+        # Each offending spelling once. Recording every repeat printed
+        # "names o/r, o/r more than once" for three copies, which reads as
+        # two separate problems.
+        if folded.index(folded[nth]) != nth and name not in twice:
+            twice.append(name)
+    if twice:
+        sys.exit("%s: repos names %s more than once, matched without case. "
+                 "A repository is polled once per pass and has one "
+                 "checkout, so a second copy buys nothing at "
+                 "parallel_repos 1 and two passes over one working tree "
+                 "above it" % (path, ", ".join(twice)))
     if config["effort"] not in EFFORTS:
         sys.exit("%s: effort must be one of %s" % (path, ", ".join(EFFORTS)))
 
@@ -905,12 +1032,13 @@ def load_config(path):
     # reached, no give-up posted, and the pull requests silent. This is
     # the file operators actually edit, and load_state guards the same
     # class for the one they are only told to edit.
-    for name in ("poll_interval", "review_timeout", "max_changed_lines"):
+    units = {"max_changed_lines": "lines", "parallel_repos": "repositories"}
+    for name in ("poll_interval", "review_timeout", "max_changed_lines",
+                 "parallel_repos"):
         value = config[name]
         if not isinstance(value, int) or isinstance(value, bool):
             sys.exit("%s: %s must be a whole number of %s, not %r" % (
-                path, name,
-                "lines" if name == "max_changed_lines" else "seconds", value))
+                path, name, units.get(name, "seconds"), value))
         if value <= 0:
             sys.exit("%s: %s must be greater than zero" % (path, name))
 
@@ -981,10 +1109,11 @@ def load_config(path):
         # not been the whole of that since it was added: it runs after the
         # review and before the posting, on the same thread.
         sys.exit("%s: review_timeout must be at most %d seconds. One pull "
-                 "request holds the only poll thread for as long as its "
-                 "review runs, plus up to %ds for the severity pass after "
-                 "it, so nothing else is listed or reviewed meanwhile and "
-                 "the watchdog reads a parked daemon as a healthy one."
+                 "request holds its repository's poll thread for as long as "
+                 "its review runs, plus up to %ds for the severity pass "
+                 "after it, so nothing else in that repository is listed or "
+                 "reviewed meanwhile and the watchdog reads a parked daemon "
+                 "as a healthy one."
                  % (path, MAX_REVIEW_TIMEOUT, SEVERITY_TIMEOUT))
 
     # Said, not refused. The cache serves a token only while
@@ -1655,14 +1784,43 @@ def load_state():
 
 
 def save_state(state):
-    os.makedirs(HOME, exist_ok=True)
-    write_atomic(STATE_PATH, json.dumps(state, indent=2, sort_keys=True))
+    # Held here as well as by every caller that mutates first, and it is a
+    # reentrant lock so those callers nest into this one for free. A site
+    # that takes it only around the mutation would still let two saves race
+    # for `state.json.tmp`, which is the half of the hazard that loses the
+    # whole file rather than one entry.
+    with STATE_LOCK:
+        os.makedirs(HOME, exist_ok=True)
+        write_atomic(STATE_PATH, json.dumps(state, indent=2, sort_keys=True))
+
+
+def remember(state, key, entry, write=True):
+    """Put one pull request's entry in what Vinegar remembers, and save it.
+
+    Every site that changes that comes through here, so the lock two
+    repositories polled at once need is taken in one place rather than at
+    the ten call sites that would each have to. What matters is that
+    the change and the save happen under a single hold: the hazard
+    STATE_LOCK describes is another repository's save serialising this
+    entry while it is half written, and a lock taken separately for each
+    of the two allows exactly that.
+
+    `write` is False for the one caller that is deliberately not paying
+    for a file write. record_once() counts a repeated skip on every poll
+    and rewrites the file on every tenth of them, and turning that into a
+    write a minute per skipped pull request is what the counter exists to
+    avoid.
+    """
+    with STATE_LOCK:
+        state[key] = entry
+        if write:
+            save_state(state)
 
 
 def open_prs(repo, env):
     # Bounded because this is the poll loop's heartbeat, once a minute per
-    # repository, on the only thread there is. A socket that is open but
-    # never answers would otherwise park the daemon indefinitely, polling
+    # repository, on the one thread that repository gets. A socket that is
+    # open but never answers would otherwise park it indefinitely, polling
     # nothing, while the watchdog sees a live pid and calls it healthy.
     try:
         result = run(["gh", "pr", "list", "-R", repo, "--state", "open",
@@ -1847,9 +2005,9 @@ def checkout(repo, pr, env):
     # Bounded like the steps above it, and more so: this one goes to the
     # network, which is the call most likely to hang. A remote that
     # accepts and never answers — a dropped VPN, a proxy holding the
-    # connection — would park the one poll thread here for ever while the
-    # watchdog saw a live pid and called it healthy. Non-fatal either
-    # way: a stale base widens the diff, it does not lose the review.
+    # connection — would park that repository's poll thread here for ever
+    # while the watchdog saw a live pid and called it healthy. Non-fatal
+    # either way: a stale base widens the diff, it does not lose the review.
     try:
         result = run(["git", "fetch", "--quiet", "--force", "origin",
                       "%s:%s" % (base, base)], cwd=path, env=env,
@@ -3242,7 +3400,7 @@ def review_body(label, pr, config, inline, general, raw=None,
         #
         # Measured by arithmetic rather than by re-joining the body on
         # every pop: thirty long findings trimmed twenty times copied
-        # megabytes of string on the one poll thread to learn a length.
+        # megabytes of string on a poll thread to learn a length.
         fixed = len("\n".join(lines + ["", heading, ""]))
         running = sum(len(bullet) + 1 for bullet in bullets)
         dropped = 0
@@ -3278,9 +3436,9 @@ def check_api(label, repo, path, method, payload, env):
     worse pull request, not a broken one.
 
     Bounded on POST_TIMEOUT, which is the same shape of call for the same
-    reason: one request on the single poll thread, with a finished review
-    waiting behind it, and a socket that never answers is not an error
-    anyone raises.
+    reason: one request on the repository's poll thread, with a finished
+    review waiting behind it, and a socket that never answers is not an
+    error anyone raises.
     """
     # One condition for both, because they are one decision. Written as
     # `is not None` for the flag and truthiness for the body, a caller
@@ -4247,8 +4405,7 @@ def repost(key, repo, pr, config, state, tokens, done, marker, sha):
     # reason.
     tries = done.get("post_tries", 0) + 1
     waived = done.get("post_waivers", 0)
-    state[key] = dict(done, post_tries=tries)
-    save_state(state)
+    remember(state, key, dict(done, post_tries=tries))
 
     at = dict(pr, headRefOid=sha or pr["headRefOid"])
     saved = transcript_path(repo, at)
@@ -4384,12 +4541,11 @@ def repost(key, repo, pr, config, state, tokens, done, marker, sha):
             # on the next line. Counted through the same helper as every
             # other site so the rule stays in one place.
             entry.update(rounds_done(True, done))
-        state[key] = entry
     else:
-        state[key] = dict(done, post_tries=tries)
+        entry = dict(done, post_tries=tries)
         if waived:
-            state[key]["post_waivers"] = waived
-    save_state(state)
+            entry["post_waivers"] = waived
+    remember(state, key, entry)
 
 
 def partial_note(cause):
@@ -5049,23 +5205,195 @@ def sweep_checks(config, tokens):
                             "review, the next poll starts one.")
 
 
-def poll_once(config, state, tokens):
-    for repo in config["repos"]:
+def poll_repo(repo, config, state, tokens):
+    """One repository's whole pass: list it, then work through what is open.
+
+    Its pull requests one at a time, always. Two reviews of one repository
+    would share the one checkout directory checkout() gives it, and the
+    second one's `git reset --hard` would move the tree under the first,
+    which then reports findings about a commit nobody asked about.
+    `parallel_repos` buys concurrency between repositories and not inside
+    one.
+
+    So a repository waits out the slowest repository's *whole pass*, not
+    one review: the fan-out is per pass, and main() sleeps for
+    `poll_interval` only once every worker has finished. Five open pull
+    requests on one repository, twenty minutes each, is a hundred minutes
+    before the other repository is listed again. Worth knowing when sizing
+    `poll_interval`, and the reason giving each repository its own loop
+    would be a different change rather than a bigger number.
+    """
+    try:
+        prs = open_prs(repo, github_env(config, repo, tokens,
+                                        good_for=LISTING_GRACE))
+    except Exception as err:
+        log("%s: cannot list pull requests: %s" % (repo, err))
+        return
+    for pr in prs:
+        # Read here, so a stop reaches this pass without it first working
+        # through every pull request the listing returned. STOPPING's own
+        # comment says why between pull requests is the right place.
+        if STOPPING.is_set():
+            return
         try:
-            prs = open_prs(repo, github_env(config, repo, tokens,
-                                            good_for=LISTING_GRACE))
+            handle_pr(repo, pr, config, state, tokens)
         except Exception as err:
-            log("%s: cannot list pull requests: %s" % (repo, err))
-            continue
-        for pr in prs:
+            # One bad pull request must not stop the daemon. Under launchd
+            # a crash restarts the process every 30 seconds and polls
+            # nothing in between.
+            log("%s#%s: unhandled error: %s" % (
+                repo, pr.get("number", "?"), err))
+
+
+def poll_width(config):
+    """How many repositories this pass will really run at once.
+
+    Both poll_once and the line main() prints at startup need this, and as
+    two expressions they disagreed: the startup line announced
+    `parallel_repos` while the pass ran at the clamped number, so a
+    one-repository install told to run four at a time said so and then
+    polled serially. That line exists to confirm the config took, which is
+    the one job it cannot do while it names a width nothing uses.
+    """
+    return min(config["parallel_repos"], len(config["repos"]))
+
+
+def poll_once(config, state, tokens):
+    """Every configured repository, poll_width() of them at a time."""
+    # One repository is the default and keeps the whole pass on the thread
+    # main() is already on, rather than handing it to a worker. That is not
+    # only tidiness: a foreground run is stopped with Ctrl-C, and a
+    # KeyboardInterrupt raised on the main thread unwinds a review that
+    # thread is running while a worker's review carries on. Every install
+    # that has not asked for this keeps that behaviour exactly.
+    width = poll_width(config)
+    if width <= 1:
+        for repo in config["repos"]:
+            poll_repo(repo, config, state, tokens)
+        return
+
+    # A queue rather than a thread each, because `parallel_repos` can be
+    # smaller than the number of repositories, and the ones over the width
+    # have to wait for any worker rather than for a particular one.
+    todo = queue.Queue()
+    for repo in config["repos"]:
+        todo.put(repo)
+    fell_over = []
+
+    def passes():
+        while not STOPPING.is_set():
             try:
-                handle_pr(repo, pr, config, state, tokens)
-            except Exception as err:
-                # One bad pull request must not stop the daemon. Under launchd
-                # a crash restarts the process every 30 seconds and polls
-                # nothing in between.
-                log("%s#%s: unhandled error: %s" % (
-                    repo, pr.get("number", "?"), err))
+                repo = todo.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                poll_repo(repo, config, state, tokens)
+            except BaseException as err:
+                # Kept rather than raised. A raise here ends one worker
+                # silently, and the repositories still in the queue are
+                # then shared out among the others as if nothing had
+                # happened.
+                #
+                # BaseException, not Exception. This replaced a pool, and
+                # a pool's work item catches BaseException and hands it
+                # back on result(), so the narrower catch quietly lost a
+                # class of failure the old shape reported. It is reachable:
+                # review() builds the reviewer's settings through
+                # load_settings(), which sys.exits on a settings file it
+                # cannot use and is re-read on every review precisely so a
+                # mid-run edit is caught. That SystemExit killed one worker
+                # with `fell_over` still empty, so the pass reported every
+                # repository clean and one of them was never reviewed
+                # again, with nothing in the log. KeyboardInterrupt cannot
+                # arrive here, because signals reach the main thread only.
+                fell_over.append((repo, err))
+
+    # Not daemons, and joined here rather than by the interpreter. Both
+    # halves matter and each was learned from a failure.
+    #
+    # A ThreadPoolExecutor's shutdown ran at interpreter exit, which is
+    # after main() had logged "stopped" and released the lock: measured
+    # with three repositories and two workers, the third repository's pass
+    # *started* after the daemon said it had gone, with the lock free for a
+    # `--pr` run to take and reset a tree a live review was reading. Making
+    # the workers daemons ended that by having the interpreter kill them
+    # instead, which was worse in a quieter way: a daemon thread killed at
+    # finalization runs no finally block, so handle_pr never closed its
+    # checks entry and every in-flight pull request kept a Vinegar check
+    # spinning for ever, blocking a merge wherever that check is required.
+    #
+    # Joining inside the interrupt handler keeps both. The lock is still
+    # held, because main() has not returned from here; the queue is
+    # abandoned, so no repository that had not started starts now; and the
+    # passes still running unwind on their own and close what they opened.
+    workers = [threading.Thread(target=passes,
+                                name=POLL_WORKER + str(nth))
+               for nth in range(width)]
+
+    # No signal handling here at all, deliberately, and the paragraph is
+    # worth reading before adding some back. Four attempts at making a
+    # stop correct by guarding it were each reopened by the next
+    # interrupt: a pool joined at interpreter exit, daemon threads that
+    # skipped handle_pr's finally, a refusal that could not cover the log
+    # calls around it, and a deafness installed a few hundred bytecodes
+    # too late. Every one of them ended the same way, with main()'s
+    # finally freeing the lock while a worker was still reading its
+    # checkout.
+    #
+    # So the lock is what changed, not the signal handling. release_lock()
+    # declines while a pass is alive, and the kernel drops the lock when
+    # the process dies, which cannot happen first because these threads
+    # are not daemons. That holds however the interrupt arrives and
+    # whatever it interrupts, so nothing here has to be timed correctly.
+    #
+    # What is left is best effort and is allowed to be. An interrupt that
+    # lands before STOPPING is set costs the early stop: the passes drain
+    # the queue and the poll is paid for in full. That is a bill, not a
+    # review of the wrong commit, and it is the only thing at stake now.
+    #
+    # And the one case this cannot reach is now caught elsewhere, which is
+    # what changed while this branch sat closed. A second interrupt
+    # arriving during interpreter shutdown kills these threads inside
+    # threading._shutdown()'s wait, which is interruptible and does not
+    # retry, so their `finally` never runs and every pull request in
+    # flight keeps a check run spinning. That was the last thing standing
+    # between this design and being good enough, and it is not a hole to
+    # be closed here: sweep_checks() closes those runs on the next start,
+    # deliberately, and PR #31 was built first so that this file would not
+    # have to get an interrupt perfectly right. Do not add signal handling
+    # back to buy what the sweep already pays for; four attempts at that
+    # are recorded above.
+    try:
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
+    except BaseException:
+        # One try over both loops. Split in two, a RuntimeError out of
+        # start() -- thread creation refused under an RLIMIT_NPROC ceiling
+        # -- left STOPPING clear and the workers that had started draining
+        # the whole queue. Measured: one failed start, and the surviving
+        # worker went on to review every remaining repository.
+        STOPPING.set()
+        # Said so the wait that follows is not read as a hang. The process
+        # does not exit until the passes finish, and the lock is theirs
+        # until it does.
+        log("stopping: the passes already running keep the lock until they "
+            "finish; kill the process to force it")
+        raise
+
+    # Every pass that fell over is named, and then the first is raised.
+    # poll_repo catches the two failures it names and no others, so
+    # anything reaching here ended the process before this existed, which
+    # under launchd is a restart and a line in the error log rather than a
+    # repository that quietly stops being reviewed. Reading one result at a
+    # time raised on the first and never looked at the rest, so a second
+    # repository failing in the same round was discarded and the traceback
+    # named one repository where two had failed.
+    for repo, err in fell_over:
+        log("%s: its whole pass fell over: %s" % (repo, err))
+    if fell_over:
+        raise fell_over[0][1]
 
 
 def give_up(key, repo, pr, config, attempts, tokens, path=None, env=None,
@@ -5152,9 +5480,8 @@ def spend_announce(key, config, state, head, attempts, tries, said):
         # told anything is the silence the README does not allow.
         waived = state.get(key, {}).get("announce_waivers", 0)
         if waive(key, "the give-up", waived):
-            state[key] = dict(state.get(key, {}),
-                              announce_waivers=waived + 1)
-            save_state(state)
+            remember(state, key, dict(state.get(key, {}),
+                                      announce_waivers=waived + 1))
             return
         said = False
     tries += 1
@@ -5168,8 +5495,7 @@ def spend_announce(key, config, state, head, attempts, tries, said):
                         **dict(carry_forward(was),
                                **reviewed_through(False, head, was),
                                **rounds_done(False, was)))
-    state[key] = entry
-    save_state(state)
+    remember(state, key, entry)
 
 
 def record_once(state, key, done, head, outcome, reason):
@@ -5191,7 +5517,12 @@ def record_once(state, key, done, head, outcome, reason):
         # again, and one line from weeks ago is indistinguishable from
         # having judged it. Tenfold intervals keep that rare.
         if seen not in (10, 100, 1000) and seen % 10000:
-            state[key] = dict(done, seen=seen)
+            # Through remember() although it saves nothing, because the
+            # lock is what it is here for. This is an insertion for a pull
+            # request whose entry may be new, and an insertion is what
+            # makes another repository's save raise part way through the
+            # file.
+            remember(state, key, dict(done, seen=seen), write=False)
             return
         log("%s: still true after %d polls: %s" % (key, seen, reason))
     else:
@@ -5202,12 +5533,12 @@ def record_once(state, key, done, head, outcome, reason):
     # not be what forgets where the last real review got to: the pull
     # request would then be read whole on the next pass that does run,
     # silently, with only the bill to show for it.
-    state[key] = state_entry(head, outcome, kept.get("attempts", 0), reason,
-                             **dict(carry_forward(kept),
-                                    **reviewed_through(False, head, done),
-                                    **rounds_done(False, done)))
-    state[key]["seen"] = seen
-    save_state(state)
+    entry = state_entry(head, outcome, kept.get("attempts", 0), reason,
+                        **dict(carry_forward(kept),
+                               **reviewed_through(False, head, done),
+                               **rounds_done(False, done)))
+    entry["seen"] = seen
+    remember(state, key, entry)
 
 
 def handle_pr(repo, pr, config, state, tokens):
@@ -5274,9 +5605,9 @@ def handle_pr(repo, pr, config, state, tokens):
             # lists a directory that only grows to learn that a file it
             # deleted is still gone.
             if done.get("unposted"):
-                state[key] = dict(done)
-                state[key].pop("unposted", None)
-                save_state(state)
+                cleared = dict(done)
+                cleared.pop("unposted", None)
+                remember(state, key, cleared)
         elif marker and done.get("post_tries", 0) < MAX_ATTEMPTS:
             repost(key, repo, pr, config, state, tokens, done, marker,
                    saved_sha)
@@ -5431,12 +5762,11 @@ def handle_pr(repo, pr, config, state, tokens):
     # a head that had exhausted its three sends made every later head's
     # review unpostable the moment it was written.
     kept = done if done.get("sha") == head else {}
-    state[key] = state_entry(head, FAILED, attempts,
-                             **dict(carry_forward(kept), post_tries=0,
-                                    waivers=0,
-                                    **reviewed_through(False, head, done),
-                                    **rounds_done(False, done)))
-    save_state(state)
+    remember(state, key, state_entry(
+        head, FAILED, attempts,
+        **dict(carry_forward(kept), post_tries=0, waivers=0,
+               **reviewed_through(False, head, done),
+               **rounds_done(False, done))))
 
     # Worked out before the review, because it is what the review is told,
     # and after the checkout, because both probes read this clone.
@@ -5462,7 +5792,11 @@ def handle_pr(repo, pr, config, state, tokens):
     # line that finishes the indicator cannot be skipped. The end of this
     # function is reachable only when nothing goes wrong: save_state
     # below raises on a full disk, a failure this function already treats
-    # as real, and Ctrl-C is how the README says to stop the daemon.
+    # as real, and a foreground run is stopped with Ctrl-C. Under launchd
+    # there is no interrupt at all: `bootout` is a SIGTERM that Python
+    # installs no handler for, so the process dies here without running
+    # this finally or any other, which is the case the pre-review marker
+    # on disk exists for rather than this try.
     # KeyboardInterrupt is not an Exception, so it walks past every
     # handler here untouched. Either way the pull request was left
     # carrying a Vinegar check that spins for ever, and a stuck run
@@ -5517,13 +5851,12 @@ def handle_pr(repo, pr, config, state, tokens):
         # what review() now answers: finish() writes the marker only when
         # the transcript write succeeded, so a run that could neither save
         # nor post leaves none and was counted as a round nobody saw.
-        state[key] = state_entry(
+        remember(state, key, state_entry(
             head, outcome, attempts,
             **dict(carry_forward(kept), post_tries=0, waivers=0,
                    unposted=os.path.exists(unposted_path(repo, pr)),
                    **reviewed_through(covered, head, done),
-                   **rounds_done(reached, done)))
-        save_state(state)
+                   **rounds_done(reached, done))))
 
         if outcome == FAILED and attempts >= MAX_ATTEMPTS:
             # Marked only if it was said, so the restart path knows.
@@ -5648,8 +5981,40 @@ def locked_by():
 
 
 def release_lock():
-    """Drop the lock. Exiting would do it too; this just makes it explicit."""
+    """Drop the lock, unless a pass is still running under it.
+
+    Exiting would drop it too, and that is now the point rather than an
+    aside. The kernel releases an flock when the process dies, and the
+    process cannot die before the poll workers finish because they are
+    not daemons, so "held for as long as a pass is running" is true by
+    construction. Releasing here while one is alive is the only way it
+    ever comes free early.
+
+    Which is how every stop on the parallel path went wrong, four times
+    over: whatever escaped poll_once -- a second Ctrl-C, an interrupt in a
+    log call, a thread that could not be started -- main()'s finally freed
+    the lock, and a `--pr` run could then take it and `git reset --hard` a
+    tree a live review was reading, which reports findings about a commit
+    nobody asked about. Guarding each of those in turn reopened the next.
+    This declines to release instead, so none of them has to be caught.
+
+    threading.enumerate() rather than is_alive(), and the difference is
+    the case that is hardest to see: a thread whose start() was
+    interrupted is running and answers False to is_alive() until it sets
+    its started flag. enumerate() lists it anyway, because start() puts it
+    in threading's limbo before the OS thread exists and enumerate()
+    reports limbo as well as the active set.
+
+    Declining rather than waiting: this runs on the way out, and the
+    interpreter is about to wait for those threads on its own.
+    """
     global _lock_handle
+    running = [thread for thread in threading.enumerate()
+               if thread.name.startswith(POLL_WORKER)]
+    if running:
+        log("%d pass(es) still finishing, so the lock stays until this "
+            "process exits" % len(running))
+        return
     if _lock_handle is not None:
         os.close(_lock_handle)
         _lock_handle = None
@@ -5880,23 +6245,35 @@ def main():
                 # forward, a spent post_tries met the new marker at 3 of 3,
                 # so neither the repost branch nor the forget branch fired
                 # and the review sat on disk for ever.
-                state[pr_key(repo, pr)] = state_entry(
+                remember(state, pr_key(repo, pr), state_entry(
                     pr["headRefOid"], outcome, kept.get("attempts", 0) + 1,
                     **dict(carry_forward(kept), post_tries=0, waivers=0,
                            unposted=bool(
                                unposted_for(repo, pr, scan=False)[0]),
                            **reviewed_through(covered, pr["headRefOid"],
                                               was),
-                           **rounds_done(reached, was)))
-                save_state(state)
+                           **rounds_done(reached, was))))
                 if state[pr_key(repo, pr)].get("unposted"):
                     log("%s: the review is saved to be posted on a later "
                         "poll" % args.pr)
             return
 
         state = load_state()
-        log("watching %s every %ds%s" % (
+        # The width is said only when it is not one, for the same reason
+        # the App is: this line is what an operator reads to confirm the
+        # config they just edited took, and a daemon reviewing two
+        # repositories at once is the fact about this run that most
+        # changes what the log below it will look like.
+        #
+        # The width the pass will use, not the number in the file. They
+        # differ whenever `parallel_repos` is larger than `repos`, and this
+        # line said "4 at a time" over a single-repository install that
+        # then polled serially: the one reading that could not be more
+        # wrong on the one question it is printed to answer.
+        width = poll_width(config)
+        log("watching %s every %ds%s%s" % (
             ", ".join(config["repos"]), config["poll_interval"],
+            ", %d at a time" % width if width > 1 else "",
             " as the GitHub App" if config.get("github_app") else ""))
         # After the line that says this Vinegar is up, because the sweep
         # logs per pull request and those lines are about the last run
