@@ -47,7 +47,7 @@ review, rather than letting comments trickle out while the reviewer works. See
 new PR (or a new head commit)
         │
         ▼
-   triage: a cheap model reads the diff  ──▶  posts a sticky comment on the PR
+   triage: a cheap model reads the diff  ──▶  posts a comment on the PR
         │
         ├─ skip    nothing here needs a reviewer
         ├─ light   claude -p '/code-review <n>'   (low/medium effort)
@@ -858,8 +858,8 @@ costs a little budget and a missed bug costs an incident.
 
 ## The triage note
 
-Triage publishes what it decided, as a single comment on the PR that is updated
-in place on later pushes:
+Triage publishes what it decided as a comment on the PR, one for every pass it
+runs:
 
 > **Vinegar** · triage of `a1b2c3d`
 >
@@ -869,23 +869,30 @@ in place on later pushes:
 > Difficulty: moderate · Risk: high
 > Reviewing at high effort: touches session handling and a database migration.
 
-Four things about that note:
+Five things about that note:
 
 - **It is a comment, never an edit to the PR description.** The description
   exists to hold the author's intent, and a machine rewriting it can damage
   text nobody backed up.
 - **It posts before the review starts.** Triage takes seconds and a review
-  takes minutes; silence in between looks like a broken daemon.
+  takes minutes; silence in between looks like a broken daemon. It is also what
+  makes the effort level readable while the review is still running, rather than
+  only in the checks list.
 - **It is mandatory on a skip.** On a skipped PR it is the only thing Vinegar
   will ever post, so without it silence cannot be told apart from a crash.
+- **Every pass posts a new comment rather than rewriting the last one.** A note
+  is about one commit and names it. Rewriting it on the next push would erase
+  what triage decided about code that has since changed, and hide the thing the
+  accumulation is for: seeing that the difficulty, the risk or the effort level
+  moved between pushes.
 - **Difficulty and risk are separate labels**, because risk is what drives
   routing. A two-line change to payment rounding is trivial and dangerous at the
   same time.
 
 The summary describes what the diff touches. It never claims the change is
 correct, safe, or complete: a small model will occasionally be confidently
-wrong, and a wrong summary pinned to the top of a PR is worse than none, because
-it misleads a human skimming and can anchor the reviewer that runs next.
+wrong, and a wrong summary sitting on a PR is worse than none, because it
+misleads a human skimming and can anchor the reviewer that runs next.
 
 ## The review
 
@@ -1161,14 +1168,13 @@ going quiet on the most-reworked code in the repository is the worse failure.
 The round is in the log line for every narrowed review, which is where a runaway
 shows up before the bill does.
 
-**Each review posts its own comment rather than updating one in place**, unlike
-the triage note above. The two look like the same shape and are not. A review
-comment is about one commit, names it, and sits above that pass's inline
-findings; rewriting it on the next push would erase what the last pass said
-about code that has since been rewritten, and leave its inline comments with
-nothing introducing them. The accumulation is small in practice, because a
-review only runs when the head has moved and later ones are usually "No
-findings."
+**Each review posts its own comment rather than updating one in place**, the
+same shape as the triage note above and for the same reason. A review comment is
+about one commit, names it, and sits above that pass's inline findings;
+rewriting it on the next push would erase what the last pass said about code
+that has since been rewritten, and leave its inline comments with nothing
+introducing them. The accumulation is small in practice, because a review only
+runs when the head has moved and later ones are usually "No findings."
 
 ## The checks list
 
