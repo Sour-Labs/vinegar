@@ -1103,9 +1103,76 @@ call that was refused. Without a configured GitHub App there is no entry at
 all, because no user token can own a check run.
 
 A retried review adds a second entry rather than reusing the first. An entry a
-killed review left running *is* reused, so a daemon stopped mid-review does not
-leave a check spinning for ever, but a completed one cannot be reopened:
+killed review left running *is* reused, but a completed one cannot be reopened:
 measured, that PATCH returns 200 and changes nothing.
+
+### Closing what a stopped Vinegar left running
+
+`launchctl bootout` sends SIGTERM and Vinegar installs no handler, so a review
+in flight dies where it stands and its entry keeps saying a review is running.
+Reuse repairs most of that by itself: the pull request is recorded failed at that
+head, the next poll reviews it again, and the same entry is picked up and closed.
+What reuse cannot do is close the entry *now* rather than at the end of the next
+review, which is nine to twenty-two minutes later. Until then a required check is
+stuck, which is the one thing `neutral` exists to prevent. That window is most of
+what this closes. The one case reuse never reaches at all is a pull request newly
+skipped before the retry *and still at the head the killed review ran on*: a
+draft toggled, because toggling one moves nothing. A branch grown past
+`max_changed_lines` reads like the same case and is not, because growing it
+pushes commits and the head moves away from the stranded entry, into the blind
+spot below.
+
+**So on startup Vinegar closes every check run of its own that it finds still
+running**, before its first poll:
+
+> **Vinegar** · The review was interrupted
+
+The lock is what makes that safe to do. `main()` holds it before the sweep runs,
+so no other Vinegar of this deployment is polling, and an entry still marked
+running is one an abandoned process left rather than one being written to. Only
+its own App's runs are touched.
+
+**Only the head commits of open pull requests**, and both halves of that are
+limits worth stating. An entry stranded at a commit the branch has moved past is
+left alone: check runs are read per commit, no endpoint lists a repository's, and
+finding those means walking every commit of every pull request. An entry on a
+pull request since closed or merged is left alone too, because the listing asks
+for open ones. That second one reads worse than it is. The harm being repaired is
+a stuck required check blocking a merge, and nothing blocks a merge that has
+already happened or been abandoned.
+
+It closes entries even at heads a retry would have reused. Sparing those would
+keep one tidy entry per pull request and give back the window this exists to
+close, so they are closed instead, and the cost of that is what you see after a
+restart: a neutral "interrupted" entry above a fresh running one. That is the
+same honest history a retried review already leaves.
+
+A third limit, and the one an operator meets first: **a repository that answers
+nothing at all stops being asked after one pull request.** That is the `checks`
+permission granted on the App and not yet accepted on the installation, which
+logs a paragraph on every call. Unbounded that is one paragraph per open pull
+request per start, every thirty seconds under launchd, burying the line saying
+which Vinegar is up. Once anything has answered, a later failure is transient by
+demonstration, so only that pull request is skipped and the rest are still swept.
+
+**Each entry records which Vinegar made it**, in the check run's `external_id`,
+and only entries carrying this deployment's own are adopted or closed. That is
+what makes running two instances on one machine safe. Both authenticate as the
+same App, so the App and the name together cannot tell their entries apart, and
+the lock cannot either because each instance holds its own under its own
+`VINEGAR_HOME`. Without the stamp, the test instance from the recipe above closes
+the production daemon's live entry and adopts entries it is still writing to.
+
+An entry carrying no `external_id` is treated as this deployment's, because that
+is every entry written before the stamp existed, and refusing them would strand
+whatever was open at the moment of the upgrade: never adopted, never swept.
+
+`--pr` still never sweeps, because a hand review of one pull request is not a
+statement about every other one. `--once` does sweep: it is the same daemon doing
+one pass, and the stamp, not the flag, is what decides whose entries it may
+touch. What is still not guarded is the other direction. A daemon starting during
+a hand run closes that run's entry, since both carry the same stamp, and the hand
+run writes its own conclusion when it finishes.
 
 ## Severity
 

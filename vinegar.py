@@ -580,6 +580,24 @@ TRIAGE_SETTINGS = {
 # tools.
 CHECK_NAME = "Vinegar"
 
+# Which Vinegar made a check run, written into it as `external_id` and
+# read back before one is adopted or closed.
+#
+# HOME is the identity because HOME is what separates two instances on one
+# machine: its own lock, its own state, its own checkouts. What it buys is
+# the question `--once` could not express. Both instances authenticate as
+# the same App, so App and name together cannot tell their runs apart, and
+# the lock cannot either because each holds its own. Without this a second
+# instance closes the production daemon's live indicator, and adopts a run
+# that daemon is still writing to.
+#
+# Not a secret. `external_id` is returned by the API to anyone who can
+# read the check run, so this is a path on the machine going somewhere
+# public. It is already the shape of thing the log prints, and there is no
+# credential in it, but it is the reason not to reach for something like
+# the App key here.
+DEPLOYMENT = HOME
+
 # How a finished review reports itself in that list, and it is never
 # `failure`.
 #
@@ -3300,6 +3318,65 @@ def check_api(label, repo, path, method, payload, env):
         return {}
 
 
+def running_checks(label, repo, sha, config, env):
+    """The ids of every check run this App has spinning at `sha`.
+
+    Two callers ask the same question for opposite reasons, which is why
+    it is one function. open_check() asks so that a retry reuses the
+    indicator an earlier attempt left rather than adding a second one;
+    sweep_checks() asks so that a startup closes the ones nobody is coming
+    back for. Written out twice they could disagree about which runs are
+    Vinegar's, and the way that shows is a sweep closing another App's
+    check run.
+
+    `.get("id")` as well as the app, not just membership. A reply with no
+    id, from a truncated body or one check_api answered as `{}`, would
+    otherwise build a handle whose every close sends
+    `PATCH check-runs/None`. open_check()'s create branch refuses exactly
+    that, and this was the one place the guard was missing.
+
+    Compared as strings, because app_jwt() already establishes that this
+    value need not be an int: it signs with `str(app_id)`, and load_config
+    type-checks only the three numeric settings. A quoted
+    `"app_id": "123456"` therefore mints tokens perfectly and matched
+    nothing here, so reuse silently stopped and the spinning duplicates it
+    exists to prevent came back with nothing logged.
+
+    The App is not enough on its own, and `DEPLOYMENT` is the rest of it.
+    Two Vinegars on one machine under different VINEGAR_HOMEs
+    authenticate as the same App, so their runs are indistinguishable on
+    the wire, and both of the things this function serves are wrong across
+    that line: a sweep closing the other one's live indicator, and a reuse
+    adopting a run another process is still writing to. The lock cannot
+    separate them, because it is per home. This can, because open_check()
+    stamps the home that made the run.
+
+    A run carrying no `external_id` at all is treated as this
+    deployment's. Those are the ones written before the stamp existed, and
+    refusing them would leave every check run open at the moment of the
+    upgrade stranded for good: never adopted, never swept, spinning on
+    a pull request nothing will come back to. Droppable once no such run
+    can still be open, the way LIFTED_MARKS is.
+    """
+    said = check_api(
+        label, repo,
+        "commits/%s/check-runs?check_name=%s&status=in_progress"
+        % (sha, CHECK_NAME), "GET", None, env)
+    # None for a call that did not answer, an empty list for one that
+    # answered nothing. open_check() cannot tell them apart and does not
+    # need to, because both mean "no run to adopt" and it creates one
+    # either way. sweep_checks() does: a repository whose reads are all
+    # failing is one it stops asking about, and read as "no runs" that is
+    # the check_api permission paragraph logged once per open pull
+    # request on every start.
+    if said is None:
+        return None
+    return [was.get("id") for was in said.get("check_runs") or []
+            if str((was.get("app") or {}).get("id"))
+            == str(config["github_app"].get("app_id")) and was.get("id")
+            and str(was.get("external_id") or DEPLOYMENT) == DEPLOYMENT]
+
+
 def open_check(label, repo, pr, config, env, blockers=False):
     """Say in the pull request's checks that a review is running.
 
@@ -3332,28 +3409,11 @@ def open_check(label, repo, pr, config, env, blockers=False):
     # review fails twice before succeeding lists three. That is honest
     # history rather than a defect, and trying to collapse it is the
     # thing that silently does not work.
-    open_already = check_api(
-        label, repo,
-        "commits/%s/check-runs?check_name=%s&status=in_progress"
-        % (sha, CHECK_NAME), "GET", None, env)
-    # `.get("id")` as well as the app, not just membership. A reply with
-    # no id, from a truncated body or one check_api answered as `{}`,
-    # would otherwise build a handle whose every close sends
-    # `PATCH check-runs/None`. The create branch below refuses exactly
-    # that, and this branch was the one place the guard was missing.
-    # Compared as strings, because app_jwt() already establishes that
-    # this value need not be an int: it signs with `str(app_id)`, and
-    # load_config type-checks only the three numeric settings. A quoted
-    # `"app_id": "123456"` therefore mints tokens perfectly and matched
-    # nothing here, so reuse silently stopped and the spinning duplicates
-    # it exists to prevent came back with nothing logged.
-    mine = [was for was in (open_already or {}).get("check_runs") or []
-            if str((was.get("app") or {}).get("id"))
-            == str(config["github_app"].get("app_id")) and was.get("id")]
+    mine = running_checks(label, repo, sha, config, env)
     if mine:
         log("%s: reusing the check run an earlier attempt left running"
             % label)
-        return {"repo": repo, "id": mine[0].get("id"), "closed": False}
+        return {"repo": repo, "id": mine[0], "closed": False}
 
     # The narrowing is in the title as well as in the comment, because the
     # checks list is the half of this an agent reads. `gh pr checks`
@@ -3362,6 +3422,11 @@ def open_check(label, repo, pr, config, env, blockers=False):
     # reach anything polling the check.
     asked = {"name": CHECK_NAME, "head_sha": sha, "status": "in_progress",
              "started_at": utc_stamp(),
+             # Which Vinegar this run belongs to. DEPLOYMENT says why it
+             # has to be written at creation: a run with no stamp is
+             # readable by every instance as its own, and that is the
+             # state every run made before this existed is in.
+             "external_id": DEPLOYMENT,
              "output": {
                  "title": "Reviewing at %s effort%s" % (
                      config["effort"], ", blockers only" if blockers else ""),
@@ -4835,6 +4900,155 @@ def review(path, repo, pr, config, env, tokens, resent=False, check=None,
     return DONE, bool(covered), bool(reached)
 
 
+def sweep_checks(config, tokens):
+    """Close the indicators an earlier process left spinning.
+
+    A check run says a review is running. Nothing here can make that true
+    again, so what this fixes is the lie: after a kill there is no review,
+    and a run left `in_progress` blocks a merge anywhere Vinegar is a
+    required check, which is the outcome CHECK_CONCLUSION exists to make
+    impossible.
+
+    The lock is the whole argument for closing them. main() holds it
+    before this runs, so no other Vinegar of this deployment is polling,
+    so an `in_progress` run is one an abandoned process left behind rather
+    than one being written to. Nothing else here has to be inferred.
+
+    What strands one is a kill with no `finally`: `launchctl bootout`
+    sends SIGTERM and this program installs no handler, so an in-flight
+    review dies where it stands. On the serial code that mostly heals
+    itself on the next poll, because the entry is FAILED at that head and
+    open_check() reuses the spinner.
+
+    So what this delivers is mostly the *bound*, and the claim should not
+    be made larger than that. Reuse leaves the run spinning through the
+    whole next review, nine to twenty-two minutes, where this closes it
+    seconds after the daemon comes back; a required check is stuck for
+    that whole window otherwise. The one case reuse never reaches at all
+    is a pull request newly skipped before the retry and still sitting at
+    the head the killed review ran on: a draft toggled is the example,
+    because toggling one moves nothing. Growing a branch past
+    `max_changed_lines` is *not* an example, however well it reads as
+    one, because growing it pushes commits and the head moves away from
+    the stranded run, into the blind spot the next paragraph describes.
+    That bound is what lets a parallel fan-out choose the simplest stop
+    it can rather than a perfect one, which is the question six review
+    rounds of PR #29 never settled.
+
+    Open pull requests only, and their heads only. Two limits, and both
+    are real rather than tidy:
+
+    A run stranded at a commit the head has moved past is not found.
+    Check runs are read per commit and no endpoint lists a repository's,
+    so finding those means walking every commit of every pull request.
+    The pull request shows its head commit's checks and nothing shows the
+    others, so what is left is invisible.
+
+    A run stranded on a pull request since closed or merged is not found
+    either, because open_prs() asks for open ones. That is not the loss
+    it first reads as: the harm being repaired is a stuck required check
+    blocking a merge, and nothing blocks a merge that has already
+    happened or been abandoned. Do not widen the listing to `--state all`
+    to reach them; that is every pull request the repository has ever had,
+    for a check nobody is waiting on.
+
+    Closed rather than spared, including at heads a retry would reuse.
+    Sparing them keeps one tidy entry per pull request and costs the
+    window this exists to bound, and it would mean deciding here whether
+    handle_pr is going to review something, which is a decision written
+    once already. The cost taken instead is a pull request listing a
+    neutral entry above a fresh running one, which open_check() argues at
+    length is honest history rather than a defect.
+
+    Every failure swallowed, per repository and per pull request, for
+    check_api()'s reason: an indicator is not worth a poll. A repository
+    whose listing fails is swept on the next start, and the daemon must
+    reach its loop either way.
+
+    The third limit, and the one an operator meets first: a repository
+    that answers nothing at all stops being asked after one pull request.
+    That is the `checks` permission granted on the App and not yet
+    accepted on the installation, which check_api() logs a paragraph for
+    every time. Once anything has answered, a later failure is transient
+    by demonstration and only that pull request is skipped.
+    """
+    # A dry run puts nothing on a pull request, so it has nothing to
+    # close; without an App these runs belong to no one Vinegar can PATCH.
+    # open_check() refuses on the same pair, and a sweep that ran where
+    # the opener cannot would be closing another App's check runs.
+    if not config["comment"] or not config.get("github_app"):
+        return
+    for repo in config["repos"]:
+        try:
+            env = github_env(config, repo, tokens, good_for=LISTING_GRACE)
+            prs = open_prs(repo, env)
+        except Exception as err:
+            log("%s: cannot list pull requests to close old checks: %s"
+                % (repo, err))
+            continue
+        answered = False
+        for pr in prs:
+            # Inside the try, not above it. `pr_key` subscripts `number`,
+            # and open_prs only establishes that each entry is a dict, so
+            # a listing answering 0 with error objects raised KeyError
+            # from here, past the per-repository handler already exited
+            # and out of sweep_checks entirely. main() catches only
+            # KeyboardInterrupt, so that killed the process before it
+            # reached the poll loop, and launchd restarted it into the
+            # same line every thirty seconds: a working deployment
+            # polling nothing at all. poll_once survives the same input
+            # because its pr_key call is inside its own try.
+            try:
+                label = pr_key(repo, pr)
+                found = running_checks(label, repo, pr["headRefOid"],
+                                       config, env)
+            except Exception as err:
+                log("%s#%s: could not read its old checks: %s"
+                    % (repo, pr.get("number", "?"), err))
+                continue
+            # A repository that has answered nothing at all is dropped
+            # rather than asked once per pull request. check_api logs a
+            # three-line paragraph naming the permission when `checks` is
+            # granted but not yet accepted on the installation, and
+            # unbounded that is one paragraph per open pull request per
+            # start, repeated every thirty seconds by launchd's restart,
+            # burying the line that says which Vinegar is up.
+            #
+            # `answered` is what makes that a repository-wide judgement
+            # rather than a per-call one. Read as "any failure ends the
+            # repository", a single 502 on the twentieth of thirty pull
+            # requests abandoned the last ten for the whole window this
+            # exists to bound, and paid the cost of a permission failure
+            # for none of its benefit. A failure after something has
+            # worked is transient by demonstration, so it is skipped like
+            # any other and the rest of the repository is still swept.
+            if found is None:
+                if answered:
+                    continue
+                log("%s: cannot read its check runs, so the rest of this "
+                    "repository is swept on a later start" % repo)
+                break
+            answered = True
+            # No try here. It wrapped running_checks(), whose subscript
+            # could raise, and that call has moved up into the guard
+            # above. What is left cannot raise: log() formats two
+            # strings, and close_check() does dict lookups on a literal
+            # it was just handed plus one check_api() call, which returns
+            # None on every failure path rather than raising. A handler
+            # over it would be a branch no mutation can arm, because
+            # deleting it would change nothing.
+            for was in found:
+                log("%s: closing the check run left spinning by a "
+                    "Vinegar that stopped" % label)
+                close_check(label, {"repo": repo, "id": was,
+                                    "closed": False},
+                            "The review was interrupted", env,
+                            "A Vinegar stopped while this review was "
+                            "running. Nothing is reviewing this commit "
+                            "now. If the pull request is still due a "
+                            "review, the next poll starts one.")
+
+
 def poll_once(config, state, tokens):
     for repo in config["repos"]:
         try:
@@ -5684,6 +5898,22 @@ def main():
         log("watching %s every %ds%s" % (
             ", ".join(config["repos"]), config["poll_interval"],
             " as the GitHub App" if config.get("github_app") else ""))
+        # After the line that says this Vinegar is up, because the sweep
+        # logs per pull request and those lines are about the last run
+        # rather than this one: read above the identity line they look
+        # like the new daemon's own work.
+        #
+        # No `--once` carve-out here, and the first version of this had
+        # one. It keyed on one-shot versus loop while its own comment said
+        # that was not the axis, and it was not: a second instance under
+        # its own VINEGAR_HOME run *as a loop* passed it and swept the
+        # production daemon's live indicator anyway. What separates two
+        # instances is the home, so DEPLOYMENT is what running_checks()
+        # matches on, and a run this deployment did not make is neither
+        # adopted nor closed whichever way either process was started.
+        #
+        # `--pr` still never reaches here, because it returns above.
+        sweep_checks(config, tokens)
         while True:
             poll_once(config, state, tokens)
             if args.once:
