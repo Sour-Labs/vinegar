@@ -365,6 +365,23 @@ MAX_REVIEW_TIMEOUT = 7200
 # machine could least afford it.
 MAX_PARALLEL_REPOS = 8
 
+# How often the App is asked which repositories its installations cover,
+# where `repos` names none and discover_repos() answers instead.
+#
+# An hour rather than every poll, and the two numbers are answering
+# different questions. `poll_interval` is how stale a pull request may be,
+# which is a minute because somebody is waiting on a review. This is how
+# stale the *list* may be, and it changes when somebody ticks a box in the
+# App's settings, which happens when a repository is onboarded rather than
+# when anyone pushes. So an hour costs one token mint and one listing per
+# installation per hour instead of per minute, to notice something that
+# moves monthly.
+#
+# It is not a bound on how quickly a change is picked up after a failure.
+# refresh_repos() asks again on the next pass when an ask does not answer,
+# so this is the interval between asks that worked.
+DISCOVERY_INTERVAL = 60 * 60
+
 # Enough life for `gh pr list`, which is one call. This is not zero because the
 # cache serves a token right up to its recorded expiry, and that expiry is
 # optimistic: it is computed from the local clock after the mint response
@@ -922,17 +939,28 @@ def app_jwt(app_id, key_path):
     return (signing_input + b"." + b64url(signed.stdout)).decode()
 
 
-def github_api(path, token, scheme="Bearer", payload=None):
+def github_api(path, token, scheme="Bearer", payload=None, method=None):
     """Call the GitHub API directly.
 
     The App endpoints need `Authorization: Bearer <jwt>`, and `gh` sends
     `token`, so these two calls cannot go through `gh` the way every other
     GitHub call in this file does.
+
+    `method` names the verb, and it exists because the line below guesses
+    one. Inferring it from whether there is a payload is right for every
+    call that has one and silently wrong for a POST that has none: minting
+    an installation-wide token for discover_repos() is exactly that call,
+    and inferred it went out as a GET, which that path answers 404 to. A
+    404 there reads as an App that is not installed, so the guess did not
+    merely fail, it accused the wrong thing. Passing `payload={}` also
+    turns it into a POST and was how this was first written; it works
+    because `json.dumps({})` is two bytes rather than because anyone
+    decided it should.
     """
     body = json.dumps(payload).encode() if payload is not None else None
-    request = urllib.request.Request("https://api.github.com" + path,
-                                     data=body,
-                                     method="POST" if body else "GET")
+    request = urllib.request.Request(
+        "https://api.github.com" + path, data=body,
+        method=method or ("POST" if body else "GET"))
     request.add_header("Authorization", "%s %s" % (scheme, token))
     request.add_header("Accept", "application/vnd.github+json")
     request.add_header("X-GitHub-Api-Version", "2022-11-28")
@@ -990,6 +1018,138 @@ def installation_token(app, repo, cache, good_for=0):
     return minted["token"]
 
 
+def discover_repos(app):
+    """What the App's installations cover, as owner/name, and what was left out.
+
+    This is what makes onboarding a repository a checkbox in the App's
+    settings rather than an edit to `repos` and a restart, which is the
+    difference between watching two repositories and watching an
+    organisation. It runs only where the config names no repositories at
+    all: an explicit `repos` is an instruction and wins over this.
+
+    The token minted here is the broadest one Vinegar ever holds, and that
+    is the reason this is a function of its own rather than a call inside
+    installation_token(). Listing what an installation covers needs a
+    token scoped to the installation rather than to one repository, so
+    that token can reach every repository the App was given.
+    installation_token()'s whole argument -- that a diff which talks the
+    reviewer into running `gh` reaches nothing but the repository under
+    review -- holds only while the token in the reviewer's environment is
+    the narrow one. So this one is minted here, spent on one listing, and
+    dropped. It is never written to the cache github_env() reads, and it is
+    not part of what this returns, so there is no path from here to a
+    reviewer's environment.
+
+    Archived repositories are left out, and that is money rather than
+    tidiness. GitHub refuses every write to an archived repository, so one
+    with an open pull request is a review paid for in full, nine to
+    twenty-two minutes of it, and then a 403 when it tries to post -- again
+    on every push, for as long as the pull request stays open. Nothing on
+    the pull request can say so, because nothing can be written to it. They
+    appear only where an installation covers every repository rather than a
+    chosen list, which is one setting away. They are returned separately
+    rather than only dropped, so refresh_repos() can say how many.
+
+    Up to a hundred installations, which is one page and no loop. An App
+    on more accounts than that is a public one serving strangers, and this
+    is a private App reviewing the organisation that owns it. The
+    repositories under each installation *are* paged, because that is the
+    list that grows with the organisation, and a silent hundred-and-first
+    entry there is a repository that is simply never reviewed.
+    """
+    jwt = app_jwt(app["app_id"], os.path.expanduser(app["private_key"]))
+    # One spelling for both the page asked for and the length that means
+    # there is another. As two literals they have to agree, and the way
+    # they disagree is silent: a URL asking for 30 beside a loop that stops
+    # below 100 reads one page and calls it the whole organisation.
+    per_page = 100
+    found, archived = [], []
+    for install in github_api("/app/installations?per_page=%d" % per_page,
+                              jwt):
+        token = github_api(
+            "/app/installations/%d/access_tokens" % install["id"],
+            jwt, method="POST")["token"]
+        page = 1
+        while True:
+            listed = github_api(
+                "/installation/repositories?per_page=%d&page=%d" % (
+                    per_page, page), token, scheme="token")
+            covered = listed.get("repositories", [])
+            for repo in covered:
+                (archived if repo.get("archived") else found).append(
+                    repo["full_name"])
+            # A short page is the last one. A full one costs one more call
+            # that answers nothing, which is the cheap half of the trade:
+            # `total_count` would save it and cannot be compared against
+            # `found`, because the archived ones have already been taken
+            # out of that list and are still counted in the number.
+            if len(covered) < per_page:
+                break
+            page += 1
+    # Sorted, so neither the poll order nor the line naming them depends on
+    # the order GitHub answered in. Below a width of one worker per
+    # repository that order decides which repositories are reviewed first,
+    # and an order that moves between passes is one nobody can reason about
+    # from the log.
+    return sorted(found), sorted(archived)
+
+
+def refresh_repos(config, asked_at):
+    """Bring `config["repos"]` up to date with what the App covers.
+
+    Called from main()'s own thread between passes, which is the only
+    place it is safe. poll_once() joins every worker before it returns, so
+    no pass is reading the list while this replaces it, and the next pass
+    reads the new one: poll_width() is recomputed from it too, so a
+    repository onboarded an hour ago is polled without a restart.
+
+    At most hourly, and an ask that failed does not count as one. A
+    failure returns `asked_at` untouched, so the next pass asks again a
+    minute later rather than an hour later. That matters most where it is
+    least visible: at startup there is no previous list at all, so an ask
+    that failed is a daemon watching nothing, and counting it would turn
+    one bad minute into a bad hour of reviewing no repository.
+
+    A failure keeps the list already being polled, rather than emptying
+    it. Listing genuinely fails on a real network -- 96 times in the three
+    days to 2026-08-19 on this deployment, about 1.1% of attempts -- and
+    reading one of those as "the App covers nothing" would stop every
+    repository being reviewed until an ask answered. The log says that it
+    kept them, because a daemon polling a list GitHub did not just confirm
+    should say which of the two it is doing.
+
+    Every change is named, both halves of it. A repository that starts
+    being reviewed, or stops, with nothing in the log saying why is the
+    failure this path is most likely to produce: the cause is a checkbox
+    in a web UI on another machine, so the log is the only place those two
+    facts ever meet.
+    """
+    if time.time() - asked_at < DISCOVERY_INTERVAL:
+        return asked_at
+    try:
+        found, archived = discover_repos(config["github_app"])
+    except Exception as err:
+        log("cannot ask the App which repositories it covers, so the %d "
+            "already being polled stay: %s" % (len(config["repos"]), err))
+        return asked_at
+
+    new = [name for name in found if name not in config["repos"]]
+    gone = [name for name in config["repos"] if name not in found]
+    if new or gone:
+        changed = []
+        if new:
+            changed.append("added " + ", ".join(new))
+        if gone:
+            changed.append("removed " + ", ".join(gone))
+        if archived:
+            changed.append("%d archived and left out" % len(archived))
+        log("the App covers %d repositor%s: %s" % (
+            len(found), "y" if len(found) == 1 else "ies",
+            "; ".join(changed)))
+    config["repos"] = found
+    return time.time()
+
+
 def github_env(config, repo, cache, good_for=0):
     """The environment for every git, gh, and claude call touching `repo`.
 
@@ -1015,10 +1175,30 @@ def load_config(path):
     unknown = set(config) - set(DEFAULTS)
     if unknown:
         sys.exit("%s: unknown keys %s" % (path, ", ".join(sorted(unknown))))
-    if not isinstance(config["repos"], list) or not config["repos"]:
+    if not isinstance(config["repos"], list):
         # A bare string passes a truthiness check and then iterates as
         # characters, which polls `-R S`, `-R o`, `-R u` once a minute forever.
-        sys.exit("%s: repos must be a non-empty list of owner/name" % path)
+        sys.exit("%s: repos must be a list of owner/name" % path)
+    # Empty is a request to discover, and only where there is an App to
+    # discover from. That is the whole rule: an explicit `repos` is an
+    # instruction and wins, and discover_repos() fills the list when the
+    # file gives none.
+    #
+    # `repos` cannot simply be dropped in favour of discovery, which is
+    # why this reads as a fallback rather than a replacement. Discovery
+    # needs an App and config.example.json ships `"github_app": null`, so
+    # an install following the example has no installation to ask.
+    #
+    # Refused here rather than discovered as nothing later. Without this
+    # the daemon starts, polls an empty list once a minute for ever, and
+    # says nothing at all: it is the same silent-stop class the shape
+    # check below exists for, and the operator's mistake is one line
+    # further up in the same file.
+    if not config["repos"] and not config["github_app"]:
+        sys.exit("%s: repos is empty and there is no github_app to discover "
+                 "repositories from, so there is nothing to poll. Name them "
+                 "in repos, or configure the App and Vinegar watches every "
+                 "repository it is installed on" % path)
     # Every entry a string, and stored stripped, the way the model names
     # further down are. Nothing checked this before: `repos: ["o/a", {}]`
     # was accepted here and then raised TypeError out of main()'s own
@@ -1143,8 +1323,12 @@ def load_config(path):
     # shipped as a bug, with the startup line naming a width the pass did
     # not use, and this line exists only to tell an operator the width
     # that will really be used.
+    # Only where the file named them. Discovered repositories are not known
+    # yet at this point, and comparing against the empty list told an
+    # operator "there are 0 repositories to poll" on a daemon that was
+    # about to discover seventeen and poll all of them.
     watched = len(config["repos"])
-    if config["parallel_repos"] > watched:
+    if watched and config["parallel_repos"] > watched:
         log("%s: parallel_repos is %d and there %s %d repositor%s to poll, "
             "so %d of them run at once" % (
                 path, config["parallel_repos"],
@@ -6395,6 +6579,21 @@ def main():
             return
 
         state = load_state()
+        # Discovery, and the decision about whether this run does any.
+        # Asked once and here, because after the first ask the list is no
+        # longer empty and the question cannot be asked a second time.
+        #
+        # Before the line below that names the repositories, because that
+        # line's one job is to say what this run will really poll, and
+        # with discovery the config file does not know.
+        #
+        # `--pr` never reaches this: it names its own repository and
+        # returns above, so a config with an App and no `repos` reviews a
+        # named pull request without asking GitHub anything extra.
+        discovering = not config["repos"]
+        asked_at = 0
+        if discovering:
+            asked_at = refresh_repos(config, asked_at)
         # The width is said only when it is not one, for the same reason
         # the App is: this line is what an operator reads to confirm the
         # config they just edited took, and a daemon reviewing two
@@ -6407,8 +6606,16 @@ def main():
         # then polled serially: the one reading that could not be more
         # wrong on the one question it is printed to answer.
         width = poll_width(config)
+        # "no repositories" rather than an empty gap in the sentence, which
+        # is what this printed as. It is reachable only under discovery,
+        # where the first ask can fail or the App can genuinely cover
+        # nothing, and load_config refuses an empty `repos` everywhere
+        # else. Both of those are states an operator has to be able to
+        # read, and "watching  every 60s" reads as a truncated line rather
+        # than as the daemon's answer.
         log("watching %s every %ds%s%s" % (
-            ", ".join(config["repos"]), config["poll_interval"],
+            ", ".join(config["repos"]) or "no repositories",
+            config["poll_interval"],
             ", %d at a time" % width if width > 1 else "",
             " as the GitHub App" if config.get("github_app") else ""))
         # After the line that says this Vinegar is up, because the sweep
@@ -6432,6 +6639,12 @@ def main():
             if args.once:
                 return
             time.sleep(config["poll_interval"])
+            # After the sleep and before the pass, so the pass about to run
+            # reads the list this just confirmed. refresh_repos() decides
+            # for itself whether the hour is up; asking it every pass is
+            # what lets a failed ask be retried in a minute.
+            if discovering:
+                asked_at = refresh_repos(config, asked_at)
     except KeyboardInterrupt:
         # "stopping", not "stopped", because above one repository this is
         # not the end of anything. The passes still running keep the lock

@@ -2927,6 +2927,34 @@ check("a repository written with stray spaces is the same repository",
 check("and the stored name has the spaces taken off",
       _loaded(repos=[" o/r "])["repos"] == ["o/r"],
       _loaded(repos=[" o/r "]))
+
+# An empty `repos` is a request to be told, not a mistake, but only where
+# there is an App to ask. Discovery cannot replace the setting outright:
+# config.example.json ships `"github_app": null`, so an install that
+# followed the example has no installation to ask and has to name them.
+_app_key = {"app_id": 1, "private_key": _covered_key}
+check("an empty repos with an App is a request to discover them",
+      _config_with(repos=[], github_app=_app_key) == "started",
+      _config_with(repos=[], github_app=_app_key))
+# Refused rather than started and left silent. Without this the daemon
+# comes up, polls an empty list once a minute for ever, reviews nothing
+# and says nothing, which is the silent-stop class every other check in
+# this function exists for.
+check("an empty repos with no App refuses, and names both ways out",
+      "nothing to poll" in _config_with(repos=[])
+      and "github_app" in _config_with(repos=[]),
+      _config_with(repos=[]))
+# The width warning reads `repos`, which under discovery is empty here and
+# says nothing about what will be polled. Printed anyway it told an
+# operator "there are 0 repositories to poll" about a daemon that was
+# about to discover seventeen and poll every one of them.
+check("the width is not compared against a list nothing has discovered yet",
+      "parallel_repos is" not in _dupe_said(
+          repos=[], parallel_repos=4, github_app=_app_key),
+      _dupe_said(repos=[], parallel_repos=4, github_app=_app_key))
+check("and it is still compared against a list the file did name",
+      "parallel_repos is" in _dupe_said(repos=["o/r"], parallel_repos=4),
+      _dupe_said(repos=["o/r"], parallel_repos=4))
 # The shape the message beside it always promised. A dropped owner started
 # the daemon perfectly and then failed on every poll for ever: `gh pr list
 # -R web` fails on the format, poll_repo swallows it, one line a minute,
@@ -3541,6 +3569,195 @@ check("an expired token is replaced whatever the caller asked for",
       vinegar.installation_token(
           APP, "o/r", {"o/r": ("stale", time.time() - 1)}) == "fresh")
 vinegar.app_jwt, vinegar.github_api = _real_jwt, _real_api
+
+# Discovery: which repositories the App is installed on, asked of GitHub
+# rather than read out of the config. Everything below runs against stubs,
+# so it costs nothing and touches nothing.
+#
+# The verb first, because github_api() used to guess it. A POST with a
+# payload was the only POST there was, so the guess held until discovery
+# needed a bodyless one, and inferred that call went out as a GET against
+# a path whose 404 reads as "the App is not installed on this repository".
+_built = []
+
+
+class _FakeResponse:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *unused):
+        return False
+
+    def read(self):
+        return b"{}"
+
+
+def _fake_urlopen(request, timeout=None):
+    _built.append(request)
+    return _FakeResponse()
+
+
+_real_urlopen = vinegar.urllib.request.urlopen
+vinegar.urllib.request.urlopen = _fake_urlopen
+try:
+    vinegar.github_api("/app/installations/7/access_tokens", "jwt",
+                       method="POST")
+    vinegar.github_api("/app", "jwt")
+    vinegar.github_api("/x", "jwt", payload={"repositories": ["r"]})
+finally:
+    vinegar.urllib.request.urlopen = _real_urlopen
+
+check("a POST asked for by name goes out as a POST with no body",
+      _built[0].get_method() == "POST" and _built[0].data is None,
+      (_built[0].get_method(), _built[0].data))
+check("a call with neither a payload nor a verb is still a GET",
+      _built[1].get_method() == "GET", _built[1].get_method())
+check("a payload still means a POST, for the calls that always had one",
+      _built[2].get_method() == "POST", _built[2].get_method())
+
+_disco_calls = []
+_disco_pages = []
+
+
+def _disco_api(path, token, scheme="Bearer", payload=None, method=None):
+    _disco_calls.append((path, token, scheme, payload, method))
+    if path.startswith("/app/installations?"):
+        return [{"id": 7}]
+    if path.endswith("/access_tokens"):
+        return {"token": "installation-wide"}
+    return {"repositories": _disco_pages.pop(0) if _disco_pages else []}
+
+
+def _repo(name, archived=False):
+    return {"full_name": name, "archived": archived}
+
+
+def _discovered(*pages):
+    """What discover_repos makes of those pages, with the calls recorded."""
+    del _disco_calls[:]
+    _disco_pages[:] = [list(page) for page in pages]
+    vinegar.app_jwt, vinegar.github_api = stub_app_jwt, _disco_api
+    try:
+        return vinegar.discover_repos(APP)
+    finally:
+        vinegar.app_jwt, vinegar.github_api = _real_jwt, _real_api
+
+
+def _called(fragment):
+    """The recorded calls whose path holds that."""
+    return [call for call in _disco_calls if fragment in call[0]]
+
+
+_two = _discovered([_repo("o/b"), _repo("o/a")])
+check("what the installations cover is what gets watched, in a fixed order",
+      _two[0] == ["o/a", "o/b"], _two)
+# Not tidiness. Below one worker per repository the order decides which
+# repositories are reviewed first, and GitHub's own order is not promised
+# to be the same twice.
+_arch = _discovered([_repo("o/a"), _repo("o/gone", archived=True)])
+check("an archived repository is not watched",
+      _arch[0] == ["o/a"], _arch)
+# GitHub refuses every write to an archived repository, so watching one is
+# a review paid for in full and then a 403 where the comment would go, on
+# every push, with nothing on the pull request able to say why.
+check("and it is handed back separately rather than only dropped",
+      _arch[1] == ["o/gone"], _arch)
+
+# Paging, because this is the list that grows with the organisation. A
+# hundred-and-first entry silently unread is a repository that is simply
+# never reviewed, and nothing anywhere would say so.
+_full = [_repo("o/r%03d" % nth) for nth in range(100)]
+_paged = _discovered(_full, [_repo("o/zlast")])
+check("a full page is followed by the one after it",
+      "o/zlast" in _paged[0] and len(_paged[0]) == 101, len(_paged[0]))
+check("a full page is asked about again, and the short one after it is not",
+      len(_called("/installation/repositories")) == 2,
+      _called("/installation/repositories"))
+
+_discovered([_repo("o/a")])
+check("a listing that comes back short is not asked about again",
+      len(_called("/installation/repositories")) == 1,
+      _called("/installation/repositories"))
+_mint = _called("/access_tokens")[0]
+# The verb by name and no `repositories` restriction: the second is what
+# makes this token installation-wide, which is what listing needs and is
+# broader than anything else here holds.
+check("the discovery token is minted by an explicit POST, not a guessed one",
+      _mint[4] == "POST" and _mint[3] is None, _mint)
+check("the listing is made with that token rather than with the App's JWT",
+      _called("/installation/repositories")[0][1] == "installation-wide",
+      _called("/installation/repositories")[0][1])
+# The security property the whole sandbox argument rests on:
+# installation_token() is narrow because a diff that talks the reviewer
+# into running `gh` must reach nothing but the repository under review.
+# This token is broader than that one, so it is spent and dropped.
+check("the installation-wide token is no part of what discovery hands back",
+      "installation-wide" not in repr(_discovered([_repo("o/a")])))
+check("and discovery is not given the cache a reviewer's environment "
+      "comes from",
+      list(inspect.signature(vinegar.discover_repos).parameters) == ["app"],
+      list(inspect.signature(vinegar.discover_repos).parameters))
+
+_refresh_log = []
+
+
+def _refreshed(repos, asked_at, *pages, fails=False):
+    """What refresh_repos does to that list, when, and what it said."""
+    config = {"repos": list(repos), "github_app": APP}
+    del _refresh_log[:]
+    del _disco_calls[:]
+    _disco_pages[:] = [list(page) for page in pages]
+
+    def blows_up(app):
+        raise RuntimeError("GitHub said 502 for /app/installations")
+
+    was_discover, was_log = vinegar.discover_repos, vinegar.log
+    vinegar.app_jwt, vinegar.github_api = stub_app_jwt, _disco_api
+    vinegar.log = lambda message: _refresh_log.append(message)
+    if fails:
+        vinegar.discover_repos = blows_up
+    try:
+        asked = vinegar.refresh_repos(config, asked_at)
+    finally:
+        vinegar.discover_repos, vinegar.log = was_discover, was_log
+        vinegar.app_jwt, vinegar.github_api = _real_jwt, _real_api
+    return config["repos"], asked, " ".join(_refresh_log)
+
+
+_fresh = _refreshed(["o/a"], time.time(), [_repo("o/b")])
+check("the App is not asked again inside the hour",
+      _fresh[0] == ["o/a"] and not _disco_calls, _fresh)
+_due = _refreshed(["o/a"], 0, [_repo("o/b")])
+check("an hour on, the watched list becomes what the App now covers",
+      _due[0] == ["o/b"], _due)
+# The cause of a change here is a checkbox in a web UI on another machine,
+# so this line is the only place the change and the effect ever meet. Both
+# halves, because a repository that stopped being reviewed is the half
+# nobody thinks to look for.
+check("a repository that appeared and one that went are both named",
+      "added o/b" in _due[2] and "removed o/a" in _due[2], _due[2])
+check("an ask that answered starts the hour again",
+      _due[1] > 0, _due[1])
+_same = _refreshed(["o/a"], 0, [_repo("o/a")])
+check("an unchanged list says nothing, so the log holds only changes",
+      _same[2] == "", _same[2])
+_counted = _refreshed([], 0, [_repo("o/a"), _repo("o/old", archived=True)])
+check("the archived ones are counted where the change is announced",
+      "1 archived and left out" in _counted[2], _counted[2])
+
+# Listing genuinely fails on a real network: 96 times in the three days to
+# 2026-08-19 on this deployment, about 1.1% of attempts. Read as "the App
+# covers nothing", one of those stops every repository being reviewed.
+_blew = _refreshed(["o/a", "o/b"], 0, fails=True)
+check("an ask that fails keeps the repositories already being polled",
+      _blew[0] == ["o/a", "o/b"], _blew)
+# And is retried on the next pass rather than in an hour. At startup there
+# is no previous list, so a failed first ask is a daemon watching nothing,
+# and counting it as an ask would make one bad minute a bad hour.
+check("a failed ask is not counted, so the next pass asks again",
+      _blew[1] == 0, _blew[1])
+check("and the log says the list being polled is the one it kept",
+      "already being polled stay" in _blew[2], _blew[2])
 
 _asked = []
 _real_env = vinegar.github_env

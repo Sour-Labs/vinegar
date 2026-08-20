@@ -1664,6 +1664,75 @@ MUTATIONS = [
      "            continue",
      "        except Exception:\n"
      "            raise"),
+
+    # --- discovering repositories from the App -------------------------
+    # The verb github_api() used to guess. A bodyless POST inferred as a
+    # GET 404s on a path whose 404 means "not installed on this
+    # repository", so the guess accused the wrong thing.
+    ("api-explicit-method",
+     '        method=method or ("POST" if body else "GET"))',
+     '        method="POST" if body else "GET")'),
+    ("discovery-mint-verb",
+     '            jwt, method="POST")["token"]',
+     '            jwt)["token"]'),
+    # An archived repository is a review paid for in full and then a 403
+    # where the comment would go, on every push, silently.
+    ("discovery-skips-archived",
+     '                (archived if repo.get("archived") else found).append(\n'
+     '                    repo["full_name"])',
+     '                found.append(repo["full_name"])'),
+    # A hundred-and-first repository never read is one never reviewed.
+    ("discovery-pages",
+     "            if len(covered) < per_page:",
+     "            if len(covered) <= per_page:"),
+    ("discovery-order",
+     "    return sorted(found), sorted(archived)",
+     "    return found, sorted(archived)"),
+    # The token that lists an installation is broader than any the
+    # reviewer may hold, so it is spent and dropped.
+    ("discovery-token-escapes",
+     "    return sorted(found), sorted(archived)",
+     "    return sorted(found), [token]"),
+    ("discovery-takes-no-cache",
+     "def discover_repos(app):",
+     "def discover_repos(app, cache=None):"),
+    # Asking every minute for an answer that changes monthly.
+    ("discovery-interval",
+     "    if time.time() - asked_at < DISCOVERY_INTERVAL:",
+     "    if time.time() - asked_at < 0:"),
+    # One failed listing read as "the App covers nothing" stops every
+    # repository being reviewed. Measured 1.1% of attempts on this network.
+    ("discovery-failure-keeps-list",
+     '        log("cannot ask the App which repositories it covers, so the %d "\n'
+     '            "already being polled stay: %s" % (len(config["repos"]), err))\n'
+     "        return asked_at",
+     '        config["repos"] = []\n'
+     "        return asked_at"),
+    # A failed ask counted as an ask is an hour of watching nothing, and
+    # at startup there is no previous list to fall back to.
+    ("discovery-failure-retries-soon",
+     '            "already being polled stay: %s" % (len(config["repos"]), err))\n'
+     "        return asked_at",
+     '            "already being polled stay: %s" % (len(config["repos"]), err))\n'
+     "        return time.time()"),
+    # A repository that starts or stops being reviewed with nothing saying
+    # why. The cause is a checkbox on another machine.
+    ("discovery-announces-change",
+     "    if new or gone:",
+     "    if not (new or gone):"),
+    ("discovery-counts-archived",
+     '            changed.append("%d archived and left out" % len(archived))',
+     "            pass"),
+    # A daemon that comes up, polls an empty list once a minute for ever,
+    # and says nothing.
+    ("config-empty-repos-needs-app",
+     '    if not config["repos"] and not config["github_app"]:',
+     '    if not config["repos"] and config["github_app"]:'),
+    # "there are 0 repositories to poll", printed at a daemon about to
+    # discover seventeen.
+    ("config-width-skips-undiscovered",
+     '    if watched and config["parallel_repos"] > watched:',
+     '    if config["parallel_repos"] > watched:'),
 ]
 
 
