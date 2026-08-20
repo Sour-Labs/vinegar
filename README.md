@@ -976,10 +976,14 @@ on the round where a blue dot would otherwise contradict the paragraph above it.
 that file rather than building a body, so a review that reaches a pull request
 from disk days later gets none of `review_body`. Its narrowing line is
 `Asked for: blockers only.` for the reason the comment and the check title say
-"asked for", and a third line explains a tier under blocker when there is one.
-That route is the one this was originally got wrong on: the line read `Reported:
-blockers only.` and `wonky-flow#107`'s transcript still has it fourteen lines
-above a blue advisory dot.
+"asked for", and a line under it explains a tier under blocker when there is
+one. That line is the same sentence pair the comment carries, from one constant,
+because this whole change is about what happens when one sentence is written in
+two places. This is the route it was originally got wrong on: the mark read
+`Reported: blockers only.` and `wonky-flow#107`'s transcript still has it
+fourteen lines above a blue advisory dot. `repost()` still recognises that old
+spelling, because a transcript is written by one version and resent by the next,
+and a mark it fails to match is sheared off the front of an oversized review.
 
 The checks list says it too, since that is the half of this an agent polling
 `gh pr checks` can read: `Reviewing at high effort, blockers only` while it runs,

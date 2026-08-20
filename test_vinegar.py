@@ -861,8 +861,20 @@ check("an ordinary review's transcript claims neither",
 # pass's tier dots, and nothing filters what the reviewer hands back. It
 # read "Reported: blockers only." until `wonky-flow#107`, whose transcript
 # has that line fourteen above a blue advisory dot.
+# Both halves, like the pair on the review comment. Forbidding one word
+# leaves "Returned:" and "Found:" making the same claim with the check
+# still green, and the absence of a word is not the property wanted.
 check("the transcript mark claims no more than the instruction it gave",
-      "Reported" not in vinegar.BLOCKERS_MARK, vinegar.BLOCKERS_MARK)
+      vinegar.BLOCKERS_MARK.startswith("Asked for")
+      and "Reported" not in vinegar.BLOCKERS_MARK, vinegar.BLOCKERS_MARK)
+# The spelling before that, which is on thirteen transcripts on the
+# deployment and on any written by a version older than the one reposting
+# them. A resend matching neither mark skips the lift, and the cut then
+# takes the last `room` characters, shearing the narrowing off the front.
+check("the lift still recognises the spelling that is already on disk",
+      "Reported: blockers only." in vinegar.LIFTED_MARKS
+      and vinegar.BLOCKERS_MARK in vinegar.LIFTED_MARKS
+      and vinegar.SCOPE_MARK in vinegar.LIFTED_MARKS, vinegar.LIFTED_MARKS)
 # And the paragraph the comment carries when the two disagree, which no
 # review delivered from disk would otherwise get: repost() sends this file
 # instead of building a body.
@@ -872,12 +884,12 @@ _tx_split = GENUINE_SAVE_TRANSCRIPT(
 with open(_tx_split) as _h:
     _tx_split_body = _h.read()
 check("a transcript whose finding came back smaller explains the tag",
-      vinegar.DISAGREED_MARK in _tx_split_body, _tx_split_body[:400])
+      vinegar.DISAGREED_SAID in _tx_split_body, _tx_split_body[:400])
 # In the lifted block, like the mark above it, and never opening it: that
 # block is found by matching its first line.
 _tx_split_block = _tx_split_body.partition("---")[2].lstrip()
 check("the explanation is inside the block the repost lifts",
-      vinegar.DISAGREED_MARK in _tx_split_block.partition("\n\n")[0]
+      vinegar.DISAGREED_SAID in _tx_split_block.partition("\n\n")[0]
       and _tx_split_block.startswith(vinegar.BLOCKERS_MARK),
       _tx_split_block[:400])
 _tx_agreed = GENUINE_SAVE_TRANSCRIPT(
@@ -886,7 +898,7 @@ _tx_agreed = GENUINE_SAVE_TRANSCRIPT(
 with open(_tx_agreed) as _h:
     _tx_agreed_body = _h.read()
 check("a narrowed transcript the severity pass agreed with explains nothing",
-      vinegar.DISAGREED_MARK not in _tx_agreed_body, _tx_agreed_body[:400])
+      vinegar.DISAGREED_SAID not in _tx_agreed_body, _tx_agreed_body[:400])
 # Nested under the narrowing there as in the comment. An ordinary review's
 # transcript carries tiers on every bullet and no claim about blockers for
 # them to contradict.
@@ -895,7 +907,7 @@ _tx_full_tier = GENUINE_SAVE_TRANSCRIPT(
 with open(_tx_full_tier) as _h:
     _tx_full_tier_body = _h.read()
 check("an ordinary transcript explains nothing whatever its tiers say",
-      vinegar.DISAGREED_MARK not in _tx_full_tier_body,
+      vinegar.DISAGREED_SAID not in _tx_full_tier_body,
       _tx_full_tier_body[:400])
 shutil.rmtree(vinegar.REVIEW_DIR, True)
 vinegar.REVIEW_DIR = _saved_dir
@@ -4714,7 +4726,20 @@ check("under blocker stays under blocker when a tier is added above it",
       not vinegar.below_blocker([{"tier": "blocker"}])
       and not vinegar.below_blocker([{"tier": "critical"}])
       and vinegar.below_blocker([{"tier": "advisory"}]))
+# And a TIERS with no `blocker` in it answers rather than raising, which
+# is triage()'s sort's rule and for its reason: this runs inside
+# save_transcript() and inside post_review(), so a ValueError here is a
+# finished review that writes no transcript and reaches no pull request
+# while the outcome is recorded DONE. Wrapped, because a check that raises
+# ends the run instead of failing it.
+vinegar.TIERS = ("severe", "minor")
+try:
+    _no_blocker = vinegar.below_blocker([{"tier": "minor"}])
+except ValueError:
+    _no_blocker = "raised"
 vinegar.TIERS = _saved_tiers
+check("a TIERS that lost the name does not cost the review that paid for it",
+      _no_blocker is False, _no_blocker)
 # The paragraph says "on each finding" and not "below", because an
 # anchored finding's tag is rendered into its inline comment on the diff
 # rather than into this body. That is the common case, and the one
@@ -4722,7 +4747,13 @@ vinegar.TIERS = _saved_tiers
 # inline." with no bullet under the paragraph at all.
 check("the explanation points at the tags wherever they are rendered",
       "tags below" not in _bl_split
-      and "tier tag on each finding" in _bl_split, _bl_split)
+      and "tier tag on each finding" in vinegar.DISAGREED_SAID, _bl_split)
+# The comment and the transcript say it from one constant rather than two
+# spellings held in step, which is the drift this whole pull request is
+# about: the first draft of the transcript's copy reworded the sentence a
+# third way in the same commit that reworded the paragraph.
+check("the comment carries the same sentence the transcript does",
+      vinegar.DISAGREED_SAID in _bl_split, _bl_split)
 _bl_inline = vinegar.review_body(
     L, PR, CONFIG, [{"path": "v.py", "line": 1, "body": "x"}], [],
     tally="1 advisory", blockers=True, disagreed=True)
@@ -4732,7 +4763,7 @@ _bl_inline = vinegar.review_body(
 # skipped and the mutation comes back ABORTED saying nothing. That is what
 # `blockers-said-on-the-pull-request` did to the first draft of this.
 check("and it is true of a body whose only finding went inline",
-      "tier tag on each finding" in _bl_inline
+      vinegar.DISAGREED_SAID in _bl_inline
       and "tags below" not in _bl_inline
       and "1 posted inline." in _bl_inline, _bl_inline)
 
@@ -6406,8 +6437,34 @@ check("a review delivered from disk explains a tier under blocker too",
       len(posted) == 1
       and len(posted[0][1]["body"]) <= vinegar.MAX_BODY
       and vinegar.BLOCKERS_MARK in posted[0][1]["body"]
-      and vinegar.DISAGREED_MARK in posted[0][1]["body"],
+      and vinegar.DISAGREED_SAID in posted[0][1]["body"],
       posted[0][1]["body"][:500] if posted else "nothing posted")
+
+# A transcript written before the mark was reworded, which is the state
+# thirteen files on the deployment are in and the state every file is in
+# during an upgrade. Written by hand rather than through save_transcript,
+# because save_transcript can only write today's spelling. Without the old
+# mark in LIFTED_MARKS the lift matches nothing and the cut below takes
+# the last `room` characters, so the narrowing is sheared off the front
+# and the review lands saying nothing about how it was scoped.
+_old_body = "%s#%d %s\n\n%s%s%s\n\n%s\n\n## Findings\n\nnone\n" % (
+    "# o/r", PR_LOST["number"], PR_LOST["headRefOid"][:7], PR_LOST["url"],
+    vinegar.TRANSCRIPT_SEP, "Reported: blockers only.", "narration " * 9000)
+with open(vinegar.transcript_path("o/r", PR_LOST), "w") as h:
+    h.write(_old_body)
+with open(_lost_marker, "w") as h:
+    h.write("%s\n" % PR_LOST["headRefOid"])
+_old_state = {_lost_key: {"outcome": vinegar.DONE,
+                          "sha": PR_LOST["headRefOid"], "attempts": 1,
+                          "unposted": True}}
+fake_run.rc = 0
+del posted[:]
+vinegar.handle_pr("o/r", PR_LOST, CONFIG, _old_state, {})
+check("a transcript written before the rename still says it was narrowed",
+      len(posted) == 1
+      and len(posted[0][1]["body"]) <= vinegar.MAX_BODY
+      and "Reported: blockers only." in posted[0][1]["body"],
+      posted[0][1]["body"][:400] if posted else "nothing posted")
 
 # The reviewer writes its own summary and it goes into the transcript
 # verbatim, so a paragraph of it beginning "Scope: " must not be mistaken

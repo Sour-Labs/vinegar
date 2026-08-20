@@ -173,17 +173,45 @@ SCOPE_MARK = "Scope: only what was added since "
 # not something a transcript posted days later can still speak for.
 BLOCKERS_MARK = "Asked for: blockers only."
 
-# The third line, and the transcript's copy of the paragraph review_body()
-# adds when the two passes disagree. It needs its own because repost()
-# delivers this file rather than building a body, so a review that reaches
-# the pull request from disk gets none of that paragraph.
+# What the lift has to recognise, which is not the set it writes. A
+# transcript is written by one version of this file and can be reposted by
+# the next, so the spelling BLOCKERS_MARK had before it said "Asked for"
+# is still on disk: thirteen transcripts carried it when it changed. A
+# resend that matches neither mark skips the lift, and for the oversized
+# transcript the lift exists for the cut then takes the *last* `room`
+# characters, shearing the front off and delivering a narrowed review with
+# nothing on it saying so.
 #
-# Written under BLOCKERS_MARK and never alone, which is what keeps it
-# inside the block repost() lifts: that block is found by matching its
-# first line, and this is never the first line.
-DISAGREED_MARK = ("A tag under blocker is the severity pass disagreeing "
-                  "with the reviewer: it reads each finding's summary and "
-                  "never the code.")
+# Droppable once no transcript predating that rename can still be pending,
+# which is when no `.unposted` marker in REVIEW_DIR is older than it.
+LIFTED_MARKS = (SCOPE_MARK, BLOCKERS_MARK, "Reported: blockers only.")
+
+# What the pull request is told when the severity pass puts a finding
+# under `blocker` on a narrowed round. One sentence pair in one place,
+# because it has to reach the pull request by two routes that build
+# nothing in common: review_body() puts it in the comment, and
+# save_transcript() writes it into the block repost() lifts, since a
+# review delivered from disk never runs review_body() at all.
+#
+# Spelled once rather than twice held in step by a check. This pull
+# request exists because the same sentence written in two places drifted,
+# and the first draft of this constant reworded it a third way in the same
+# commit that reworded the paragraph.
+#
+# "on each finding" and not "below", because an anchored finding's tag is
+# rendered into its inline comment on the diff rather than into the review
+# body. That is the common case and the one `wonky-flow#107` took, where
+# the body ends "1 finding (1 advisory), 1 posted inline." and a paragraph
+# promising tags below it points at nothing.
+#
+# In the transcript it goes under BLOCKERS_MARK and never alone, which is
+# what keeps it inside the block repost() lifts: that block is found by
+# matching its first line, and this is never the first line.
+DISAGREED_SAID = (
+    "The tier tag on each finding is set after the review, by a separate "
+    "pass that reads only its summary and never the code. A tag under "
+    "blocker is that pass disagreeing with the reviewer, not a smaller "
+    "finding shown here anyway.")
 
 # Between a transcript's heading and its body. Named because both the
 # writer and repost()'s reader have to agree on it, and because reading
@@ -1866,12 +1894,12 @@ def save_transcript(repo, pr, text, findings=None, note=None, since=None,
         marks.append("%s`%s`." % (SCOPE_MARK, since[:7]))
     if blockers:
         marks.append(BLOCKERS_MARK)
-        # Nested, not a third `if`, because DISAGREED_MARK explains the
-        # line above it and must never be the block's first line: repost()
-        # finds the block by matching that first line and would leave a
-        # block opening with this one in the body, unlifted.
+        # Nested, not a third `if`, because DISAGREED_SAID explains the
+        # line above it and must never open the block: repost() finds the
+        # block by matching its first line and would leave a block opening
+        # with this one in the body, unlifted.
         if below_blocker(findings):
-            marks.append(DISAGREED_MARK)
+            marks.append(DISAGREED_SAID)
     if marks:
         body = "%s\n\n%s" % ("\n".join(marks), body)
     if findings:
@@ -2969,12 +2997,21 @@ def below_blocker(findings):
     the two passes agreed would explain a disagreement over a row of red
     dots. A check reorders TIERS and holds this to the name.
 
+    Defaulted rather than raising when `blocker` is not there at all,
+    which is triage()'s sort's rule and for the reason argued there: this
+    runs inside save_transcript() and inside post_review(), so a
+    ValueError is a finished review that writes no transcript and reaches
+    no pull request while the outcome is recorded DONE. An empty tuple
+    means no finding is under `blocker`, which is the behaviour this
+    function was added to, and it costs an explanation nobody can act on
+    rather than the review that paid for it.
+
     Off the findings for severity_tally()'s reason: half of them are
     GitHub comment payloads by the time the comment is built, and those
     carry no tier.
     """
-    return any(finding.get("tier") in TIERS[TIERS.index("blocker") + 1:]
-               for finding in findings or ())
+    under = TIERS[TIERS.index("blocker") + 1:] if "blocker" in TIERS else ()
+    return any(finding.get("tier") in under for finding in findings or ())
 
 
 def pr_key(repo, pr):
@@ -3124,17 +3161,12 @@ def review_body(label, pr, config, inline, general, raw=None,
         # because on the ordinary narrowed round, nothing found or
         # everything tiered `blocker`, it answers a question nobody has.
         if disagreed:
-            # "on each finding", not "below". An anchored finding's tag is
-            # rendered into its inline comment on the diff rather than
-            # into this body, which is the common case and the one
-            # `wonky-flow#107` took: the body then ends "1 finding
-            # (1 advisory), 1 posted inline." and a paragraph promising
-            # tags below it points at nothing.
-            lines += ["", "The tier tag on each finding is set after the "
-                          "review, by a separate pass that reads only its "
-                          "summary and never the code. A tag under blocker "
-                          "is that pass disagreeing with the reviewer, not a "
-                          "smaller finding shown here anyway."]
+            # The constant, not a copy: save_transcript() writes the same
+            # sentences for the resend path, and this pull request is
+            # about what happens when one sentence is spelled in two
+            # places. DISAGREED_SAID says why it reads "on each finding"
+            # rather than "below".
+            lines += ["", DISAGREED_SAID]
 
     # A run that was killed or that errored still reports whatever it had
     # got to, and without this that is indistinguishable from a finished
@@ -4205,8 +4237,7 @@ def repost(key, repo, pr, config, state, tokens, done, marker, sha):
             sep = body.find(TRANSCRIPT_SEP)
             starts = sep + len(TRANSCRIPT_SEP) if sep != -1 else -1
             end = (body.find("\n\n", starts)
-                   if starts != -1 and body.startswith(
-                       (SCOPE_MARK, BLOCKERS_MARK), starts)
+                   if starts != -1 and body.startswith(LIFTED_MARKS, starts)
                    else -1)
             if end != -1:
                 opening += "%s\n\n" % body[starts:end]
