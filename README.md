@@ -390,8 +390,11 @@ Three things are worth knowing before you turn it on.
 **The installation is still the boundary.** Discovery does not widen what a
 review can reach: each review is handed a token scoped to the one repository
 it is reviewing, exactly as before. Listing needs a broader token, so Vinegar
-mints an installation-wide one for that single call and drops it. It is never
-cached and never reaches a review. What discovery changes is how many
+mints an installation-wide one for that single call and revokes it before the
+listing returns. It is never cached and never reaches a review. Revoking
+matters because GitHub honours an installation token for an hour after it is
+minted, so dropping the reference alone would leave the broadest credential
+Vinegar holds usable for that whole hour. What discovery changes is how many
 repositories get polled, not what any one review can touch.
 
 **Archived repositories are left out.** GitHub refuses every write to one, so
@@ -405,7 +408,14 @@ real network, and treating one failure as "the App covers nothing" would stop
 every repository being reviewed. Vinegar keeps polling what it was already
 polling, says so in the log, and asks again on the next poll rather than in an
 hour. At startup there is no previous set, so a first listing that fails means
-one poll that watches nothing and a retry a minute later.
+one poll that watches nothing and a retry a minute later. The startup sweep of
+stale check runs waits for a list rather than sweeping an empty one, so it
+still happens on the first poll that knows what to sweep.
+
+`--once` has no next poll, so a one-shot run whose only listing failed exits
+non-zero and says why, rather than reporting success for a run that polled
+nothing. An App that genuinely covers no repositories is a true answer and
+still exits 0.
 
 Every change to the set is logged, both what was added and what was removed.
 The cause of a change is a checkbox in a browser on some other machine, so the

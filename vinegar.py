@@ -966,7 +966,13 @@ def github_api(path, token, scheme="Bearer", payload=None, method=None):
     request.add_header("X-GitHub-Api-Version", "2022-11-28")
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
-            return json.load(response)
+            # An empty body is not JSON, and json.load raises on one.
+            # Revoking the discovery token is the call that answers this
+            # way: 204 No Content, whose whole point is that it has
+            # nothing to say. Read first, then decode, so the verb that
+            # succeeds does not come back as a parse error.
+            body = response.read()
+            return json.loads(body) if body else None
     except urllib.error.HTTPError as err:
         raise RuntimeError("GitHub said %s for %s: %s" % (
             err.code, path, err.read().decode(errors="replace")[:200]))
@@ -1036,9 +1042,18 @@ def discover_repos(app):
     reviewer into running `gh` reaches nothing but the repository under
     review -- holds only while the token in the reviewer's environment is
     the narrow one. So this one is minted here, spent on one listing, and
-    dropped. It is never written to the cache github_env() reads, and it is
-    not part of what this returns, so there is no path from here to a
-    reviewer's environment.
+    revoked before this returns. It is never written to the cache
+    github_env() reads and it is not part of what this returns, so there is
+    no path from here to a reviewer's environment.
+
+    Revoked, and not merely dropped, because dropping the last reference to
+    the string ends nothing. GitHub honours an installation token for an
+    hour from minting, measured on this deployment 2026-08-20: minted at
+    17:16Z, `expires_at` 18:16Z. With DISCOVERY_INTERVAL also an hour that
+    left the broadest credential Vinegar holds live essentially all of the
+    time, which is the opposite of what the paragraph above claimed. What
+    revoking closes is the window in which a core file, a swapped page or a
+    memory dump holds a token GitHub would still accept.
 
     Archived repositories are left out, and that is money rather than
     tidiness. GitHub refuses every write to an archived repository, so one
@@ -1070,22 +1085,40 @@ def discover_repos(app):
             "/app/installations/%d/access_tokens" % install["id"],
             jwt, method="POST")["token"]
         page = 1
-        while True:
-            listed = github_api(
-                "/installation/repositories?per_page=%d&page=%d" % (
-                    per_page, page), token, scheme="token")
-            covered = listed.get("repositories", [])
-            for repo in covered:
-                (archived if repo.get("archived") else found).append(
-                    repo["full_name"])
-            # A short page is the last one. A full one costs one more call
-            # that answers nothing, which is the cheap half of the trade:
-            # `total_count` would save it and cannot be compared against
-            # `found`, because the archived ones have already been taken
-            # out of that list and are still counted in the number.
-            if len(covered) < per_page:
-                break
-            page += 1
+        try:
+            while True:
+                listed = github_api(
+                    "/installation/repositories?per_page=%d&page=%d" % (
+                        per_page, page), token, scheme="token")
+                covered = listed.get("repositories", [])
+                for repo in covered:
+                    (archived if repo.get("archived") else found).append(
+                        repo["full_name"])
+                # A short page is the last one. A full one costs one more
+                # call that answers nothing, which is the cheap half of the
+                # trade: `total_count` would save it and cannot be compared
+                # against `found`, because the archived ones have already
+                # been taken out of that list and are still counted in the
+                # number.
+                if len(covered) < per_page:
+                    break
+                page += 1
+        finally:
+            # In a `finally`, so a listing that fails halfway does not
+            # leave the token it failed with alive for the rest of its
+            # hour. That is the case the revoke is most needed in.
+            #
+            # Best effort, and it has to be. A revoke that fails leaves a
+            # token expiring on its own within the hour, which is exactly
+            # where this started, so failing discovery over the cleanup
+            # would trade a working listing for nothing at all.
+            try:
+                github_api("/installation/token", token, scheme="token",
+                           method="DELETE")
+            except Exception as err:
+                log("could not revoke the token that listed the App's "
+                    "repositories, so it stays usable until it expires "
+                    "within the hour: %s" % err)
     # Sorted, so neither the poll order nor the line naming them depends on
     # the order GitHub answered in. Below a width of one worker per
     # repository that order decides which repositories are reviewed first,
@@ -6633,10 +6666,39 @@ def main():
         # adopted nor closed whichever way either process was started.
         #
         # `--pr` still never reaches here, because it returns above.
-        sweep_checks(config, tokens)
+        swept = False
         while True:
+            # The sweep needs a list to sweep, and under discovery the
+            # first ask is allowed to fail. Run above this loop it then
+            # swept an empty list and never ran again, because it only
+            # ever ran once: a check run a killed predecessor left
+            # `in_progress` stayed that way for the life of the process,
+            # which is the single harm sweep_checks() exists to bound.
+            # Behind the flag it runs on the first pass that knows what to
+            # sweep, however many asks that took.
+            #
+            # Nothing moves where `repos` came from the file, because
+            # load_config refuses an empty one there. The first pass
+            # sweeps, before the first poll, exactly as before.
+            if not swept and config["repos"]:
+                sweep_checks(config, tokens)
+                swept = True
             poll_once(config, state, tokens)
             if args.once:
+                # A one-shot run whose only ask failed polled nothing, and
+                # said so by exiting 0, which is the one answer a cron
+                # entry reads as "the pull requests are reviewed". The
+                # loop's retry a minute later does not exist on this path.
+                #
+                # `asked_at` is the signal and needs nothing new:
+                # refresh_repos() hands back the time of an ask that
+                # answered and the untouched value of one that did not, so
+                # zero here means the only ask there was failed. An ask
+                # that answered "no repositories" is a true answer about
+                # an App installed nowhere, and still exits 0.
+                if discovering and not asked_at:
+                    sys.exit("could not ask the App which repositories it "
+                             "covers, so this run polled nothing")
                 return
             time.sleep(config["poll_interval"])
             # After the sleep and before the pass, so the pass about to run

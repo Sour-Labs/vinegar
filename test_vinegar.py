@@ -3579,6 +3579,7 @@ vinegar.app_jwt, vinegar.github_api = _real_jwt, _real_api
 # needed a bodyless one, and inferred that call went out as a GET against
 # a path whose 404 reads as "the App is not installed on this repository".
 _built = []
+_fake_body = [b"{}"]
 
 
 class _FakeResponse:
@@ -3589,7 +3590,7 @@ class _FakeResponse:
         return False
 
     def read(self):
-        return b"{}"
+        return _fake_body[0]
 
 
 def _fake_urlopen(request, timeout=None):
@@ -3615,8 +3616,24 @@ check("a call with neither a payload nor a verb is still a GET",
 check("a payload still means a POST, for the calls that always had one",
       _built[2].get_method() == "POST", _built[2].get_method())
 
+_fake_body[0] = b""
+vinegar.urllib.request.urlopen = _fake_urlopen
+try:
+    _empty = vinegar.github_api("/installation/token", "t", method="DELETE")
+except Exception as err:
+    # Caught rather than raised through: an exception at module level ends
+    # the run where it stands and reports the checks below as never run,
+    # which mutate.py can only call coverage voided.
+    _empty = "raised %s" % type(err).__name__
+finally:
+    vinegar.urllib.request.urlopen = _real_urlopen
+    _fake_body[0] = b"{}"
+check("a 204 with no body is not read as broken JSON",
+      _empty is None, _empty)
+
 _disco_calls = []
 _disco_pages = []
+_disco_boom = []
 
 
 def _disco_api(path, token, scheme="Bearer", payload=None, method=None):
@@ -3625,6 +3642,10 @@ def _disco_api(path, token, scheme="Bearer", payload=None, method=None):
         return [{"id": 7}]
     if path.endswith("/access_tokens"):
         return {"token": "installation-wide"}
+    if path == "/installation/token":
+        return None
+    if _disco_boom:
+        raise RuntimeError("GitHub said 502 for /installation/repositories")
     return {"repositories": _disco_pages.pop(0) if _disco_pages else []}
 
 
@@ -3697,6 +3718,32 @@ check("and discovery is not given the cache a reviewer's environment "
       "comes from",
       list(inspect.signature(vinegar.discover_repos).parameters) == ["app"],
       list(inspect.signature(vinegar.discover_repos).parameters))
+# Dropping the last reference to the string ends nothing: GitHub honours
+# an installation token for an hour from minting, and DISCOVERY_INTERVAL
+# is also an hour, so unrevoked the broadest credential Vinegar holds is
+# live essentially all of the time.
+_discovered([_repo("o/a")])
+_revoked = _called("/installation/token")
+check("the token that listed the repositories is revoked, not just dropped",
+      len(_revoked) == 1 and _revoked[0][4] == "DELETE"
+      and _revoked[0][1] == "installation-wide", _revoked)
+# The case the revoke is most needed in, so it lives in a `finally`: a
+# listing that fails halfway would otherwise leave the token it failed
+# with usable for the rest of its hour.
+del _disco_calls[:]
+_disco_boom[:] = [True]
+vinegar.app_jwt, vinegar.github_api = stub_app_jwt, _disco_api
+try:
+    vinegar.discover_repos(APP)
+    _boomed = "returned"
+except RuntimeError as err:
+    _boomed = str(err)
+finally:
+    vinegar.app_jwt, vinegar.github_api = _real_jwt, _real_api
+    del _disco_boom[:]
+check("a listing that fails still revokes the token it failed with",
+      len(_called("/installation/token")) == 1 and "502" in _boomed,
+      (_called("/installation/token"), _boomed))
 
 _refresh_log = []
 
@@ -3724,9 +3771,15 @@ def _refreshed(repos, asked_at, *pages, fails=False):
     return config["repos"], asked, " ".join(_refresh_log)
 
 
-_fresh = _refreshed(["o/a"], time.time(), [_repo("o/b")])
+_an_hour = time.time()
+_fresh = _refreshed(["o/a"], _an_hour, [_repo("o/b")])
 check("the App is not asked again inside the hour",
       _fresh[0] == ["o/a"] and not _disco_calls, _fresh)
+# main() reassigns `asked_at` from this on every pass, so handing back a
+# fresh clock here restarts the hour once a minute and the hour never
+# ends: the App is asked at startup and never again, silently.
+check("and the clock it hands back is the one it was given",
+      _fresh[1] == _an_hour, (_fresh[1], _an_hour))
 _due = _refreshed(["o/a"], 0, [_repo("o/b")])
 check("an hour on, the watched list becomes what the App now covers",
       _due[0] == ["o/b"], _due)
@@ -5956,6 +6009,113 @@ finally:
     sys.argv, vinegar.poll_once, vinegar.sweep_checks = _oo_kept
 check("a one-shot run sweeps on the same rule the daemon does",
       _once_order == ["sweep", "poll"], _once_order)
+
+# The wire again, for discovery, and it carries the same argument the
+# sweep's does: every check on refresh_repos() calls it directly, so a
+# main() that never calls it leaves all of them green while no deployment
+# ever learns that a repository was onboarded.
+
+
+def _discovery_config(**over):
+    """A config that names no repositories and has an App to ask."""
+    with open(os.path.join(os.environ["VINEGAR_HOME"], "config.json"),
+              "w") as handle:
+        json.dump(dict({"repos": [], "poll_interval": 1,
+                        "github_app": {"app_id": 77,
+                                       "private_key": _covered_key}},
+                       **over), handle)
+
+
+def _wired(name, ask):
+    """One daemon run against that ask, and the order it did things in."""
+    order = []
+    kept = (sys.argv, vinegar.poll_once, vinegar.sweep_checks,
+            vinegar.refresh_repos)
+
+    def poll(config, *unused, **unused_kw):
+        order.append("poll:" + ",".join(config["repos"]))
+        # Bounded on polls rather than on asks. Bounded on asks, a
+        # mutation that removes an ask never reaches the bound and the
+        # run hangs instead of failing, which reports nothing.
+        if len([done for done in order if done.startswith("poll")]) >= 2:
+            raise KeyboardInterrupt
+
+    _discovery_config()
+    vinegar.refresh_repos = lambda config, asked_at: (
+        order.append("ask") or ask(config, asked_at))
+    vinegar.poll_once = poll
+    vinegar.sweep_checks = lambda *a, **k: order.append("sweep")
+    sys.argv = ["vinegar.py"]
+    try:
+        vinegar.main()
+    except SystemExit:
+        pass
+    finally:
+        (sys.argv, vinegar.poll_once, vinegar.sweep_checks,
+         vinegar.refresh_repos) = kept
+    return order
+
+
+def _answers(config, asked_at):
+    config["repos"] = ["o/found"]
+    return asked_at + 1
+
+
+_dwire = _wired("answers", _answers)
+check("the daemon asks the App before it polls, and again every pass",
+      _dwire == ["ask", "sweep", "poll:o/found", "ask", "poll:o/found"],
+      _dwire)
+
+
+def _fails_once(config, asked_at):
+    # The first ask fails, so the list stays empty; the second answers.
+    if config.get("_asked"):
+        config["repos"] = ["o/late"]
+        return asked_at + 1
+    config["_asked"] = True
+    return asked_at
+
+
+# The blocker the `swept` flag exists for. Run above the loop, a sweep met
+# an empty list after a failed first ask, swept nothing, and never ran
+# again, because it only ever ran once. A check run a killed predecessor
+# left `in_progress` then stayed that way for the life of the process,
+# which is the single harm sweep_checks() is there to bound.
+_swire = _wired("fails once", _fails_once)
+check("a sweep waits for a list rather than sweeping an empty one",
+      _swire == ["ask", "poll:", "ask", "sweep", "poll:o/late"], _swire)
+
+
+def _one_shot(ask):
+    """What a `--once` run exits with, against that ask."""
+    kept = (sys.argv, vinegar.poll_once, vinegar.sweep_checks,
+            vinegar.refresh_repos)
+    _discovery_config()
+    vinegar.refresh_repos = ask
+    vinegar.poll_once = lambda *a, **k: None
+    vinegar.sweep_checks = lambda *a, **k: None
+    sys.argv = ["vinegar.py", "--once"]
+    try:
+        vinegar.main()
+        return "returned"
+    except SystemExit as err:
+        return str(err.code)
+    finally:
+        (sys.argv, vinegar.poll_once, vinegar.sweep_checks,
+         vinegar.refresh_repos) = kept
+
+
+# Exiting 0 having polled nothing is the one answer a cron entry reads as
+# "every pull request is reviewed". The loop's retry a minute later does
+# not exist on this path, so the exit code is all there is.
+_once_failed = _one_shot(lambda config, asked_at: asked_at)
+check("a one-shot run whose only ask failed says so in its exit code",
+      "polled nothing" in _once_failed, _once_failed)
+# An ask that answered "no repositories" is a true answer about an App
+# installed nowhere, and is not a failure.
+_once_empty = _one_shot(lambda config, asked_at: asked_at + 1)
+check("and an App that genuinely covers nothing is not a failure",
+      _once_empty == "returned", _once_empty)
 vinegar.save_state({})
 
 
