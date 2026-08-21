@@ -254,10 +254,8 @@ MUTATIONS = [
      '    if config.get("github_app") and checkout_grace(config) >= TOKEN_LIFE:',
      "    if checkout_grace(config) >= TOKEN_LIFE:"),
     ("token-cap-no-remedy",
-     "               TOKEN_LIFE - CHECKOUT_GRACE))",
-     "               0))"),
-    # It must stay a warning. A refusal here took down the deploy of the
-    # change that introduced it, which is the whole subject of issue #15.
+     '               TOKEN_LIFE, TOKEN_LIFE - review_reserve(config)))',
+     '               TOKEN_LIFE, 0))'),
     ("token-cap-refuses",
      '        log("%s: review_timeout is %d, and with the %ds the checkout "',
      '        sys.exit("%s: review_timeout is %d, and with the %ds the checkout "'),
@@ -2030,6 +2028,35 @@ MUTATIONS = [
      "Reply with that one JSON object and nothing else: no prose before it, none\n"
      "after it, and no sentence on its own.",
      "That is all."),
+    # --- the floor under a narrowed round, and the token it must outlive --
+    # Those rounds review the fixes and their increments are nearly always
+    # small, so without a floor the bands sent almost every one to `low`
+    # at the same time as blockers_only_after narrowed what it could
+    # report. Five of six blockers across PRs #32 and #33 landed in a fix.
+    ("narrowed-round-has-a-floor",
+     "    if narrowed and EFFORTS.index(wanted) < EFFORTS.index(NARROWED_FLOOR):",
+     "    if False and EFFORTS.index(wanted) < EFFORTS.index(NARROWED_FLOOR):"),
+    ("narrowed-floor-value",
+     'NARROWED_FLOOR = "high"',
+     'NARROWED_FLOOR = "low"'),
+    # The floor is bounded by the ceiling like every other answer, or an
+    # operator who configured `low` stops getting `low`.
+    ("narrowed-floor-under-the-ceiling",
+     "        return min(NARROWED_FLOOR, ceiling, key=EFFORTS.index), (",
+     "        return NARROWED_FLOOR, ("),
+    # review() is the only caller that knows which kind of round this is.
+    ("narrowed-round-is-declared",
+     "                             config, narrowed=bool(since))",
+     "                             config)"),
+    # The token has to outlive the triage pass as well as the clone and
+    # the review, and the warning has to measure against the same sum.
+    ("reserve-counts-the-triage-pass",
+     "    return CHECKOUT_GRACE + (SHAPE_TIMEOUT + DIFF_TIMEOUT\n"
+     '                             if config["triage_model"] else 0)',
+     "    return CHECKOUT_GRACE"),
+    ("reserve-counts-nothing-when-triage-is-off",
+     '                             if config["triage_model"] else 0)',
+     "                             if True else 0)"),
 ]
 
 

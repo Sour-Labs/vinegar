@@ -59,6 +59,8 @@ new PR (or a new head commit)
              ├─ 100 to 400 lines     ──▶  medium
              ├─ 400 to 1000 lines    ──▶  high
              └─ 1000 lines and over  ──▶  the ceiling
+
+           a round that reads only what is new never goes below high
                           │
                           ▼
               claude -p '/code-review <effort> <n>'
@@ -201,7 +203,7 @@ Every key in `config.example.json`:
 | --- | --- | --- |
 | `repos` | none | Repositories to poll, as `owner/name`. Required, unless `github_app` is set: an empty list then means every repository the App is installed on. See below. |
 | `poll_interval` | `60` | Seconds between polls. |
-| `effort` | `"high"` | The most effort any review may be given: `low`, `medium`, `high`, `xhigh`, `max`. `ultra` is rejected. With `triage_model` set this is a ceiling rather than the level every review runs at, and triage may spend less. Read the note below before pairing it with `model`. |
+| `effort` | `"high"` | The most effort any review may be given: `low`, `medium`, `high`, `xhigh`, `max`. `ultra` is rejected. With `triage_model` set this is a ceiling rather than the level every review runs at, and triage may spend less, though never below `high` on a round that reads only what is new. Read the note below before pairing it with `model`. |
 | `comment` | `true` | Post findings on the pull request. False runs the review and writes only to `~/.vinegar/reviews.dry/`, remembering what it did in `state.json.dry`. |
 | `model` | `null` | Model for the review. Null uses your Claude Code default. Read the note below before setting it. |
 | `fallback_model` | `null` | Model to run the review again on when `model` cannot be routed. Null means no fallback. See below. |
@@ -213,7 +215,7 @@ Every key in `config.example.json`:
 | `skip_bots` | `true` | Skip pull requests opened by bots. |
 | `skip_forks` | `true` | Skip pull requests whose head branch lives in a fork. Read the next section before you turn this off. |
 | `authors` | `[]` | Only review these GitHub logins. Empty means anyone who passes the checks above. |
-| `review_timeout` | `1800` | Kill a review that runs longer than this many seconds. |
+| `review_timeout` | `1800` | Kill a review that runs longer than this many seconds. The GitHub token a review runs on has to outlive the clone, the triage pass and this together, so raising it far enough makes every review mint a fresh token; Vinegar says so at startup when it does. |
 | `severity_model` | `"haiku"` | Model that tiers the findings before they are posted. Null posts them in the order the reviewer reported them. See below. |
 | `triage_model` | `"sonnet"` | Model that reads the diff before the review and decides how much effort it earns. Null reviews everything at `effort`. It can only ever lower the effort, never raise it. See "The triage pass". |
 | `github_app` | `null` | Post as a GitHub App instead of as you. See below. |
@@ -888,6 +890,15 @@ too large to send whole. The unsure list is worth acting on and is not worth
 trusting alone: measured over 27 labelled pull requests, the domain each run
 actually got wrong was never the domain it had called unsure. Confidently wrong
 is the failure mode, not doubt.
+
+**A round that reads only what is new has a floor as well as a ceiling, and
+never goes below `high`.** Those rounds review the fixes, and a fix is a small
+diff, so the bands alone would send nearly every one of them to `low` at the
+same moment `blockers_only_after` narrows what they may report. That pairing is
+backwards. Across two pull requests on this repository, five of six blockers
+were found in a fix rather than in the branch it repaired, so the follow-up
+rounds are the ones least safe to go cheap on. The floor is bounded by the
+ceiling like every other answer, so configuring `low` still means `low`.
 
 The bands come from 58 first reviews. Under 100 changed lines cost a median of
 $1.19, 100 to 400 cost $2.29, 400 to 1000 cost $2.93, and 1000 and over cost

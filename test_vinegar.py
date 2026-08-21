@@ -3179,7 +3179,13 @@ check("the shipped default starts",
 # because it is waste rather than breakage: a daemon that will not start is
 # worse than one that mints too often, and refusing took the deploy of its
 # own change down for exactly that reason.
-_cap = vinegar.TOKEN_LIFE - vinegar.CHECKOUT_GRACE
+# Through review_reserve() rather than CHECKOUT_GRACE, because the clone is
+# no longer the only thing the token has to outlive: the triage pass runs
+# between it and the review. Derived rather than written out, so the
+# boundary checks below follow the function instead of pinning a number
+# that moved once already.
+_cap = vinegar.TOKEN_LIFE - vinegar.review_reserve(
+    dict(vinegar.DEFAULTS, triage_model="sonnet"))
 _APP_CFG = {"app_id": 1, "private_key": _covered_key}
 
 
@@ -3227,6 +3233,23 @@ check("a review_timeout exactly on the cap says so as well",
 # The remedy clause verbatim, not the number loose in the message. `_cap`
 # appears in the echoed setting too, and in the interpolated temp path,
 # so a bare substring match passes with the remedy deleted.
+# What the token must outlive before the review starts. Leaving triage out
+# understated it by four minutes and the warning measured against the
+# smaller sum, so it stayed quiet about the case it exists to catch.
+check("the reserve counts the triage pass when it will run",
+      vinegar.review_reserve(dict(vinegar.DEFAULTS, triage_model="sonnet"))
+      == vinegar.CHECKOUT_GRACE + vinegar.SHAPE_TIMEOUT + vinegar.DIFF_TIMEOUT,
+      vinegar.review_reserve(dict(vinegar.DEFAULTS, triage_model="sonnet")))
+check("the reserve counts nothing for a pass that will not run",
+      vinegar.review_reserve(dict(vinegar.DEFAULTS, triage_model=None))
+      == vinegar.CHECKOUT_GRACE)
+check("the token must outlive the triage pass as well as the review",
+      vinegar.checkout_grace(dict(vinegar.DEFAULTS, triage_model="sonnet",
+                                  review_timeout=1800))
+      - vinegar.checkout_grace(dict(vinegar.DEFAULTS, triage_model=None,
+                                    review_timeout=1800))
+      == vinegar.SHAPE_TIMEOUT + vinegar.DIFF_TIMEOUT)
+
 check("the warning names the value that would fix it",
       any("Set it under %d" % _cap in m for m in _over_said), _over_said)
 check("the largest review_timeout inside the cap still starts",
@@ -8615,6 +8638,39 @@ check("a change with no readable text takes the ceiling, not `low`",
 check("one readable line is enough to be judged on its size",
       _effort(_clear(), 1)[0] == "low")
 
+# A round that reads only what is new has a floor as well as a ceiling.
+# Its increment is nearly always small, so the bands alone sent almost
+# every follow-up to `low` at the same time as blockers_only_after
+# narrowed what it could report — and the follow-ups are the rounds that
+# review the fixes, where five of six blockers across PRs #32 and #33
+# landed.
+def _narrowed(shape, changed, ceiling="xhigh"):
+    return vinegar.effort_for(shape, changed, dict(CONFIG, effort=ceiling),
+                              narrowed=True)
+
+
+check("a narrowed round is not reviewed below the floor",
+      _narrowed(_clear(), 12)[0] == vinegar.NARROWED_FLOOR,
+      _narrowed(_clear(), 12))
+check("the floor says it is the floor, not the band",
+      "not reviewed below" in _narrowed(_clear(), 12)[1],
+      _narrowed(_clear(), 12)[1])
+check("a first round is still judged on its size alone",
+      _effort(_clear(), 12)[0] == "low")
+check("a narrowed round above the floor keeps the band's answer",
+      _narrowed(_clear(), 700)[0] == "high")
+check("a narrowed round still takes the ceiling when it reaches a domain",
+      _narrowed(_clear(auth=True), 12)[0] == "xhigh")
+# The floor is capped like every other answer, so configuring `low` still
+# means `low` everywhere.
+check("the floor never raises a round above the configured ceiling",
+      _narrowed(_clear(), 12, ceiling="low")[0] == "low",
+      _narrowed(_clear(), 12, ceiling="low"))
+check("the floor never exceeds the ceiling at any size",
+      all(vinegar.EFFORTS.index(_narrowed(_clear(), n, ceiling="medium")[0])
+          <= vinegar.EFFORTS.index("medium")
+          for n in (10, 250, 700, 5000)))
+
 # The ceiling is a ceiling in both directions: triage may lower it and may
 # never raise it, so an operator who configured `low` gets `low`.
 check("a ceiling below the band's level wins",
@@ -8661,7 +8717,7 @@ check("the whole file list survives a cut diff",
           if c[0] == "claude"), "")
 
 # The wiring: what triage decides has to reach the command that is run.
-def _reviewed_at(answer, ceiling="xhigh"):
+def _reviewed_at(answer, ceiling="xhigh", since=None):
     ran = []
 
     def run(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
@@ -8676,7 +8732,7 @@ def _reviewed_at(answer, ceiling="xhigh"):
     try:
         vinegar.review(ROOT, "o/r", _SHAPE_PR,
                        dict(CONFIG, effort=ceiling, triage_model="sonnet"),
-                       None, {})
+                       None, {}, since=since)
     except Exception:
         pass
     finally:
@@ -8693,6 +8749,10 @@ check("a triage that could not be read still buys the configured effort",
 check("a domain reached is reviewed at the ceiling through the wiring",
       _reviewed_at(_SHAPE_OK.replace('"auth": false', '"auth": true')
                    ).startswith("/code-review xhigh "))
+check("a narrowed round reaches the reviewer at the floor, not at `low`",
+      _reviewed_at(_SHAPE_OK, since="abc123").startswith(
+          "/code-review %s " % vinegar.NARROWED_FLOOR),
+      _reviewed_at(_SHAPE_OK, since="abc123"))
 
 
 

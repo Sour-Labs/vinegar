@@ -337,11 +337,12 @@ TOKEN_LIFE = 3600
 # past it is a typo rather than an intent.
 #
 # It is not the whole hold any more, and load_config's message says so.
-# The severity pass is a second subprocess on the same thread, after the
-# review and before the posting, so the worst case is this plus
-# SEVERITY_TIMEOUT. The cap is left where it is rather than lowered by
-# 300: the number is a typo detector, not a budget, and the argument for
-# 7200 is unchanged by five minutes.
+# Three other subprocesses share the thread: the triage pass runs before
+# the review, as a git diff and a model call, and the severity pass runs
+# after it and before the posting. So the worst case is this plus
+# DIFF_TIMEOUT, SHAPE_TIMEOUT and SEVERITY_TIMEOUT. The cap is left where
+# it is rather than lowered by nine minutes: the number is a typo
+# detector, not a budget, and the argument for 7200 is unchanged by them.
 MAX_REVIEW_TIMEOUT = 7200
 
 # The most repositories one machine will review at once, whatever the file
@@ -495,6 +496,16 @@ RISKS = ("auth", "payments", "migrations", "concurrency", "money")
 DIFFICULTY = ((100, "trivial"), (400, "small"), (1000, "moderate"),
               (None, "large"))
 BANDS = {"trivial": "low", "small": "medium", "moderate": "high"}
+
+# The least effort a round that reads only what is new may be given.
+#
+# Those rounds review the fixes, and their increments are nearly always
+# small, so the bands alone would send almost every one of them to `low`
+# at the same time as blockers_only_after narrows what they may report.
+# That is backwards: across PRs #32 and #33 five of six blockers landed in
+# a fix rather than in the branch it repaired. Capped by the ceiling like
+# every other answer, so configuring `low` still means `low`.
+NARROWED_FLOOR = "high"
 
 SHAPE_BRIEF = """You classify the shape of a code change. You never look for bugs, and you
 never say whether the change is correct, safe or complete.
@@ -921,14 +932,31 @@ DEFAULTS = {
 }
 
 
+def review_reserve(config):
+    """Everything the token must survive before the review even starts.
+
+    The clone, and then the triage pass, which is two subprocesses on the
+    same thread between the checkout and the review. Leaving triage out
+    understated the requirement by SHAPE_TIMEOUT + DIFF_TIMEOUT: at the
+    default review_timeout that took the margin against a token expiring
+    from 300 seconds to 60, and the warning below went on measuring
+    against the smaller sum, so it stayed quiet about it.
+
+    Nothing is reserved for a pass that will not run, so an install with
+    `triage_model` null asks for exactly what it asked for before.
+    """
+    return CHECKOUT_GRACE + (SHAPE_TIMEOUT + DIFF_TIMEOUT
+                             if config["triage_model"] else 0)
+
+
 def checkout_grace(config):
-    """Token life the checkout and the review need between them.
+    """Token life the checkout, the triage and the review need between them.
 
     Both the daemon and the `--pr` path ask for this, and each used to spell
     the sum out with a comment saying it had to match the other. Drift shows
     up only under a slow clone, at review time, on a real pull request.
     """
-    return CHECKOUT_GRACE + config["review_timeout"]
+    return review_reserve(config) + config["review_timeout"]
 
 
 def utc_stamp():
@@ -1613,8 +1641,8 @@ def load_config(path):
             "No cached token can satisfy it, so every review mints a fresh "
             "one and then runs on a token that can expire before it "
             "finishes. Set it under %d to use the cache."
-            % (path, config["review_timeout"], CHECKOUT_GRACE, TOKEN_LIFE,
-               TOKEN_LIFE - CHECKOUT_GRACE))
+            % (path, config["review_timeout"], review_reserve(config),
+               TOKEN_LIFE, TOKEN_LIFE - review_reserve(config)))
 
     # A misconfigured App is caught here rather than at the first review, which
     # is minutes later and on a real pull request.
@@ -3458,7 +3486,7 @@ def difficulty(changed):
     return DIFFICULTY[-1][1]
 
 
-def effort_for(shape, changed, config):
+def effort_for(shape, changed, config, narrowed=False):
     """The effort this change gets, and the sentence saying why.
 
     Triage may only ever spend less than the configured effort, never
@@ -3505,6 +3533,13 @@ def effort_for(shape, changed, config):
     wanted = BANDS.get(band)
     if wanted is None:
         return ceiling, "it is a %s change, at %d lines" % (band, changed)
+    # The floor, before the ceiling, because both bound the same answer
+    # and the ceiling has the last word either way.
+    if narrowed and EFFORTS.index(wanted) < EFFORTS.index(NARROWED_FLOOR):
+        return min(NARROWED_FLOOR, ceiling, key=EFFORTS.index), (
+            "it is a %s change of %d lines, and a round reading only what "
+            "is new is not reviewed below %s effort"
+            % (band, changed, NARROWED_FLOOR))
     # Lower by position, so a ceiling below the band's level wins. An
     # operator who configured `low` gets `low` for everything, which is
     # what configuring `low` asked for.
@@ -5528,7 +5563,8 @@ def review(path, repo, pr, config, env, tokens, resent=False, check=None,
     # here on the configured effort, which is what Vinegar did before this
     # existed.
     shaped = shape(label, repo, path, pr, config, env, since)
-    chosen, why = effort_for(shaped, (shaped or {}).get("changed", 0), config)
+    chosen, why = effort_for(shaped, (shaped or {}).get("changed", 0),
+                             config, narrowed=bool(since))
     if chosen != config["effort"]:
         log("%s: triage lowered this from %s to %s effort: %s" % (
             label, config["effort"], chosen, why))
