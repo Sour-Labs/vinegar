@@ -107,8 +107,8 @@ MUTATIONS = [
 
     # --- posting -------------------------------------------------------
     ("post-timeout",
-     "                     env=env, timeout=POST_TIMEOUT,",
-     "                     env=env,"),
+     '                     env=env, timeout=POST_TIMEOUT,\n                     stdin_text=json.dumps(payload))\n',
+     '                     env=env,\n                     stdin_text=json.dumps(payload))\n'),
     ("already-posted-gate",
      "        if already_posted(label, repo, pr, env, verb):\n"
      '            log("%s: the review is already on the pull request" % label)\n'
@@ -1833,10 +1833,8 @@ MUTATIONS = [
      "    reached = sorted(name for name in RISKS if shape[name])\n"
      "    if False:"),
     ("triage-unsure-escalates",
-     '    if shape["unsure"]:\n'
-     '        return ceiling, "unsure about %s" % ", ".join(shape["unsure"])',
-     '    if False:\n'
-     '        return ceiling, "unsure about %s" % ", ".join(shape["unsure"])'),
+     '    if shape["unsure"]:\n        return ceiling, "triage was unsure about %s" % ", ".join(\n            shape["unsure"])\n',
+     '    if False:\n        return ceiling, "triage was unsure about %s" % ", ".join(\n            shape["unsure"])\n'),
     ("triage-truncated-escalates",
      '    if shape.get("truncated"):\n'
      '        return ceiling, "the diff was too large to read whole"',
@@ -1899,6 +1897,65 @@ MUTATIONS = [
     ("triage-fenced-answer",
      '    start, end = said.find("{"), said.rfind("}")',
      '    start, end = (0, said.rfind("}")) if said.startswith("{") else (-1, -1)'),
+    # --- the triage note -----------------------------------------------
+    # A note is about one commit and names it. Rewriting it on the next
+    # push erases what triage decided about code that has since changed.
+    ("note-is-a-new-comment",
+     '                      "repos/%s/issues/%d/comments" % (repo, pr["number"]),\n'
+     '                      "--method", "POST", "--input", "-"],',
+     '                      "repos/%s/issues/%d/comments" % (repo, pr["number"]),\n'
+     '                      "--method", "PATCH", "--input", "-"],'),
+    ("note-abbreviates-the-sha",
+     'lines = ["**%s** \u00b7 triage of `%s`" % (CHECK_NAME, pr["headRefOid"][:7]),',
+     'lines = ["**%s** \u00b7 triage of `%s`" % (CHECK_NAME, pr["headRefOid"]),'),
+    # A blank where the domains should be reads as "nobody looked".
+    ("note-says-no-domain-reached",
+     '    risk = ", ".join(reached) if reached else "none of %s" % ", ".join(RISKS)',
+     '    risk = ", ".join(reached)'),
+    ("note-names-the-effort",
+     '        "Reviewing at %s effort, because %s." % (effort, why)]',
+     '        "Reviewing at some effort, because %s." % why]'),
+    ("note-plural-files",
+     '        "" if shaped["files"] == 1 else "s", risk), "",',
+     '        "s", risk), "",'),
+    # The dry run reviews and posts nothing at all.
+    ("note-respects-the-dry-run",
+     '        if config["comment"]:\n'
+     '            post_note(label, repo, pr, note_body(pr, shaped, chosen, why),',
+     '        if True:\n'
+     '            post_note(label, repo, pr, note_body(pr, shaped, chosen, why),'),
+    # A pass that decided nothing has nothing to publish.
+    # `or True` here would reach note_body(None) and raise, which aborts
+    # the run and reports nothing. `and False` fails instead, which is
+    # what a mutation has to do to be readable.
+    ("note-only-when-triage-answered",
+     "    if shaped is not None:\n"
+     "        # The indicator was opened before this ran, so it is carrying the",
+     "    if shaped is not None and False:\n"
+     "        # The indicator was opened before this ran, so it is carrying the"),
+    # The note is worth posting and is not worth a review.
+    ("note-failure-is-swallowed",
+     '    except Exception as err:\n'
+     '        log("%s: the triage note did not post: %s" % (\n'
+     '            label, "it timed out" if isinstance(\n'
+     '                err, subprocess.TimeoutExpired) else err))\n'
+     '        return False',
+     '    except Exception:\n'
+     '        raise'),
+    # Opened before triage ran, so left alone it announces the ceiling for
+    # the whole of a review running lower.
+    ("retitle-corrects-the-checks-list",
+     "        retitle_check(label, check, chosen, blockers, env)",
+     "        pass"),
+    ("retitle-uses-the-chosen-effort",
+     '                  "title": "Reviewing at %s effort%s" % (\n'
+     '                      effort, ", blockers only" if blockers else ""),\n'
+     '                  "summary": "Vinegar is reviewing this commit. The findings "\n'
+     '                             "arrive as one review when it finishes."}}, env)',
+     '                  "title": "Reviewing at some effort%s" % (\n'
+     '                      ", blockers only" if blockers else "",),\n'
+     '                  "summary": "Vinegar is reviewing this commit. The findings "\n'
+     '                             "arrive as one review when it finishes."}}, env)'),
 ]
 
 

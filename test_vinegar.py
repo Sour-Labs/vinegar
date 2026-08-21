@@ -8443,13 +8443,13 @@ check("a large change takes the ceiling rather than a level of its own",
 # Risk is what drives routing, so a two-line change that reaches one of the
 # domains has to come out at the ceiling, not at `low`.
 check("a trivial change that reaches a domain still takes the ceiling",
-      _effort(_clear(money=True), 12) == ("xhigh", "touches money"))
+      _effort(_clear(money=True), 12) == ("xhigh", "it touches money"))
 check("the reason names every domain the change reached",
       _effort(_clear(auth=True, migrations=True), 12)[1]
-      == "touches auth, migrations")
+      == "it touches auth, migrations")
 check("a domain the model was unsure about takes the ceiling",
       _effort(_clear(unsure=["concurrency"]), 12)
-      == ("xhigh", "unsure about concurrency"))
+      == ("xhigh", "triage was unsure about concurrency"))
 check("a diff too large to read whole takes the ceiling",
       _effort(_clear(truncated=True), 12)[0] == "xhigh")
 
@@ -8532,6 +8532,144 @@ check("a domain reached is reviewed at the ceiling through the wiring",
       _reviewed_at(_SHAPE_OK.replace('"auth": false', '"auth": true')
                    ).startswith("/code-review xhigh "))
 
+
+
+# ── The triage note ────────────────────────────────────────────────────
+#
+# A new comment every pass, never an edit of the last one, carrying what
+# triage decided and the effort that bought. The checks list is patched at
+# the same moment, because the indicator was opened before triage ran and
+# is otherwise announcing the ceiling for the whole of a lower review.
+
+def _note(**over):
+    got = _clear(**over)
+    # changed and difficulty must agree: effort_for() recomputes the band
+    # from the line count, so a fixture naming a different one would be
+    # testing a state shape() cannot produce.
+    got.update(changed=700, files=7, difficulty="moderate",
+               touches="Reworks session refresh.")
+    for name, value in over.items():
+        got[name] = value
+    effort, why = _effort(got, got["changed"])
+    return vinegar.note_body(_SHAPE_PR, got, effort, why)
+
+
+_plain = _note()
+# The whole first line, not a substring: the full sha contains the short
+# one, so `in` would pass just as happily with the abbreviation removed.
+check("the note names the commit it triaged, abbreviated",
+      _plain.splitlines()[0]
+      == "**Vinegar** \u00b7 triage of `%s`" % PR["headRefOid"][:7],
+      _plain.splitlines()[0])
+# shape() derives both from the same line count, so a note can never
+# disagree with the routing about what band the change is in.
+check("the difficulty a note prints is the one the routing used",
+      all(vinegar.difficulty(n) in vinegar.note_body(
+          _SHAPE_PR, dict(_clear(), changed=n, files=1,
+                          difficulty=vinegar.difficulty(n), touches="x"),
+          "low", "why")
+          for n in (12, 250, 700, 4000)))
+check("the note carries the model's sentence unchanged",
+      "Reworks session refresh." in _plain, _plain)
+check("the note names the difficulty and what it measured",
+      "Difficulty: moderate, 700 lines across 7 files" in _plain, _plain)
+check("a note reaching no domain says so rather than leaving it blank",
+      "Risk: none of auth, payments, migrations, concurrency, money" in _plain,
+      _plain)
+check("the note names the effort the review will run at",
+      "Reviewing at high effort, because" in _plain, _plain)
+
+_risky = _note(auth=True, migrations=True)
+check("a note names every domain the change reached",
+      "Risk: auth, migrations" in _risky, _risky)
+check("a note says why the ceiling was taken",
+      "Reviewing at xhigh effort, because it touches auth, migrations."
+      in _risky, _risky)
+
+check("one changed file is not called one files",
+      "across 1 file ·" in _note(changed=9, files=1, difficulty="trivial"),
+      _note(changed=9, files=1, difficulty="trivial"))
+# An absent summary is a missing sentence, not a blank line to pad with.
+check("a note with no summary has no empty paragraph in it",
+      "\\n\\n\\n" not in _note(touches=""), repr(_note(touches="")))
+# The note describes; it never grades. The summary is the model's and is
+# passed through, but nothing this function adds may judge the change.
+check("nothing the note itself adds claims the change is good",
+      not any(word in _plain.replace("Reworks session refresh.", "")
+              for word in ("correct", "safe", "fixes", "improves", "clean")),
+      _plain)
+
+
+def _posts(comment=True, model="sonnet", rc=0, answer=_SHAPE_OK, boom=None):
+    """Drive review() far enough to post a note, and record every call."""
+    sent = []
+
+    def run(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
+        sent.append((cmd, stdin_text))
+        if cmd[0] == "git":
+            return subprocess.CompletedProcess(cmd, 0, DIFF, "")
+        if cmd[0] == "gh":
+            if boom:
+                raise boom
+            return subprocess.CompletedProcess(cmd, rc, "{}", "boom")
+        if cmd[2].startswith("/code-review"):
+            raise subprocess.TimeoutExpired("claude", 1)
+        return subprocess.CompletedProcess(
+            cmd, 0, json.dumps({"result": answer, "total_cost_usd": 0.01}), "")
+    was, vinegar.run = vinegar.run, run
+    try:
+        vinegar.review(ROOT, "o/r", _SHAPE_PR,
+                       dict(CONFIG, effort="xhigh", comment=comment,
+                            triage_model=model), None, {},
+                       check={"repo": "o/r", "id": 77, "closed": False})
+    except Exception:
+        pass
+    finally:
+        vinegar.run = was
+    return sent
+
+
+_sent = _posts()
+_comments = [(c, b) for c, b in _sent
+             if c[0] == "gh" and "issues/12/comments" in " ".join(c)]
+check("the note is posted as a comment on the pull request",
+      len(_comments) == 1, [c for c, _ in _sent if c[0] == "gh"])
+check("the note is a new comment, never an edit of an older one",
+      _comments and "POST" in _comments[0][0]
+      and "PATCH" not in _comments[0][0], _comments)
+check("what is posted is the note, carrying the effort",
+      _comments and "Reviewing at low effort" in json.loads(
+          _comments[0][1])["body"], _comments)
+
+# The indicator is opened before triage runs, so it starts out announcing
+# the ceiling. Left alone it says xhigh for the whole of a low review.
+_patched = [(c, b) for c, b in _sent
+            if c[0] == "gh" and "check-runs/77" in " ".join(c)]
+check("the checks list is corrected to the effort triage settled on",
+      _patched and "PATCH" in _patched[0][0]
+      and "Reviewing at low effort" in _patched[0][1], _patched)
+
+check("a dry run posts no note",
+      not [c for c, _ in _posts(comment=False)
+           if c[0] == "gh" and "comments" in " ".join(c)])
+check("triage turned off posts no note",
+      not [c for c, _ in _posts(model=None)
+           if c[0] == "gh" and "comments" in " ".join(c)])
+check("a triage that could not be read posts no note",
+      not [c for c, _ in _posts(answer="not json")
+           if c[0] == "gh" and "comments" in " ".join(c)])
+# The note is worth posting and is not worth a review.
+check("a note refused by GitHub does not stop the review",
+      any(c[2].startswith("/code-review")
+          for c, _ in _posts(rc=1) if c[0] == "claude"),
+      [c for c, _ in _posts(rc=1)])
+# The other half of the same rule. A refusal answers a return code; a
+# network that never answers raises, and that path swallows separately.
+check("a note whose posting times out does not stop the review",
+      any(c[2].startswith("/code-review")
+          for c, _ in _posts(boom=subprocess.TimeoutExpired("gh", 30))
+          if c[0] == "claude"),
+      [c for c, _ in _posts(boom=subprocess.TimeoutExpired("gh", 30))])
 
 reached_the_end.append(True)
 print()

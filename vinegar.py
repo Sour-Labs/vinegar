@@ -3416,27 +3416,28 @@ def effort_for(shape, changed, config):
         return ceiling, "triage did not answer"
     reached = sorted(name for name in RISKS if shape[name])
     if reached:
-        return ceiling, "touches %s" % ", ".join(reached)
+        return ceiling, "it touches %s" % ", ".join(reached)
     # Unsure escalates, and it is the model's own word for a domain it
     # could not settle. It is worth acting on and it is not worth
     # trusting alone: in four measured runs on 2026-08-20 the domain each
     # one actually missed was never the domain it called unsure. So this
     # is one of three escalations, not the escalation.
     if shape["unsure"]:
-        return ceiling, "unsure about %s" % ", ".join(shape["unsure"])
+        return ceiling, "triage was unsure about %s" % ", ".join(
+            shape["unsure"])
     if shape.get("truncated"):
         return ceiling, "the diff was too large to read whole"
     band = difficulty(changed)
     wanted = BANDS.get(band)
     if wanted is None:
-        return ceiling, "%s change, %d lines" % (band, changed)
+        return ceiling, "it is a %s change, at %d lines" % (band, changed)
     # Lower by position, so a ceiling below the band's level wins. An
     # operator who configured `low` gets `low` for everything, which is
     # what configuring `low` asked for.
     chosen = wanted if EFFORTS.index(wanted) < EFFORTS.index(
         ceiling) else ceiling
-    return chosen, "%s change, %d lines, reaching none of %s" % (
-        band, changed, ", ".join(RISKS))
+    return chosen, "it is a %s change of %d lines and nothing in it "\
+                   "reaches %s" % (band, changed, ", ".join(RISKS))
 
 
 def shape(label, repo, path, pr, config, env, since=None):
@@ -3580,6 +3581,85 @@ def shape(label, repo, path, pr, config, env, since=None):
         ", reaching %s" % ", ".join(sorted(n for n in RISKS if read[n]))
         if any(read[n] for n in RISKS) else ", reaching none of them"))
     return read
+
+
+def note_body(pr, shaped, effort, why):
+    """The triage note, as it appears on the pull request.
+
+    It says what the change touches and what that bought it. It never says
+    the change is correct, safe or complete: the model that wrote the
+    summary will occasionally be confidently wrong, and one measured
+    answer described a comment-only pull request as a "fee rate
+    calculation correction". A wrong summary on a pull request is worse
+    than none, because a human skimming reads it before the diff.
+    """
+    reached = [name for name in RISKS if shaped[name]]
+    risk = ", ".join(reached) if reached else "none of %s" % ", ".join(RISKS)
+    lines = ["**%s** · triage of `%s`" % (CHECK_NAME, pr["headRefOid"][:7]),
+             ""]
+    # Only when the model gave one. An empty summary is a missing sentence,
+    # not a blank line to pad the comment with.
+    if shaped["touches"]:
+        lines += [shaped["touches"], ""]
+    lines += ["Difficulty: %s, %d lines across %d file%s · Risk: %s" % (
+        shaped["difficulty"], shaped["changed"], shaped["files"],
+        "" if shaped["files"] == 1 else "s", risk), "",
+        "Reviewing at %s effort, because %s." % (effort, why)]
+    return "\n".join(lines)
+
+
+def post_note(label, repo, pr, body, env):
+    """Put the note on the pull request. Answers whether it landed.
+
+    A new comment every pass, never an edit of the last one. A note is
+    about one commit and names it, so rewriting it on the next push would
+    erase what triage decided about code that has since changed, and hide
+    the one thing the accumulation is for: seeing that the difficulty, the
+    risk or the effort moved between pushes. The review comment has posted
+    this way for the same reason.
+
+    Every failure is logged and swallowed. The note is worth posting and
+    is not worth a review: a pull request reviewed with no note beside it
+    is a worse pull request, not a broken one.
+    """
+    try:
+        result = run(["gh", "api",
+                      "repos/%s/issues/%d/comments" % (repo, pr["number"]),
+                      "--method", "POST", "--input", "-"],
+                     env=env, timeout=POST_TIMEOUT,
+                     stdin_text=json.dumps({"body": body}))
+    except Exception as err:
+        log("%s: the triage note did not post: %s" % (
+            label, "it timed out" if isinstance(
+                err, subprocess.TimeoutExpired) else err))
+        return False
+    if result.returncode:
+        log("%s: the triage note did not post: %s" % (
+            label, both_streams(result, 300)))
+        return False
+    return True
+
+
+def retitle_check(label, check, effort, blockers, env):
+    """Tell the checks list the effort triage settled on.
+
+    The indicator is opened before the review, and therefore before triage
+    has run, so it is created carrying the configured ceiling. Without
+    this it says `xhigh` for the whole of a review that is running at
+    `low`, and the checks list is the half of this an agent reads.
+
+    Swallowed like every other Checks call, for the reason check_api()
+    gives: an indicator that is out of date is worse than one that is
+    right and better than a review that did not run.
+    """
+    if not check or check.get("closed"):
+        return
+    check_api(label, check["repo"], "check-runs/%s" % check["id"], "PATCH",
+              {"output": {
+                  "title": "Reviewing at %s effort%s" % (
+                      effort, ", blockers only" if blockers else ""),
+                  "summary": "Vinegar is reviewing this commit. The findings "
+                             "arrive as one review when it finishes."}}, env)
 
 
 def diff_lines(path, base, env, label):
@@ -5356,6 +5436,23 @@ def review(path, repo, pr, config, env, tokens, resent=False, check=None,
         log("%s: triage lowered this from %s to %s effort: %s" % (
             label, config["effort"], chosen, why))
     config = dict(config, effort=chosen)
+
+    # Only when triage produced a classification. A pass that was turned
+    # off, or that failed, decided nothing, and a note saying so would be
+    # noise on the pull request: the checks list already carries the
+    # effort and the log already carries the reason.
+    if shaped is not None:
+        # The indicator was opened before this ran, so it is carrying the
+        # ceiling rather than what triage settled on.
+        retitle_check(label, check, chosen, blockers, env)
+        # On `comment`, never on posting_env() answering None. None means
+        # the dry run *and* it means no App is configured, in which case
+        # every other caller runs on the ambient environment through the
+        # same `or env`. Gating the note on it posted nothing at all on
+        # any install that authenticates as a person.
+        if config["comment"]:
+            post_note(label, repo, pr, note_body(pr, shaped, chosen, why),
+                      posting_env(label, config, repo, tokens, env) or env)
 
     prompt = "/code-review %s %d" % (config["effort"], pr["number"])
 

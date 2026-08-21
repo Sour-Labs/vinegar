@@ -6,8 +6,7 @@ A self-hosted pull-request reviewer. It runs on a machine you already own, uses
 a Claude subscription you already pay for, and posts inline review comments on
 your PRs.
 
-> **Status: the poller works. The triage pass routes effort; its note on
-> the pull request is not written yet.**
+> **Status: the poller works. The triage pass routes effort and posts its note.**
 > `vinegar.py` polls GitHub, picks which pull requests deserve a reviewer, and
 > runs the review. The cheap model that reads a diff and decides whether to
 > review it at all is still a design, so today every pull request that passes
@@ -911,12 +910,13 @@ runs:
 > **Vinegar** · triage of `a1b2c3d`
 >
 > Reworks session refresh and adds a `sessions.revoked_at` column with a
-> backfill migration. 340 lines across 7 files.
+> backfill migration.
 >
-> Difficulty: moderate · Risk: high
-> Reviewing at high effort: touches session handling and a database migration.
+> Difficulty: moderate, 700 lines across 7 files · Risk: auth, migrations
+>
+> Reviewing at xhigh effort, because it touches auth, migrations.
 
-Five things about that note:
+Seven things about that note:
 
 - **It is a comment, never an edit to the PR description.** The description
   exists to hold the author's intent, and a machine rewriting it can damage
@@ -939,7 +939,16 @@ Five things about that note:
   moved between pushes.
 - **Difficulty and risk are separate labels**, because risk is what drives
   routing. A two-line change to payment rounding is trivial and dangerous at the
-  same time.
+  same time. Difficulty is the line count and names what the review will cost;
+  risk is the domains the change reaches, and names what it costs to be wrong.
+- **The checks list is corrected at the same moment.** The indicator is opened
+  before triage runs, so it is created carrying the configured ceiling. Left
+  alone it would announce `xhigh` for the whole of a review running at `low`,
+  and the checks list is the half of this an agent reads.
+- **A pass that decided nothing posts nothing.** Triage turned off, or a triage
+  that failed, publishes no note: the checks list already carries the effort and
+  the log already carries the reason, and a note saying "this did not work"
+  is noise on someone's pull request.
 
 The summary describes what the diff touches. It never claims the change is
 correct, safe, or complete: a small model will occasionally be confidently
