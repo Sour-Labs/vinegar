@@ -859,6 +859,47 @@ STOPPING = threading.Event()
 # exactly and a literal in either place is a silent way to disagree.
 POLL_WORKER = "vinegar-poll-"
 
+# The schedule the continuous loop runs on: when each repository may next
+# be taken, and which ones a worker is on right now.
+#
+# This replaced a queue drained once per pass, and it is the thing that
+# made the pass unnecessary. A queue answers "what is left in this round",
+# so somebody has to decide when a round ends, and the only honest answer
+# was to join every worker -- which is the barrier: the gap between passes
+# became the slowest repository's whole pass plus `poll_interval`, and a
+# push to one repository waited out a review of another. Measured on
+# 2026-08-21 at seventeen repositories: eight minutes.
+#
+# A due time answers a different question, "when may this one be taken
+# again", and every repository answers it for itself. There is no round,
+# so there is nothing to join, so `poll_interval` goes back to meaning
+# what its name says.
+#
+# One Condition guards both, and workers wait on it rather than sleeping:
+# a repository falling due, a discovery adding one, and a stop are all
+# reasons to wake, and only the first of them is a time.
+SCHEDULE = threading.Condition()
+# repo -> the monotonic time it may next be taken. Membership is the
+# authority on what is polled at all, which is what lets refresh_repos()
+# replace the list without a barrier to do it behind.
+#
+# time.monotonic(), never time.time(). SCHEDULE.wait() times out on the
+# monotonic clock, so a wall clock here can disagree with the thing that
+# does the waiting: an NTP correction stepping the clock back an hour
+# leaves every due time an hour in the future, and each worker wakes on
+# schedule, compares against a clock that is still behind, and parks
+# again. Nothing is polled until the wall clock catches up and nothing
+# says why. The `time.sleep(poll_interval)` this replaced could not stall
+# that way, and nothing outside the schedule reads these values, so there
+# is no reason for them to be wall-clock times.
+DUE = {}
+# The repositories a worker is in a turn on. Never two workers on one, for
+# the reason poll_repo() gives: they would share its one checkout.
+HELD = set()
+# repo -> the pull request number the last turn on it reviewed, which is
+# where the next turn starts looking. turn_order() says why.
+TURN_AFTER = {}
+
 DEFAULTS = {
     "repos": [],
     "poll_interval": 60,
@@ -1283,11 +1324,18 @@ def revoke_discovery_token(token):
 def refresh_repos(config, asked_at):
     """Bring `config["repos"]` up to date with what the App covers.
 
-    Called from main()'s own thread between passes, which is the only
-    place it is safe. poll_once() joins every worker before it returns, so
-    no pass is reading the list while this replaces it, and the next pass
-    reads the new one: poll_width() is recomputed from it too, so a
-    repository onboarded an hour ago is polled without a restart.
+    Called from the loop's own thread, and safe there because of what a
+    worker reads rather than because of when this runs. Workers read the
+    schedule, never this list, and reconcile() below moves the schedule
+    across under its lock. There is no moment when a worker is reading a
+    list being replaced, which is what "between passes" used to buy and
+    what a continuous loop has no place to offer.
+
+    Do not take that reconcile() call out or move it after a return. It
+    is the only thing that connects a checkbox on the App's settings page
+    to what the daemon polls, and without it this function would keep a
+    list that decides nothing: the fifteen repositories added on
+    2026-08-20 arrived that way, with no restart.
 
     At most hourly, and an ask that failed does not count as one. A
     failure returns `asked_at` untouched, so the next pass asks again a
@@ -1343,6 +1391,7 @@ def refresh_repos(config, asked_at):
             len(found), "y" if len(found) == 1 else "ies",
             "; ".join(changed)))
     config["repos"] = found
+    reconcile(found)
     return time.time()
 
 
@@ -6169,44 +6218,120 @@ def sweep_checks(config, tokens):
                             "review, the next poll starts one.")
 
 
-def poll_repo(repo, config, state, tokens):
-    """One repository's whole pass: list it, then work through what is open.
+def turn_order(prs, after):
+    """The listing rotated to start just after the one a turn last reviewed.
+
+    A turn returns on the first pull request it reviews and the next turn
+    re-lists from GitHub, so without this every turn starts in the same
+    place. One pull request that is reviewable on every turn then takes
+    every turn, and the ones behind it in the listing are never handed to
+    handle_pr at all: with `review_on_push` on, a branch pushed to during
+    each review is exactly that, and `gh pr list` puts the newest first,
+    which is the one most likely to be under active work.
+
+    The pass this replaced walked every pull request, so that starvation
+    is one the turn introduced rather than one it inherited. It is also
+    the same failure the turn exists to prevent, moved down a level: a
+    repository no longer starves its neighbours, so its own pull requests
+    must not starve each other either.
+
+    A rotation rather than a slice, so nothing is skipped. Every pull
+    request is still reachable within one turn, in a different order.
+    A number that is not in the listing starts at the top, which covers
+    both the first turn and a pull request closed since the last one.
+    """
+    # None means there is no resume point, and it is returned early rather
+    # than compared. open_prs() checks only that an entry is a dict, so
+    # `pr.get("number")` is None for one without the key -- poll_repo's own
+    # error path says the same by writing `pr.get("number", "?")` -- and
+    # compared, None == None matches that entry and rotates a first turn
+    # that was supposed to begin at the top.
+    if after is None:
+        return prs
+    for at, pr in enumerate(prs):
+        if pr.get("number") == after:
+            return prs[at + 1:] + prs[:at + 1]
+    return prs
+
+
+def poll_repo(repo, config, state, tokens, turn=False):
+    """One repository: list it, then work through what is open.
 
     Its pull requests one at a time, always. Two reviews of one repository
     would share the one checkout directory checkout() gives it, and the
     second one's `git reset --hard` would move the tree under the first,
     which then reports findings about a commit nobody asked about.
     `parallel_repos` buys concurrency between repositories and not inside
-    one.
+    one. HELD is what holds that line for the continuous loop, which has
+    no pass to keep one repository inside: a repository a worker is on is
+    not offered to another.
 
-    So a repository waits out the slowest repository's *whole pass*, not
-    one review: the fan-out is per pass, and main() sleeps for
-    `poll_interval` only once every worker has finished. Five open pull
-    requests on one repository, twenty minutes each, is a hundred minutes
-    before the other repository is listed again. Worth knowing when sizing
-    `poll_interval`, and the reason giving each repository its own loop
-    would be a different change rather than a bigger number.
+    `turn` is that loop's unit of work. It returns after the first pull
+    request that is really reviewed, so a repository with five of them
+    holds a worker for one review rather than for five while the other
+    sixteen repositories wait. The repository goes back on the schedule
+    due immediately, so the next turn takes the next pull request. `--once`
+    and the single-repository path leave it False and read the whole
+    listing, exactly as every pass did before there was a schedule.
+
+    Answers whether a review ran, which is what the next due time is
+    decided from. **Only a review counts.** A skip, a checkout that
+    failed, and a review reposted from disk are all cheap, and none of
+    them means more work is waiting. Counting one would put the repository
+    back due immediately and poll it in a tight loop for as long as the
+    condition lasted -- which for a checkout that keeps failing is for
+    ever, since that retry is deliberately not bounded by MAX_ATTEMPTS.
     """
     try:
         prs = open_prs(repo, github_env(config, repo, tokens,
                                         good_for=LISTING_GRACE))
     except Exception as err:
         log("%s: cannot list pull requests: %s" % (repo, err))
-        return
+        return False
+    if turn:
+        with SCHEDULE:
+            after = TURN_AFTER.get(repo)
+        prs = turn_order(prs, after)
+    reviewed = False
     for pr in prs:
         # Read here, so a stop reaches this pass without it first working
         # through every pull request the listing returned. STOPPING's own
         # comment says why between pull requests is the right place.
         if STOPPING.is_set():
-            return
+            return reviewed
         try:
-            handle_pr(repo, pr, config, state, tokens)
+            if handle_pr(repo, pr, config, state, tokens):
+                reviewed = True
+                if turn:
+                    # Recorded before returning, so the next turn starts
+                    # at the one behind this rather than at this one
+                    # again.
+                    #
+                    # Guarded on DUE the way release_repo() guards its own
+                    # write, and for the same reason. A discovery that
+                    # dropped this repository mid-turn has already popped
+                    # its resume point, and reconcile() only visits names
+                    # it finds in DUE, so a write landing after that pop is
+                    # never cleaned up by anything: the entry outlives the
+                    # repository, and if the App covers it again its first
+                    # turn resumes from a pull request nobody remembers.
+                    #
+                    # A missing number is not a resume point either. Stored
+                    # it would be None, which turn_order() reads as "there
+                    # is none", so every later turn would re-anchor on the
+                    # same entry.
+                    number = pr.get("number")
+                    with SCHEDULE:
+                        if number is not None and repo in DUE:
+                            TURN_AFTER[repo] = number
+                    return True
         except Exception as err:
             # One bad pull request must not stop the daemon. Under launchd
             # a crash restarts the process every 30 seconds and polls
             # nothing in between.
             log("%s#%s: unhandled error: %s" % (
                 repo, pr.get("number", "?"), err))
+    return reviewed
 
 
 def poll_width(config):
@@ -6387,6 +6512,239 @@ def poll_once(config, state, tokens):
         raise first[0]
 
 
+def stop_polling():
+    """Set STOPPING, and wake the workers that are waiting on a time.
+
+    Both halves, always. STOPPING on its own ends a worker that is between
+    pull requests and does nothing at all to one parked in SCHEDULE.wait()
+    until a repository falls due, so a stop that only set the flag was
+    answered `poll_interval` later rather than now.
+    """
+    with SCHEDULE:
+        STOPPING.set()
+        SCHEDULE.notify_all()
+
+
+def take_repo(config):
+    """The repository this worker polls next, or None once STOPPING is set.
+
+    The one that is due soonest, whose time has come, and that no other
+    worker holds. Nothing qualifying is the normal state of a quiet
+    deployment, so this waits rather than spinning: on the nearest due
+    time, or to be woken by a release, a discovery or a stop.
+
+    Taking marks it HELD, and only release_repo() gives it back. That is
+    what keeps one repository's reviews serial now that no pass does.
+    """
+    with SCHEDULE:
+        while not STOPPING.is_set():
+            now = time.monotonic()
+            # Free rather than every entry: a repository a worker is on is
+            # not a candidate, however overdue it looks.
+            free = [(when, name) for name, when in DUE.items()
+                    if name not in HELD]
+            if free:
+                # min over the pair, so the name breaks a tie rather
+                # than DUE's insertion order. Ties are the common case
+                # rather than a corner, because every repository a
+                # discovery adds is due at the same instant. Both orders
+                # are deterministic; the difference is that insertion
+                # order changes as repositories are added and dropped, so
+                # the same tie would resolve differently after a
+                # discovery, and alphabetical never moves.
+                when, name = min(free)
+                if when <= now:
+                    HELD.add(name)
+                    return name
+                waiting = when - now
+            else:
+                waiting = config["poll_interval"]
+            # Bounded even when a time is known, so a worker cannot be
+            # parked past a stop that set STOPPING without going through
+            # stop_polling(). The suite does exactly that, and so would
+            # any later caller that reaches for the flag it can see.
+            SCHEDULE.wait(min(waiting, config["poll_interval"]))
+        return None
+
+
+def release_repo(repo, reviewed, config):
+    """Give the repository back, due again at the time its turn earned.
+
+    Reviewed something, so more may be waiting behind it: due now, and the
+    next turn takes the next pull request. Found nothing to do: due in
+    `poll_interval`, which is Kevin's call and the reason that setting
+    still means anything -- how often a quiet repository is looked at.
+
+    A repository discovery has dropped meanwhile is not put back. Deleting
+    the entry is how a removal is expressed, so writing one here would
+    resurrect a repository the App no longer covers, on the one path that
+    runs after the removal.
+    """
+    with SCHEDULE:
+        HELD.discard(repo)
+        if repo in DUE:
+            DUE[repo] = time.monotonic() + (0 if reviewed
+                                            else config["poll_interval"])
+        SCHEDULE.notify_all()
+
+
+def reconcile(repos):
+    """Bring the schedule up to date with the list refresh_repos() just set.
+
+    Under the lock, which is the whole answer to what poll_once()'s join
+    used to provide. A worker reads the schedule and never the list, so
+    there is no moment when one is reading a list being replaced.
+
+    A repository that is new is due immediately: it was onboarded at some
+    point in the last hour and there may be a pull request open on it
+    already. A repository that has gone is deleted, so no worker takes it
+    again; one currently holding it finishes that turn, and release_repo()
+    then declines to put it back.
+    """
+    with SCHEDULE:
+        now = time.monotonic()
+        for name in repos:
+            if name not in DUE:
+                DUE[name] = now
+        for name in list(DUE):
+            if name not in repos:
+                del DUE[name]
+                # Its resume point goes with it, rather than being kept
+                # against a repository the App no longer covers.
+                TURN_AFTER.pop(name, None)
+        # A repository added while every worker was parked on a due time
+        # would otherwise wait out that time before anything looked at it.
+        SCHEDULE.notify_all()
+
+
+def poll_forever(config, state, tokens, discovering, asked_at):
+    """The daemon's loop above one repository: turns, not passes.
+
+    Workers live for the process rather than for a pass. Each takes a
+    repository that is due, reviews at most one pull request on it, and
+    puts it back; nothing waits for anything else to finish, which is the
+    whole change. `parallel_repos` still bounds how many reviews run at
+    once, because a worker is in exactly one turn at a time.
+
+    The count is fixed here and cannot follow `parallel_repos` up without
+    a restart, which the README's config table now says. It is the setting
+    and not poll_width(): the width is clamped to the number of
+    repositories, and under discovery that number is zero until the first
+    ask answers, which would have sized the pool at nothing for ever. A
+    worker with nothing due costs a parked thread, and HELD still keeps
+    the number of concurrent reviews down to the repository count.
+    """
+    # Before any worker exists, rather than before the first poll, because
+    # there is no first poll to be before any more. The sweep closes check
+    # runs a killed predecessor left spinning, and a worker started first
+    # could open a review on the very pull request it is about to sweep.
+    #
+    # Under discovery the first ask is allowed to fail, so this waits for
+    # a list rather than sweeping an empty one and never running again.
+    # load_config refuses an empty `repos` everywhere else, so the loop is
+    # entered at all only when the App is the source.
+    while not config["repos"] and discovering and not STOPPING.is_set():
+        STOPPING.wait(config["poll_interval"])
+        asked_at = refresh_repos(config, asked_at)
+    if STOPPING.is_set() or not config["repos"]:
+        return
+    sweep_checks(config, tokens)
+    reconcile(config["repos"])
+
+    # Text for every failure and the exception object once, exactly as the
+    # pass this replaced kept them, and for the same reason: a worker that
+    # raises ends one thread silently, and with no pass to report at the
+    # end of, the repository it was holding is simply never polled again.
+    fell_over, first, hurt = [], [], threading.Lock()
+
+    def turns():
+        while True:
+            repo = take_repo(config)
+            if repo is None:
+                return
+            # Bound before the try, so the finally can read it however the
+            # turn ended.
+            reviewed = False
+            try:
+                reviewed = poll_repo(repo, config, state, tokens, turn=True)
+            except BaseException as err:
+                # BaseException, not Exception, for the reason the pass
+                # gave: review() builds the reviewer's settings through
+                # load_settings(), which sys.exits on a settings file it
+                # cannot use, and SystemExit killed one worker with
+                # nothing in the log while the repository it held stopped
+                # being reviewed. KeyboardInterrupt cannot arrive here;
+                # signals reach the main thread alone.
+                with hurt:
+                    if not first:
+                        first.append(err)
+                    fell_over.append((repo, str(err)))
+                # The whole loop, not this worker. A failure that reaches
+                # here ended the process before the loop was continuous,
+                # which under launchd is a restart and a line in the error
+                # log; carrying on instead would be a daemon that had
+                # quietly lost a worker and says so nowhere.
+                stop_polling()
+            finally:
+                release_repo(repo, reviewed, config)
+
+    workers = [threading.Thread(target=turns, name=POLL_WORKER + str(nth))
+               for nth in range(config["parallel_repos"])]
+    # Not daemons, and joined in the finally below. A daemon thread killed
+    # at interpreter finalization runs no finally block, so handle_pr never
+    # closes its checks entry and every in-flight pull request keeps a
+    # Vinegar check spinning for ever, blocking a merge wherever that check
+    # is required. poll_once()'s own comment records the four attempts at
+    # getting a stop right that ended in this shape; none of them is worth
+    # repeating here.
+    # Appended as each start() succeeds, and the finally joins this rather
+    # than `workers`. Thread.join() raises RuntimeError on a thread that
+    # was never started, and raised from a finally that is unwinding, that
+    # RuntimeError *replaces* the exception on its way out: a failed
+    # start() came back as "cannot join thread before it is started" with
+    # the real cause gone, and a Ctrl-C between two start() calls stopped
+    # being a KeyboardInterrupt at all, so main()'s handler did not match
+    # it and the operator got a traceback where the "stopping" line
+    # belongs. This is the exact path the single try below exists for.
+    started = []
+    try:
+        for worker in workers:
+            worker.start()
+            started.append(worker)
+        # main()'s thread does the discovery and nothing else. It has to
+        # stay on this thread: a KeyboardInterrupt is delivered here, and
+        # the log line below is what tells the operator the lock is still
+        # held by the turns that are finishing.
+        while not STOPPING.is_set():
+            if discovering:
+                asked_at = refresh_repos(config, asked_at)
+            # Not time.sleep(). A stop lands during this wait far more
+            # often than anywhere else, and slept through it was answered
+            # a minute later.
+            STOPPING.wait(config["poll_interval"])
+    except BaseException:
+        # One try over the starts and the loop both. Split in two, a
+        # RuntimeError out of start() -- thread creation refused under an
+        # RLIMIT_NPROC ceiling -- left STOPPING clear and the workers that
+        # had started running for ever.
+        stop_polling()
+        # Said so the wait that follows is not read as a hang. The process
+        # does not exit until the turns finish, and the lock is theirs
+        # until it does.
+        log("stopping: the turns already running keep the lock until they "
+            "finish; kill the process to force it")
+        raise
+    finally:
+        for worker in started:
+            worker.join()
+
+    # Every turn that fell over is named, and then the first is raised.
+    for repo, said in fell_over:
+        log("%s: its turn fell over: %s" % (repo, said))
+    if first:
+        raise first[0]
+
+
 def give_up(key, repo, pr, config, attempts, tokens, path=None, env=None,
             tries=0, resent=False):
     """Say, once, that Vinegar has stopped trying to review this.
@@ -6533,6 +6891,14 @@ def record_once(state, key, done, head, outcome, reason):
 
 
 def handle_pr(repo, pr, config, state, tokens):
+    """Everything one pull request needs, and whether that was a review.
+
+    The answer is what poll_repo's `turn` stops on and what the schedule
+    reads to decide when this repository is next due, so it is True on one
+    path only: a review ran. Every other ending here is cheap and means
+    the repository has nothing more waiting -- see poll_repo's docstring
+    for why counting a cheap one polls in a tight loop.
+    """
     key = pr_key(repo, pr)
     head = pr["headRefOid"]
     done = state.get(key) or {}
@@ -6602,7 +6968,7 @@ def handle_pr(repo, pr, config, state, tokens):
         elif marker and done.get("post_tries", 0) < MAX_ATTEMPTS:
             repost(key, repo, pr, config, state, tokens, done, marker,
                    saved_sha)
-            return
+            return False
 
     # Only a finished review closes a pull request off. A skip is decided
     # again on every poll, because the filter that caused it can stop
@@ -6610,7 +6976,7 @@ def handle_pr(repo, pr, config, state, tokens):
     # down, a login is added to `authors`.
     if done.get("outcome") == DONE:
         if done.get("sha") == head or not config["review_on_push"]:
-            return
+            return False
 
     # A review that never ran is worth retrying, because it spent nothing. The
     # case this protects is a rate-limit window: without it, every pull request
@@ -6652,7 +7018,7 @@ def handle_pr(repo, pr, config, state, tokens):
                         "%s" % (key, err))
                     spend_announce(key, config, state, head,
                                    done["attempts"], tries, False)
-                    return
+                    return False
                 # None is not a failure here: it is what github_env answers
                 # when no App is configured, and ambient `gh` is then the
                 # credential the operator chose.
@@ -6678,7 +7044,7 @@ def handle_pr(repo, pr, config, state, tokens):
                                resent=True)
                 spend_announce(key, config, state, head, done["attempts"],
                                tries, said)
-            return
+            return False
 
     reason = skip_reason(pr, config)
     if reason:
@@ -6686,7 +7052,7 @@ def handle_pr(repo, pr, config, state, tokens):
         # attempts burned at this head have to ride along: dropping them
         # is what let a draft toggle launder the retry budget.
         record_once(state, key, done, head, "skipped", "skipped, %s" % reason)
-        return
+        return False
 
     # Credentials are minted here, once a review is actually going to happen,
     # rather than for every pull request the pass looks at.
@@ -6735,7 +7101,7 @@ def handle_pr(repo, pr, config, state, tokens):
         # while MAX_ATTEMPTS was never reached.
         record_once(state, key, done, head, "checkout",
                     "checkout failed: %s" % err)
-        return
+        return False
 
     attempts = done.get("attempts", 0) + 1 if done.get("sha") == head else 1
 
@@ -6865,6 +7231,10 @@ def handle_pr(repo, pr, config, state, tokens):
         # exact moment the indicator most needs finishing.
         close_check(key, check, ended_title(outcome, attempts),
                     posting_env(key, config, repo, tokens, env) or env)
+    # A review ran. Whether it ended DONE or FAILED, it spent the minutes
+    # this answer is really about, and anything else open on this
+    # repository has been waiting through them.
+    return True
 
 
 def find_pr(repo, number, env):
@@ -7304,6 +7674,48 @@ def main():
         # adopted nor closed whichever way either process was started.
         #
         # `--pr` still never reaches here, because it returns above.
+        # Above one repository the loop is continuous: workers that take
+        # a repository, review at most one pull request on it and put it
+        # back, for the life of the process. What that removes is the
+        # barrier -- poll_once() joined every worker before returning, so
+        # the gap between passes was the slowest repository's whole pass
+        # plus `poll_interval`. Measured 2026-08-21: a push waited eight
+        # minutes behind a review of an unrelated repository.
+        #
+        # The width the line above just reported, and under discovery the
+        # setting instead. Both halves are load-bearing and each was
+        # wrong on its own.
+        #
+        # The width alone is wrong under discovery, because it is clamped
+        # to the number of repositories and that number is zero until the
+        # first ask answers. A daemon whose first ask failed would have
+        # stayed on the serial loop for the life of the process, however
+        # many repositories the App turned out to cover.
+        #
+        # The setting alone is wrong everywhere else, because it moves a
+        # single-repository install off this thread. `repos: ["o/one"]`
+        # with `parallel_repos: 4` used to reach poll_once, where the
+        # clamp made the width 1 and the review ran here: Ctrl-C raised
+        # straight through handle_pr, whose finally closed the check, and
+        # the run ended in a second. Through the pool the review is on a
+        # worker, so Ctrl-C waits out the whole of it in the join, up to
+        # `review_timeout`. Nothing would have told the operator, because
+        # the width really is 1 and the line above says nothing about it.
+        #
+        # An explicit `repos` cannot grow without a restart, so the width
+        # is a safe thing to decide on there. Discovery is the only case
+        # where it can, and there the setting is what the operator asked
+        # for and it does not move.
+        #
+        # `--once` never takes this path. Cron reads its exit code and
+        # wants one pass over everything, which is what poll_once() is.
+        # `parallel_repos` at one keeps the serial loop whatever else is
+        # true, since neither half of the condition can hold.
+        if not args.once and (width > 1 or (discovering
+                                            and config["parallel_repos"] > 1)):
+            poll_forever(config, state, tokens, discovering, asked_at)
+            return
+
         swept = False
         while True:
             # The sweep needs a list to sweep, and under discovery the

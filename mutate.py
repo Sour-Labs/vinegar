@@ -330,6 +330,245 @@ MUTATIONS = [
      "            return",
      "        if False:\n"
      "            return"),
+    # --- the continuous loop -------------------------------------------
+    # What replaced the barrier. poll_once() joined every worker before it
+    # returned, so the gap between passes was the slowest repository's
+    # whole pass plus `poll_interval`; at seventeen repositories a push
+    # waited eight minutes behind a review of something unrelated.
+    #
+    # A turn stopping after one review is the fairness half. Without it a
+    # repository with five open pull requests holds a worker for five
+    # reviews while every other repository waits, which trades one
+    # starvation for another.
+    ("turn-one-pull-request",
+     "            if handle_pr(repo, pr, config, state, tokens):\n"
+     "                reviewed = True\n"
+     "                if turn:\n",
+     "            if handle_pr(repo, pr, config, state, tokens):\n"
+     "                reviewed = True\n"
+     "                if False:\n"),
+    # Where the next turn starts. Without it every turn re-lists and stops
+    # at the same pull request, so one that is reviewable every time takes
+    # every turn and the ones behind it are never handed to handle_pr.
+    ("turn-records-where-it-stopped",
+     "                    number = pr.get(\"number\")\n"
+     "                    with SCHEDULE:\n"
+     "                        if number is not None and repo in DUE:\n"
+     "                            TURN_AFTER[repo] = number\n",
+     ""),
+    # The same guard release_repo() has. Without it a repository discovery
+    # dropped mid-turn gets its resume point written back after reconcile()
+    # popped it, and reconcile only visits names it finds in DUE, so
+    # nothing ever removes it again.
+    ("resume-point-only-for-a-live-repo",
+     "                        if number is not None and repo in DUE:",
+     "                        if number is not None:"),
+    # A missing number stored as a resume point reads back as "there is
+    # none", so every later turn re-anchors on the same entry.
+    ("resume-point-is-never-none",
+     "                        if number is not None and repo in DUE:",
+     "                        if repo in DUE:"),
+    # None is a sentinel, not a number to compare against. open_prs only
+    # checks that an entry is a dict, so one with no `number` key answers
+    # None too, and matched, a first turn rotates instead of starting at
+    # the top.
+    ("first-turn-starts-at-the-top",
+     "    if after is None:\n"
+     "        return prs\n",
+     ""),
+    ("turn-resumes-after-the-last",
+     "    if turn:\n"
+     "        with SCHEDULE:\n"
+     "            after = TURN_AFTER.get(repo)\n"
+     "        prs = turn_order(prs, after)\n",
+     ""),
+    # A rotation, not a slice: truncating would drop the pull requests
+    # ahead of the resume point instead of moving them behind it.
+    ("turn-order-rotates",
+     "            return prs[at + 1:] + prs[:at + 1]",
+     "            return prs[at + 1:]"),
+    ("resume-point-dropped-with-repo",
+     "                del DUE[name]\n"
+     "                # Its resume point goes with it, rather than being "
+     "kept\n"
+     "                # against a repository the App no longer covers.\n"
+     "                TURN_AFTER.pop(name, None)",
+     "                del DUE[name]"),
+    # Both clocks, and they have to be the same one. SCHEDULE.wait() times
+    # out on the monotonic clock, so a wall-clock due time disagrees with
+    # the thing doing the waiting.
+    ("due-times-are-monotonic",
+     "            DUE[repo] = time.monotonic() + (0 if reviewed\n"
+     '                                            else config["poll_interval"])',
+     "            DUE[repo] = time.time() + (0 if reviewed\n"
+     '                                       else config["poll_interval"])'),
+    ("due-times-compared-on-one-clock",
+     "        while not STOPPING.is_set():\n"
+     "            now = time.monotonic()",
+     "        while not STOPPING.is_set():\n"
+     "            now = time.time()"),
+    # Joining a thread that was never started raises, and raised from a
+    # finally that is unwinding it replaces the exception going out.
+    ("join-only-what-started",
+     "    finally:\n"
+     "        for worker in started:\n"
+     "            worker.join()",
+     "    finally:\n"
+     "        for worker in workers:\n"
+     "            worker.join()"),
+    # The answer the schedule reads. Every entry below it is about the
+    # same hazard from the other side: an ending that says True is due
+    # again immediately, so a cheap ending that repeats is polled as fast
+    # as the machine can go with `poll_interval` never consulted.
+    ("turn-answers-reviewed",
+     "    # A review ran. Whether it ended DONE or FAILED, it spent the "
+     "minutes\n"
+     "    # this answer is really about, and anything else open on this\n"
+     "    # repository has been waiting through them.\n"
+     "    return True\n",
+     "    return False\n"),
+    ("handle-skip-is-not-work",
+     '        record_once(state, key, done, head, "skipped", '
+     '"skipped, %s" % reason)\n'
+     "        return False",
+     '        record_once(state, key, done, head, "skipped", '
+     '"skipped, %s" % reason)\n'
+     "        return True"),
+    # The worst of the three: this retry is deliberately not bounded by
+    # MAX_ATTEMPTS, so a clone that keeps failing would be retried for
+    # ever at whatever rate the machine manages.
+    ("handle-checkout-is-not-work",
+     '        record_once(state, key, done, head, "checkout",\n'
+     '                    "checkout failed: %s" % err)\n'
+     "        return False",
+     '        record_once(state, key, done, head, "checkout",\n'
+     '                    "checkout failed: %s" % err)\n'
+     "        return True"),
+    ("handle-done-is-not-work",
+     '    if done.get("outcome") == DONE:\n'
+     '        if done.get("sha") == head or not config["review_on_push"]:\n'
+     "            return False",
+     '    if done.get("outcome") == DONE:\n'
+     '        if done.get("sha") == head or not config["review_on_push"]:\n'
+     "            return True"),
+    # The two due times, which are the whole scheduling rule. The second
+    # is Kevin's call, asked explicitly: a repository that found nothing
+    # goes back on the normal timer.
+    ("due-now-after-a-review",
+     '            DUE[repo] = time.monotonic() + (0 if reviewed\n'
+     '                                            else config["poll_interval"])',
+     '            DUE[repo] = time.monotonic() + config["poll_interval"]'),
+    ("due-later-after-nothing",
+     '        if repo in DUE:\n'
+     '            DUE[repo] = time.monotonic() + (0 if reviewed\n'
+     '                                            else config["poll_interval"])',
+     '        if repo in DUE:\n'
+     '            DUE[repo] = time.monotonic()'),
+    # Deleting the entry is how a removal is expressed, so the one path
+    # that runs after a removal must not write it back.
+    ("dropped-stays-dropped",
+     "        HELD.discard(repo)\n"
+     "        if repo in DUE:\n",
+     "        HELD.discard(repo)\n"
+     "        if True:\n"),
+    # One worker per repository, which the queue used to give for free.
+    # Two reviews of one repository share its one checkout directory, and
+    # the second's `git reset --hard` moves the tree under the first.
+    ("one-worker-per-repository",
+     "            free = [(when, name) for name, when in DUE.items()\n"
+     "                    if name not in HELD]",
+     "            free = [(when, name) for name, when in DUE.items()]"),
+    ("taking-marks-it-held",
+     "                if when <= now:\n"
+     "                    HELD.add(name)\n"
+     "                    return name",
+     "                if when <= now:\n"
+     "                    return name"),
+    # STOPPING on its own does not wake a worker parked in
+    # SCHEDULE.wait(), so a stop that only set the flag was answered
+    # `poll_interval` later rather than now.
+    ("stop-wakes-the-parked",
+     "    with SCHEDULE:\n"
+     "        STOPPING.set()\n"
+     "        SCHEDULE.notify_all()",
+     "    with SCHEDULE:\n"
+     "        STOPPING.set()"),
+    # Discovery, which is the half that had no safe place left to run.
+    # The hourly ask must add and drop without disturbing what is already
+    # scheduled: made due again every hour, seventeen repositories would
+    # all be taken at the same instant for ever after.
+    ("discovery-keeps-earned-times",
+     "        for name in repos:\n"
+     "            if name not in DUE:\n"
+     "                DUE[name] = now",
+     "        for name in repos:\n"
+     "            DUE[name] = now"),
+    ("discovery-adds-what-arrived",
+     "        for name in repos:\n"
+     "            if name not in DUE:\n"
+     "                DUE[name] = now\n",
+     ""),
+    ("discovery-drops-what-went",
+     "        for name in list(DUE):\n"
+     "            if name not in repos:\n"
+     "                del DUE[name]\n",
+     ""),
+    # Without this refresh_repos() updates a list that decides nothing.
+    ("refresh-reaches-the-schedule",
+     '    config["repos"] = found\n'
+     "    reconcile(found)\n",
+     '    config["repos"] = found\n'),
+    ("continuous-asks-for-discovery",
+     "        while not STOPPING.is_set():\n"
+     "            if discovering:\n"
+     "                asked_at = refresh_repos(config, asked_at)",
+     "        while not STOPPING.is_set():"),
+    # A daemon whose first ask failed has no list to sweep, and no worker
+    # may exist before the sweep. Run once over an empty list, a check run
+    # a killed predecessor left spinning stays that way for the life of
+    # the process, which is the single harm sweep_checks() bounds.
+    ("continuous-waits-for-a-list",
+     "    while not config[\"repos\"] and discovering and not "
+     "STOPPING.is_set():\n"
+     "        STOPPING.wait(config[\"poll_interval\"])\n"
+     "        asked_at = refresh_repos(config, asked_at)\n",
+     ""),
+    ("sweep-before-any-worker",
+     "    sweep_checks(config, tokens)\n"
+     '    reconcile(config["repos"])',
+     '    reconcile(config["repos"])'),
+    # `--once` is what cron reads the exit code of, and it wants one pass
+    # over everything rather than a loop that never returns.
+    ("once-never-goes-continuous",
+     "        if not args.once and (width > 1 or (discovering\n",
+     "        if (width > 1 or (discovering\n"),
+    # The width alone. A single-repository install told to run four at a
+    # time used to keep its reviews on main()'s thread, where Ctrl-C
+    # unwinds them; through the pool the interrupt waits out the whole
+    # review in the join.
+    ("single-repository-stays-on-the-main-thread",
+     "        if not args.once and (width > 1 or (discovering\n"
+     '                                            and config["parallel_repos"] > 1)):',
+     '        if not args.once and config["parallel_repos"] > 1:'),
+    # And the discovery half alone. The width is clamped to the repository
+    # count, which is zero until the first ask answers, so keyed on it a
+    # daemon whose first ask failed stays serial for the life of the
+    # process.
+    ("discovery-takes-the-pool-before-the-first-ask",
+     "        if not args.once and (width > 1 or (discovering\n"
+     '                                            and config["parallel_repos"] > 1)):',
+     "        if not args.once and width > 1:"),
+    # The pool is as wide as the setting. Sized at one, the slow
+    # repository holds the only worker and every other one waits it out,
+    # which is the barrier again by another route.
+    ("the-pool-is-parallel-repos-wide",
+     '    workers = [threading.Thread(target=turns, name=POLL_WORKER '
+     '+ str(nth))\n'
+     '               for nth in range(config["parallel_repos"])]',
+     '    workers = [threading.Thread(target=turns, name=POLL_WORKER '
+     '+ str(nth))\n'
+     '               for nth in range(1)]'),
+
     # The shape the entry guard's own message promises. A dropped owner
     # starts the daemon and then fails on every poll for ever, with
     # nothing at startup saying the name is wrong.
@@ -1784,9 +2023,16 @@ MUTATIONS = [
      "            asked_at = refresh_repos(config, asked_at)",
      "        discovering = not config[\"repos\"]\n"
      "        asked_at = None"),
+    # Carrying the comment above it. The continuous loop has its own copy
+    # of these two lines, so the pair on its own stopped matching once the
+    # day that loop was written -- a disarmed anchor, and the suite green
+    # through it. This comment is the serial loop's and appears nowhere
+    # else.
     ("discovery-asks-every-pass",
+     "            # what lets a failed ask be retried in a minute.\n"
      "            if discovering:\n"
      "                asked_at = refresh_repos(config, asked_at)",
+     "            # what lets a failed ask be retried in a minute.\n"
      "            pass"),
 
     # --- what the second review round of PR #33 found -------------------
