@@ -8,10 +8,10 @@ your PRs.
 
 > **Status: the poller works. The triage pass routes effort and posts its note.**
 > `vinegar.py` polls GitHub, picks which pull requests deserve a reviewer, and
-> runs the review. The cheap model that reads a diff and decides whether to
-> review it at all is still a design, so today every pull request that passes
-> the filters gets a full review. The severity pass that tiers the findings
-> afterwards is a different thing and does work; see "Severity".
+> runs the review. A cheap model reads each diff first and decides how much
+> effort that review earns; it never decides whether to run one. The severity
+> pass that tiers the findings afterwards is a third thing again; see
+> "Severity".
 
 ## Why it exists
 
@@ -1453,9 +1453,9 @@ cost is dominated by reading the repository rather than by reading the diff.
 Vinegar pays that in subscription limits instead of dollars.
 
 The entire saving comes from running reviews through a Claude subscription you
-already have, plus letting cheap triage drop the PRs that never needed a
-reviewer. If you were planning to swap a vendor for an API key, Vinegar will not
-help you.
+already have, plus letting cheap triage spend less on the changes that do not
+need a full one. If you were planning to swap a vendor for an API key, Vinegar
+will not help you.
 
 ## The subscription rule you need to know
 
