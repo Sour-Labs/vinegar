@@ -343,10 +343,57 @@ MUTATIONS = [
     ("turn-one-pull-request",
      "            if handle_pr(repo, pr, config, state, tokens):\n"
      "                reviewed = True\n"
-     "                if turn:\n"
-     "                    return True\n",
+     "                if turn:\n",
      "            if handle_pr(repo, pr, config, state, tokens):\n"
-     "                reviewed = True\n"),
+     "                reviewed = True\n"
+     "                if False:\n"),
+    # Where the next turn starts. Without it every turn re-lists and stops
+    # at the same pull request, so one that is reviewable every time takes
+    # every turn and the ones behind it are never handed to handle_pr.
+    ("turn-records-where-it-stopped",
+     "                    with SCHEDULE:\n"
+     '                        TURN_AFTER[repo] = pr.get("number")\n',
+     ""),
+    ("turn-resumes-after-the-last",
+     "    if turn:\n"
+     "        with SCHEDULE:\n"
+     "            after = TURN_AFTER.get(repo)\n"
+     "        prs = turn_order(prs, after)\n",
+     ""),
+    # A rotation, not a slice: truncating would drop the pull requests
+    # ahead of the resume point instead of moving them behind it.
+    ("turn-order-rotates",
+     "            return prs[at + 1:] + prs[:at + 1]",
+     "            return prs[at + 1:]"),
+    ("resume-point-dropped-with-repo",
+     "                del DUE[name]\n"
+     "                # Its resume point goes with it, rather than being "
+     "kept\n"
+     "                # against a repository the App no longer covers.\n"
+     "                TURN_AFTER.pop(name, None)",
+     "                del DUE[name]"),
+    # Both clocks, and they have to be the same one. SCHEDULE.wait() times
+    # out on the monotonic clock, so a wall-clock due time disagrees with
+    # the thing doing the waiting.
+    ("due-times-are-monotonic",
+     "            DUE[repo] = time.monotonic() + (0 if reviewed\n"
+     '                                            else config["poll_interval"])',
+     "            DUE[repo] = time.time() + (0 if reviewed\n"
+     '                                       else config["poll_interval"])'),
+    ("due-times-compared-on-one-clock",
+     "        while not STOPPING.is_set():\n"
+     "            now = time.monotonic()",
+     "        while not STOPPING.is_set():\n"
+     "            now = time.time()"),
+    # Joining a thread that was never started raises, and raised from a
+    # finally that is unwinding it replaces the exception going out.
+    ("join-only-what-started",
+     "    finally:\n"
+     "        for worker in started:\n"
+     "            worker.join()",
+     "    finally:\n"
+     "        for worker in workers:\n"
+     "            worker.join()"),
     # The answer the schedule reads. Every entry below it is about the
     # same hazard from the other side: an ending that says True is due
     # again immediately, so a cheap ending that repeats is polled as fast
@@ -386,15 +433,15 @@ MUTATIONS = [
     # is Kevin's call, asked explicitly: a repository that found nothing
     # goes back on the normal timer.
     ("due-now-after-a-review",
-     '            DUE[repo] = time.time() + (0 if reviewed\n'
-     '                                       else config["poll_interval"])',
-     '            DUE[repo] = time.time() + config["poll_interval"]'),
+     '            DUE[repo] = time.monotonic() + (0 if reviewed\n'
+     '                                            else config["poll_interval"])',
+     '            DUE[repo] = time.monotonic() + config["poll_interval"]'),
     ("due-later-after-nothing",
      '        if repo in DUE:\n'
-     '            DUE[repo] = time.time() + (0 if reviewed\n'
-     '                                       else config["poll_interval"])',
+     '            DUE[repo] = time.monotonic() + (0 if reviewed\n'
+     '                                            else config["poll_interval"])',
      '        if repo in DUE:\n'
-     '            DUE[repo] = time.time()'),
+     '            DUE[repo] = time.monotonic()'),
     # Deleting the entry is how a removal is expressed, so the one path
     # that runs after a removal must not write it back.
     ("dropped-stays-dropped",
@@ -466,8 +513,24 @@ MUTATIONS = [
     # `--once` is what cron reads the exit code of, and it wants one pass
     # over everything rather than a loop that never returns.
     ("once-never-goes-continuous",
-     '        if not args.once and config["parallel_repos"] > 1:',
-     '        if config["parallel_repos"] > 1:'),
+     "        if not args.once and (width > 1 or (discovering\n",
+     "        if (width > 1 or (discovering\n"),
+    # The width alone. A single-repository install told to run four at a
+    # time used to keep its reviews on main()'s thread, where Ctrl-C
+    # unwinds them; through the pool the interrupt waits out the whole
+    # review in the join.
+    ("single-repository-stays-on-the-main-thread",
+     "        if not args.once and (width > 1 or (discovering\n"
+     '                                            and config["parallel_repos"] > 1)):',
+     '        if not args.once and config["parallel_repos"] > 1:'),
+    # And the discovery half alone. The width is clamped to the repository
+    # count, which is zero until the first ask answers, so keyed on it a
+    # daemon whose first ask failed stays serial for the life of the
+    # process.
+    ("discovery-takes-the-pool-before-the-first-ask",
+     "        if not args.once and (width > 1 or (discovering\n"
+     '                                            and config["parallel_repos"] > 1)):',
+     "        if not args.once and width > 1:"),
     # The pool is as wide as the setting. Sized at one, the slow
     # repository holds the only worker and every other one waits it out,
     # which is the barrier again by another route.

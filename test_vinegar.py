@@ -8271,6 +8271,7 @@ def _schedule_cleared():
     with vinegar.SCHEDULE:
         vinegar.DUE.clear()
         vinegar.HELD.clear()
+        vinegar.TURN_AFTER.clear()
 
 
 def _loop(config, discovering=False, asked_at=None):
@@ -8287,8 +8288,16 @@ def _loop(config, discovering=False, asked_at=None):
     return runner
 
 
-def _stop(runner):
-    """Ask the loop to stop, and say whether it did.
+_stops = []
+
+
+def _stop(runner, label):
+    """Ask the loop to stop, and record whether it did, under `label`.
+
+    The answer is recorded rather than returned into a variable a caller
+    may forget to read. Four of the five call sites here dropped it, so a
+    stop that timed out was silent in exactly the section written to prove
+    stops work; one check below reads the whole list.
 
     Clears STOPPING again, but only once the loop has really finished --
     poll_forever() joins its workers before it returns, so by then nothing
@@ -8302,8 +8311,10 @@ def _stop(runner):
     vinegar.stop_polling()
     runner.join(15)
     if runner.is_alive():
+        _stops.append((label, False))
         return False
     vinegar.STOPPING.clear()
+    _stops.append((label, True))
     return True
 
 
@@ -8340,7 +8351,7 @@ _runner = _loop(dict(CONFIG, repos=["o/quick", "o/slow"], parallel_repos=2,
 _waited_for(lambda: len(_quick_turns) >= 3)
 _quick_while_slow = len(_quick_turns)
 _slow_go.set()
-_slow_stopped = _stop(_runner)
+_slow_stopped = _stop(_runner, "slow")
 check("a repository being reviewed does not delay a quiet one",
       _quick_while_slow >= 3, (_quick_while_slow, len(_slow_turns)))
 check("and the loop stops when it is asked to", _slow_stopped, _slow_stopped)
@@ -8373,7 +8384,7 @@ _schedule_cleared()
 _runner = _loop(dict(CONFIG, repos=["o/one"], parallel_repos=4,
                      poll_interval=0.01))
 _waited_for(lambda: len(_entered) >= 5)
-_held_stopped = _stop(_runner)
+_stop(_runner, "held")
 check("one repository is never in two workers at once",
       _most_inside[0] == 1, _most_inside[0])
 # Without this the check above passes on a loop that never ran at all.
@@ -8419,6 +8430,11 @@ check("a whole pass still works through every pull request",
 # A turn stops on the first pull request it *reviewed*, not on the first
 # it looked at. Skips are cheap and a repository whose first two pull
 # requests are drafts must still reach the third.
+#
+# From a cleared schedule, so the listing is read in its own order: the
+# check above reviewed number 1 and left that behind as where the next
+# turn resumes, which is the rotation two blocks below.
+_schedule_cleared()
 _looked = []
 
 
@@ -8438,6 +8454,35 @@ _nothing_said = vinegar.poll_repo("o/r", CONFIG, {}, {}, turn=True)
 check("a turn that reviewed nothing says so", _nothing_said is False,
       _nothing_said)
 
+# A pull request that is reviewable on every turn must not take every
+# turn. The turn exists so one repository cannot starve its neighbours,
+# and without a resume point it introduced exactly that starvation one
+# level down: `gh pr list` puts the newest first, a branch pushed to
+# during each review is reviewable every time, and the pull requests
+# behind it were never handed to handle_pr at all.
+_schedule_cleared()
+_in_turns = []
+vinegar.open_prs = lambda repo, env: [dict(PR, number=n) for n in (10, 9, 8)]
+vinegar.handle_pr = lambda repo, pr, config, state, tokens: (
+    _in_turns.append(pr["number"]) or True)
+for _ in range(3):
+    vinegar.poll_repo("o/r", CONFIG, {}, {}, turn=True)
+check("a pull request reviewable on every turn does not take every turn",
+      sorted(_in_turns) == [8, 9, 10], _in_turns)
+# A rotation, not a slice: nothing is dropped, so the whole listing is
+# still reachable inside one turn.
+check("the resume point rotates the listing rather than truncating it",
+      [p["number"] for p in vinegar.turn_order(
+          [dict(PR, number=n) for n in (10, 9, 8)], 9)] == [8, 10, 9],
+      [p["number"] for p in vinegar.turn_order(
+          [dict(PR, number=n) for n in (10, 9, 8)], 9)])
+# The pull request it stopped on can be closed before the next turn.
+check("a resume point that is no longer in the listing starts at the top",
+      [p["number"] for p in vinegar.turn_order(
+          [dict(PR, number=n) for n in (10, 9)], 99)] == [10, 9],
+      [p["number"] for p in vinegar.turn_order(
+          [dict(PR, number=n) for n in (10, 9)], 99)])
+
 # What a turn earns: due now when it reviewed, due in `poll_interval` when
 # it did not. The second half is Kevin's call, asked explicitly, and it is
 # what keeps `poll_interval` meaning anything at all.
@@ -8446,7 +8491,7 @@ _due_config = dict(CONFIG, poll_interval=60)
 with vinegar.SCHEDULE:
     vinegar.DUE["o/r"] = 0
     vinegar.HELD.add("o/r")
-_before = time.time()
+_before = time.monotonic()
 vinegar.release_repo("o/r", True, _due_config)
 _due_after_review = vinegar.DUE.get("o/r", 0) - _before
 check("a repository that reviewed something is due immediately",
@@ -8455,11 +8500,43 @@ check("and it is not still held once its turn is over",
       "o/r" not in vinegar.HELD, vinegar.HELD)
 with vinegar.SCHEDULE:
     vinegar.HELD.add("o/r")
-_before = time.time()
+_before = time.monotonic()
 vinegar.release_repo("o/r", False, _due_config)
 _due_after_nothing = vinegar.DUE.get("o/r", 0) - _before
 check("a repository that found nothing is due in poll_interval",
       59 <= _due_after_nothing <= 61, _due_after_nothing)
+# And on the monotonic clock, not the wall clock. SCHEDULE.wait() times
+# out on the monotonic one, so a wall-clock due time can disagree with the
+# thing doing the waiting: a backward NTP step leaves every repository due
+# in the future, and each worker wakes on time, compares against a clock
+# that is still behind, and parks again until the wall clock catches up.
+# The two timescales are billions of seconds apart, so this cannot pass by
+# accident.
+_due_scale = vinegar.DUE.get("o/r", 0)
+check("and on the monotonic clock, which is what the wait uses",
+      abs(_due_scale - (time.monotonic() + 60)) < 2,
+      (_due_scale, time.monotonic(), time.time()))
+
+# A repository that found nothing is not handed straight back out.
+# take_repo has to compare against the same clock the due times are
+# written on: reading the wall clock while DUE holds monotonic times makes
+# every repository look overdue for ever, and `poll_interval` stops
+# meaning anything at all. The two clocks are billions of seconds apart,
+# so the comparison fails in that direction every time.
+_schedule_cleared()
+_taken_again = []
+vinegar.poll_repo = lambda repo, config, state, tokens, turn=False: (
+    _taken_again.append(repo) or False)
+_runner = _loop(dict(CONFIG, repos=["o/one", "o/two"], parallel_repos=2,
+                     poll_interval=30))
+_waited_for(lambda: len(_taken_again) >= 2)
+# Long enough to catch a second turn that should be thirty seconds away,
+# short enough not to slow every mutation down.
+time.sleep(0.4)
+_stop(_runner, "not due yet")
+check("a repository that found nothing is not taken again until it is due",
+      _taken_again.count("o/one") == 1 and _taken_again.count("o/two") == 1,
+      _taken_again)
 
 # A stop is answered now, not when the next repository happens to fall
 # due. STOPPING on its own does not wake a worker parked in
@@ -8480,7 +8557,7 @@ _waited_for(lambda: len(_parked) >= 2)
 time.sleep(0.2)
 _asked_at = time.time()
 _stop_took = None
-if _stop(_runner):
+if _stop(_runner, "prompt"):
     _stop_took = time.time() - _asked_at
 check("a stop does not wait for the next repository to fall due",
       _stop_took is not None and _stop_took < 2, _stop_took)
@@ -8498,7 +8575,7 @@ _schedule_cleared()
 _runner = _loop(dict(CONFIG, repos=["o/one"], parallel_repos=2,
                      poll_interval=0.02))
 _waited_for(lambda: "poll" in _order)
-_sweep_stopped = _stop(_runner)
+_stop(_runner, "sweep")
 vinegar.sweep_checks = lambda config, tokens: None
 # Sliced rather than indexed. An empty list is exactly what a broken guard
 # leaves, and `_order[0]` on one raises, which aborts the run and reports
@@ -8541,6 +8618,15 @@ vinegar.release_repo("o/gone", True, CONFIG)
 check("a repository dropped while held is not put back when its turn ends",
       "o/gone" not in vinegar.DUE and "o/gone" not in vinegar.HELD,
       (dict(vinegar.DUE), vinegar.HELD))
+# Its resume point goes with it rather than being kept against a
+# repository the App no longer covers.
+_schedule_cleared()
+with vinegar.SCHEDULE:
+    vinegar.DUE["o/gone"] = 0
+    vinegar.TURN_AFTER["o/gone"] = 7
+vinegar.reconcile([])
+check("a repository dropped takes its resume point with it",
+      "o/gone" not in vinegar.TURN_AFTER, dict(vinegar.TURN_AFTER))
 # The list and the schedule stay in step through the real entry point,
 # not only through reconcile() called by hand. refresh_repos() is where
 # that call has to be, and dropping it leaves a function that updates a
@@ -8554,6 +8640,7 @@ vinegar.discover_repos = lambda app: (["o/one", "o/two"], [])
 # against 0 rather than against None -- raised a TypeError here and ended
 # the run at check 842 of 945, so 103 checks below reported nothing rather
 # than one of them failing. Measured, not guessed.
+_refresh_raised = None
 try:
     vinegar.refresh_repos(dict(CONFIG, repos=["o/one"], github_app={"id": 1}),
                           None)
@@ -8561,7 +8648,8 @@ except Exception as err:
     _refresh_raised = "raised %r" % err
 vinegar.discover_repos = _kept_discover
 check("refresh_repos puts what it discovered on the schedule",
-      sorted(vinegar.DUE) == ["o/one", "o/two"], dict(vinegar.DUE))
+      sorted(vinegar.DUE) == ["o/one", "o/two"],
+      (dict(vinegar.DUE), _refresh_raised))
 
 # Discovery keeps being asked for, on the loop's own thread. Under the
 # barrier that call sat between two passes; there is no such place now,
@@ -8575,7 +8663,7 @@ _schedule_cleared()
 _runner = _loop(dict(CONFIG, repos=["o/one"], parallel_repos=2,
                      poll_interval=0.02), discovering=True)
 _waited_for(lambda: len(_asks) >= 2)
-_ask_stopped = _stop(_runner)
+_stop(_runner, "discovery")
 check("the continuous loop keeps asking which repositories the App covers",
       len(_asks) >= 2, len(_asks))
 
@@ -8601,7 +8689,7 @@ vinegar.sweep_checks = lambda config, tokens: _swept_at.append(
 _schedule_cleared()
 _runner = _loop(_late_config, discovering=True)
 _waited_for(lambda: _swept_at)
-_late_stopped = _stop(_runner)
+_stop(_runner, "late list")
 vinegar.refresh_repos = _kept_refresh
 vinegar.sweep_checks = lambda config, tokens: None
 check("a first discovery that failed does not sweep an empty list",
@@ -8647,6 +8735,136 @@ check("--once still polls every repository exactly once",
       sorted(_once_polled) == ["o/one", "o/two"], _once_polled)
 check("and a one-shot run never takes the continuous loop",
       _once_forever == [], _once_forever)
+
+# A start() that fails partway must report why it failed. Thread.join()
+# raises RuntimeError on a thread that was never started, and raised from
+# a finally that is already unwinding, that RuntimeError *replaces* the
+# exception on its way out: the real cause was gone, and a Ctrl-C landing
+# between two start() calls stopped being a KeyboardInterrupt at all, so
+# main()'s handler did not match it and the operator got a traceback where
+# the "stopping" line belongs.
+_schedule_cleared()
+vinegar.sweep_checks = lambda config, tokens: None
+vinegar.poll_repo = lambda repo, config, state, tokens, turn=False: False
+_starts = [0]
+_real_thread = threading.Thread
+
+
+class _FailsTheThirdStart(_real_thread):
+    def start(self):
+        _starts[0] += 1
+        if _starts[0] >= 3:
+            raise RuntimeError("can't start new thread")
+        return _real_thread.start(self)
+
+
+# On a thread with a bounded join, never called straight. A mutation that
+# narrows the pool to one worker means the third start() never happens, so
+# poll_forever does not raise and drops into its own wait instead: called
+# straight, that hung the suite until mutate.py's 300-second timeout
+# killed the whole run, which reports nothing about any check. Measured on
+# `the-pool-is-parallel-repos-wide`.
+_started_escape = []
+
+
+def _start_a_pool():
+    try:
+        vinegar.poll_forever(dict(CONFIG, repos=["o/one"], parallel_repos=4,
+                                  poll_interval=0.05), {}, {}, False, None)
+        _started_escape.append(None)
+    except BaseException as err:
+        _started_escape.append(err)
+
+
+_start_runner = _real_thread(target=_start_a_pool)
+_start_runner.daemon = True
+threading.Thread = _FailsTheThirdStart
+try:
+    _start_runner.start()
+    _start_runner.join(10)
+finally:
+    threading.Thread = _real_thread
+if _start_runner.is_alive():
+    vinegar.stop_polling()
+    _start_runner.join(10)
+vinegar.STOPPING.clear()
+_start_escaped = _started_escape[0] if _started_escape else "never returned"
+# Two workers did start, so the finally has something to join and the
+# broken shape has something to trip over. Without that the unstarted
+# thread is never reached and this passes against the very bug it names.
+check("two workers started before the third was refused",
+      _starts[0] == 3, _starts[0])
+check("a loop that cannot start a worker reports why, not a join error",
+      isinstance(_start_escaped, RuntimeError)
+      and "start new thread" in str(_start_escaped), _start_escaped)
+
+# Which loop main() takes. Both halves of that condition are load-bearing:
+# the width alone leaves a discovery install whose first ask failed on the
+# serial loop for ever, and the setting alone moves a single-repository
+# install off main()'s thread, where Ctrl-C would no longer unwind the
+# review it is running.
+_taken = []
+
+
+def _loop_taken(**over):
+    """Which loop main() reaches for this config, without letting it run."""
+    kept = (sys.argv, vinegar.poll_once, vinegar.poll_forever,
+            vinegar.sweep_checks, vinegar.log, vinegar.refresh_repos)
+    del _taken[:]
+    with open(os.path.join(os.environ["VINEGAR_HOME"], "config.json"),
+              "w") as handle:
+        json.dump(dict({"repos": ["o/one"]}, **over), handle)
+    sys.argv = ["vinegar.py"]
+    vinegar.sweep_checks = lambda config, tokens: None
+    vinegar.log = lambda message: None
+    # Discovery answers nothing, so the width stays at whatever the file
+    # gives it and this measures the branch rather than the network.
+    vinegar.refresh_repos = lambda config, asked_at: None
+
+    def serial(config, state, tokens):
+        _taken.append("poll_once")
+        # The daemon path has no exit of its own, and main() catches this
+        # the way it catches a real Ctrl-C.
+        raise KeyboardInterrupt
+
+    def pool(config, state, tokens, discovering, asked_at):
+        _taken.append("poll_forever")
+
+    vinegar.poll_once, vinegar.poll_forever = serial, pool
+    try:
+        vinegar.main()
+    except SystemExit as err:
+        _taken.append("refused to start: %s" % err)
+    except Exception as err:
+        _taken.append("raised: %r" % err)
+    finally:
+        (sys.argv, vinegar.poll_once, vinegar.poll_forever,
+         vinegar.sweep_checks, vinegar.log, vinegar.refresh_repos) = kept
+    return _taken[0] if _taken else "took neither loop"
+
+
+_one_repo_wide = _loop_taken(repos=["o/one"], parallel_repos=4)
+check("one repository stays on the thread Ctrl-C reaches, whatever the "
+      "setting says", _one_repo_wide == "poll_once", _one_repo_wide)
+_two_repos = _loop_taken(repos=["o/one", "o/two"], parallel_repos=2)
+check("two repositories and a width above one take the continuous loop",
+      _two_repos == "poll_forever", _two_repos)
+# The case the width cannot answer: under discovery it is zero until an
+# ask succeeds, and keyed on it alone a daemon whose first ask failed
+# would have stayed serial for the life of the process.
+_discovering = _loop_taken(repos=[], parallel_repos=4, github_app=_app_key)
+check("a discovery install takes it even before the first ask answers",
+      _discovering == "poll_forever", _discovering)
+_discovering_serial = _loop_taken(repos=[], parallel_repos=1,
+                                  github_app=_app_key)
+check("and parallel_repos at one still does not",
+      _discovering_serial == "poll_once", _discovering_serial)
+
+# Every stop in this section, read in one place. Four of the five call
+# sites used to drop this answer, so a stop that timed out was silent in
+# the one section written to prove that stops work.
+check("every stop in this section really stopped the loop",
+      _stops and all(ok for _, ok in _stops), _stops)
 
 vinegar.poll_repo, vinegar.poll_once, vinegar.sweep_checks, \
     vinegar.open_prs, vinegar.handle_pr = _real_loop_parts

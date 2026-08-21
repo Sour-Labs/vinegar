@@ -311,14 +311,25 @@ over the width wait for a worker. It is the one setting that multiplies every
 other runaway this program bounds, and a cap that followed the repository count
 would make the same file mean something different as repositories were added.
 
-**No repository waits for another to finish.** Above 1 there are no passes at
-all: that many workers run for the life of the process, and each one takes
-whichever repository is due, reviews **at most one** pull request on it, and
-puts it straight back. A repository that reviewed something is due again
-immediately, so the next turn takes its next pull request; one that found
-nothing to do is due in `poll_interval`. Nothing waits for anything else, so a
-push to a quiet repository is picked up while a twenty-minute review runs
-somewhere else.
+**No repository waits for another to finish.** Once there is more than one
+repository to run at a time there are no passes at all: that many workers run
+for the life of the process, and each one takes whichever repository is due,
+reviews **at most one** pull request on it, and puts it straight back. A
+repository that reviewed something is due again immediately, so the next turn
+takes its next pull request; one that found nothing to do is due in
+`poll_interval`. Nothing waits for anything else, so a push to a quiet
+repository is picked up while a twenty-minute review runs somewhere else.
+
+Each turn picks up where the last one left off, rather than re-reading the
+listing from the top. Without that, a branch that is pushed to during every
+review is reviewable on every turn and would take all of them, and the other
+pull requests on that repository would never be reached: the rotation is what
+stops the fairness rule solving one starvation by creating another.
+
+A single-repository install keeps its reviews on the main thread whatever
+`parallel_repos` says, because there is nothing for a second worker to do and
+Ctrl-C only unwinds a review running on that thread. Discovery is the
+exception: the list starts empty, so the setting decides there.
 
 It did not always work that way, and the symptom is worth recognising if you
 are running an older version. Vinegar used to poll in passes and join every
