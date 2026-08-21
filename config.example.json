@@ -15,5 +15,6 @@
   "authors": [],
   "review_timeout": 1800,
   "severity_model": "haiku",
+  "triage_model": "sonnet",
   "github_app": null
 }

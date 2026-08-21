@@ -58,7 +58,13 @@ GENUINE_SAVE_TRANSCRIPT = vinegar.save_transcript
 
 PR = {"number": 12, "headRefOid": "a1b2c3d4e5f6", "baseRefName": "release-2",
       "url": "https://github.com/o/r/pull/12"}
-CONFIG = dict(vinegar.DEFAULTS, effort="high", comment=True)
+# triage_model off, so the sections below assert on what they are about.
+# With it on, fake_run answers the shape call as if it were the severity
+# pass, every review() here quietly runs a triage that cannot be read, and
+# its git diff overwrites the one diff_lines() recorded. The triage section
+# turns it on deliberately and is the only place that does.
+CONFIG = dict(vinegar.DEFAULTS, effort="high", comment=True,
+              triage_model=None)
 ROOT = "/checkouts/o__r"
 L = "o/r#12"
 
@@ -8300,6 +8306,232 @@ except TypeError as err:
 vinegar.SETTINGS_PATH = _sp
 check("an allow list that is null is refused with a sentence, not a stack",
       "does not allow" in _null_said, _null_said)
+
+# ── The triage pass: the diff's shape, and the effort it earns ──────────
+#
+# Every check here is one the 2026-08-20 measurement or the wiring paid
+# for. The pass may only ever lower the effort, so the checks that matter
+# most are the ones proving each failure lands back on the configured
+# ceiling: a triage that silently reviewed at `low` because its answer was
+# unreadable would be indistinguishable, on the pull request, from a
+# triage that read the diff and decided `low` on purpose.
+
+_SHAPE_OK = ('{"auth": false, "payments": false, "migrations": false, '
+             '"concurrency": false, "money": false, "generated": false, '
+             '"unsure": [], "touches": "Renames a helper."}')
+
+
+_SHAPE_PR = dict(PR, title="Rename a helper")
+
+
+def _shape_run(answer, diff=None, rc=0, boom=None):
+    """A stub answering the two calls shape() makes, in order."""
+    seen = []
+
+    def run(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
+        seen.append((cmd, env, timeout))
+        if cmd[0] == "git":
+            return subprocess.CompletedProcess(cmd, rc, diff or DIFF, "boom")
+        if boom:
+            raise boom
+        return subprocess.CompletedProcess(
+            cmd, 0, json.dumps({"result": answer, "total_cost_usd": 0.01}), "")
+    run.seen = seen
+    return run
+
+
+def _shaped(answer=_SHAPE_OK, diff=None, rc=0, boom=None, model="sonnet",
+            since=None):
+    stub = _shape_run(answer, diff, rc, boom)
+    was, vinegar.run = vinegar.run, stub
+    try:
+        got = vinegar.shape(L, "o/r", ROOT, _SHAPE_PR,
+                            dict(CONFIG, triage_model=model), {}, since)
+    finally:
+        vinegar.run = was
+    return got, stub.seen
+
+
+check("a null triage_model reviews everything at the configured effort",
+      _shaped(model=None)[0] is None)
+
+_ok, _ = _shaped()
+# 9 changed lines over 5 files. The counts are spelled out because they
+# are what the routing divides into bands, and because the fixture is
+# built to break a careless parser: `doc.md` contains a line that renders
+# as `+++ b/spoofed.py`, `gone.py` is a delete with no head-side file,
+# `my file.py` carries git's trailing tab, and `crlf.py` holds a lone CR.
+check("a readable answer comes back with the diff's own measurements",
+      _ok and _ok["changed"] == 9 and _ok["files"] == 5
+      and _ok["difficulty"] == "trivial" and _ok["truncated"] is False, _ok)
+check("a line that only looks like a file header invents no file",
+      _ok and "spoofed.py" not in str(_ok), _ok)
+check("a deleted file contributes no head-side file",
+      _ok and "gone.py" not in str(_ok), _ok)
+
+check("a git diff that fails leaves the effort where it was",
+      _shaped(rc=1)[0] is None)
+check("an answer that is not JSON leaves the effort where it was",
+      _shaped(answer="I could not classify this.")[0] is None)
+check("an answer missing a domain leaves the effort where it was",
+      _shaped(answer='{"auth": false, "payments": false, "money": false,'
+                     ' "generated": false}')[0] is None)
+check("a domain that is not a bool leaves the effort where it was",
+      _shaped(answer=_SHAPE_OK.replace('"auth": false', '"auth": "no"')
+              )[0] is None)
+check("a triage that times out leaves the effort where it was",
+      _shaped(boom=subprocess.TimeoutExpired("claude", 120))[0] is None)
+check("a claude that is not on PATH leaves the effort where it was",
+      _shaped(boom=OSError("claude: not found"))[0] is None)
+
+# The fence is the common case, not the exception: haiku fenced all 27
+# answers in the measurement and sonnet fenced none. A pass that only
+# accepts bare JSON works on one model and quietly falls back on the other.
+check("a fenced answer is read rather than thrown away",
+      (_shaped(answer="```json\n%s\n```" % _SHAPE_OK)[0] or {}
+       ).get("touches") == "Renames a helper.")
+
+# read_shape's own surface, driven directly.
+check("a word outside the domains is dropped from unsure, keeping the rest",
+      vinegar.read_shape(_SHAPE_OK.replace('"unsure": []',
+                                           '"unsure": ["money", "vibes"]')
+                         )["unsure"] == ["money"])
+check("an unsure that is not a list is read as no doubt at all",
+      vinegar.read_shape(_SHAPE_OK.replace('"unsure": []', '"unsure": 7')
+                         )["unsure"] == [])
+check("a summary past the cap is cut rather than posted whole",
+      len(vinegar.read_shape(
+          _SHAPE_OK.replace("Renames a helper.", "x" * 5000))["touches"])
+      == vinegar.SHAPE_SUMMARY)
+check("a summary that is not a string becomes no summary",
+      vinegar.read_shape(_SHAPE_OK.replace('"Renames a helper."', "42")
+                         )["touches"] == "")
+
+# The bands, at their edges. Each boundary is a separate check because an
+# off-by-one in either direction is a whole effort level on real changes.
+check("under 100 changed lines is trivial", vinegar.difficulty(99) == "trivial")
+check("100 changed lines is small", vinegar.difficulty(100) == "small")
+check("399 changed lines is still small", vinegar.difficulty(399) == "small")
+check("400 changed lines is moderate", vinegar.difficulty(400) == "moderate")
+check("999 changed lines is still moderate",
+      vinegar.difficulty(999) == "moderate")
+check("1000 changed lines is large", vinegar.difficulty(1000) == "large")
+
+
+def _clear(**over):
+    got = {name: False for name in vinegar.RISKS}
+    got.update(unsure=[], generated=False, touches="", truncated=False)
+    got.update(over)
+    return got
+
+
+def _effort(shape, changed, ceiling="xhigh"):
+    return vinegar.effort_for(shape, changed, dict(CONFIG, effort=ceiling))
+
+
+check("a triage that did not answer keeps the configured effort",
+      _effort(None, 40) == ("xhigh", "triage did not answer"))
+check("a trivial change reaching nothing is reviewed at low effort",
+      _effort(_clear(), 40)[0] == "low")
+check("a small change reaching nothing is reviewed at medium effort",
+      _effort(_clear(), 250)[0] == "medium")
+check("a moderate change reaching nothing is reviewed at high effort",
+      _effort(_clear(), 700)[0] == "high")
+check("a large change takes the ceiling rather than a level of its own",
+      _effort(_clear(), 4000)[0] == "xhigh")
+
+# Risk is what drives routing, so a two-line change that reaches one of the
+# domains has to come out at the ceiling, not at `low`.
+check("a trivial change that reaches a domain still takes the ceiling",
+      _effort(_clear(money=True), 12) == ("xhigh", "touches money"))
+check("the reason names every domain the change reached",
+      _effort(_clear(auth=True, migrations=True), 12)[1]
+      == "touches auth, migrations")
+check("a domain the model was unsure about takes the ceiling",
+      _effort(_clear(unsure=["concurrency"]), 12)
+      == ("xhigh", "unsure about concurrency"))
+check("a diff too large to read whole takes the ceiling",
+      _effort(_clear(truncated=True), 12)[0] == "xhigh")
+
+# The ceiling is a ceiling in both directions: triage may lower it and may
+# never raise it, so an operator who configured `low` gets `low`.
+check("a ceiling below the band's level wins",
+      _effort(_clear(), 700, ceiling="low")[0] == "low")
+check("triage never names a level above the configured ceiling",
+      all(vinegar.EFFORTS.index(_effort(_clear(), n, ceiling="medium")[0])
+          <= vinegar.EFFORTS.index("medium")
+          for n in (10, 250, 700, 5000)))
+
+# The range it reads. A narrowed round judged on the whole branch would buy
+# the ceiling for every round after the first.
+_, _seen = _shaped(since="abc123")
+check("a narrowed round is sized on what that round reads",
+      any("abc123...HEAD" in c for c, _, _ in _seen if c[0] == "git"), _seen)
+_, _seen = _shaped()
+check("a first round is sized against the base branch",
+      any("refs/heads/release-2...HEAD" in c for c, _, _ in _seen
+          if c[0] == "git"), _seen)
+
+# The diff came out of a branch Vinegar does not trust, so the call that
+# reads it does not run beside an operator's token.
+_was_env = dict(os.environ)
+os.environ["GH_TOKEN"] = "leak-me"
+try:
+    _, _seen = _shaped()
+finally:
+    os.environ.clear()
+    os.environ.update(_was_env)
+check("the triage call does not carry a GH_TOKEN it could leak",
+      all("GH_TOKEN" not in (env or {}) for c, env, _ in _seen
+          if c[0] == "claude"), _seen)
+
+# Truncation has to be both told to the model and remembered, because the
+# second is what escalates.
+_big = DIFF + "\n".join("+filler %d" % n for n in range(60000))
+_trunc, _seen = _shaped(diff=_big)
+check("an oversized diff is cut and the cut is remembered",
+      _trunc and _trunc["truncated"] is True, _trunc)
+check("the model is told its diff was cut, not handed one silently",
+      any("the rest was cut" in c[2] for c, _, _ in _seen
+          if c[0] == "claude"), "")
+check("the whole file list survives a cut diff",
+      any("vinegar.py" in c[2].split("Diff (")[0] for c, _, _ in _seen
+          if c[0] == "claude"), "")
+
+# The wiring: what triage decides has to reach the command that is run.
+def _reviewed_at(answer, ceiling="xhigh"):
+    ran = []
+
+    def run(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
+        if cmd[0] == "git":
+            return subprocess.CompletedProcess(cmd, 0, DIFF, "")
+        if cmd[2].startswith("/code-review"):
+            ran.append(cmd[2])
+            raise subprocess.TimeoutExpired("claude", 1)
+        return subprocess.CompletedProcess(
+            cmd, 0, json.dumps({"result": answer, "total_cost_usd": 0.01}), "")
+    was, vinegar.run = vinegar.run, run
+    try:
+        vinegar.review(ROOT, "o/r", _SHAPE_PR,
+                       dict(CONFIG, effort=ceiling, triage_model="sonnet"),
+                       None, {})
+    except Exception:
+        pass
+    finally:
+        vinegar.run = was
+    return ran[0] if ran else ""
+
+
+check("the effort triage chose is the effort the reviewer is asked for",
+      _reviewed_at(_SHAPE_OK).startswith("/code-review low "),
+      _reviewed_at(_SHAPE_OK))
+check("a triage that could not be read still buys the configured effort",
+      _reviewed_at("not json").startswith("/code-review xhigh "),
+      _reviewed_at("not json"))
+check("a domain reached is reviewed at the ceiling through the wiring",
+      _reviewed_at(_SHAPE_OK.replace('"auth": false', '"auth": true')
+                   ).startswith("/code-review xhigh "))
+
 
 reached_the_end.append(True)
 print()

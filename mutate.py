@@ -136,14 +136,14 @@ MUTATIONS = [
 
     # --- anchoring, in diff_lines --------------------------------------
     ("diff-failure-gate",
-     "    if result is None or result.returncode != 0:",
-     "    if result is None:"),
+     '    if result is None or result.returncode != 0:\n        # Every finding is about to be routed to the general comment. Say why\n',
+     '    if result is None:\n        # Every finding is about to be routed to the general comment. Say why\n'),
     ("heading-gate",
-     '        elif heading and line.startswith("+++ "):',
-     '        elif line.startswith("+++ "):'),
+     '        elif heading and line.startswith("+++ "):\n            target = line[4:]\n            # /dev/null is a delete, and there is no head-side file to\n',
+     '        elif line.startswith("+++ "):\n            target = line[4:]\n            # /dev/null is a delete, and there is no head-side file to\n'),
     ("deleted-file",
-     '            name = None if target == "/dev/null" else target[2:].rstrip("\\t")',
-     '            name = target[2:].rstrip("\\t")'),
+     '            name = None if target == "/dev/null" else target[2:].rstrip("\\t")\n        elif name and line.startswith("@@"):\n',
+     '            name = target[2:].rstrip("\\t")\n        elif name and line.startswith("@@"):\n'),
     ("empty-hunk",
      "                if count:\n"
      "                    covered.setdefault(name, set()).update(\n"
@@ -1816,6 +1816,89 @@ MUTATIONS = [
     ("discovery-first-ask-unconditional",
      "    if asked_at is not None and time.time() - asked_at < DISCOVERY_INTERVAL:",
      "    if asked_at != 0 and time.time() - asked_at < DISCOVERY_INTERVAL:"),
+    # --- the triage pass -----------------------------------------------
+    # Each band boundary is a whole effort level on real changes, so both
+    # the edges and the comparison that places them are anchored.
+    ("triage-band-edges",
+     'DIFFICULTY = ((100, "trivial"), (400, "small"), (1000, "moderate"),',
+     'DIFFICULTY = ((10, "trivial"), (40, "small"), (100, "moderate"),'),
+    ("triage-band-comparison",
+     "        if ceiling is None or changed < ceiling:",
+     "        if ceiling is None or changed <= ceiling:"),
+    # Risk is what drives routing. A two-line change to money arithmetic
+    # coming out at `low` is the failure this whole pass exists to avoid.
+    ("triage-risk-escalates",
+     "    reached = sorted(name for name in RISKS if shape[name])\n"
+     "    if reached:",
+     "    reached = sorted(name for name in RISKS if shape[name])\n"
+     "    if False:"),
+    ("triage-unsure-escalates",
+     '    if shape["unsure"]:\n'
+     '        return ceiling, "unsure about %s" % ", ".join(shape["unsure"])',
+     '    if False:\n'
+     '        return ceiling, "unsure about %s" % ", ".join(shape["unsure"])'),
+    ("triage-truncated-escalates",
+     '    if shape.get("truncated"):\n'
+     '        return ceiling, "the diff was too large to read whole"',
+     '    if False:\n'
+     '        return ceiling, "the diff was too large to read whole"'),
+    # A failure that reviews at `low` is indistinguishable, on the pull
+    # request, from a triage that read the diff and chose `low`.
+    ("triage-no-answer-is-ceiling",
+     '    if shape is None:\n'
+     '        return ceiling, "triage did not answer"',
+     '    if shape is None:\n'
+     '        return "low", "triage did not answer"'),
+    # The ceiling has to hold in both directions, or configuring `low`
+    # stops meaning anything.
+    ("triage-ceiling-holds",
+     "    chosen = wanted if EFFORTS.index(wanted) < EFFORTS.index(\n"
+     "        ceiling) else ceiling",
+     "    chosen = wanted"),
+    # The forgery guard. Without it an added line reading `+++ b/x.py`
+    # invents a file and every count this pass reports goes wrong.
+    ("triage-header-forgery",
+     '        elif heading and line.startswith("+++ "):\n            target = line[4:]\n            # /dev/null is a delete: there is no head-side file. The b/\n            ',
+     '        elif line.startswith("+++ "):\n            target = line[4:]\n            # /dev/null is a delete: there is no head-side file. The b/\n            '),
+    ("triage-deleted-file",
+     '            name = None if target == "/dev/null" else target[2:].rstrip("\\t")\n            if name:\n                files.setdefault(name, [0, 0])',
+     '            name = target[2:].rstrip("\\t")\n            if name:\n                files.setdefault(name, [0, 0])'),
+    # The summary goes on the pull request, and one measured answer ran
+    # past its output limit inside this string and cut the JSON.
+    ("triage-summary-cap",
+     '    shape["touches"] = touches[:SHAPE_SUMMARY].strip() if isinstance(\n'
+     '        touches, str) else ""',
+     '    shape["touches"] = touches.strip() if isinstance(\n'
+     '        touches, str) else ""'),
+    # A domain that did not parse as a bool must not read as False, which
+    # is the value that lowers the effort.
+    ("triage-flag-must-be-bool",
+     "        if not isinstance(got.get(name), bool):\n"
+     "            return None\n"
+     "        shape[name] = got[name]",
+     "        shape[name] = got.get(name) is True"),
+    ("triage-unsure-vocabulary",
+     "    shape[\"unsure\"] = sorted({name for name in (unsure or [])\n"
+     "                              if name in RISKS}) if isinstance(\n"
+     "                                  unsure, list) else []",
+     "    shape[\"unsure\"] = sorted(set(unsure or [])) if isinstance(\n"
+     "                                  unsure, list) else []"),
+    # A narrowed round judged on the whole branch buys the ceiling for
+    # every round after the first.
+    ("triage-narrowed-range",
+     '                      "%s...HEAD" % (since or "refs/heads/%s"\n'
+     '                                     % pr["baseRefName"])], cwd=path,',
+     '                      "refs/heads/%s...HEAD" % pr["baseRefName"]], cwd=path,'),
+    # The diff came out of a branch Vinegar does not trust.
+    ("triage-token-stripped",
+     '    call_env = dict(os.environ)\n'
+     '    for carried in ("GH_TOKEN", "GITHUB_TOKEN"):\n'
+     '        call_env.pop(carried, None)',
+     '    call_env = dict(os.environ)'),
+    # Measured: haiku fenced all 27 answers, sonnet fenced none.
+    ("triage-fenced-answer",
+     '    start, end = said.find("{"), said.rfind("}")',
+     '    start, end = (0, said.rfind("}")) if said.startswith("{") else (-1, -1)'),
 ]
 
 

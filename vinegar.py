@@ -464,6 +464,84 @@ POST_TIMEOUT = 60
 # gives, but overrunning it costs nothing here: triage() logs and returns
 # the findings untiered, and the review posts exactly as it did before this
 # existed.
+# How long the diff-shape pass may take, and how much of a diff it reads.
+#
+# 120s against a measured median of 4s over 27 pull requests on 2026-08-20.
+# The budget is characters of diff body; the file list is never cut. 60k was
+# measured against 12k on the same set: sonnet held its accuracy at both and
+# haiku lost a real migration at the smaller one, because the evidence for it
+# was past the cut.
+SHAPE_TIMEOUT = 120
+SHAPE_BUDGET = 60000
+
+# The most of the model's one-sentence summary that is kept. It goes on the
+# pull request, so it is bounded here rather than asked for politely.
+SHAPE_SUMMARY = 400
+
+# The domains that decide routing. Risk here means blast radius, not
+# likelihood: across 58 first reviews every one found something whatever the
+# diff looked like, so what separates a change worth the ceiling is how bad
+# it is when wrong.
+RISKS = ("auth", "payments", "migrations", "concurrency", "money")
+
+# Changed lines to a difficulty band, and the band to the effort it earns
+# when it reaches none of RISKS. Both derived on 2026-08-20 from 58 first
+# reviews: under 100 lines cost a median of 1.19 USD, 100 to 400 cost 2.29,
+# 400 to 1000 cost 2.93, and 1000 and over cost 3.94.
+#
+# `large` is deliberately absent from BANDS. It takes the configured ceiling,
+# so raising the ceiling raises what a large change gets without editing a
+# table, and no band here can ever name a level above it.
+DIFFICULTY = ((100, "trivial"), (400, "small"), (1000, "moderate"),
+              (None, "large"))
+BANDS = {"trivial": "low", "small": "medium", "moderate": "high"}
+
+SHAPE_BRIEF = """You classify the shape of a code change. You never look for bugs, and you
+never say whether the change is correct, safe or complete.
+
+Repository: %s
+Pull request title: %s
+
+Files changed (%d):
+%s
+
+Diff (%s):
+%s
+
+Answer with one JSON object and nothing else:
+
+{"auth": bool, "payments": bool, "migrations": bool, "concurrency": bool,
+ "money": bool, "generated": bool, "unsure": [flag names], "touches": "one sentence"}
+
+A flag is true only when the changed lines themselves reach that area:
+
+- auth: authentication, authorization, sessions, credentials, secrets, access
+  control, or cryptographic signing and verification.
+- payments: charging money to a customer. Billing, checkout, subscriptions,
+  payment processors.
+- migrations: a change that alters stored data or its schema in place, so that
+  running it is not undone by reverting the code.
+- concurrency: threads, locks, async coordination, parallelism, or shared
+  mutable state across workers.
+- money: arithmetic on amounts. Fees, balances, rounding, conversion, dust
+  thresholds, unit scaling.
+
+Two rules decide the hard cases:
+
+- Judge the changed lines, not the repository's subject and not the file's
+  name. A comment, a document or a version bump that only mentions an area
+  does not reach it. A wallet repository is not automatically money.
+- Put a flag in "unsure" when the diff you were shown does not settle it,
+  including when the diff was truncated. Unsure is a useful answer here.
+  Guessing is not.
+
+"generated" is true when most of the changed lines are machine-produced: lock
+files, vendored dependencies, compiled output, generated clients.
+
+"touches" says in one sentence what the change touches. It never claims the
+change is correct, safe, complete or good."""
+
+
 SEVERITY_TIMEOUT = 300
 
 # How every review Vinegar posts opens, and how it recognises its own when
@@ -817,6 +895,13 @@ DEFAULTS = {
     # cost. An alias rather than a dated model id, so it does not name a
     # model that is retired while this default goes on being shipped.
     "severity_model": "haiku",
+    # The model that reads the diff before the review and decides how much
+    # effort it earns, or null to review everything at `effort`, as Vinegar
+    # did before this existed. Sonnet rather than something smaller: on 27
+    # labelled pull requests across 8 repositories it held its accuracy when
+    # the diff was truncated, where haiku lost a real migration, and it
+    # answered in four seconds against sixteen. See the README.
+    "triage_model": "sonnet",
 }
 
 
@@ -1439,6 +1524,7 @@ def load_config(path):
     for name, off in (
             ("severity_model",
              " to post findings in the order the reviewer reported them"),
+            ("triage_model", " to review everything at `effort`"),
             ("model", " to use your Claude Code default"),
             ("fallback_model", " for no fallback")):
         named = config[name]
@@ -3224,6 +3310,278 @@ def triage(label, findings, config):
                   if finding["tier"] in TIERS else len(TIERS))
 
 
+def shape_brief(repo, pr, listing, files, body, shown):
+    """What the shape pass asks, which is never whether the code is right.
+
+    The safety rule the README states is that this model never looks for
+    bugs. It is asked for the shape of the change, which is a
+    classification a small model is reliable at, and nothing else. A model
+    that has been asked to judge correctness will answer, and the answer
+    goes on the pull request above the reviewer's, where a human skimming
+    reads it first.
+
+    The file list is always whole and only the diff body is bounded. The
+    list is the cheapest signal there is: a path named `migrations/` or
+    `TransactionSigner.kt` decides most of this on its own, and cutting it
+    to fit would throw away the part that costs nothing.
+    """
+    return SHAPE_BRIEF % (repo, pr["title"], files, listing, shown, body)
+
+
+def read_shape(said):
+    """The classification out of the answer, or None if it cannot be read.
+
+    All or nothing, for the reason read_tiers() is: a half-read answer
+    would leave some domains judged and some not, and the caller cannot
+    tell the difference between "this change does not touch money" and
+    "nobody looked". Only the second one may lower the effort, so the two
+    must never collapse into each other.
+
+    Every value is checked rather than trusted for having parsed. The text
+    this reads was produced from a diff Vinegar did not write, and a bare
+    `json.loads` would let that diff put any key it liked into a dict the
+    routing then reads.
+    """
+    # The fence is expected, not exceptional. Measured over 27 pull
+    # requests on 2026-08-20, haiku fenced every one of them and sonnet
+    # fenced none, so a pass that only accepts bare JSON works on one
+    # model and silently falls back to the ceiling on the other.
+    start, end = said.find("{"), said.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        got = json.loads(said[start:end + 1])
+    except Exception:
+        return None
+    if not isinstance(got, dict):
+        return None
+
+    shape = {}
+    for name in RISKS + ("generated",):
+        if not isinstance(got.get(name), bool):
+            return None
+        shape[name] = got[name]
+    # Anything outside RISKS is dropped rather than refused. The list is
+    # the model's own hedge and a word Vinegar does not know is not a
+    # reason to throw away a classification that is otherwise complete;
+    # it is only a reason not to act on that word.
+    unsure = got.get("unsure")
+    shape["unsure"] = sorted({name for name in (unsure or [])
+                              if name in RISKS}) if isinstance(
+                                  unsure, list) else []
+    touches = got.get("touches")
+    # Bounded here rather than trusted to the prompt. One sonnet answer in
+    # the 2026-08-20 measurement ran past its output limit inside this
+    # string, which cut the JSON and lost the whole classification with
+    # it. The prompt asks for one sentence; this is what makes the length
+    # a fact instead of a request.
+    shape["touches"] = touches[:SHAPE_SUMMARY].strip() if isinstance(
+        touches, str) else ""
+    return shape
+
+
+def difficulty(changed):
+    """The band a change of this many lines falls in.
+
+    Lines, never files. Measured across 58 first reviews on 2026-08-20,
+    cost correlates with changed lines at 0.69 and with file count at
+    0.14: `wonky-flow#105` changed 131 files for 2.75 USD because nearly
+    all of them were the same one-line edit to a task list.
+    """
+    for ceiling, name in DIFFICULTY:
+        if ceiling is None or changed < ceiling:
+            return name
+    return DIFFICULTY[-1][1]
+
+
+def effort_for(shape, changed, config):
+    """The effort this change gets, and the sentence saying why.
+
+    Triage may only ever spend less than the configured effort, never
+    more. `effort` stops being the level every review runs at and becomes
+    the ceiling it may not pass, so the worst a wrong classification here
+    can do is buy the review that was already going to be bought. That is
+    the whole safety argument for letting a small model touch routing at
+    all, and it is why every failure path below answers the ceiling
+    rather than a guess.
+
+    Nothing here can skip. Across 58 first reviews there was not one that
+    reported nothing, the smallest being 28 lines in one file which
+    returned three findings, so a skip route would be built on no
+    evidence at all. What the same measurement does support is that a
+    small change costs less to review, which is a level, not a skip.
+    """
+    ceiling = config["effort"]
+    if shape is None:
+        return ceiling, "triage did not answer"
+    reached = sorted(name for name in RISKS if shape[name])
+    if reached:
+        return ceiling, "touches %s" % ", ".join(reached)
+    # Unsure escalates, and it is the model's own word for a domain it
+    # could not settle. It is worth acting on and it is not worth
+    # trusting alone: in four measured runs on 2026-08-20 the domain each
+    # one actually missed was never the domain it called unsure. So this
+    # is one of three escalations, not the escalation.
+    if shape["unsure"]:
+        return ceiling, "unsure about %s" % ", ".join(shape["unsure"])
+    if shape.get("truncated"):
+        return ceiling, "the diff was too large to read whole"
+    band = difficulty(changed)
+    wanted = BANDS.get(band)
+    if wanted is None:
+        return ceiling, "%s change, %d lines" % (band, changed)
+    # Lower by position, so a ceiling below the band's level wins. An
+    # operator who configured `low` gets `low` for everything, which is
+    # what configuring `low` asked for.
+    chosen = wanted if EFFORTS.index(wanted) < EFFORTS.index(
+        ceiling) else ceiling
+    return chosen, "%s change, %d lines, reaching none of %s" % (
+        band, changed, ", ".join(RISKS))
+
+
+def shape(label, repo, path, pr, config, env, since=None):
+    """What the diff is, as a small model reads it, or None.
+
+    None on every failure, and the caller answers the configured effort
+    for it. Like the severity pass, nothing here is worth costing a
+    review: the pull request is about to be reviewed either way, and the
+    only thing a failure here loses is the chance to have reviewed it
+    more cheaply.
+    """
+    chooser = config["triage_model"]
+    if not chooser:
+        return None
+
+    try:
+        result = run(["git", "-c", "core.quotepath=false", "-c",
+                      "color.ui=false", "diff", "--unified=3", "--no-color",
+                      "--no-textconv", "--no-ext-diff",
+                      "--src-prefix=a/", "--dst-prefix=b/",
+                      # The range this round will actually read. A narrowed
+                      # round is judged on its own increment, not on the
+                      # whole branch: sizing a twenty-line follow-up by the
+                      # two thousand lines behind it would buy the ceiling
+                      # for every round after the first.
+                      "%s...HEAD" % (since or "refs/heads/%s"
+                                     % pr["baseRefName"])], cwd=path,
+                     env=env, timeout=DIFF_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        result = None
+    if result is None or result.returncode != 0:
+        log("%s: cannot diff the pull request, so it is reviewed at the "
+            "configured effort" % label)
+        return None
+
+    diff = result.stdout
+    # `+++ ` counts only between `diff --git` and the first hunk, which is
+    # the discipline diff_lines() argues for and needs for the same reason:
+    # an added line whose own text begins with `++ ` renders as `+++ ...`
+    # and is indistinguishable from a file header. Without the heading
+    # flag the `doc.md` fixture in the tests invents a file called
+    # `spoofed.py`, and every count this pass reports is then wrong on any
+    # pull request that edits a diff, a patch or a README showing one.
+    #
+    # stream_lines, not splitlines(), so a lone CR stays inside its line
+    # rather than splitting one added line into two.
+    files, changed, name, heading = {}, 0, None, False
+    for line in stream_lines(diff):
+        if line.startswith("diff --git "):
+            name, heading = None, True
+        elif heading and line.startswith("+++ "):
+            target = line[4:]
+            # /dev/null is a delete: there is no head-side file. The b/
+            # prefix is git's, and git appends a tab to this header for a
+            # path containing a space.
+            name = None if target == "/dev/null" else target[2:].rstrip("\t")
+            if name:
+                files.setdefault(name, [0, 0])
+        elif line.startswith("@@"):
+            heading = False
+        elif name and not heading:
+            if line.startswith("+"):
+                files[name][0] += 1
+                changed += 1
+            elif line.startswith("-"):
+                files[name][1] += 1
+                changed += 1
+    if not files:
+        return None
+
+    listing = "\n".join("  %s  +%d-%d" % (n, a, d)
+                        for n, (a, d) in files.items())
+    truncated = len(diff) > SHAPE_BUDGET
+    if truncated:
+        body = diff[:SHAPE_BUDGET]
+        shown = ("the first %d of %d characters; the rest was cut, and the "
+                 "file list above is still complete" % (SHAPE_BUDGET,
+                                                        len(diff)))
+    else:
+        body, shown = diff, "%d characters, whole" % len(diff)
+
+    # From os.environ rather than the review's env, and stripped anyway,
+    # for the reason triage() argues at length: the text this call reads
+    # came out of a branch Vinegar does not trust, so it does not run
+    # beside an operator's `GH_TOKEN`.
+    call_env = dict(os.environ)
+    for carried in ("GH_TOKEN", "GITHUB_TOKEN"):
+        call_env.pop(carried, None)
+
+    # Built before the try, so a mistake in shape_brief() raises here
+    # instead of being caught below and reported once per review as "the
+    # triage pass did not run". That message names a model that failed,
+    # and a KeyError wearing it would go on looking like a flaky model
+    # for as long as nobody read the code.
+    brief = shape_brief(repo, pr, listing, len(files), body, shown)
+
+    started = time.monotonic()
+    try:
+        result = run(["claude", "-p", brief,
+                      "--output-format", "json",
+                      "--model", chooser,
+                      "--settings", json.dumps(TRIAGE_SETTINGS),
+                      "--setting-sources", "", "--strict-mcp-config"],
+                     timeout=SHAPE_TIMEOUT, env=call_env)
+        event = json.loads(result.stdout)
+        said = str(event.get("result") or "")
+        if event.get("is_error"):
+            log("%s: the triage pass failed, so this is reviewed at the "
+                "configured effort: %s" % (label, said[:200]))
+            return None
+        read = read_shape(said)
+    except Exception as err:
+        # Named by type rather than quoted, for the reason triage()
+        # gives: TimeoutExpired stringifies the whole command, and this
+        # command carries a diff out of a branch Vinegar does not trust.
+        if isinstance(err, subprocess.TimeoutExpired):
+            why = "it ran longer than %ds" % SHAPE_TIMEOUT
+        elif isinstance(err, OSError):
+            why = str(err)
+        else:
+            why = type(err).__name__
+        log("%s: the triage pass did not run, so this is reviewed at the "
+            "configured effort: %s" % (label, why))
+        return None
+
+    if read is None:
+        log("%s: the triage pass did not answer readably, so this is "
+            "reviewed at the configured effort" % label)
+        return None
+
+    read["truncated"] = truncated
+    read["changed"] = changed
+    read["files"] = len(files)
+    read["difficulty"] = difficulty(changed)
+    # Priced on one line and through priced(), because this is now a third
+    # model call per review and an operator totalling the daemon's spend
+    # should not have to infer any of them.
+    log("%s: triaged the diff in %ds%s: %s, %d lines across %d file(s)%s" % (
+        label, round(time.monotonic() - started), priced(event),
+        read["difficulty"], changed, len(files),
+        ", reaching %s" % ", ".join(sorted(n for n in RISKS if read[n]))
+        if any(read[n] for n in RISKS) else ", reaching none of them"))
+    return read
+
+
 def diff_lines(path, base, env, label):
     """The head-side line numbers the pull request's diff covers, per file.
 
@@ -4980,6 +5338,25 @@ def review(path, repo, pr, config, env, tokens, resent=False, check=None,
     narrowing on one of those steps the next pass over lines nothing ever
     read.
     """
+    env = env or os.environ
+    label = pr_key(repo, pr)
+
+    # Triage runs here because what it decides is the word in the prompt on
+    # the next line, and because a checkout already exists by now.
+    #
+    # It may only ever lower the effort. `effort` stops being the level
+    # every review runs at and becomes the ceiling triage may not pass, so
+    # the worst this call can do is buy the review that was already going
+    # to be bought. Every failure inside shape() answers None and lands
+    # here on the configured effort, which is what Vinegar did before this
+    # existed.
+    shaped = shape(label, repo, path, pr, config, env, since)
+    chosen, why = effort_for(shaped, (shaped or {}).get("changed", 0), config)
+    if chosen != config["effort"]:
+        log("%s: triage lowered this from %s to %s effort: %s" % (
+            label, config["effort"], chosen, why))
+    config = dict(config, effort=chosen)
+
     prompt = "/code-review %s %d" % (config["effort"], pr["number"])
 
     # The review reads a diff that Vinegar did not write, so it runs under
@@ -5048,12 +5425,9 @@ def review(path, repo, pr, config, env, tokens, resent=False, check=None,
     # The caller's `env` is left alone, because posting_env() falls back
     # to it when minting a fresh token fails, and that fallback is what
     # gets a finished review onto the pull request during a GitHub blip.
-    env = env or os.environ
     reviewing = dict(env, CLAUDE_CODE_REPORT_FINDINGS="1")
     for carried in ("GH_TOKEN", "GITHUB_TOKEN"):
         reviewing.pop(carried, None)
-
-    label = pr_key(repo, pr)
 
     # Whether a whole reading of the review scope reached the author, which
     # is the only thing that may narrow a later pass. Filled in by deliver()

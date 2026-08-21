@@ -6,7 +6,8 @@ A self-hosted pull-request reviewer. It runs on a machine you already own, uses
 a Claude subscription you already pay for, and posts inline review comments on
 your PRs.
 
-> **Status: the poller works. The triage pass does not exist yet.**
+> **Status: the poller works. The triage pass routes effort; its note on
+> the pull request is not written yet.**
 > `vinegar.py` polls GitHub, picks which pull requests deserve a reviewer, and
 > runs the review. The cheap model that reads a diff and decides whether to
 > review it at all is still a design, so today every pull request that passes
@@ -49,9 +50,19 @@ new PR (or a new head commit)
         ▼
    triage: a cheap model reads the diff  ──▶  posts a comment on the PR
         │
-        ├─ skip    nothing here needs a reviewer
-        ├─ light   claude -p '/code-review <n>'   (low/medium effort)
-        └─ full    claude -p '/code-review <n>'   (high effort)
+        │  it picks how much effort the change earns, and never skips it
+        │
+        ├─ reaches auth, payments, migrations, concurrency or money,
+        │  or triage was unsure, or the diff was too big to read whole
+        │                    ──▶  the configured ceiling
+        └─ reaches none of them
+             ├─ under 100 lines      ──▶  low
+             ├─ 100 to 400 lines     ──▶  medium
+             ├─ 400 to 1000 lines    ──▶  high
+             └─ 1000 lines and over  ──▶  the ceiling
+                          │
+                          ▼
+              claude -p '/code-review <effort> <n>'
                           │
                           ▼
                    findings returned  ──▶  one review posted on the PR
@@ -191,7 +202,7 @@ Every key in `config.example.json`:
 | --- | --- | --- |
 | `repos` | none | Repositories to poll, as `owner/name`. Required, unless `github_app` is set: an empty list then means every repository the App is installed on. See below. |
 | `poll_interval` | `60` | Seconds between polls. |
-| `effort` | `"high"` | Effort passed to `/code-review`: `low`, `medium`, `high`, `xhigh`, `max`. `ultra` is rejected. Read the note below before pairing it with `model`. |
+| `effort` | `"high"` | The most effort any review may be given: `low`, `medium`, `high`, `xhigh`, `max`. `ultra` is rejected. With `triage_model` set this is a ceiling rather than the level every review runs at, and triage may spend less. Read the note below before pairing it with `model`. |
 | `comment` | `true` | Post findings on the pull request. False runs the review and writes only to `~/.vinegar/reviews.dry/`, remembering what it did in `state.json.dry`. |
 | `model` | `null` | Model for the review. Null uses your Claude Code default. Read the note below before setting it. |
 | `fallback_model` | `null` | Model to run the review again on when `model` cannot be routed. Null means no fallback. See below. |
@@ -205,6 +216,7 @@ Every key in `config.example.json`:
 | `authors` | `[]` | Only review these GitHub logins. Empty means anyone who passes the checks above. |
 | `review_timeout` | `1800` | Kill a review that runs longer than this many seconds. |
 | `severity_model` | `"haiku"` | Model that tiers the findings before they are posted. Null posts them in the order the reviewer reported them. See below. |
+| `triage_model` | `"sonnet"` | Model that reads the diff before the review and decides how much effort it earns. Null reviews everything at `effort`. It can only ever lower the effort, never raise it. See "The triage pass". |
 | `github_app` | `null` | Post as a GitHub App instead of as you. See below. |
 
 `max_changed_lines`, the three `skip_` keys and `authors` are budget and
@@ -845,16 +857,51 @@ a single review should.
 
 ## The triage pass
 
-A cheap model, local or hosted, reads each diff before any review runs and
-decides whether the PR is worth reviewing and how hard.
+A cheap model reads each diff before the review runs and decides how much
+effort the change earns. Set `triage_model` to null to turn it off and review
+everything at `effort`, which is what Vinegar did before this existed.
 
 The rule that makes this safe: **the triage model never looks for bugs.** It
-classifies the *shape* of the diff, which is size, which paths are touched,
-whether they are generated or hand-written, and whether the change reaches
-authentication, payments, migrations, concurrency, or money arithmetic. Small
-models are unreliable at finding bugs and perfectly reliable at that
-classification. When triage is unsure it escalates, because a wasted review
-costs a little budget and a missed bug costs an incident.
+classifies the *shape* of the diff, which is how many lines changed, which
+paths are touched, whether they are generated or hand-written, and whether the
+change reaches authentication, payments, migrations, concurrency, or money
+arithmetic. Small models are unreliable at finding bugs and reliable at that
+classification.
+
+**Triage may only ever spend less than you configured.** `effort` is the
+ceiling and triage cannot pass it, so the worst a wrong classification can do
+is buy the review that was already going to be bought. That is the whole
+argument for letting a small model touch routing at all, and it is why every
+failure inside the pass lands on the ceiling rather than on a guess.
+
+**It never skips.** The spec used to have a skip branch, on the assumption that
+some pull requests never needed a reviewer. Vinegar's own history does not
+support it: across 58 first reviews, not one reported nothing. The smallest
+change ever reviewed was 28 lines in one file and produced three findings for
+$0.97. What the same history does support is that a small change is cheaper to
+review, which is a level rather than a skip. The 16 reviews that did report
+nothing were all round three or later, where `blockers_only_after` has already
+narrowed the reviewer to blockers.
+
+**Three things escalate to the ceiling**, and none of them is the model saying
+it is confident. A domain reached, a domain the model marked unsure, or a diff
+too large to send whole. The unsure list is worth acting on and is not worth
+trusting alone: measured over 27 labelled pull requests, the domain each run
+actually got wrong was never the domain it had called unsure. Confidently wrong
+is the failure mode, not doubt.
+
+The bands come from 58 first reviews. Under 100 changed lines cost a median of
+$1.19, 100 to 400 cost $2.29, 400 to 1000 cost $2.93, and 1000 and over cost
+$3.94. They count **lines, never files**: cost correlates with changed lines at
+0.69 and with file count at 0.14, because one pull request changed 131 files
+for $2.75 when nearly all of them were the same one-line edit.
+
+Sonnet rather than something smaller, measured on 27 labelled pull requests
+across 8 repositories. It held its accuracy when the diff was truncated, where
+haiku lost a real migration whose evidence was past the cut, and it answered in
+four seconds against sixteen. Both missed the same single case, so the gap is
+robustness rather than recall. A model call costs about $0.13 against a review
+at $2.80 to $6.40.
 
 ## The triage note
 
@@ -878,8 +925,13 @@ Five things about that note:
   takes minutes; silence in between looks like a broken daemon. It is also what
   makes the effort level readable while the review is still running, rather than
   only in the checks list.
-- **It is mandatory on a skip.** On a skipped PR it is the only thing Vinegar
-  will ever post, so without it silence cannot be told apart from a crash.
+- **Every pass produces one, and triage never skips.** The note used to be
+  argued for as the only thing a skipped pull request would ever get. Triage
+  no longer has a skip branch, so the argument changes rather than disappears:
+  the note is what stands between triage finishing in seconds and the review
+  landing nine to twenty-two minutes later, and it is where the effort level
+  that run is spending at becomes readable. Silence in that window is what
+  a crash looks like.
 - **Every pass posts a new comment rather than rewriting the last one.** A note
   is about one commit and names it. Rewriting it on the next push would erase
   what triage decided about code that has since changed, and hide the thing the
@@ -1411,8 +1463,8 @@ Two consequences worth planning for:
 
 - Automated reviews spend the same limits as your interactive Claude Code work,
   so a heavy review load will throttle you. Reviewing on PR open rather than
-  every push, skipping drafts, capping diff size, and letting triage drop cheap
-  PRs are budget features, not optimizations.
+  every push, skipping drafts, capping diff size, and letting triage spend less
+  on a small change are budget features, not optimizations.
 - `/code-review ultra` runs a deeper review in the cloud and bills usage credits
   separately. Vinegar never invokes it from automation.
 
