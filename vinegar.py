@@ -6240,6 +6240,14 @@ def turn_order(prs, after):
     A number that is not in the listing starts at the top, which covers
     both the first turn and a pull request closed since the last one.
     """
+    # None means there is no resume point, and it is returned early rather
+    # than compared. open_prs() checks only that an entry is a dict, so
+    # `pr.get("number")` is None for one without the key -- poll_repo's own
+    # error path says the same by writing `pr.get("number", "?")` -- and
+    # compared, None == None matches that entry and rotates a first turn
+    # that was supposed to begin at the top.
+    if after is None:
+        return prs
     for at, pr in enumerate(prs):
         if pr.get("number") == after:
             return prs[at + 1:] + prs[:at + 1]
@@ -6298,8 +6306,24 @@ def poll_repo(repo, config, state, tokens, turn=False):
                     # Recorded before returning, so the next turn starts
                     # at the one behind this rather than at this one
                     # again.
+                    #
+                    # Guarded on DUE the way release_repo() guards its own
+                    # write, and for the same reason. A discovery that
+                    # dropped this repository mid-turn has already popped
+                    # its resume point, and reconcile() only visits names
+                    # it finds in DUE, so a write landing after that pop is
+                    # never cleaned up by anything: the entry outlives the
+                    # repository, and if the App covers it again its first
+                    # turn resumes from a pull request nobody remembers.
+                    #
+                    # A missing number is not a resume point either. Stored
+                    # it would be None, which turn_order() reads as "there
+                    # is none", so every later turn would re-anchor on the
+                    # same entry.
+                    number = pr.get("number")
                     with SCHEDULE:
-                        TURN_AFTER[repo] = pr.get("number")
+                        if number is not None and repo in DUE:
+                            TURN_AFTER[repo] = number
                     return True
         except Exception as err:
             # One bad pull request must not stop the daemon. Under launchd

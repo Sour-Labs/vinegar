@@ -8295,7 +8295,7 @@ def _stop(runner, label):
     """Ask the loop to stop, and record whether it did, under `label`.
 
     The answer is recorded rather than returned into a variable a caller
-    may forget to read. Four of the five call sites here dropped it, so a
+    may forget to read. Four of the six call sites here dropped it, so a
     stop that timed out was silent in exactly the section written to prove
     stops work; one check below reads the whole list.
 
@@ -8461,6 +8461,12 @@ check("a turn that reviewed nothing says so", _nothing_said is False,
 # during each review is reviewable every time, and the pull requests
 # behind it were never handed to handle_pr at all.
 _schedule_cleared()
+# On the schedule, because that is the only way a turn ever runs: take_repo
+# hands out names from DUE, and the resume point is written only for a
+# repository still on it. Without this the check drove a turn on a
+# repository the loop would never have offered.
+with vinegar.SCHEDULE:
+    vinegar.DUE["o/r"] = 0
 _in_turns = []
 vinegar.open_prs = lambda repo, env: [dict(PR, number=n) for n in (10, 9, 8)]
 vinegar.handle_pr = lambda repo, pr, config, state, tokens: (
@@ -8471,17 +8477,42 @@ check("a pull request reviewable on every turn does not take every turn",
       sorted(_in_turns) == [8, 9, 10], _in_turns)
 # A rotation, not a slice: nothing is dropped, so the whole listing is
 # still reachable inside one turn.
+_rotated = [p["number"] for p in vinegar.turn_order(
+    [dict(PR, number=n) for n in (10, 9, 8)], 9)]
 check("the resume point rotates the listing rather than truncating it",
-      [p["number"] for p in vinegar.turn_order(
-          [dict(PR, number=n) for n in (10, 9, 8)], 9)] == [8, 10, 9],
-      [p["number"] for p in vinegar.turn_order(
-          [dict(PR, number=n) for n in (10, 9, 8)], 9)])
+      _rotated == [8, 10, 9], _rotated)
 # The pull request it stopped on can be closed before the next turn.
+_gone = [p["number"] for p in vinegar.turn_order(
+    [dict(PR, number=n) for n in (10, 9)], 99)]
 check("a resume point that is no longer in the listing starts at the top",
-      [p["number"] for p in vinegar.turn_order(
-          [dict(PR, number=n) for n in (10, 9)], 99)] == [10, 9],
-      [p["number"] for p in vinegar.turn_order(
-          [dict(PR, number=n) for n in (10, 9)], 99)])
+      _gone == [10, 9], _gone)
+# A first turn has no resume point, and None must not be compared against
+# a listing entry's own number: open_prs() checks only that an entry is a
+# dict, so one without a `number` key answers None too, and matched, a
+# first turn rotates instead of starting at the top.
+_numberless = [{"number": 10}, {"title": "no number key"}, {"number": 8}]
+_first = vinegar.turn_order(_numberless, None)
+check("a first turn starts at the top, even beside an entry with no number",
+      _first == _numberless, _first)
+# And such an entry is never stored as a resume point, which would read
+# back as "there is none" and re-anchor every later turn on it.
+_schedule_cleared()
+vinegar.open_prs = lambda repo, env: [{"title": "no number key"}]
+vinegar.handle_pr = lambda repo, pr, config, state, tokens: True
+with vinegar.SCHEDULE:
+    vinegar.DUE["o/r"] = 0
+vinegar.poll_repo("o/r", CONFIG, {}, {}, turn=True)
+check("a pull request with no number is not stored as a resume point",
+      "o/r" not in vinegar.TURN_AFTER, dict(vinegar.TURN_AFTER))
+# A repository discovery dropped mid-turn does not get its resume point
+# written back. reconcile() only visits names it finds in DUE, so an entry
+# written after the drop is never cleaned up by anything.
+_schedule_cleared()
+vinegar.open_prs = lambda repo, env: [dict(PR, number=4)]
+vinegar.poll_repo("o/gone", CONFIG, {}, {}, turn=True)
+check("a repository dropped mid-turn does not resurrect its resume point",
+      "o/gone" not in vinegar.TURN_AFTER, dict(vinegar.TURN_AFTER))
+vinegar.open_prs, vinegar.handle_pr = _real_loop_parts[3], _real_loop_parts[4]
 
 # What a turn earns: due now when it reviewed, due in `poll_interval` when
 # it did not. The second half is Kevin's call, asked explicitly, and it is
@@ -8589,13 +8620,20 @@ check("and it runs once, not once a turn",
 # because poll_once() joined every worker before returning, so no pass was
 # reading the list while it was replaced. There is no such moment now, and
 # the schedule is what a worker reads instead.
+# On the monotonic clock, which is the one the schedule is written on.
+# Left comparing a monotonic due time against time.time() this check could
+# not fail at all: the two timescales are billions of seconds apart, so
+# every due time is "already due" against a wall clock and the assertion
+# held whatever reconcile() did. It was written before DUE moved clocks and
+# survived the move silently, which is the shape of a guard that protects
+# nothing.
 _schedule_cleared()
-_later = time.time() + 500
+_later = time.monotonic() + 500
 with vinegar.SCHEDULE:
     vinegar.DUE["o/one"] = _later
 vinegar.reconcile(["o/one", "o/two"])
 check("a repository discovery adds is due at once, with no restart",
-      vinegar.DUE.get("o/two", _later) <= time.time(), dict(vinegar.DUE))
+      vinegar.DUE.get("o/two", _later) <= time.monotonic(), dict(vinegar.DUE))
 # The hourly ask must not reset the ones already on the schedule. Made
 # due again every hour, seventeen repositories would all be taken at the
 # same instant and `parallel_repos` would decide the order for ever after.
@@ -8751,10 +8789,15 @@ _real_thread = threading.Thread
 
 
 class _FailsTheThirdStart(_real_thread):
+    # Only the pool's own threads are counted. This class replaces
+    # threading.Thread process-wide for the length of the block, so
+    # anything else that happens to construct a thread in that window
+    # would move a count the check below asserts exactly.
     def start(self):
-        _starts[0] += 1
-        if _starts[0] >= 3:
-            raise RuntimeError("can't start new thread")
+        if self.name.startswith(vinegar.POLL_WORKER):
+            _starts[0] += 1
+            if _starts[0] >= 3:
+                raise RuntimeError("can't start new thread")
         return _real_thread.start(self)
 
 
@@ -8787,7 +8830,13 @@ finally:
 if _start_runner.is_alive():
     vinegar.stop_polling()
     _start_runner.join(10)
-vinegar.STOPPING.clear()
+# Only once it has really finished. Cleared while a worker the block failed
+# to stop is still alive, the flag it is waiting on goes back to false and
+# it carries on polling into every check below -- the same failure _stop()
+# records for its own call sites, on the one path that does not go through
+# _stop().
+if not _start_runner.is_alive():
+    vinegar.STOPPING.clear()
 _start_escaped = _started_escape[0] if _started_escape else "never returned"
 # Two workers did start, so the finally has something to join and the
 # broken shape has something to trip over. Without that the unstarted
@@ -8860,7 +8909,7 @@ _discovering_serial = _loop_taken(repos=[], parallel_repos=1,
 check("and parallel_repos at one still does not",
       _discovering_serial == "poll_once", _discovering_serial)
 
-# Every stop in this section, read in one place. Four of the five call
+# Every stop in this section, read in one place. Four of the six call
 # sites used to drop this answer, so a stop that timed out was silent in
 # the one section written to prove that stops work.
 check("every stop in this section really stopped the loop",

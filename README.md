@@ -326,10 +326,14 @@ review is reviewable on every turn and would take all of them, and the other
 pull requests on that repository would never be reached: the rotation is what
 stops the fairness rule solving one starvation by creating another.
 
-A single-repository install keeps its reviews on the main thread whatever
-`parallel_repos` says, because there is nothing for a second worker to do and
-Ctrl-C only unwinds a review running on that thread. Discovery is the
-exception: the list starts empty, so the setting decides there.
+An install that **names** one repository in `repos` keeps its reviews on the
+main thread whatever `parallel_repos` says, because there is nothing for a
+second worker to do and Ctrl-C only unwinds a review running on that thread.
+
+Discovery is decided differently, and a discovery install that happens to
+cover one repository does run the pool. The list starts empty and can grow at
+any time without a restart, so there is no count to decide on: `parallel_repos`
+above 1 means the pool, for the life of the process.
 
 It did not always work that way, and the symptom is worth recognising if you
 are running an older version. Vinegar used to poll in passes and join every

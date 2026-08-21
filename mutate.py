@@ -351,8 +351,30 @@ MUTATIONS = [
     # at the same pull request, so one that is reviewable every time takes
     # every turn and the ones behind it are never handed to handle_pr.
     ("turn-records-where-it-stopped",
+     "                    number = pr.get(\"number\")\n"
      "                    with SCHEDULE:\n"
-     '                        TURN_AFTER[repo] = pr.get("number")\n',
+     "                        if number is not None and repo in DUE:\n"
+     "                            TURN_AFTER[repo] = number\n",
+     ""),
+    # The same guard release_repo() has. Without it a repository discovery
+    # dropped mid-turn gets its resume point written back after reconcile()
+    # popped it, and reconcile only visits names it finds in DUE, so
+    # nothing ever removes it again.
+    ("resume-point-only-for-a-live-repo",
+     "                        if number is not None and repo in DUE:",
+     "                        if number is not None:"),
+    # A missing number stored as a resume point reads back as "there is
+    # none", so every later turn re-anchors on the same entry.
+    ("resume-point-is-never-none",
+     "                        if number is not None and repo in DUE:",
+     "                        if repo in DUE:"),
+    # None is a sentinel, not a number to compare against. open_prs only
+    # checks that an entry is a dict, so one with no `number` key answers
+    # None too, and matched, a first turn rotates instead of starting at
+    # the top.
+    ("first-turn-starts-at-the-top",
+     "    if after is None:\n"
+     "        return prs\n",
      ""),
     ("turn-resumes-after-the-last",
      "    if turn:\n"
@@ -481,6 +503,11 @@ MUTATIONS = [
      "                DUE[name] = now",
      "        for name in repos:\n"
      "            DUE[name] = now"),
+    ("discovery-adds-what-arrived",
+     "        for name in repos:\n"
+     "            if name not in DUE:\n"
+     "                DUE[name] = now\n",
+     ""),
     ("discovery-drops-what-went",
      "        for name in list(DUE):\n"
      "            if name not in repos:\n"
