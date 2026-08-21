@@ -118,8 +118,10 @@ python3 vinegar.py                       # poll forever
 
 **Ctrl-C stops a run in the foreground.** It ends the review that is running
 and closes that pull request's entry in the checks list on the way out, so
-nothing is left spinning. With `parallel_repos` above 1 it also stops any
-repository that had not started, and waits for the ones that had. Under
+nothing is left spinning. With `parallel_repos` above 1 it stops every worker
+from taking another repository, and waits for the turns already running to
+finish; the lock is theirs until they do, and Vinegar says so rather than
+looking like it has hung. Under
 launchd there is no interrupt: see "Running it under launchd" for `bootout`,
 which kills the process outright.
 
@@ -202,7 +204,7 @@ Every key in `config.example.json`:
 | Key | Default | What it does |
 | --- | --- | --- |
 | `repos` | none | Repositories to poll, as `owner/name`. Required, unless `github_app` is set: an empty list then means every repository the App is installed on. See below. |
-| `poll_interval` | `60` | Seconds between polls. |
+| `poll_interval` | `60` | How long a repository with nothing to do waits before it is looked at again. At `parallel_repos` 1 it is also the gap between passes. |
 | `effort` | `"high"` | The most effort any review may be given: `low`, `medium`, `high`, `xhigh`, `max`. `ultra` is rejected. With `triage_model` set this is a ceiling rather than the level every review runs at, and triage may spend less, though never below `high` on a round that reads only what is new. Read the note below before pairing it with `model`. |
 | `comment` | `true` | Post findings on the pull request. False runs the review and writes only to `~/.vinegar/reviews.dry/`, remembering what it did in `state.json.dry`. |
 | `model` | `null` | Model for the review. Null uses your Claude Code default. Read the note below before setting it. |
@@ -210,7 +212,7 @@ Every key in `config.example.json`:
 | `review_on_push` | `false` | Review again when the head commit changes. A second review reads only what was added since the last one that posted. See "The review". |
 | `blockers_only_after` | `2` | After this many reviews of one pull request, later reviews of it report only blockers. Nothing stops them running. Reached on every push with `review_on_push` on, and through repeated `--pr` runs without it. Null reports everything, every time. See below. |
 | `max_changed_lines` | `3000` | Skip pull requests larger than this. |
-| `parallel_repos` | `1` | How many repositories to poll and review at the same time. Reviews of one repository stay one at a time whatever this says. See below. |
+| `parallel_repos` | `1` | How many repositories to poll and review at the same time. Reviews of one repository stay one at a time whatever this says. Read at startup, so changing it needs a restart. See below. |
 | `skip_drafts` | `true` | Skip drafts. |
 | `skip_bots` | `true` | Skip pull requests opened by bots. |
 | `skip_forks` | `true` | Skip pull requests whose head branch lives in a fork. Read the next section before you turn this off. |
@@ -309,13 +311,28 @@ over the width wait for a worker. It is the one setting that multiplies every
 other runaway this program bounds, and a cap that followed the repository count
 would make the same file mean something different as repositories were added.
 
-**A repository waits out the slowest repository's whole pass, not one review.**
-The fan-out is per pass: every repository is polled, and only when the last
-worker finishes does Vinegar sleep for `poll_interval`. Five open pull requests
-on one repository at twenty minutes each is a hundred minutes before the other
-repository is listed again. Size `poll_interval` knowing that, and read this
-setting as "several repositories per pass" rather than as a queue that never
-makes anyone wait.
+**No repository waits for another to finish.** Above 1 there are no passes at
+all: that many workers run for the life of the process, and each one takes
+whichever repository is due, reviews **at most one** pull request on it, and
+puts it straight back. A repository that reviewed something is due again
+immediately, so the next turn takes its next pull request; one that found
+nothing to do is due in `poll_interval`. Nothing waits for anything else, so a
+push to a quiet repository is picked up while a twenty-minute review runs
+somewhere else.
+
+It did not always work that way, and the symptom is worth recognising if you
+are running an older version. Vinegar used to poll in passes and join every
+worker before sleeping, which made the gap between passes the slowest
+repository's *whole pass* plus `poll_interval`. Measured at seventeen
+repositories: a push waited eight minutes behind a review of a repository it
+had nothing to do with. Because the checks entry is created when a review
+*starts*, a pull request waiting for the next pass looked exactly like one
+Vinegar had never heard of.
+
+**`parallel_repos` is read once, at startup.** The workers are made then and
+their number cannot follow the setting up without a restart. Repositories may
+come and go underneath them freely -- that is what discovery does, and it needs
+no restart -- but the width does.
 
 **It buys latency, not money.** The same reviews are paid for, closer together.
 Concentrating them is what makes a rate limit more likely to refuse one, and a
@@ -1233,9 +1250,11 @@ withholds anything smaller than a blocker is not the whole review the flag's nam
 promises.
 
 **What this does not bound is spend.** A branch pushed to fifteen times buys
-fifteen reviews, and each one parks its repository's poll thread for nine to
-twenty-two minutes while nothing else in that repository is listed or reviewed.
-`parallel_repos` frees the other repositories, not this one. That is deliberate:
+fifteen reviews, and each one holds its repository for nine to twenty-two
+minutes while nothing else in that repository is reviewed. `parallel_repos`
+frees the other repositories, not this one: they are taken by other workers
+while this one is busy, but a second pull request on *this* repository still
+waits, because the one checkout directory is shared. That is deliberate:
 going quiet on the most-reworked code in the repository is the worse failure.
 The round is in the log line for every narrowed review, which is where a runaway
 shows up before the bill does.
