@@ -236,8 +236,22 @@ found between 2 and 6 for $1.31 to $2.18, so the deeper setting was both
 better and cheaper per finding. Measure on your own repository before
 believing that.
 
+**Opus 5.5 gets a different prompt from Opus 5 at `high`, and only there.**
+On Claude Code 2.1.282 the table has rows for Opus 5, Opus 4.8 and Sonnet 5,
+and any other model, Opus 5.5 included, takes a default row. At `low`,
+`medium` and `xhigh` that row gives Opus 5.5 the same prompt Opus 5 gets. At
+`high` it replaces the single pass with a smaller copy of the `xhigh` prompt:
+eight finder angles instead of ten, five of them looking for cleanup and
+conventions rather than bugs, no sweep, at most ten findings, and a target of
+at least five where the single pass set none. Triage never takes a round that
+reads only what is new below `high`, so small re-reviews land there, and on
+the deployment this was written for it was the most common level: 61 of 137
+reviews between 21 August and 25 September 2026. The comparison was made by
+reading the prompt each model received on that one release, and a later
+release can give Opus 5.5 a row of its own.
+
 **`fallback_model` is for the day `model` stops resolving.** A pinned model
-is not always a public model id. `claude-opus-5[1m]` selects a routing
+is not always a public model id. `claude-opus-5-5[1m]` selects a routing
 variant, and nothing promises a variant keeps answering across Claude Code
 releases or account changes. When one stops, every review comes back the same
 way: a result event carrying `api_error_status` 404, about a second in, having
@@ -247,8 +261,8 @@ request in any repository it polls gets reviewed until somebody fixes the
 config.
 
 Set `fallback_model` to a plain model id and that failure costs one extra
-second per review instead of every review. `"claude-opus-5"` is the sensible
-partner to a pinned `"claude-opus-5[1m]"`.
+second per review instead of every review. `"claude-opus-5-5"` is the sensible
+partner to a pinned `"claude-opus-5-5[1m]"`.
 
 Only that one failure falls back. An overload, a review killed at
 `review_timeout`, and a spent subscription have all burned the review's budget
