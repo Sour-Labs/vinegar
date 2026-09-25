@@ -764,23 +764,35 @@ CHECK_NAME = "Vinegar"
 # the App key here.
 DEPLOYMENT = HOME
 
-# How a finished review reports itself in that list, and it is never
-# `failure`.
-#
-# `failure` would make Vinegar a merge gate wherever the check is required,
-# which the README promises it is not, and reviews are submitted as COMMENT
-# for the same reason. Severity triage knows what a blocker is now, so
-# failing on one is newly possible and still wrong: the blocker rate
-# measured 45% on two of four reviews, so the gate would be closed most of
-# the time on a judgement that is only good enough to sort a list.
+# How a finished review reports itself in that list when it found nothing
+# tiered `blocker`.
 #
 # `neutral` renders as a grey mark that cannot block anything, and the
 # count goes in the title where it says something true. It is what every
-# ending gets except the one below, including the four that report nothing
+# ending gets except the two below, including the four that report nothing
 # without being clean: a review whose output could not be read, one killed
 # part way, one that never reached the pull request, and a retry whose
 # posting was the earlier attempt's. finish() names them in one line.
 CHECK_CONCLUSION = "neutral"
+
+# And the ending that found a blocker, which is the one ending that fails.
+#
+# That makes Vinegar a merge gate wherever the check is required, and
+# nowhere else: a red mark on a check the repository does not require
+# blocks nothing. Reviews are still submitted as COMMENT, so this check is
+# the only thing Vinegar says that can hold up a merge.
+#
+# The tier it fails on is the severity pass's, which reads one summary
+# line and never the code, and which measured 45% blockers on two of four
+# reviews. A repository that makes this check required gates its merges on
+# that judgement. With `severity_model` off, or a triage that fails, no
+# finding carries a tier and the check never fails.
+#
+# Any ending carrying a blocker fails, whether or not the review finished,
+# landed, or was a retry. The terms that keep `clean` narrow guard a claim
+# that nothing was found, and a blocker in the tally is the opposite claim,
+# already made in the title beside it.
+CHECK_BLOCKED = "failure"
 
 # And the one ending that is a pass, so a clean pull request reads as clean
 # in the list rather than as a grey mark beside the failures.
@@ -3194,7 +3206,8 @@ def severity_brief(findings):
     What is left unfixed, so that it is not mistaken for working: on two
     of those four reviews about 45% of findings still came back blockers,
     and on one of them three test-coverage findings did, against rule 1.
-    That is good enough to order a comment, which is all this is used for.
+    That is good enough to order a comment. It also decides whether the
+    check fails, and CHECK_BLOCKED records that as a known cost.
     It is not good enough on its own to decide when to stop re-reviewing a
     pull request, so whatever does that needs a bound that does not depend
     on the blocker count falling.
@@ -4169,6 +4182,25 @@ def below_blocker(findings):
     return any(finding.get("tier") in under for finding in findings or ())
 
 
+def reaches_blocker(findings):
+    """Whether anything here is tiered `blocker` or above it.
+
+    What fails the check. Read off TIERS for below_blocker()'s reason: a
+    tier added above `blocker` is more severe than it, and a site naming
+    `blocker` alone would close neutral on exactly the findings that
+    matter most, under a title counting them.
+
+    Defaulted the same way when `blocker` is not there at all. This runs
+    in finish() after the review is posted, and announce() swallows a
+    ValueError there, so the backstop closes the indicator saying nothing
+    reached a pull request that visibly carries the review. An empty
+    tuple means the check never fails, which is what an untiered review
+    already gets.
+    """
+    over = TIERS[:TIERS.index("blocker") + 1] if "blocker" in TIERS else ()
+    return any(finding.get("tier") in over for finding in findings or ())
+
+
 def pr_key(repo, pr):
     """How one pull request is named in the state file and the log."""
     return "%s#%s" % (repo, pr["number"])
@@ -4620,8 +4652,8 @@ def close_check(label, check, title, env, summary="",
     are current, and finish() hands over the fresh ones it just minted to
     post with.
 
-    `neutral` unless the caller says otherwise, and never `failure`:
-    CHECK_CONCLUSION and CHECK_CLEAN say why at length. Only finish()
+    `neutral` unless the caller says otherwise: CHECK_CONCLUSION,
+    CHECK_CLEAN and CHECK_BLOCKED say why at length. Only finish()
     passes anything else, because it is the only caller that knows both
     what was found and whether it landed. The title carries the rest, so
     it says what happened rather than how it feels about it.
@@ -5274,11 +5306,15 @@ def finish(label, repo, pr, path, text, findings, config, env, tokens,
     # `covered` logic that decides narrowing and is why it is not done
     # here.
     clean = findings == [] and whole and landed and not resent
+    # Red off the same tiers the title counts, for every ending, for the
+    # reason CHECK_BLOCKED gives.
+    blocked = reaches_blocker(findings)
     close_check(label, check, title, sending or env,
                 "The review is on the pull request." if landed
                 else "The review did not reach the pull request. The log "
                      "says where it is saved.",
-                CHECK_CLEAN if clean else CHECK_CONCLUSION)
+                CHECK_BLOCKED if blocked
+                else CHECK_CLEAN if clean else CHECK_CONCLUSION)
     return posted
 
 

@@ -95,6 +95,12 @@ EXPECT = {
 # next time one of its terms moves, and threading `whole` through this
 # file already broke six.
 CLEAN = "    clean = findings == [] and whole and landed and not resent"
+# Hoisted for the same reason, and the tail of it is the text each of its
+# mutants keeps.
+FOUND = "reaches_blocker(findings)"
+BLOCKED = "    blocked = " + FOUND
+OVER = ('    over = TIERS[:TIERS.index("blocker") + 1] if "blocker" in TIERS '
+        "else ()")
 
 # name, the text that implements a guard in vinegar.py, what breaks it
 MUTATIONS = [
@@ -1046,8 +1052,8 @@ MUTATIONS = [
      "    if False:"),
 
     # --- the checks-list indicator -------------------------------------
-    # A check that can fail is a merge gate, and the README promises
-    # Vinegar is not one. Both halves: the constant and its use.
+    # A check that can fail is a merge gate wherever it is required, so
+    # only a blocker may fail it. Both halves: the constant and its use.
     ("check-conclusion-never-fails",
      'CHECK_CONCLUSION = "neutral"', 'CHECK_CONCLUSION = "failure"'),
     ("check-conclusion-is-used",
@@ -1072,6 +1078,36 @@ MUTATIONS = [
     # review already up, and that earlier review is the one on the commit.
     ("check-green-not-for-a-retry-that-posted-nothing",
      CLEAN, "    clean = findings == [] and whole and landed"),
+    # Red is the ending that found a blocker. Six entries: one for the
+    # constant, one for never failing, one for failing on any tier, and
+    # one per term of `clean` that must not reach it, because a blocker
+    # fails the check on every ending.
+    ("check-blocker-is-a-fail",
+     'CHECK_BLOCKED = "failure"', 'CHECK_BLOCKED = "neutral"'),
+    ("check-fails-on-a-blocker",
+     BLOCKED, "    blocked = False"),
+    ("check-fails-only-on-a-blocker",
+     BLOCKED,
+     '    blocked = any(finding.get("tier") for finding in findings or ())'),
+    ("check-fails-on-a-killed-run",
+     BLOCKED, "    blocked = whole and " + FOUND),
+    ("check-fails-on-a-review-that-never-landed",
+     BLOCKED, "    blocked = landed and " + FOUND),
+    ("check-fails-on-a-retry",
+     BLOCKED, "    blocked = not resent and " + FOUND),
+    # What a blocker is, read off TIERS the way below_blocker() reads it.
+    # Naming `blocker` alone is the same set today, and the day a tier is
+    # added above it the most severe findings close neutral.
+    ("reaches-blocker-names-only-blocker",
+     OVER, '    over = ("blocker",)'),
+    ("reaches-blocker-reads-position-not-name",
+     OVER, "    over = TIERS[:1]"),
+    ("reaches-blocker-counts-every-tier",
+     OVER, "    over = TIERS"),
+    # And raising when the name is gone, after the review is posted, where
+    # announce() swallows it and the backstop says nothing was posted.
+    ("reaches-blocker-raises-without-the-name",
+     OVER, '    over = TIERS[:TIERS.index("blocker") + 1]'),
     # Each reviewed commit gets its own run, and the entry a pull request
     # shows is the one on its head. Closing anything but the run it was
     # handed would let one review's conclusion stand for another's.
