@@ -97,9 +97,10 @@ EXPECT = {
 CLEAN = "    clean = findings == [] and whole and landed and not resent"
 # Hoisted for the same reason, and the tail of it is the text each of its
 # mutants keeps.
-FOUND = ('any(finding.get("tier") == "blocker"\n'
-         "                  for finding in findings or ())")
+FOUND = "reaches_blocker(findings)"
 BLOCKED = "    blocked = " + FOUND
+OVER = ('    over = TIERS[:TIERS.index("blocker") + 1] if "blocker" in TIERS '
+        "else ()")
 
 # name, the text that implements a guard in vinegar.py, what breaks it
 MUTATIONS = [
@@ -1094,6 +1095,19 @@ MUTATIONS = [
      BLOCKED, "    blocked = landed and " + FOUND),
     ("check-fails-on-a-retry",
      BLOCKED, "    blocked = not resent and " + FOUND),
+    # What a blocker is, read off TIERS the way below_blocker() reads it.
+    # Naming `blocker` alone is the same set today, and the day a tier is
+    # added above it the most severe findings close neutral.
+    ("reaches-blocker-names-only-blocker",
+     OVER, '    over = ("blocker",)'),
+    ("reaches-blocker-reads-position-not-name",
+     OVER, "    over = TIERS[:1]"),
+    ("reaches-blocker-counts-every-tier",
+     OVER, "    over = TIERS"),
+    # And raising when the name is gone, after the review is posted, where
+    # announce() swallows it and the backstop says nothing was posted.
+    ("reaches-blocker-raises-without-the-name",
+     OVER, '    over = TIERS[:TIERS.index("blocker") + 1]'),
     # Each reviewed commit gets its own run, and the entry a pull request
     # shows is the one on its head. Closing anything but the run it was
     # handed would let one review's conclusion stand for another's.

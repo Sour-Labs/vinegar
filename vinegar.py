@@ -4182,6 +4182,25 @@ def below_blocker(findings):
     return any(finding.get("tier") in under for finding in findings or ())
 
 
+def reaches_blocker(findings):
+    """Whether anything here is tiered `blocker` or above it.
+
+    What fails the check. Read off TIERS for below_blocker()'s reason: a
+    tier added above `blocker` is more severe than it, and a site naming
+    `blocker` alone would close neutral on exactly the findings that
+    matter most, under a title counting them.
+
+    Defaulted the same way when `blocker` is not there at all. This runs
+    in finish() after the review is posted, and announce() swallows a
+    ValueError there, so the backstop closes the indicator saying nothing
+    reached a pull request that visibly carries the review. An empty
+    tuple means the check never fails, which is what an untiered review
+    already gets.
+    """
+    over = TIERS[:TIERS.index("blocker") + 1] if "blocker" in TIERS else ()
+    return any(finding.get("tier") in over for finding in findings or ())
+
+
 def pr_key(repo, pr):
     """How one pull request is named in the state file and the log."""
     return "%s#%s" % (repo, pr["number"])
@@ -5289,8 +5308,7 @@ def finish(label, repo, pr, path, text, findings, config, env, tokens,
     clean = findings == [] and whole and landed and not resent
     # Red off the same tiers the title counts, for every ending, for the
     # reason CHECK_BLOCKED gives.
-    blocked = any(finding.get("tier") == "blocker"
-                  for finding in findings or ())
+    blocked = reaches_blocker(findings)
     close_check(label, check, title, sending or env,
                 "The review is on the pull request." if landed
                 else "The review did not reach the pull request. The log "

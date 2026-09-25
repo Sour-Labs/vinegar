@@ -5322,6 +5322,13 @@ check("under blocker stays under blocker when a tier is added above it",
       not vinegar.below_blocker([{"tier": "blocker"}])
       and not vinegar.below_blocker([{"tier": "critical"}])
       and vinegar.below_blocker([{"tier": "advisory"}]))
+# The other side of the same line, which is what fails the check. A tier
+# added above `blocker` is more severe, and a site naming `blocker` alone
+# would close neutral under a title counting `1 critical`.
+check("a tier added above blocker fails the check too",
+      vinegar.reaches_blocker([{"tier": "critical"}])
+      and vinegar.reaches_blocker([{"tier": "blocker"}])
+      and not vinegar.reaches_blocker([{"tier": "advisory"}]))
 # And a TIERS with no `blocker` in it answers rather than raising, which
 # is triage()'s sort's rule and for its reason: this runs inside
 # save_transcript() and inside post_review(), so a ValueError here is a
@@ -5333,9 +5340,20 @@ try:
     _no_blocker = vinegar.below_blocker([{"tier": "minor"}])
 except ValueError:
     _no_blocker = "raised"
+try:
+    _no_blocker_red = vinegar.reaches_blocker([{"tier": "severe"}])
+except ValueError:
+    _no_blocker_red = "raised"
 vinegar.TIERS = _saved_tiers
 check("a TIERS that lost the name does not cost the review that paid for it",
       _no_blocker is False, _no_blocker)
+check("nor does it cost the indicator that review closes",
+      _no_blocker_red is False, _no_blocker_red)
+check("only a blocker fails the check, never a smaller or missing tier",
+      vinegar.reaches_blocker([{"tier": "note"}, {"tier": "blocker"}])
+      and not any(map(vinegar.reaches_blocker,
+                      ([{"tier": "advisory"}], [{"tier": "note"}],
+                       [{"summary": "none"}], [], None))))
 # The paragraph says "on each finding" and not "below", because an
 # anchored finding's tag is rendered into its inline comment on the diff
 # rather than into this body. That is the common case, and the one
