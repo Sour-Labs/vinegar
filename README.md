@@ -1054,7 +1054,8 @@ the top-level comment, which needs no anchor. Silence means something broke, and
 that is the only thing it is allowed to mean.
 
 Reviews are submitted with `event: COMMENT`. Vinegar never approves and never
-requests changes, so it cannot hold up a merge. See "What this is not".
+requests changes, so the review itself cannot hold up a merge. A review that
+finds a blocker fails its check instead. See "The checks list".
 
 ### A second review reads only what is new
 
@@ -1294,13 +1295,24 @@ When the review ends, the same entry carries the tally the comment carries:
 `10 findings (2 blocker, 8 advisory)`, or `No findings`, or
 `The review failed 3 times and was given up on`.
 
-**It is never a fail, and a pass only when the review found nothing.**
-`failure` would make Vinegar a merge gate, which "What this is not" says it
-isn't, and severity triage is not accurate enough to be one: the blocker rate
-measured 45% on two of four reviews. Every other ending is `neutral`, a grey
-mark that cannot block a merge even where the check is required, because a green
-tick on a pull request carrying twelve findings is a statement nobody made and
-the tick is what people read.
+**It fails when the review found a blocker, and passes only when the review
+found nothing.** Every other ending is `neutral`, a grey mark that cannot block
+a merge even where the check is required, because a green tick on a pull
+request carrying twelve findings is a statement nobody made and the tick is
+what people read.
+
+A blocker is a finding the severity pass tiered `blocker`, the same count the
+title shows. The check fails on every ending that carries one: a review killed
+part way, one that never reached the pull request, and a retry all fail if they
+found a blocker. With `severity_model` set to `null`, or a severity pass that
+fails, no finding carries a tier and the check never fails.
+
+**A failing check blocks a merge only where the repository requires it.** Make
+the Vinegar check required in branch protection and Vinegar becomes a merge
+gate. Leave it optional and the red mark is information only. Before you
+require it, know what the gate reads: the severity pass reads one summary line
+and never the code, and on two of four reviews measured about 45% of findings
+came back `blocker`. See "Severity".
 
 A review that reported nothing is the one ending where a tick says what the
 reviewer said, so that one is `success`. Three endings that also report nothing
@@ -1325,10 +1337,12 @@ still invisible: the in-progress title carries the blockers narrowing only.
 
 **Green belongs to a commit, not to a pull request.** Each review closes the
 entry on the head it reviewed, so a clean first pass is green and a later pass
-that finds something is grey on its own commit, which is the one the pull
-request shows. The accepted cost is the other order: a later pass narrowed to
-the new commits, or to blockers only, goes green on a pull request whose earlier
-findings are still open.
+that finds something is grey or red on its own commit, which is the one the
+pull request shows. The accepted cost is the other order: a later pass narrowed
+to the new commits, or to blockers only, goes green on a pull request whose
+earlier findings are still open. That includes a blocker: a red check turns
+green when a later pass finds nothing in what it read, whether or not the
+blocker was fixed.
 
 That is a choice and not an oversight. A finding still open several rounds later
 is usually one somebody decided not to act on, and what the list is wanted for is
@@ -1473,9 +1487,11 @@ allowed to cost it.
 **What it does not do.** On two of the four reviews measured, about 45% of
 findings still came back `blocker`, and on one of them three `test-coverage`
 findings did, against the rule the model is given. That is good enough to order
-a comment. It is not good enough to decide which findings reach the pull request
-at all, which is why `blockers_only_after` narrows the reviewer's instructions
-rather than filtering these tiers. See "A later review reports only blockers".
+a comment. It also decides whether the check fails, which is a known cost; see
+"The checks list". It is not good enough to decide which findings reach the
+pull request at all, which is why `blockers_only_after` narrows the reviewer's
+instructions rather than filtering these tiers. See "A later review reports
+only blockers".
 
 Two things that measured worse and are recorded so they are not retried.
 Requiring the model to name the runtime harm beside each tier, which sounds
@@ -1526,7 +1542,9 @@ Two consequences worth planning for:
 
 - Not a hosted service and not a paid product.
 - Not a reimplementation of a review engine. It orchestrates `/code-review`.
-- Not a merge gate. Reviews inform; they never block.
+- Not a merge gate unless you make it one. Reviews are comments and never
+  block. A review that finds a blocker fails its check, and that blocks a merge
+  only where the repository requires the check.
 - Not a replacement for CI. Lint, format, type, and test checks stay where they
   are, and Vinegar is told not to duplicate them.
 

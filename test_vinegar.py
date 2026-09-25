@@ -1560,8 +1560,9 @@ check("a create that answers without an id leaves no handle",
       _opened(check_rc=0, check_made={"no": "id"}) is None, checked)
 _opened(check_made={"id": 4242})
 
-# Closing. The conclusion is the whole safety argument: a check that can
-# fail is a merge gate, and the README promises Vinegar is not one.
+# Closing. Only finish() names a conclusion. The sweep and both backstops
+# close with the default, and a failing check is a merge gate wherever it
+# is required, so a close that names none must never fail.
 del checked[:]
 _handle = {"repo": "o/r", "id": 4242, "closed": False}
 vinegar.close_check(L, _handle, "7 findings (1 blocker, 6 advisory)", CHK_ENV)
@@ -1572,7 +1573,7 @@ check("closing completes the indicator",
 check("the indicator's end time is the same shape",
       re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$",
                _patch[0]["completed_at"]), _patch[0]["completed_at"])
-check("a finished review never fails the check",
+check("a close that names no conclusion never fails the check",
       _patch[0]["conclusion"] == "neutral", _patch[0]["conclusion"])
 check("the tally is what the checks list shows",
       _patch[0]["output"]["title"] == "7 findings (1 blocker, 6 advisory)",
@@ -6699,14 +6700,34 @@ check("an ordinary review's finished check claims no scope",
       "added since" not in _titled([], sha="ae00ae00ae00"), _titles[-1])
 
 # The conclusion, which is a second thing the closed indicator says and the
-# one people read before any title. Green is the exception and every other
-# ending is the grey mark that cannot block a merge.
+# one people read before any title. Green for nothing found, red for a
+# blocker, and every other ending is the grey mark that cannot block a
+# merge.
 _titled([], sha="ad00ad00ad00")
 check("a review that found nothing is a pass in the checks list",
       _conclusions[-1] == "success", _conclusions[-1])
 _titled(_tier_found, sha="ae00ae00ae00")
-check("a review that found something is not a pass",
-      _conclusions[-1] == "neutral", _conclusions[-1])
+check("a review that found a blocker fails the check",
+      _conclusions[-1] == "failure", _conclusions[-1])
+# Tiered, and tiered under `blocker`. The title is asked as well so that a
+# triage that failed, and left the finding with no tier at all, cannot
+# pass this for the wrong reason.
+_titled(_tier_found[:1], sha="ae10ae10ae10")
+check("a review whose worst finding is not a blocker is neither",
+      (_titles[-1], _conclusions[-1]) == ("1 finding (1 note)", "neutral"),
+      (_titles[-1], _conclusions[-1]))
+# A blocker fails the check on every ending, and these are the three that
+# keep a clean review grey. Each reaches the conclusion by its own route.
+_titled(_tier_found, note="killed at 30 minutes", sha="ae20ae20ae20",
+        whole=False)
+check("a blocker found before the review was killed fails the check",
+      _conclusions[-1] == "failure", _conclusions[-1])
+_titled(_tier_found, sha="ae30ae30ae30", posts=False)
+check("a blocker in a review that never landed fails the check",
+      _conclusions[-1] == "failure", _conclusions[-1])
+_titled(_tier_found, sha="ae40ae40ae40", resent=True)
+check("a blocker found by a retry fails the check",
+      _conclusions[-1] == "failure", _conclusions[-1])
 # The four endings that report nothing without being clean. Each is the
 # false all-clear a green tick would be, and each reaches this line by a
 # different route, so each is asked separately.
@@ -6739,7 +6760,7 @@ check("a clean review that finished on the fallback model is a pass",
 _titled([], sha="be00be00be00")
 _titled(_tier_found, sha="bf00bf00bf00")
 check("a later pass closes its own run, so green does not carry over",
-      [c for _, c in _closed[-2:]] == ["success", "neutral"]
+      [c for _, c in _closed[-2:]] == ["success", "failure"]
       and _closed[-2][0] != _closed[-1][0], _closed[-2:])
 _titled([], sha="bc00bc00bc00", posts=False)
 check("a clean review that never reached the pull request is not a pass",
