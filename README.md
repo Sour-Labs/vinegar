@@ -591,6 +591,25 @@ the width of any terminal it can find and a long checkout path loses the
 `vinegar.py` you are matching on. If you write your own check, these are the
 parts to get right.
 
+**A daemon that is running but cannot log in to Claude reviews nothing**, and
+the heartbeat cannot see that. When a review finds Claude logged out, which
+Claude Code reports as `authentication_failed` in about a second at no cost,
+Vinegar does not count it as one of the three attempts. Instead every review
+waits ten minutes (`LOGIN_RETRY`) and the next one tries again, and the pull
+request's check says the review will run once Claude can log in. Counted, the
+three attempts ran out in under a minute. On the deployment this was written
+for that happened three times between 28 August and 29 September 2026, the
+login worked again within forty minutes on two of them, and three pull
+requests were merged at the commit Vinegar had given up on.
+
+Vinegar also writes `~/.vinegar/logged-out` with the time the outage began,
+and the watchdog's next pass sends one ntfy push about it. Vinegar removes the
+file after the next review that runs, and the watchdog then clears its record
+of the push, so the next outage pushes again. The file stays after a restart
+and after the waiting pull request is closed, because neither proves the login
+works. Nothing about it goes to healthchecks.io, which is the channel for a
+daemon that is not running.
+
 ## What the reviewer is allowed to do
 
 A pull request diff is input written by someone else, and the reviewer reads it

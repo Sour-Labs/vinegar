@@ -427,11 +427,9 @@ MUTATIONS = [
     # again immediately, so a cheap ending that repeats is polled as fast
     # as the machine can go with `poll_interval` never consulted.
     ("turn-answers-reviewed",
-     "    # A review ran. Whether it ended DONE or FAILED, it spent the "
-     "minutes\n"
-     "    # this answer is really about, and anything else open on this\n"
-     "    # repository has been waiting through them.\n"
-     "    return True\n",
+     "    # repository has been waiting through them. A login failure spent a\n"
+     "    # few seconds, and True would put the repository back due at once.\n"
+     "    return outcome != LOGGED_OUT\n",
      "    return False\n"),
     ("handle-skip-is-not-work",
      '        record_once(state, key, done, head, "skipped", '
@@ -2339,6 +2337,80 @@ MUTATIONS = [
     ("reserve-counts-nothing-when-triage-is-off",
      '                             if config["triage_model"] else 0)',
      "                             if True else 0)"),
+
+    # --- a login that fails, which is not a failed review ---------------
+    # Three attempts seconds apart cannot outlast it, and three pull
+    # requests given up on that way were merged at the commit nobody
+    # reviewed.
+    ("login-detected",
+     "                return LOGGED_OUT, False, False",
+     "                return FAILED, False, False"),
+    ("login-reads-the-field",
+     '                and event.get("error") == "authentication_failed"):',
+     '                and event.get("error")):'),
+    ("login-not-a-subagent",
+     '                and not event.get("parent_tool_use_id")\n'
+     '                and event.get("error")',
+     '                and event.get("error")'),
+    # Free, like unroutable(), or it counts.
+    ("login-is-free-only",
+     '            if (output.get("total_cost_usd") == 0\n'
+     "                    and logged_out(result.stdout)):",
+     "            if logged_out(result.stdout):"),
+    ("login-hands-back-attempt",
+     "        if outcome == LOGGED_OUT:\n"
+     "            attempts -= 1",
+     "        if outcome == LOGGED_OUT:\n"
+     "            pass"),
+    ("login-answers-no-review",
+     "    return outcome != LOGGED_OUT",
+     "    return True"),
+    ("login-holds-every-review",
+     "    if (_login_failed_at is not None\n"
+     "            and time.monotonic() - _login_failed_at < LOGIN_RETRY):\n"
+     "        return False",
+     "    pass"),
+    ("login-wait-ends",
+     "            and time.monotonic() - _login_failed_at < LOGIN_RETRY):",
+     "            and LOGIN_RETRY):"),
+    ("login-retry-value", "LOGIN_RETRY = 600", "LOGIN_RETRY = 0"),
+    ("login-sets-the-wait",
+     "    _login_failed_at = time.monotonic()",
+     "    _login_failed_at = None"),
+    ("login-failed-called",
+     "        if outcome == LOGGED_OUT:\n"
+     "            login_failed(key)",
+     "        if False:\n"
+     "            login_failed(key)"),
+    # The watchdog's half: written, written once, and cleared only by a
+    # review that ran.
+    ("login-marker-written",
+     "    if not os.path.exists(LOGGED_OUT_PATH):\n"
+     '        with open(LOGGED_OUT_PATH, "w", encoding="utf-8") as handle:',
+     "    if False:\n"
+     '        with open(LOGGED_OUT_PATH, "w", encoding="utf-8") as handle:'),
+    ("login-marker-once",
+     "    if not os.path.exists(LOGGED_OUT_PATH):\n"
+     '        with open(LOGGED_OUT_PATH, "w", encoding="utf-8") as handle:',
+     "    if True:\n"
+     '        with open(LOGGED_OUT_PATH, "w", encoding="utf-8") as handle:'),
+    ("login-marker-text",
+     '"since %s, first seen on %s\\n" % (utc_stamp(), key)',
+     '"\\n"'),
+    ("login-marker-cleared",
+     "            forget(LOGGED_OUT_PATH)",
+     "            pass"),
+    ("login-marker-kept-on-failed",
+     "        elif outcome == DONE and os.path.exists(LOGGED_OUT_PATH):",
+     "        elif os.path.exists(LOGGED_OUT_PATH):"),
+    ("login-title",
+     "    if outcome == LOGGED_OUT:\n"
+     '        return "Claude could not log in',
+     "    if False:\n"
+     '        return "Claude could not log in'),
+    ("login-hand-run-no-attempt",
+     '                    kept.get("attempts", 0) + (outcome != LOGGED_OUT),',
+     '                    kept.get("attempts", 0) + 1,'),
 ]
 
 

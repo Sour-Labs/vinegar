@@ -266,6 +266,9 @@ def reset_stubs():
     fake_run.check_err = ""
     fake_run.check_open = {"check_runs": []}
     fake_run.check_made = {"id": 4242}
+    # Left set, every handle_pr in the next section returns before its
+    # review runs, and its checks pass or fail about a review nobody made.
+    vinegar._login_failed_at = None
     del posted[:]
     del looked[:]
     del checked[:]
@@ -2233,6 +2236,52 @@ del claude_run.calls[:]
 check("a truncated stream with a fallback configured fails, never raises",
       _reviewed(FALLING_BACK) == vinegar.FAILED
       and len(claude_run.calls) == 1, len(claude_run.calls))
+
+# A login that fails is not a failed review. Three attempts seconds apart
+# cannot outlast it, and three pull requests given up on that way in August
+# 2026 were merged at the commit nobody reviewed.
+#
+# The shape is what Claude Code 2.1.284 wrote for a token it could not use,
+# with the words the daemon logged on 29 September 2026 and no
+# `api_error_status`: the session record of that failure carries the same
+# `error` field and nothing that says a status came back.
+_AUTH = {"type": "assistant", "parent_tool_use_id": None,
+         "error": "authentication_failed", "is_api_error_message": True,
+         "message": {"model": "<synthetic>", "role": "assistant",
+                     "content": [{"type": "text", "text": (
+                         "Failed to authenticate: OAuth session expired and "
+                         "could not be refreshed")}]}}
+_AUTH_END = result_event(is_error=True, total_cost_usd=0,
+                         terminal_reason="api_error",
+                         result="Failed to authenticate: OAuth session "
+                                "expired and could not be refreshed")
+claude_run.stream = stream(_AUTH, _AUTH_END)
+del posted[:]
+_login = _reviewed(CONFIG)
+check("a review that cannot log in says so rather than failing",
+      _login == vinegar.LOGGED_OUT and not posted, (_login, posted))
+# Everything else that fails for free stays FAILED, which is what keeps
+# MAX_ATTEMPTS in charge of it. A rate limit is the common one.
+claude_run.stream = stream(
+    {"type": "assistant", "error": "rate_limit",
+     "message": {"content": [{"type": "text", "text": "Usage limit"}]}},
+    dict(_AUTH_END, result="Claude AI usage limit reached"))
+_login = _reviewed(CONFIG)
+check("an error that is not the login is still a failed attempt",
+      _login == vinegar.FAILED, _login)
+# Like unroutable(): only a run that bought nothing is free to throw away.
+# A login lost part way through a review has spent it, and treating that
+# as no attempt re-buys the review every LOGIN_RETRY with nothing to stop
+# it.
+claude_run.stream = stream(_AUTH, dict(_AUTH_END, total_cost_usd=2.2))
+_login = _reviewed(CONFIG)
+check("a login lost after the review spent something is an attempt",
+      _login == vinegar.FAILED, _login)
+# A subagent's event is not the review's, the rule read_stream() keeps.
+check("a subagent that cannot log in is not the review logged out",
+      not vinegar.logged_out(stream(dict(_AUTH, parent_tool_use_id="t_1"),
+                                    _AUTH_END)))
+claude_run.stream = stream(call(FINDINGS[:4]), result_event())
 
 # The two attempts share one bound. Given a fresh review_timeout each, one
 # pull request parks the only poll thread for twice it, and load_config
@@ -4452,6 +4501,93 @@ vinegar.checkout = _ans_kept
 check("nor does a checkout that failed, whose retry is unbounded",
       _ans_broken is False, _ans_broken)
 
+# A login failure through handle_pr. The attempt it was charged before the
+# review ran is handed back, every review waits LOGIN_RETRY, and the
+# watchdog is left its marker.
+os.makedirs(vinegar.HOME, exist_ok=True)
+vinegar.forget(vinegar.LOGGED_OUT_PATH)
+_lo_ran = []
+_lo_answer = [vinegar.LOGGED_OUT]
+vinegar.review = lambda *a, **k: _lo_ran.append(1) or (_lo_answer[0], False,
+                                                        False)
+# The day this was written: the last of three attempts, a login that failed
+# for about ten minutes, and a give-up on a pull request that was then
+# reviewed only because its author pushed again.
+_lo_state = {L: {"outcome": vinegar.FAILED, "sha": PR["headRefOid"],
+                 "attempts": vinegar.MAX_ATTEMPTS - 1}}
+del posted[:]
+_lo_said = vinegar.handle_pr("o/r", PR_LIVE, CONFIG, _lo_state, {})
+check("a login failure hands back the attempt it was charged",
+      _lo_state[L].get("attempts") == vinegar.MAX_ATTEMPTS - 1
+      and _lo_state[L]["outcome"] == vinegar.LOGGED_OUT, _lo_state)
+check("a login failure on the last attempt does not give up",
+      not posted, len(posted))
+# True puts the repository back due at once, and the next turn would find
+# the login still broken a second later.
+check("a login failure answers that no review ran",
+      _lo_said is False, _lo_said)
+check("a login failure leaves the watchdog its marker",
+      os.path.exists(vinegar.LOGGED_OUT_PATH), vinegar.LOGGED_OUT_PATH)
+
+# The login is the machine's, so another pull request must not find out
+# for itself a minute later.
+del _lo_ran[:]
+_lo_other = dict(PR_LIVE, number=13, headRefOid="b2c3d4e5f6a7")
+vinegar.handle_pr("o/r", _lo_other, CONFIG, {}, {})
+check("a login failure holds every review back",
+      not _lo_ran, len(_lo_ran))
+vinegar._login_failed_at = time.monotonic() - vinegar.LOGIN_RETRY - 1
+vinegar.handle_pr("o/r", _lo_other, CONFIG, {}, {})
+check("the wait ends after LOGIN_RETRY",
+      len(_lo_ran) == 1, len(_lo_ran))
+
+def _lo_marker():
+    """The marker's text, or None. Opened bare, a marker the code under
+    test failed to write aborted the suite rather than failing a check."""
+    try:
+        with open(vinegar.LOGGED_OUT_PATH) as handle:
+            return handle.read()
+    except OSError:
+        return None
+
+
+# Written once per outage, so the watchdog pushes once and the file says
+# when the outage began rather than when it was last seen.
+_lo_first = _lo_marker() or ""
+vinegar._login_failed_at = None
+with open(vinegar.LOGGED_OUT_PATH, "w") as h:
+    h.write("since the first failure\n")
+vinegar.handle_pr("o/r", _lo_other, CONFIG, {}, {})
+_lo_kept = _lo_marker()
+check("the marker says when the outage began, not when it was last seen",
+      _lo_kept == "since the first failure\n", _lo_kept)
+check("the marker names the time and the pull request",
+      _lo_first.startswith("since 20") and L in _lo_first, _lo_first)
+
+# Only a review that ran proves the login works. A FAILED can be anything,
+# and clearing on it would let the watchdog push again for an outage it
+# already pushed about.
+vinegar._login_failed_at = None
+_lo_answer[0] = vinegar.FAILED
+vinegar.handle_pr("o/r", _lo_other, CONFIG, {}, {})
+check("a review that failed for another reason keeps the marker",
+      os.path.exists(vinegar.LOGGED_OUT_PATH), vinegar.LOGGED_OUT_PATH)
+_lo_answer[0] = vinegar.DONE
+vinegar.handle_pr("o/r", _lo_other, CONFIG, {}, {})
+check("a review that ran removes the marker",
+      not os.path.exists(vinegar.LOGGED_OUT_PATH), vinegar.LOGGED_OUT_PATH)
+
+# The checks list is where the author sees why no review came. "Failed
+# and will be tried again" would tell them an attempt was spent.
+_lo_title = _indicator_after(vinegar.LOGGED_OUT, 0)
+check("a login failure says so in the checks list",
+      _lo_title == ["Claude could not log in, so the review will run once "
+                    "it can"], _lo_title)
+vinegar._login_failed_at = None
+vinegar.forget(vinegar.LOGGED_OUT_PATH)
+del checked[:]
+del posted[:]
+
 # The pre-review marker can be the last thing an attempt writes: a kill
 # mid-review leaves a spent budget that nothing announced. The next poll's
 # discovery must say so on the pull request, once.
@@ -6058,6 +6194,16 @@ check("a hand run that reached nobody does not count a round",
       _hu_state.get("rounds") == 1, _hu_state)
 vinegar.forget(vinegar.unposted_path("o/r", dict(PR_LIVE,
                                                  headRefOid=NEW_SHA)))
+
+# The daemon's rule for a login failure, kept by the hand run too. Counted
+# here, three hand runs against a broken login would leave the daemon a
+# spent budget at a head nothing has reviewed.
+_, _hl_state = _hand_scoped(
+    {"outcome": vinegar.FAILED, "sha": NEW_SHA, "attempts": 1},
+    review=lambda *a, **k: (vinegar.LOGGED_OUT, False, False))
+check("a hand run that cannot log in costs no attempt",
+      _hl_state.get("attempts") == 1
+      and _hl_state.get("outcome") == vinegar.LOGGED_OUT, _hl_state)
 
 # Refused rather than ignored. `--whole` is read only by the --pr branch,
 # so as a bare flag it was accepted, did nothing, and said nothing: an

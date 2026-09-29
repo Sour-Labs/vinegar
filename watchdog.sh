@@ -116,6 +116,29 @@ if [ "$alive" = "1" ]; then
         curl -fsS -m 10 --retry 3 -o /dev/null "$HEALTHCHECK_URL" \
             || log "heartbeat failed to send"
     fi
+
+    # Running is not the same as reviewing. Vinegar writes this file when
+    # Claude cannot log in and removes it after the next review that runs,
+    # and in between every review waits. One push per outage: SENT records
+    # that this one was said, and goes when the outage does. The heartbeat
+    # above is untouched, because the daemon is alive and healthchecks.io
+    # is the channel for a daemon that is not.
+    LOGGED_OUT="$HOME_DIR/logged-out"
+    SENT="$HOME_DIR/logged-out.sent"
+    if [ ! -e "$LOGGED_OUT" ]; then
+        rm -f "$SENT"
+    elif [ ! -e "$SENT" ] && [ -n "$NTFY_TOPIC" ]; then
+        if curl -fsS -m 10 --retry 3 -o /dev/null \
+            -H "Title: Vinegar cannot log in to Claude" \
+            -H "Priority: high" \
+            -H "Tags: key" \
+            -d "Claude Code on $(hostname -s) cannot log in, $(head -c 200 "$LOGGED_OUT"). Reviews wait and retry by themselves. If it does not clear, log in again with claude on that machine. No second push until a review works again." \
+            "https://ntfy.sh/$NTFY_TOPIC"; then
+            touch "$SENT"
+        else
+            log "ntfy push about the Claude login did not send"
+        fi
+    fi
     exit 0
 fi
 
