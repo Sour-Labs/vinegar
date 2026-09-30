@@ -595,20 +595,24 @@ parts to get right.
 the heartbeat cannot see that. When a review finds Claude logged out, which
 Claude Code reports as `authentication_failed` in about a second at no cost,
 Vinegar does not count it as one of the three attempts. Instead every review
-waits ten minutes (`LOGIN_RETRY`) and the next one tries again, and the pull
-request's check says the review will run once Claude can log in. Counted, the
-three attempts ran out in under a minute. On the deployment this was written
-for that happened three times between 28 August and 29 September 2026, the
-login worked again within forty minutes on two of them, and three pull
-requests were merged at the commit Vinegar had given up on.
+waits ten minutes (`LOGIN_RETRY`) and the next one tries again. The pull
+request that met the outage keeps its check running, titled `Waiting for Claude
+to log in`, so where the check is required the merge waits for the review; a
+closed check would be `neutral`, which a required check accepts. Each retry at
+that commit reuses the same running check. Counted, the three attempts ran out
+in under a minute. On the deployment this was written for that happened three
+times between 28 August and 29 September 2026, the login worked again within
+forty minutes on two of them, and three pull requests were merged at the commit
+Vinegar had given up on.
 
-Vinegar also writes `~/.vinegar/logged-out` with the time the outage began,
-and the watchdog's next pass sends one ntfy push about it. Vinegar removes the
-file after the next review that runs, and the watchdog then clears its record
-of the push, so the next outage pushes again. The file stays after a restart
-and after the waiting pull request is closed, because neither proves the login
-works. Nothing about it goes to healthchecks.io, which is the channel for a
-daemon that is not running.
+Vinegar also writes `~/.vinegar/logged-out` with the time the outage began, and
+the watchdog's next pass sends one ntfy push about it. Vinegar removes the file
+after the next review that runs. The watchdog keeps the text it pushed and
+pushes again whenever the file names a different start, so a new outage gets
+its own push even when it begins before the next pass. The file stays after a
+restart and after the waiting pull request is closed, because neither proves
+the login works. Nothing about it goes to healthchecks.io, which is the channel
+for a daemon that is not running.
 
 ## What the reviewer is allowed to do
 
@@ -1333,6 +1337,11 @@ found nothing.** Every other ending is `neutral`, a grey mark that cannot block
 a merge even where the check is required, because a green tick on a pull
 request carrying twelve findings is a statement nobody made and the tick is
 what people read.
+
+**One wait is not an ending.** While Claude cannot log in, the check is left
+running as `Waiting for Claude to log in` rather than closed, because a
+`neutral` close would let a required check pass a commit nobody reviewed. See
+"Watching the watcher" for the rest of that case.
 
 A blocker is a finding the severity pass tiered `blocker`, the same count the
 title shows. The check fails on every ending that carries one: a review killed

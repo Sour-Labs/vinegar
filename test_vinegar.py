@@ -4529,6 +4529,18 @@ check("a login failure answers that no review ran",
 check("a login failure leaves the watchdog its marker",
       os.path.exists(vinegar.LOGGED_OUT_PATH), vinegar.LOGGED_OUT_PATH)
 
+# A login failure writes no transcript, so a saved review's spent budget
+# is still that review's. Reset, a saved review GitHub keeps refusing was
+# sent three more times every LOGIN_RETRY for the whole outage.
+vinegar._login_failed_at = None
+_lo_budget = {L: {"outcome": vinegar.FAILED, "sha": PR["headRefOid"],
+                  "attempts": 1, "post_tries": vinegar.MAX_ATTEMPTS,
+                  "post_waivers": 2}}
+vinegar.handle_pr("o/r", PR_LIVE, CONFIG, _lo_budget, {})
+check("a login failure keeps a saved review's spent repost budget",
+      _lo_budget[L].get("post_tries") == vinegar.MAX_ATTEMPTS
+      and _lo_budget[L].get("post_waivers") == 2, _lo_budget)
+
 # The login is the machine's, so another pull request must not find out
 # for itself a minute later.
 del _lo_ran[:]
@@ -4577,12 +4589,23 @@ vinegar.handle_pr("o/r", _lo_other, CONFIG, {}, {})
 check("a review that ran removes the marker",
       not os.path.exists(vinegar.LOGGED_OUT_PATH), vinegar.LOGGED_OUT_PATH)
 
-# The checks list is where the author sees why no review came. "Failed
-# and will be tried again" would tell them an attempt was spent.
+# Left running, not closed. A closed check is neutral, and GitHub counts
+# neutral as passing a required check: the pull request that met the
+# outage became mergeable at a commit nobody had reviewed, on a repository
+# that requires this one.
 _lo_title = _indicator_after(vinegar.LOGGED_OUT, 0)
+_lo_patches = [asked for how, _, asked in checked if how == "PATCH"]
 check("a login failure says so in the checks list",
-      _lo_title == ["Claude could not log in, so the review will run once "
-                    "it can"], _lo_title)
+      _lo_title == ["Waiting for Claude to log in"], _lo_title)
+check("a login failure leaves the check running, so a required one blocks",
+      _lo_patches and not any(asked.get("status") == "completed"
+                              for asked in _lo_patches), _lo_patches)
+# A hand run cannot leave one running. Under its own VINEGAR_HOME the
+# daemon neither reuses nor sweeps its checks, so it would spin for ever.
+check("a hand run that cannot log in closes its check saying why",
+      vinegar.ended_title(vinegar.LOGGED_OUT)
+      == "Claude could not log in, so the review will run once it can",
+      vinegar.ended_title(vinegar.LOGGED_OUT))
 vinegar._login_failed_at = None
 vinegar.forget(vinegar.LOGGED_OUT_PATH)
 del checked[:]

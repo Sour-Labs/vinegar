@@ -119,22 +119,28 @@ if [ "$alive" = "1" ]; then
 
     # Running is not the same as reviewing. Vinegar writes this file when
     # Claude cannot log in and removes it after the next review that runs,
-    # and in between every review waits. One push per outage: SENT records
-    # that this one was said, and goes when the outage does. The heartbeat
-    # above is untouched, because the daemon is alive and healthchecks.io
-    # is the channel for a daemon that is not.
+    # and in between every review waits. One push per outage, and the file's
+    # text is what tells two outages apart: it names when this one began.
+    # SENT holds the text last pushed. Comparing text rather than asking
+    # whether a record exists matters when one outage ends and the next
+    # begins inside five minutes: no pass ever sees the file gone, and an
+    # existence test stayed silent through the second outage. Read once, so
+    # a file removed or still empty mid-read pushes nothing this pass
+    # rather than a message with no time in it. The heartbeat above is
+    # untouched, because the daemon is alive and healthchecks.io is the
+    # channel for a daemon that is not.
     LOGGED_OUT="$HOME_DIR/logged-out"
     SENT="$HOME_DIR/logged-out.sent"
-    if [ ! -e "$LOGGED_OUT" ]; then
-        rm -f "$SENT"
-    elif [ ! -e "$SENT" ] && [ -n "$NTFY_TOPIC" ]; then
+    outage="$(head -c 200 "$LOGGED_OUT" 2>/dev/null)"
+    if [ -n "$outage" ] && [ -n "$NTFY_TOPIC" ] \
+        && [ "$outage" != "$(cat "$SENT" 2>/dev/null)" ]; then
         if curl -fsS -m 10 --retry 3 -o /dev/null \
             -H "Title: Vinegar cannot log in to Claude" \
             -H "Priority: high" \
             -H "Tags: key" \
-            -d "Claude Code on $(hostname -s) cannot log in, $(head -c 200 "$LOGGED_OUT"). Reviews wait and retry by themselves. If it does not clear, log in again with claude on that machine. No second push until a review works again." \
+            -d "Claude Code on $(hostname -s) cannot log in, $outage. Reviews wait and retry by themselves. If it does not clear, log in again with claude on that machine. No second push until a review works again." \
             "https://ntfy.sh/$NTFY_TOPIC"; then
-            touch "$SENT"
+            printf '%s\n' "$outage" > "$SENT"
         else
             log "ntfy push about the Claude login did not send"
         fi

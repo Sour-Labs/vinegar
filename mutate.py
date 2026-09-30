@@ -1220,9 +1220,10 @@ MUTATIONS = [
      '    return "The review ran but nothing reached the pull request"',
      '    return "The review finished"'),
     ("check-closed-on-fresh-credentials",
-     "        close_check(key, check, ended_title(outcome, attempts),\n"
-     "                    posting_env(key, config, repo, tokens, env) or env)",
-     "        close_check(key, check, ended_title(outcome, attempts), env)"),
+     "            close_check(key, check, ended_title(outcome, attempts),\n"
+     "                        posting_env(key, config, repo, tokens, env) "
+     "or env)",
+     "            close_check(key, check, ended_title(outcome, attempts), env)"),
     # Not the extraction, which changes no behaviour and so nothing can
     # catch: the format itself, which GitHub rejects the update over.
     ("utc-stamp-format",
@@ -2411,6 +2412,30 @@ MUTATIONS = [
     ("login-hand-run-no-attempt",
      '                    kept.get("attempts", 0) + (outcome != LOGGED_OUT),',
      '                    kept.get("attempts", 0) + 1,'),
+    # A login failure wrote no transcript, so a saved review keeps its
+    # spent budget; every other ending still starts it over.
+    ("login-keeps-the-repost-budget",
+     "        budget = ({} if outcome == LOGGED_OUT\n"
+     '                  else {"post_tries": 0, "waivers": 0})',
+     '        budget = {"post_tries": 0, "waivers": 0}'),
+    ("login-budget-reset-otherwise",
+     '                  else {"post_tries": 0, "waivers": 0})',
+     "                  else {})"),
+    # Left running, because a neutral close passes a required check.
+    ("login-check-held",
+     "        if outcome == LOGGED_OUT:\n"
+     "            hold_check(key, check,",
+     "        if False:\n"
+     "            hold_check(key, check,"),
+    ("login-hold-leaves-it-running",
+     '              {"output": {\n'
+     '                  "title": "Waiting for Claude to log in",',
+     '              {"status": "completed", "conclusion": "neutral",\n'
+     '               "output": {\n'
+     '                  "title": "Waiting for Claude to log in",'),
+    ("login-hold-title",
+     '                  "title": "Waiting for Claude to log in",',
+     '                  "title": "Reviewing",'),
 ]
 
 
