@@ -787,7 +787,7 @@ DEPLOYMENT = HOME
 #
 # `neutral` renders as a grey mark that cannot block anything, and the
 # count goes in the title where it says something true. It is what every
-# ending gets except the two below, including the four that report nothing
+# ending gets except the three below, including the four that report nothing
 # without being clean: a review whose output could not be read, one killed
 # part way, one that never reached the pull request, and a retry whose
 # posting was the earlier attempt's. finish() names them in one line.
@@ -834,6 +834,21 @@ CHECK_BLOCKED = "failure"
 # state file whether any round found anything is a new field to keep
 # correct for a tick.
 CHECK_CLEAN = "success"
+
+# And a review that never started because Claude could not log in, which is
+# the one ending that asks someone to act. Not CHECK_CONCLUSION: a required
+# check passes on success, neutral or skipped and on nothing else, so closed
+# neutral, the pull request that met the outage became mergeable at a commit
+# nobody had reviewed, and `bad-wallet-client` requires this check. This
+# blocks that merge until a later run at the same commit replaces it.
+#
+# A finished run, not one held open. Holding it open was tried first and
+# undone three ways, because a running check is what sweep_checks() closes
+# as neutral: at every start, at the start of every `--once`, and by a hand
+# run that reused it. Nothing touches a finished one. The price is one
+# finished run per attempt while the outage lasts, about six an hour on
+# the pull request being tried.
+CHECK_LOGGED_OUT = "action_required"
 
 # Characters a review comment may carry. GitHub's own ceiling is 65536 and it
 # refuses the whole review for going over, which on the path that posts the
@@ -3874,35 +3889,6 @@ def retitle_check(label, check, effort, blockers, env):
                              "arrive as one review when it finishes."}}, env)
 
 
-def hold_check(label, check, env):
-    """Leave the indicator running, and say why, while Claude cannot log in.
-
-    Running rather than closed. handle_pr's backstop closes an ending as
-    CHECK_CONCLUSION, and GitHub counts a neutral check as passing a
-    required one, so the pull request that met the outage became mergeable
-    at a commit nobody had reviewed: `bad-wallet-client` requires this
-    check. A running check
-    blocks that merge until the review lands, and the next attempt at this
-    head reuses it through open_check() instead of adding one more entry
-    every LOGIN_RETRY.
-
-    What still closes it is what closes any running one: finish() when the
-    review lands, or sweep_checks() on the next start. A push strands it
-    on a commit the pull request no longer shows, which sweep_checks()
-    records as the limit it already has.
-    """
-    if not check or check.get("closed"):
-        return
-    check_api(label, check["repo"], "check-runs/%s" % check["id"], "PATCH",
-              {"output": {
-                  "title": "Waiting for Claude to log in",
-                  "summary": "Claude could not log in on the machine "
-                             "Vinegar runs on, so this commit is not "
-                             "reviewed yet. Vinegar tries again every %d "
-                             "minutes and reviews it once the login works."
-                             % (LOGIN_RETRY // 60)}}, env)
-
-
 def diff_lines(path, base, env, label):
     """The head-side line numbers the pull request's diff covers, per file.
 
@@ -4685,6 +4671,16 @@ def ended_title(outcome, attempts=0):
         return ("The review failed and will be tried again" if attempts
                 else "The review failed")
     return "The review ran but nothing reached the pull request"
+
+
+def ended_conclusion(outcome):
+    """The conclusion that goes with ended_title()'s title.
+
+    Beside it and called from the same two finallys, for the reason its
+    docstring gives: written out twice, the hand run's copy is the one
+    nothing checks.
+    """
+    return CHECK_LOGGED_OUT if outcome == LOGGED_OUT else CHECK_CONCLUSION
 
 
 def close_check(label, check, title, env, summary="",
@@ -7031,9 +7027,12 @@ def login_failed(key):
     _login_failed_at = time.monotonic()
     log("%s: Claude could not log in. That is not counted as an attempt, "
         "and no review starts for %ds" % (key, LOGIN_RETRY))
+    # Whole or not at all, because the watchdog tells one outage from the
+    # next by this text, and a half-written line read mid-write would push
+    # once for the fragment and again for the whole.
     if not os.path.exists(LOGGED_OUT_PATH):
-        with open(LOGGED_OUT_PATH, "w", encoding="utf-8") as handle:
-            handle.write("since %s, first seen on %s\n" % (utc_stamp(), key))
+        write_atomic(LOGGED_OUT_PATH,
+                     "since %s, first seen on %s\n" % (utc_stamp(), key))
 
 
 def handle_pr(repo, pr, config, state, tokens):
@@ -7402,12 +7401,9 @@ def handle_pr(repo, pr, config, state, tokens):
         # cover the checkout and the review, and by here a full-length
         # review has spent all of that: closing on them was a 401 at the
         # exact moment the indicator most needs finishing.
-        if outcome == LOGGED_OUT:
-            hold_check(key, check,
-                       posting_env(key, config, repo, tokens, env) or env)
-        else:
-            close_check(key, check, ended_title(outcome, attempts),
-                        posting_env(key, config, repo, tokens, env) or env)
+        close_check(key, check, ended_title(outcome, attempts),
+                    posting_env(key, config, repo, tokens, env) or env,
+                    conclusion=ended_conclusion(outcome))
     # A review ran. Whether it ended DONE or FAILED, it spent the minutes
     # this answer is really about, and anything else open on this
     # repository has been waiting through them. A login failure spent a
@@ -7756,7 +7752,7 @@ def main():
                 # happen. handle_pr says the same at more length.
                 close_check(args.pr, hand, ended_title(outcome),
                             posting_env(args.pr, config, repo, tokens, env)
-                            or env)
+                            or env, conclusion=ended_conclusion(outcome))
 
                 # Recorded, always. A manual run is still a review of that
                 # commit, and leaving no trace meant the daemon reviewed the
@@ -7787,10 +7783,14 @@ def main():
                 #
                 # A login failure costs no attempt here either, so a hand
                 # run cannot spend the budget the daemon was told to keep.
+                # Nor does it void a saved review's repost budget, for the
+                # reason handle_pr gives: it wrote no transcript.
+                budget = ({} if outcome == LOGGED_OUT
+                          else {"post_tries": 0, "waivers": 0})
                 remember(state, pr_key(repo, pr), state_entry(
                     pr["headRefOid"], outcome,
                     kept.get("attempts", 0) + (outcome != LOGGED_OUT),
-                    **dict(carry_forward(kept), post_tries=0, waivers=0,
+                    **dict(carry_forward(kept), **budget,
                            unposted=bool(
                                unposted_for(repo, pr, scan=False)[0]),
                            **reviewed_through(covered, pr["headRefOid"],

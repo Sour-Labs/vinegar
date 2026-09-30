@@ -4589,23 +4589,17 @@ vinegar.handle_pr("o/r", _lo_other, CONFIG, {}, {})
 check("a review that ran removes the marker",
       not os.path.exists(vinegar.LOGGED_OUT_PATH), vinegar.LOGGED_OUT_PATH)
 
-# Left running, not closed. A closed check is neutral, and GitHub counts
-# neutral as passing a required check: the pull request that met the
-# outage became mergeable at a commit nobody had reviewed, on a repository
-# that requires this one.
+# Not neutral. GitHub lets a required check pass on neutral, so the pull
+# request that met the outage became mergeable at a commit nobody had
+# reviewed, on a repository that requires this check.
 _lo_title = _indicator_after(vinegar.LOGGED_OUT, 0)
-_lo_patches = [asked for how, _, asked in checked if how == "PATCH"]
+_lo_ends = [asked.get("conclusion") for how, _, asked in checked
+            if how == "PATCH"]
 check("a login failure says so in the checks list",
-      _lo_title == ["Waiting for Claude to log in"], _lo_title)
-check("a login failure leaves the check running, so a required one blocks",
-      _lo_patches and not any(asked.get("status") == "completed"
-                              for asked in _lo_patches), _lo_patches)
-# A hand run cannot leave one running. Under its own VINEGAR_HOME the
-# daemon neither reuses nor sweeps its checks, so it would spin for ever.
-check("a hand run that cannot log in closes its check saying why",
-      vinegar.ended_title(vinegar.LOGGED_OUT)
-      == "Claude could not log in, so the review will run once it can",
-      vinegar.ended_title(vinegar.LOGGED_OUT))
+      _lo_title == ["Claude could not log in, so the review will run once "
+                    "it can"], _lo_title)
+check("a login failure closes the check as one a required check refuses",
+      _lo_ends == ["action_required"], _lo_ends)
 vinegar._login_failed_at = None
 vinegar.forget(vinegar.LOGGED_OUT_PATH)
 del checked[:]
@@ -6227,6 +6221,15 @@ _, _hl_state = _hand_scoped(
 check("a hand run that cannot log in costs no attempt",
       _hl_state.get("attempts") == 1
       and _hl_state.get("outcome") == vinegar.LOGGED_OUT, _hl_state)
+# Nor does it refill a saved review's spent repost budget, the daemon's
+# rule again: it wrote no transcript.
+_, _hp_budget = _hand_scoped(
+    {"outcome": vinegar.FAILED, "sha": NEW_SHA, "attempts": 1,
+     "post_tries": vinegar.MAX_ATTEMPTS, "post_waivers": 2},
+    review=lambda *a, **k: (vinegar.LOGGED_OUT, False, False))
+check("a hand run that cannot log in keeps the saved review's budget",
+      _hp_budget.get("post_tries") == vinegar.MAX_ATTEMPTS
+      and _hp_budget.get("post_waivers") == 2, _hp_budget)
 
 # Refused rather than ignored. `--whole` is read only by the --pr branch,
 # so as a bare flag it was accepted, did nothing, and said nothing: an
@@ -6481,6 +6484,17 @@ check("a hand run opens and finishes the indicator too",
 _hand_failed = _hand_run(lambda *a, **k: (vinegar.FAILED, False, False))
 check("a hand run that failed says so on the indicator",
       _hand_failed == ["The review failed"], _hand_failed)
+# The same refusal as the daemon's. A hand run that met the outage and
+# closed neutral let the commit through wherever the check is required,
+# since the newest run of the name is the one GitHub reads.
+_hand_logged = _hand_run(lambda *a, **k: (vinegar.LOGGED_OUT, False, False))
+_hand_logged_ends = [asked.get("conclusion") for how, _, asked in checked
+                     if how == "PATCH"]
+check("a hand run that cannot log in closes its check as one that blocks",
+      _hand_logged_ends == ["action_required"]
+      and _hand_logged == ["Claude could not log in, so the review will run "
+                           "once it can"],
+      (_hand_logged, _hand_logged_ends))
 
 
 def _hand_interrupted(*a, **k):

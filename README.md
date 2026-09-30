@@ -596,14 +596,15 @@ the heartbeat cannot see that. When a review finds Claude logged out, which
 Claude Code reports as `authentication_failed` in about a second at no cost,
 Vinegar does not count it as one of the three attempts. Instead every review
 waits ten minutes (`LOGIN_RETRY`) and the next one tries again. The pull
-request that met the outage keeps its check running, titled `Waiting for Claude
-to log in`, so where the check is required the merge waits for the review; a
-closed check would be `neutral`, which a required check accepts. Each retry at
-that commit reuses the same running check. Counted, the three attempts ran out
-in under a minute. On the deployment this was written for that happened three
-times between 28 August and 29 September 2026, the login worked again within
-forty minutes on two of them, and three pull requests were merged at the commit
-Vinegar had given up on.
+request that met the outage has its check closed as `action_required`, titled
+`Claude could not log in, so the review will run once it can`. A required check
+refuses that, so the merge waits for a later run at the same commit; a
+`neutral` close would have let it through. Each attempt adds one such run to
+the pull request it tried, about six an hour. Counted, the three attempts ran
+out in under a minute. On the deployment this was written for that happened
+three times between 28 August and 29 September 2026, the login worked again
+within forty minutes on two of them, and three pull requests were merged at the
+commit Vinegar had given up on.
 
 Vinegar also writes `~/.vinegar/logged-out` with the time the outage began, and
 the watchdog's next pass sends one ntfy push about it. Vinegar removes the file
@@ -1333,15 +1334,14 @@ When the review ends, the same entry carries the tally the comment carries:
 `The review failed 3 times and was given up on`.
 
 **It fails when the review found a blocker, and passes only when the review
-found nothing.** Every other ending is `neutral`, a grey mark that cannot block
-a merge even where the check is required, because a green tick on a pull
-request carrying twelve findings is a statement nobody made and the tick is
-what people read.
+found nothing.** Every other ending except a login failure, below, is
+`neutral`, a grey mark that cannot block a merge even where the check is
+required, because a green tick on a pull request carrying twelve findings is a
+statement nobody made and the tick is what people read.
 
-**One wait is not an ending.** While Claude cannot log in, the check is left
-running as `Waiting for Claude to log in` rather than closed, because a
-`neutral` close would let a required check pass a commit nobody reviewed. See
-"Watching the watcher" for the rest of that case.
+**A login failure blocks a merge too.** It closes as `action_required`,
+because a `neutral` close would let a required check pass a commit nobody
+reviewed. See "Watching the watcher" for the rest of that case.
 
 A blocker is a finding the severity pass tiered `blocker`, the same count the
 title shows. The check fails on every ending that carries one: a review killed

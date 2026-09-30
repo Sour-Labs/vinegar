@@ -1220,10 +1220,10 @@ MUTATIONS = [
      '    return "The review ran but nothing reached the pull request"',
      '    return "The review finished"'),
     ("check-closed-on-fresh-credentials",
-     "            close_check(key, check, ended_title(outcome, attempts),\n"
-     "                        posting_env(key, config, repo, tokens, env) "
-     "or env)",
-     "            close_check(key, check, ended_title(outcome, attempts), env)"),
+     "        close_check(key, check, ended_title(outcome, attempts),\n"
+     "                    posting_env(key, config, repo, tokens, env) or env,\n",
+     "        close_check(key, check, ended_title(outcome, attempts),\n"
+     "                    env,\n"),
     # Not the extraction, which changes no behaviour and so nothing can
     # catch: the format itself, which GitHub rejects the update over.
     ("utc-stamp-format",
@@ -2387,14 +2387,14 @@ MUTATIONS = [
     # review that ran.
     ("login-marker-written",
      "    if not os.path.exists(LOGGED_OUT_PATH):\n"
-     '        with open(LOGGED_OUT_PATH, "w", encoding="utf-8") as handle:',
+     "        write_atomic(LOGGED_OUT_PATH,",
      "    if False:\n"
-     '        with open(LOGGED_OUT_PATH, "w", encoding="utf-8") as handle:'),
+     "        write_atomic(LOGGED_OUT_PATH,"),
     ("login-marker-once",
      "    if not os.path.exists(LOGGED_OUT_PATH):\n"
-     '        with open(LOGGED_OUT_PATH, "w", encoding="utf-8") as handle:',
+     "        write_atomic(LOGGED_OUT_PATH,",
      "    if True:\n"
-     '        with open(LOGGED_OUT_PATH, "w", encoding="utf-8") as handle:'),
+     "        write_atomic(LOGGED_OUT_PATH,"),
     ("login-marker-text",
      '"since %s, first seen on %s\\n" % (utc_stamp(), key)',
      '"\\n"'),
@@ -2419,23 +2419,30 @@ MUTATIONS = [
      '                  else {"post_tries": 0, "waivers": 0})',
      '        budget = {"post_tries": 0, "waivers": 0}'),
     ("login-budget-reset-otherwise",
+     "        budget = ({} if outcome == LOGGED_OUT\n"
      '                  else {"post_tries": 0, "waivers": 0})',
+     "        budget = ({} if outcome == LOGGED_OUT\n"
      "                  else {})"),
-    # Left running, because a neutral close passes a required check.
-    ("login-check-held",
-     "        if outcome == LOGGED_OUT:\n"
-     "            hold_check(key, check,",
-     "        if False:\n"
-     "            hold_check(key, check,"),
-    ("login-hold-leaves-it-running",
-     '              {"output": {\n'
-     '                  "title": "Waiting for Claude to log in",',
-     '              {"status": "completed", "conclusion": "neutral",\n'
-     '               "output": {\n'
-     '                  "title": "Waiting for Claude to log in",'),
-    ("login-hold-title",
-     '                  "title": "Waiting for Claude to log in",',
-     '                  "title": "Reviewing",'),
+    ("login-hand-run-keeps-the-budget",
+     "                budget = ({} if outcome == LOGGED_OUT\n"
+     '                          else {"post_tries": 0, "waivers": 0})',
+     '                budget = {"post_tries": 0, "waivers": 0}'),
+    # Closed as one a required check refuses, because neutral passes it.
+    # The value, the one place that picks it, and both finallys.
+    ("login-conclusion-value",
+     'CHECK_LOGGED_OUT = "action_required"',
+     'CHECK_LOGGED_OUT = "neutral"'),
+    ("login-conclusion-chosen",
+     "    return CHECK_LOGGED_OUT if outcome == LOGGED_OUT else "
+     "CHECK_CONCLUSION",
+     "    return CHECK_CONCLUSION"),
+    ("login-conclusion-daemon",
+     "or env,\n"
+     "                    conclusion=ended_conclusion(outcome))",
+     "or env)"),
+    ("login-conclusion-hand-run",
+     "                            or env, conclusion=ended_conclusion(outcome))",
+     "                            or env)"),
 ]
 
 
