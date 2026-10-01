@@ -275,12 +275,13 @@ DONE, FAILED = "reviewed", "failed"
 
 # The third ending: Claude could not log in, so nothing ran and nothing was
 # spent. Not FAILED, because MAX_ATTEMPTS cannot outlast it. The three
-# attempts run seconds apart, so a login that failed for ten minutes gave
+# attempts ran seconds apart, so a login that failed for ten minutes gave
 # up on every pull request that came up inside them, and three pull
 # requests given up on that way in August 2026 were merged at the commit
 # nobody reviewed. Twice out of three times the login worked again within
-# forty minutes with no restart. So it costs no attempt, and every review
-# waits LOGIN_RETRY seconds before the next one tries.
+# forty minutes with no restart, and FAILED_RETRY spaces the three over
+# only twenty. So it costs no attempt, and every review waits LOGIN_RETRY
+# seconds before the next one tries.
 LOGGED_OUT = "logged out"
 LOGIN_RETRY = 600
 
@@ -297,6 +298,16 @@ POSTED, REFUSED, THROTTLED, UNSURE = "posted", "refused", "throttled", "unsure"
 # point is to survive a rate-limit window without turning a permanent failure
 # into a review every minute forever.
 MAX_ATTEMPTS = 3
+
+# How long a FAILED pull request waits before it is tried again at the same
+# head. A failed review still ends its repository's turn and leaves it due at
+# once, so without this the next turn found the same pull request and the
+# three attempts ran back to back, all spent in under a minute: every give-up
+# in the deployment's log so far. Ten minutes apart they span twenty, the
+# length of the login outages measured (which now wait on LOGIN_RETRY
+# instead), and a blip like the 529 that wonky-flow#124 recovered from on an
+# immediate retry costs only the wait.
+FAILED_RETRY = 600
 
 # Seconds of token life reserved for the checkout, on top of the review's own
 # budget. One token covers both and the checkout runs first: a clone of a
@@ -7014,6 +7025,11 @@ def record_once(state, key, done, head, outcome, reason):
 # is let two reviews find the login broken in the same second, for nothing.
 _login_failed_at = None
 
+# When each pull request's last attempt ended FAILED, by key, on the same
+# clock and in memory for the same reason. Each key is written only by the
+# worker holding that pull request's repository.
+_failed_at = {}
+
 
 def login_failed(key):
     """Hold every review back for LOGIN_RETRY, and leave the watchdog its
@@ -7207,6 +7223,14 @@ def handle_pr(repo, pr, config, state, tokens):
             and time.monotonic() - _login_failed_at < LOGIN_RETRY):
         return False
 
+    # A failed attempt waits FAILED_RETRY before the next one, and only at
+    # the head that failed. A push is new work, and holding it back would
+    # delay a review the failure says nothing about.
+    if (done.get("outcome") == FAILED and done.get("sha") == head
+            and key in _failed_at
+            and time.monotonic() - _failed_at[key] < FAILED_RETRY):
+        return False
+
     # Credentials are minted here, once a review is actually going to happen,
     # rather than for every pull request the pass looks at.
     #
@@ -7386,6 +7410,11 @@ def handle_pr(repo, pr, config, state, tokens):
         elif outcome == DONE and os.path.exists(LOGGED_OUT_PATH):
             log("%s: Claude can log in again" % key)
             forget(LOGGED_OUT_PATH)
+
+        if outcome == FAILED and attempts < MAX_ATTEMPTS:
+            _failed_at[key] = time.monotonic()
+            log("%s: attempt %d of %d failed, and the next waits at least "
+                "%ds" % (key, attempts, MAX_ATTEMPTS, FAILED_RETRY))
 
         if outcome == FAILED and attempts >= MAX_ATTEMPTS:
             # Marked only if it was said, so the restart path knows.

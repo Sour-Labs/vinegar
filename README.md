@@ -255,7 +255,8 @@ is not always a public model id. `claude-opus-5-5[1m]` selects a routing
 variant, and nothing promises a variant keeps answering across Claude Code
 releases or account changes. When one stops, every review comes back the same
 way: a result event carrying `api_error_status` 404, about a second in, having
-spent nothing. Vinegar retries three times and gives up. It says so on each
+spent nothing. Vinegar retries three times, about ten minutes apart
+(`FAILED_RETRY`), and gives up. It says so on each
 pull request, so the failure is visible rather than silent, but no pull
 request in any repository it polls gets reviewed until somebody fixes the
 config.
@@ -601,7 +602,8 @@ request that met the outage has its check closed as `action_required`, titled
 refuses that, so the merge waits for a later run at the same commit; a
 `neutral` close would have let it through. Each attempt adds one such run to
 the pull request it tried, about six an hour. Counted, the three attempts ran
-out in under a minute. On the deployment this was written for that happened
+out in under a minute, and even ten minutes apart they last only twenty. On
+the deployment this was written for that happened
 three times between 28 August and 29 September 2026, the login worked again
 within forty minutes on two of them, and three pull requests were merged at the
 commit Vinegar had given up on.

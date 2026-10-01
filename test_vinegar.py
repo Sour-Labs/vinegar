@@ -269,6 +269,7 @@ def reset_stubs():
     # Left set, every handle_pr in the next section returns before its
     # review runs, and its checks pass or fail about a review nobody made.
     vinegar._login_failed_at = None
+    vinegar._failed_at.clear()
     del posted[:]
     del looked[:]
     del checked[:]
@@ -4353,6 +4354,9 @@ def _indicator_after(what, attempts, closes=None):
     vinegar.review = review_stub
     state = {L: {"outcome": vinegar.FAILED, "sha": PR_LIVE["headRefOid"],
                  "attempts": attempts}} if attempts else {}
+    # The entry stands for attempts made long enough ago, so a wait left by
+    # the previous call must not hold this one back.
+    vinegar._failed_at.clear()
     vinegar.handle_pr("o/r", PR_LIVE, CHK_CONFIG, state, {})
     return [asked["output"]["title"] for how, _, asked in checked
             if how == "PATCH"]
@@ -4501,6 +4505,40 @@ vinegar.checkout = _ans_kept
 check("nor does a checkout that failed, whose retry is unbounded",
       _ans_broken is False, _ans_broken)
 
+# A failed review is retried, but not in the same minute. Its repository is
+# due again at once, so the next turn found the same pull request at the
+# same head and tried again, and the three attempts ran out in under a
+# minute: every give-up in the deployment's log, issue #39.
+vinegar._failed_at.clear()
+_fr_ran = []
+vinegar.review = lambda *a, **k: _fr_ran.append(1) or (vinegar.FAILED, False,
+                                                        False)
+_fr_state = {}
+_fr_log = []
+vinegar.log = lambda m: _fr_log.append(m)
+_fr_said = vinegar.handle_pr("o/r", PR_LIVE, CONFIG, _fr_state, {})
+vinegar.handle_pr("o/r", PR_LIVE, CONFIG, _fr_state, {})
+vinegar.log = lambda message: None
+# False would carry the turn on to the next pull request's review, after a
+# failure that can come twenty minutes into this one.
+check("a failed review still ends the turn",
+      _fr_said is True, _fr_said)
+check("a failed review is not tried again at once",
+      len(_fr_ran) == 1 and _fr_state[L].get("attempts") == 1,
+      (_fr_ran, _fr_state))
+check("the log says when the next attempt can come",
+      any("attempt 1 of %d failed" % vinegar.MAX_ATTEMPTS in m
+          and "%ds" % vinegar.FAILED_RETRY in m for m in _fr_log), _fr_log)
+vinegar._failed_at[L] = time.monotonic() - vinegar.FAILED_RETRY - 1
+vinegar.handle_pr("o/r", PR_LIVE, CONFIG, _fr_state, {})
+check("a failed review is tried again after FAILED_RETRY",
+      len(_fr_ran) == 2 and _fr_state[L].get("attempts") == 2,
+      (_fr_ran, _fr_state))
+vinegar.handle_pr("o/r", dict(PR_LIVE, headRefOid="c3d4e5f6a7b8"), CONFIG,
+                  _fr_state, {})
+check("a push after a failed review is reviewed at once",
+      len(_fr_ran) == 3, (_fr_ran, _fr_state))
+
 # A login failure through handle_pr. The attempt it was charged before the
 # review ran is handed back, every review waits LOGIN_RETRY, and the
 # watchdog is left its marker.
@@ -4515,6 +4553,7 @@ vinegar.review = lambda *a, **k: _lo_ran.append(1) or (_lo_answer[0], False,
 # reviewed only because its author pushed again.
 _lo_state = {L: {"outcome": vinegar.FAILED, "sha": PR["headRefOid"],
                  "attempts": vinegar.MAX_ATTEMPTS - 1}}
+vinegar._failed_at.clear()
 del posted[:]
 _lo_said = vinegar.handle_pr("o/r", PR_LIVE, CONFIG, _lo_state, {})
 check("a login failure hands back the attempt it was charged",
@@ -4806,6 +4845,7 @@ check("a dry run's give-up counts as said, not as a silence",
 # retrying costs no subscription, so the noise is what was worth fixing.
 _ck_state = {L: {"outcome": vinegar.FAILED, "sha": PR["headRefOid"],
                  "attempts": 2}}
+vinegar._failed_at.clear()
 _ck_log = []
 vinegar.review = lambda *a, **k: (vinegar.DONE, True, True)
 vinegar.save_state = lambda st: None
