@@ -427,11 +427,9 @@ MUTATIONS = [
     # again immediately, so a cheap ending that repeats is polled as fast
     # as the machine can go with `poll_interval` never consulted.
     ("turn-answers-reviewed",
-     "    # A review ran. Whether it ended DONE or FAILED, it spent the "
-     "minutes\n"
-     "    # this answer is really about, and anything else open on this\n"
-     "    # repository has been waiting through them.\n"
-     "    return True\n",
+     "    # repository has been waiting through them. A login failure spent a\n"
+     "    # few seconds, and True would put the repository back due at once.\n"
+     "    return outcome != LOGGED_OUT\n",
      "    return False\n"),
     ("handle-skip-is-not-work",
      '        record_once(state, key, done, head, "skipped", '
@@ -1223,8 +1221,9 @@ MUTATIONS = [
      '    return "The review finished"'),
     ("check-closed-on-fresh-credentials",
      "        close_check(key, check, ended_title(outcome, attempts),\n"
-     "                    posting_env(key, config, repo, tokens, env) or env)",
-     "        close_check(key, check, ended_title(outcome, attempts), env)"),
+     "                    posting_env(key, config, repo, tokens, env) or env,\n",
+     "        close_check(key, check, ended_title(outcome, attempts),\n"
+     "                    env,\n"),
     # Not the extraction, which changes no behaviour and so nothing can
     # catch: the format itself, which GitHub rejects the update over.
     ("utc-stamp-format",
@@ -2339,6 +2338,111 @@ MUTATIONS = [
     ("reserve-counts-nothing-when-triage-is-off",
      '                             if config["triage_model"] else 0)',
      "                             if True else 0)"),
+
+    # --- a login that fails, which is not a failed review ---------------
+    # Three attempts seconds apart cannot outlast it, and three pull
+    # requests given up on that way were merged at the commit nobody
+    # reviewed.
+    ("login-detected",
+     "                return LOGGED_OUT, False, False",
+     "                return FAILED, False, False"),
+    ("login-reads-the-field",
+     '                and event.get("error") == "authentication_failed"):',
+     '                and event.get("error")):'),
+    ("login-not-a-subagent",
+     '                and not event.get("parent_tool_use_id")\n'
+     '                and event.get("error")',
+     '                and event.get("error")'),
+    # Free, like unroutable(), or it counts.
+    ("login-is-free-only",
+     '            if (output.get("total_cost_usd") == 0\n'
+     "                    and logged_out(result.stdout)):",
+     "            if logged_out(result.stdout):"),
+    ("login-hands-back-attempt",
+     "        if outcome == LOGGED_OUT:\n"
+     "            attempts -= 1",
+     "        if outcome == LOGGED_OUT:\n"
+     "            pass"),
+    ("login-answers-no-review",
+     "    return outcome != LOGGED_OUT",
+     "    return True"),
+    ("login-holds-every-review",
+     "    if (_login_failed_at is not None\n"
+     "            and time.monotonic() - _login_failed_at < LOGIN_RETRY):\n"
+     "        return False",
+     "    pass"),
+    ("login-wait-ends",
+     "            and time.monotonic() - _login_failed_at < LOGIN_RETRY):",
+     "            and LOGIN_RETRY):"),
+    ("login-retry-value", "LOGIN_RETRY = 600", "LOGIN_RETRY = 0"),
+    ("login-sets-the-wait",
+     "    _login_failed_at = time.monotonic()",
+     "    _login_failed_at = None"),
+    ("login-failed-called",
+     "        if outcome == LOGGED_OUT:\n"
+     "            login_failed(key)",
+     "        if False:\n"
+     "            login_failed(key)"),
+    # The watchdog's half: written, written once, and cleared only by a
+    # review that ran.
+    ("login-marker-written",
+     "    if not os.path.exists(LOGGED_OUT_PATH):\n"
+     "        write_atomic(LOGGED_OUT_PATH,",
+     "    if False:\n"
+     "        write_atomic(LOGGED_OUT_PATH,"),
+    ("login-marker-once",
+     "    if not os.path.exists(LOGGED_OUT_PATH):\n"
+     "        write_atomic(LOGGED_OUT_PATH,",
+     "    if True:\n"
+     "        write_atomic(LOGGED_OUT_PATH,"),
+    ("login-marker-text",
+     '"since %s, first seen on %s\\n" % (utc_stamp(), key)',
+     '"\\n"'),
+    ("login-marker-cleared",
+     "            forget(LOGGED_OUT_PATH)",
+     "            pass"),
+    ("login-marker-kept-on-failed",
+     "        elif outcome == DONE and os.path.exists(LOGGED_OUT_PATH):",
+     "        elif os.path.exists(LOGGED_OUT_PATH):"),
+    ("login-title",
+     "    if outcome == LOGGED_OUT:\n"
+     '        return "Claude could not log in',
+     "    if False:\n"
+     '        return "Claude could not log in'),
+    ("login-hand-run-no-attempt",
+     '                    kept.get("attempts", 0) + (outcome != LOGGED_OUT),',
+     '                    kept.get("attempts", 0) + 1,'),
+    # A login failure wrote no transcript, so a saved review keeps its
+    # spent budget; every other ending still starts it over.
+    ("login-keeps-the-repost-budget",
+     "        budget = ({} if outcome == LOGGED_OUT\n"
+     '                  else {"post_tries": 0, "waivers": 0})',
+     '        budget = {"post_tries": 0, "waivers": 0}'),
+    ("login-budget-reset-otherwise",
+     "        budget = ({} if outcome == LOGGED_OUT\n"
+     '                  else {"post_tries": 0, "waivers": 0})',
+     "        budget = ({} if outcome == LOGGED_OUT\n"
+     "                  else {})"),
+    ("login-hand-run-keeps-the-budget",
+     "                budget = ({} if outcome == LOGGED_OUT\n"
+     '                          else {"post_tries": 0, "waivers": 0})',
+     '                budget = {"post_tries": 0, "waivers": 0}'),
+    # Closed as one a required check refuses, because neutral passes it.
+    # The value, the one place that picks it, and both finallys.
+    ("login-conclusion-value",
+     'CHECK_LOGGED_OUT = "action_required"',
+     'CHECK_LOGGED_OUT = "neutral"'),
+    ("login-conclusion-chosen",
+     "    return CHECK_LOGGED_OUT if outcome == LOGGED_OUT else "
+     "CHECK_CONCLUSION",
+     "    return CHECK_CONCLUSION"),
+    ("login-conclusion-daemon",
+     "or env,\n"
+     "                    conclusion=ended_conclusion(outcome))",
+     "or env)"),
+    ("login-conclusion-hand-run",
+     "                            or env, conclusion=ended_conclusion(outcome))",
+     "                            or env)"),
 ]
 
 

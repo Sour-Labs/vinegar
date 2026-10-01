@@ -130,6 +130,13 @@ HOME = os.path.abspath(
 STATE_PATH = os.path.join(HOME, "state.json")
 LOCK_PATH = os.path.join(HOME, "vinegar.pid")
 REVIEW_DIR = os.path.join(HOME, "reviews")
+# There while Claude cannot log in, for watchdog.sh to push about. A file
+# rather than a push from here, because the watchdog already owns the ntfy
+# topic and this program has no copy of it. Removed only by a review that
+# ran, so it means "no review has worked since the login failed", which
+# stays true across a restart and across a pull request closed while it
+# waited.
+LOGGED_OUT_PATH = os.path.join(HOME, "logged-out")
 
 # What `reviewed_sha` has to look like before anything diffs from it.
 #
@@ -263,8 +270,19 @@ EFFORTS = ("low", "medium", "high", "xhigh", "max")
 # What a review attempt settled. DONE means the subscription was spent, whether
 # or not findings came back, so the pull request is closed off. FAILED means it
 # never got that far, which is the case worth retrying: an exhausted rate
-# limit, a logged-out CLI, a model name that does not exist.
+# limit, a model name that does not exist.
 DONE, FAILED = "reviewed", "failed"
+
+# The third ending: Claude could not log in, so nothing ran and nothing was
+# spent. Not FAILED, because MAX_ATTEMPTS cannot outlast it. The three
+# attempts run seconds apart, so a login that failed for ten minutes gave
+# up on every pull request that came up inside them, and three pull
+# requests given up on that way in August 2026 were merged at the commit
+# nobody reviewed. Twice out of three times the login worked again within
+# forty minutes with no restart. So it costs no attempt, and every review
+# waits LOGIN_RETRY seconds before the next one tries.
+LOGGED_OUT = "logged out"
+LOGIN_RETRY = 600
 
 # What one posting attempt settled. Named rather than True/False/None,
 # because the caller has four distinct moves to make and three of these
@@ -769,7 +787,7 @@ DEPLOYMENT = HOME
 #
 # `neutral` renders as a grey mark that cannot block anything, and the
 # count goes in the title where it says something true. It is what every
-# ending gets except the two below, including the four that report nothing
+# ending gets except the three below, including the four that report nothing
 # without being clean: a review whose output could not be read, one killed
 # part way, one that never reached the pull request, and a retry whose
 # posting was the earlier attempt's. finish() names them in one line.
@@ -816,6 +834,21 @@ CHECK_BLOCKED = "failure"
 # state file whether any round found anything is a new field to keep
 # correct for a tick.
 CHECK_CLEAN = "success"
+
+# And a review that never started because Claude could not log in, which is
+# the one ending that asks someone to act. Not CHECK_CONCLUSION: a required
+# check passes on success, neutral or skipped and on nothing else, so closed
+# neutral, the pull request that met the outage became mergeable at a commit
+# nobody had reviewed, and `bad-wallet-client` requires this check. This
+# blocks that merge until a later run at the same commit replaces it.
+#
+# A finished run, not one held open. Holding it open was tried first and
+# undone three ways, because a running check is what sweep_checks() closes
+# as neutral: at every start, at the start of every `--once`, and by a hand
+# run that reused it. Nothing touches a finished one. The price is one
+# finished run per attempt while the outage lasts, about six an hour on
+# the pull request being tried.
+CHECK_LOGGED_OUT = "action_required"
 
 # Characters a review comment may carry. GitHub's own ceiling is 65536 and it
 # refuses the whole review for going over, which on the path that posts the
@@ -4630,12 +4663,24 @@ def ended_title(outcome, attempts=0):
     it takes the grey default, which is the right answer for every ending
     that reaches it.
     """
+    if outcome == LOGGED_OUT:
+        return "Claude could not log in, so the review will run once it can"
     if outcome == FAILED and attempts >= MAX_ATTEMPTS:
         return "The review failed %d times and was given up on" % attempts
     if outcome == FAILED:
         return ("The review failed and will be tried again" if attempts
                 else "The review failed")
     return "The review ran but nothing reached the pull request"
+
+
+def ended_conclusion(outcome):
+    """The conclusion that goes with ended_title()'s title.
+
+    Beside it and called from the same two finallys, for the reason its
+    docstring gives: written out twice, the hand run's copy is the one
+    nothing checks.
+    """
+    return CHECK_LOGGED_OUT if outcome == LOGGED_OUT else CHECK_CONCLUSION
 
 
 def close_check(label, check, title, env, summary="",
@@ -5619,6 +5664,37 @@ def unroutable(output, findings):
             and output.get("total_cost_usd") == 0)
 
 
+def logged_out(stdout):
+    """Did that attempt stop because Claude could not log in?
+
+    Read off the field and not the words. When the login fails, Claude Code
+    writes an assistant event in place of an answer and marks it `error:
+    "authentication_failed"`. The text beside it depends on why: the
+    daemon's three outages said "OAuth session expired and could not be
+    refreshed", and a token that is simply wrong says "API Error: 401
+    OAuth access token is invalid". The field was read in a stream from
+    Claude Code 2.1.284, and in the session record a failed review of the
+    daemon's left on 2.1.283.
+
+    A subagent's event is not the review's, for the reason read_stream()
+    gives, and a subagent that fails to log in part way through a review
+    has not stopped the review from spending.
+    """
+    for line in stream_lines(stdout):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if (event.get("type") == "assistant"
+                and not event.get("parent_tool_use_id")
+                and event.get("error") == "authentication_failed"):
+            return True
+    return False
+
+
 def review(path, repo, pr, config, env, tokens, resent=False, check=None,
            since=None, blockers=False):
     """Run one review and post it. Answers the outcome and whether it covered.
@@ -6078,6 +6154,12 @@ def review(path, repo, pr, config, env, tokens, resent=False, check=None,
         log("%s: review failed after %ds%s: %s" % (
             label, took, spent, text[:400]))
         if findings is None:
+            # Free, like unroutable(), or it is FAILED. A login lost part
+            # way through a review has spent the review, and nothing here
+            # re-buys one without MAX_ATTEMPTS counting it.
+            if (output.get("total_cost_usd") == 0
+                    and logged_out(result.stdout)):
+                return LOGGED_OUT, False, False
             keep(label, repo, pr, spoken, "the review failed")
             return FAILED, False, False
         log("%s: it failed with %d finding(s) already reported, so those are "
@@ -6926,6 +7008,33 @@ def record_once(state, key, done, head, outcome, reason):
     remember(state, key, entry)
 
 
+# When a review last found Claude unable to log in, on the monotonic clock,
+# or None. In memory, because a restart is exactly when trying again at once
+# is right. The poll workers share it without a lock: the worst a race does
+# is let two reviews find the login broken in the same second, for nothing.
+_login_failed_at = None
+
+
+def login_failed(key):
+    """Hold every review back for LOGIN_RETRY, and leave the watchdog its
+    marker.
+
+    The marker is written once and then left alone, so the watchdog can
+    tell an outage it has already pushed about from a new one by whether
+    the file is there, and its first line keeps when this one began.
+    """
+    global _login_failed_at
+    _login_failed_at = time.monotonic()
+    log("%s: Claude could not log in. That is not counted as an attempt, "
+        "and no review starts for %ds" % (key, LOGIN_RETRY))
+    # Whole or not at all, because the watchdog tells one outage from the
+    # next by this text, and a half-written line read mid-write would push
+    # once for the fragment and again for the whole.
+    if not os.path.exists(LOGGED_OUT_PATH):
+        write_atomic(LOGGED_OUT_PATH,
+                     "since %s, first seen on %s\n" % (utc_stamp(), key))
+
+
 def handle_pr(repo, pr, config, state, tokens):
     """Everything one pull request needs, and whether that was a review.
 
@@ -7090,6 +7199,14 @@ def handle_pr(repo, pr, config, state, tokens):
         record_once(state, key, done, head, "skipped", "skipped, %s" % reason)
         return False
 
+    # The login is this machine's, not this pull request's, so one failure
+    # holds every review back rather than each one finding out for itself
+    # a minute apart. Nothing is said or recorded here: login_failed() has
+    # said it once for all of them, and the entry keeps what it had.
+    if (_login_failed_at is not None
+            and time.monotonic() - _login_failed_at < LOGIN_RETRY):
+        return False
+
     # Credentials are minted here, once a review is actually going to happen,
     # rather than for every pull request the pass looks at.
     #
@@ -7233,23 +7350,42 @@ def handle_pr(repo, pr, config, state, tokens):
             log("%s: the review did not complete: %s" % (key, err))
             outcome, covered, reached = FAILED, False, False
 
+        # Handed back, because the marker above charged it before anything
+        # ran. Kept, a login broken for the length of three polls spends
+        # every budget it meets, which is the give-up LOGGED_OUT exists to
+        # prevent.
+        if outcome == LOGGED_OUT:
+            attempts -= 1
+
         # Recorded with whether a saved review is waiting behind it, so the
         # next poll can find that out without listing a directory.
         # post_tries reset: this review writes its own transcript over any
         # saved one, so the budget that governed the old copy is void. Kept,
         # it met the new marker already spent and nothing would repost or
         # forget it.
+        # Not after a login failure, which wrote no transcript: the saved
+        # review is the old one and its budget is still its own. Reset
+        # there, a saved review GitHub keeps refusing was sent three more
+        # times every LOGIN_RETRY for as long as the outage lasted.
         # The marker says a review is waiting to be sent. It does not say
         # the author saw nothing, which is what the round count needs and
         # what review() now answers: finish() writes the marker only when
         # the transcript write succeeded, so a run that could neither save
         # nor post leaves none and was counted as a round nobody saw.
+        budget = ({} if outcome == LOGGED_OUT
+                  else {"post_tries": 0, "waivers": 0})
         remember(state, key, state_entry(
             head, outcome, attempts,
-            **dict(carry_forward(kept), post_tries=0, waivers=0,
+            **dict(carry_forward(kept), **budget,
                    unposted=os.path.exists(unposted_path(repo, pr)),
                    **reviewed_through(covered, head, done),
                    **rounds_done(reached, done))))
+
+        if outcome == LOGGED_OUT:
+            login_failed(key)
+        elif outcome == DONE and os.path.exists(LOGGED_OUT_PATH):
+            log("%s: Claude can log in again" % key)
+            forget(LOGGED_OUT_PATH)
 
         if outcome == FAILED and attempts >= MAX_ATTEMPTS:
             # Marked only if it was said, so the restart path knows.
@@ -7266,11 +7402,13 @@ def handle_pr(repo, pr, config, state, tokens):
         # review has spent all of that: closing on them was a 401 at the
         # exact moment the indicator most needs finishing.
         close_check(key, check, ended_title(outcome, attempts),
-                    posting_env(key, config, repo, tokens, env) or env)
+                    posting_env(key, config, repo, tokens, env) or env,
+                    conclusion=ended_conclusion(outcome))
     # A review ran. Whether it ended DONE or FAILED, it spent the minutes
     # this answer is really about, and anything else open on this
-    # repository has been waiting through them.
-    return True
+    # repository has been waiting through them. A login failure spent a
+    # few seconds, and True would put the repository back due at once.
+    return outcome != LOGGED_OUT
 
 
 def find_pr(repo, number, env):
@@ -7614,7 +7752,7 @@ def main():
                 # happen. handle_pr says the same at more length.
                 close_check(args.pr, hand, ended_title(outcome),
                             posting_env(args.pr, config, repo, tokens, env)
-                            or env)
+                            or env, conclusion=ended_conclusion(outcome))
 
                 # Recorded, always. A manual run is still a review of that
                 # commit, and leaving no trace meant the daemon reviewed the
@@ -7631,20 +7769,28 @@ def main():
                 was = state.get(pr_key(repo, pr), {})
                 kept = was if was.get("sha") == pr["headRefOid"] else {}
                 # The outcome the review actually reached, not DONE. Writing
-                # DONE for a run that never got that far — a rate-limit
-                # window, a logged-out CLI — closed the pull request off for
-                # good: the daemon returns at the DONE check and, with
+                # DONE for a run that never got that far, a rate-limit window
+                # or a logged-out CLI, closed the pull request off for good:
+                # the daemon returns at the DONE check and, with
                 # review_on_push false, never looks again. FAILED is what
-                # MAX_ATTEMPTS is for.
+                # MAX_ATTEMPTS is for, and LOGGED_OUT is outside it.
                 #
                 # And a fresh review voids any earlier saved one's budget,
                 # because this run writes its own transcript over it. Carried
                 # forward, a spent post_tries met the new marker at 3 of 3,
                 # so neither the repost branch nor the forget branch fired
                 # and the review sat on disk for ever.
+                #
+                # A login failure costs no attempt here either, so a hand
+                # run cannot spend the budget the daemon was told to keep.
+                # Nor does it void a saved review's repost budget, for the
+                # reason handle_pr gives: it wrote no transcript.
+                budget = ({} if outcome == LOGGED_OUT
+                          else {"post_tries": 0, "waivers": 0})
                 remember(state, pr_key(repo, pr), state_entry(
-                    pr["headRefOid"], outcome, kept.get("attempts", 0) + 1,
-                    **dict(carry_forward(kept), post_tries=0, waivers=0,
+                    pr["headRefOid"], outcome,
+                    kept.get("attempts", 0) + (outcome != LOGGED_OUT),
+                    **dict(carry_forward(kept), **budget,
                            unposted=bool(
                                unposted_for(repo, pr, scan=False)[0]),
                            **reviewed_through(covered, pr["headRefOid"],
