@@ -2443,6 +2443,40 @@ MUTATIONS = [
     ("login-conclusion-hand-run",
      "                            or env, conclusion=ended_conclusion(outcome))",
      "                            or env)"),
+
+    # --- a failed review waits before its next attempt ------------------
+    # Retried at once, the three attempts were spent in under a minute,
+    # which is every give-up in the deployment's log (issue #39).
+    ("failed-retry-holds",
+     "            and key in _failed_at\n"
+     "            and time.monotonic() - _failed_at[key] < FAILED_RETRY):\n"
+     "        return False",
+     "            and key in _failed_at\n"
+     "            and time.monotonic() - _failed_at[key] < FAILED_RETRY):\n"
+     "        pass"),
+    ("failed-retry-wait-ends",
+     "            and time.monotonic() - _failed_at[key] < FAILED_RETRY):",
+     "            and FAILED_RETRY):"),
+    ("failed-retry-value", "FAILED_RETRY = 600", "FAILED_RETRY = 0"),
+    ("failed-retry-recorded",
+     "            _failed_at[key] = time.monotonic()",
+     "            pass"),
+    # A push is new work and is reviewed at once.
+    ("failed-retry-same-head-only",
+     '    if (done.get("outcome") == FAILED and done.get("sha") == head\n'
+     "            and key in _failed_at",
+     '    if (done.get("outcome") == FAILED\n'
+     "            and key in _failed_at"),
+    ("failed-retry-logged",
+     '            log("%s: attempt %d of %d failed, and the next waits at '
+     'least "',
+     '            (lambda *a: None)("%s: attempt %d of %d failed, and the '
+     'next waits at least "'),
+    # The wait is what spaces the attempts, so the turn still ends on a
+    # failed review rather than going on to review the next pull request.
+    ("failed-review-ends-the-turn",
+     "    return outcome != LOGGED_OUT",
+     "    return outcome == DONE"),
 ]
 
 
