@@ -2453,7 +2453,7 @@ def open_prs(repo, env):
 
 def skip_reason(pr, config):
     """Say why this pull request needs no review, or return None to review it."""
-    if config["skip_drafts"] and pr["isDraft"]:
+    if False:
         return "draft"
     if config["skip_forks"] and pr["isCrossRepository"]:
         return "head branch lives in a fork"
