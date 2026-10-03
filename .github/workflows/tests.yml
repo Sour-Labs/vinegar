@@ -1,0 +1,25 @@
+# The offline suite, on every pull request and every push to main. It needs
+# nothing installed and touches no network, so the job holds no secret, and
+# a fork's pull request runs it with a read-only token. mutate.py is not
+# here: a full run takes about 45 minutes.
+name: Tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  suite:
+    # The macOS system Python, which is what the deployment runs.
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - run: /usr/bin/python3 --version
+      - run: /usr/bin/python3 test_vinegar.py

@@ -137,6 +137,10 @@ There are tests, and they need nothing installed:
 python3 test_vinegar.py
 ```
 
+GitHub Actions runs them on every pull request and every push to `main`, with
+the macOS system Python that the deployment uses
+(`.github/workflows/tests.yml`).
+
 They cover the part between the reviewer finishing and the review appearing:
 reading findings out of the stream, working out which can be anchored in the
 diff, and deciding what to post. Nothing in them touches the network, GitHub,
