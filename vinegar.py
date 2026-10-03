@@ -62,6 +62,23 @@ DENY_HOME = "Read(//**/.vinegar/**)"
 # and the write denials are backed by the sandbox now; what cannot be
 # recovered from is a credential read, because the finding carrying it is
 # already public by the time anyone notices.
+#
+# Every one of these binds Bash as well as Read. Claude Code merges Read
+# deny rules into the sandbox, so `cat`, `grep -r` and `git` get
+# "Operation not permitted" on these paths whether or not their arguments
+# name them. Measured on 2.1.285 with a harmless file under a `.vinegar`
+# directory: Read was refused, `cat` of it failed in the kernel, and a
+# `grep -r` over its parent could not open that directory.
+#
+# The last four had no rule before 2026-10-03. `.claude.json` holds Claude
+# Code's MCP server configuration, which can carry tokens, and `.claude/**`
+# does not match it. `~/Library` is where macOS applications keep their
+# logins: the Vercel CLI's token and the Claude app's cookies are both
+# there. opencode keeps its provider keys under `~/.local/share/opencode`,
+# and the rest of `~/.local/share` is left alone because Claude Code's own
+# install lives there. `~/src` is the operator's own working copies,
+# private repositories among them: a review of `bad-wallet-client` read
+# three files from `~/src/btc-wallet-kmp`.
 DENY_ALWAYS = (
     DENY_HOME,
     "Read(//**/.claude/**)",
@@ -71,6 +88,10 @@ DENY_ALWAYS = (
     "Read(//**/.config/gh/**)",
     "Read(//**/.netrc)",
     "Read(//**/.env)",
+    "Read(//**/.claude.json)",
+    "Read(~/Library/**)",
+    "Read(~/.local/share/opencode/**)",
+    "Read(~/src/**)",
 )
 
 # And the one key that would make all of them moot. `bypassPermissions`
@@ -2041,6 +2062,32 @@ def reviewer_settings(workspace):
         ((name, wanted) for name, wanted, _ in SANDBOX_RULES),
         filesystem={"denyWrite": denied},
         network=dict(SANDBOX_NETWORK))
+    # And no read of any other checkout. A review of a public repository
+    # could read the private clone beside it and quote it into a finding
+    # posted in public: measured on 2.1.285, a file in a sibling checkout
+    # was readable by Read and by `cat`. Built here because the file cannot
+    # name the one checkout that must stay readable, and a permission rule
+    # cannot carve it out of a broader one, since a deny beats an allow.
+    # Claude Code applies these in the sandbox too, like DENY_ALWAYS. Both
+    # forms of each path, for the reason the write denies give; the
+    # workspace is recognised by where it resolves to. A checkout cloned
+    # while this review runs is not covered until the next review.
+    own = os.path.realpath(workspace)
+    reads = settings["permissions"]["deny"]
+    try:
+        names = sorted(os.listdir(CHECKOUT_DIR))
+    except FileNotFoundError:
+        # No checkouts yet, so none to deny. Raising would end the review
+        # as an ordinary failure, already charged as an attempt.
+        names = []
+    for name in names:
+        path = os.path.join(CHECKOUT_DIR, name)
+        if os.path.realpath(path) == own:
+            continue
+        for form in (path, os.path.realpath(path)):
+            rule = "Read(/%s/**)" % form
+            if rule not in reads:
+                reads.append(rule)
     return json.dumps(settings)
 
 
