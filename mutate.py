@@ -191,6 +191,34 @@ MUTATIONS = [
     ("review-cwd",
      "                         cwd=path, timeout=left, env=reviewing)",
      "                         timeout=left, env=reviewing)"),
+    # The read denies added 2026-10-03. Each is pinned in DENY_ALWAYS, so
+    # dropping one from the tuple lets a file without it start.
+    ("deny-always-claude-json", '    "Read(//**/.claude.json)",\n', ""),
+    ("deny-always-library", '    "Read(~/Library/**)",\n', ""),
+    ("deny-always-opencode", '    "Read(~/.local/share/opencode/**)",\n', ""),
+    ("deny-always-src", '    "Read(~/src/**)",\n', ""),
+    # And every other checkout, built per review.
+    ("other-checkouts-read-denied",
+     "                reads.append(rule)",
+     "                pass"),
+    ("own-checkout-stays-readable",
+     "        if os.path.realpath(path) == own:\n            continue",
+     "        if False:\n            continue"),
+    ("other-checkouts-by-resolved-path",
+     "        for form in (path, os.path.realpath(path)):\n            rule = ",
+     "        for form in (path,):\n            rule = "),
+    ("own-checkout-by-resolved-path",
+     "    own = os.path.realpath(workspace)",
+     "    own = workspace"),
+    ("checkout-denies-added-to-file-denies",
+     '    reads = settings["permissions"]["deny"]\n',
+     '    reads = settings["permissions"]["deny"] = []\n'),
+    ("checkout-denies-before-first-clone",
+     "    try:\n"
+     "        names = sorted(os.listdir(CHECKOUT_DIR))\n"
+     "    except FileNotFoundError:",
+     "    names = sorted(os.listdir(CHECKOUT_DIR))\n"
+     "    if False:"),
 
     # --- which pull requests are reviewed at all -----------------------
     ("skip-drafts",

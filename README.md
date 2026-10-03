@@ -693,23 +693,44 @@ nothing. Saying it once is cheaper, and it leaves `permission_denials` closer
 to what it is for, which is the denials worth acting on.
 
 Reads are path-denied for `~/.vinegar`, `~/.claude`, `~/.ssh`, `~/.aws`,
-`~/.gnupg`, `~/.config/gh`, `.netrc` and `.env`. Without that, the App's own
-private key is a file the reviewer can read, and that key is the one
-credential that is **not** scoped to a single repository.
+`~/.gnupg`, `~/.config/gh`, `.netrc`, `.env`, `.claude.json`, `~/Library`,
+`~/.local/share/opencode` and `~/src`. Without that, the App's own private
+key is a file the reviewer can read, and that key is the one credential that
+is **not** scoped to a single repository. The last four are Claude Code's MCP
+server configuration, where macOS applications keep their logins (the Vercel
+CLI's token and the Claude app's cookies among them), opencode's provider
+keys, and your own working copies, private repositories included.
 
-Those eight are pinned in `DENY_ALWAYS` and re-checked before every review,
-not just at startup, because losing one is unrecoverable in a way the rest of
-the file is not: the finding carrying a private key is already published by
-the time anyone reads it. `permissions.defaultMode` is pinned for the same
-reason — `bypassPermissions` ignores the allow and deny lists entirely, so one
-word there would undo every rule in the file without touching one of them. The
-allow list itself is meant to be tuned and is not pinned.
+These bind Bash as well as Read. Claude Code applies Read deny rules in the
+sandbox too, so `cat`, `grep -r` and `git` get "Operation not permitted" on
+these paths even when their arguments do not name them. Measured on 2.1.285
+with harmless files: Read was refused, `cat` of each file failed in the
+kernel, and a `grep -r` over a parent directory skipped the denied one.
+
+**Every other checkout is denied too, and Vinegar adds those rules itself.**
+A review of a public repository could otherwise read the private clone
+beside it and quote it into a finding posted in public. The file cannot
+carry these rules, because it cannot name the one checkout that must stay
+readable, and a deny cannot be carved out by an allow. So each review gets a
+`Read(//<checkouts>/<owner>__<repo>/**)` rule for every checkout but its own,
+in both the written and the resolved form. A checkout cloned while a review
+runs is covered from the next review on. A hand-run with the file alone does
+not carry them.
+
+The twelve path denies are pinned in `DENY_ALWAYS` and re-checked before every
+review, not just at startup, because losing one is unrecoverable in a way the
+rest of the file is not: the finding carrying a private key is already
+published by the time anyone reads it. `permissions.defaultMode` is pinned for
+the same reason: `bypassPermissions` ignores the allow and deny lists
+entirely, so one word there would undo every rule in the file without touching
+one of them. The allow list itself is meant to be tuned and is not pinned.
 
 That is why clones live in `~/.vinegar-checkouts/` rather than under
-`~/.vinegar`. A blanket deny on a directory catches everything you later put
-inside it, including the repository the reviewer is supposed to read. Keep the
-deny broad and keep the checkout out of it, rather than narrowing the rule to
-name each secret: the next secret added to `~/.vinegar` would not be named.
+`~/.vinegar`, `~/src` or `~/Library`. A blanket deny on a directory catches
+everything you later put inside it, including the repository the reviewer is
+supposed to read. Keep the deny broad and keep the checkout out of it, rather
+than narrowing the rule to name each secret: the next secret added to
+`~/.vinegar` would not be named.
 
 ### What the permission rules cannot do
 

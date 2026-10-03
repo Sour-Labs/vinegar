@@ -1867,6 +1867,23 @@ vinegar.announce("o/r#12", exploding_callback)
 check("a posting failure cannot escape and cost a re-review",
       boom == [1] and not posted, (boom, posted))
 
+# The reviewer's settings name every checkout but its own, so they list
+# CHECKOUT_DIR. Before the first clone there is no such directory, and a
+# raise there ends the review as an ordinary failure, already charged.
+_cd_real = vinegar.CHECKOUT_DIR
+vinegar.CHECKOUT_DIR = os.path.join(_home, "no-checkouts-yet")
+try:
+    _first = json.loads(vinegar.reviewer_settings(ROOT))["permissions"]["deny"]
+except OSError as err:
+    _first = "raised %r" % err
+finally:
+    vinegar.CHECKOUT_DIR = _cd_real
+check("the reviewer's settings are built before any checkout exists",
+      isinstance(_first, list) and vinegar.DENY_HOME in _first, _first)
+# The reviews below run with a checkout directory, as every real one does:
+# checkout() makes it first.
+os.makedirs(vinegar.CHECKOUT_DIR, exist_ok=True)
+
 # The same thing through review(), which is where it actually matters:
 # handle_pr does not wrap the call, so anything escaping leaves no state and
 # the pull request is re-reviewed at full cost on every poll from then on.
@@ -2520,7 +2537,9 @@ check("a missing private-key deny rule refuses to start",
 # review able to quote `~/.ssh/id_ed25519` into a published finding.
 _settings_real = vinegar.SETTINGS_PATH
 for _rule in ("Read(//**/.ssh/**)", "Read(//**/.config/gh/**)",
-              "Read(//**/.aws/**)", "Read(//**/.netrc)"):
+              "Read(//**/.aws/**)", "Read(//**/.netrc)",
+              "Read(//**/.claude.json)", "Read(~/Library/**)",
+              "Read(~/.local/share/opencode/**)", "Read(~/src/**)"):
     _short = json.load(open(_settings_real))
     _short["permissions"]["deny"] = [r for r in
                                      _short["permissions"]["deny"]
@@ -2809,6 +2828,51 @@ check("the workspace itself is denied, not only the directory above it",
 check("a symlinked workspace is denied by the path it resolves to",
       os.path.realpath(_real_repo) in _sent["filesystem"]["denyWrite"],
       json.dumps(_sent["filesystem"]))
+
+# No read of any other checkout. A review of a public repository could
+# otherwise read the private clone beside it and quote it into a finding
+# posted in public: measured on 2.1.285, a harmless file in a sibling
+# checkout came back through both Read and `cat`.
+_own = os.path.join(vinegar.CHECKOUT_DIR, "o__r")
+_other = os.path.join(vinegar.CHECKOUT_DIR, "o__private")
+for _dir in (_own, _other):
+    os.makedirs(_dir, exist_ok=True)
+
+
+def _reads_denied(workspace):
+    """The permission rules sent for a review that runs in `workspace`."""
+    return json.loads(vinegar.reviewer_settings(workspace))[
+        "permissions"]["deny"]
+
+
+def _names(rules, path):
+    """The rules among these that would cover `path`, in either form."""
+    forms = {path, os.path.realpath(path)}
+    return [rule for rule in rules
+            if any(rule == "Read(/%s/**)" % form for form in forms)]
+
+
+_deny = _reads_denied(_own)
+check("another checkout is denied to the reviewer",
+      _names(_deny, _other) != [], _deny[-6:])
+check("the checkout under review stays readable",
+      _names(_deny, _own) == [], _names(_deny, _own))
+# The symlinked clone beside it, which resolves outside CHECKOUT_DIR. A
+# rule on the link alone leaves the files readable by the path they live at.
+check("another checkout is denied by the path it resolves to",
+      "Read(/%s/**)" % os.path.realpath(_real_repo) in _deny, _deny[-6:])
+# And the same clone as the one under review. Compared by the path written,
+# the link and its target look like two checkouts, and the review would be
+# denied its own files.
+_deny = _reads_denied(_linked_repo)
+check("a workspace reached through a symlink stays readable",
+      _names(_deny, _linked_repo) == [] and _names(_deny, _real_repo) == [],
+      _names(_deny, _linked_repo) + _names(_deny, _real_repo))
+check("the other checkouts are still denied from a symlinked workspace",
+      _names(_deny, _own) != [], _deny[-6:])
+# Added to the file's rules, not put in place of them.
+check("the file's own read denies still go with the checkout denies",
+      all(rule in _deny for rule in vinegar.DENY_ALWAYS), _deny[:4])
 
 # What these checks cannot reach, said plainly rather than left implied.
 # They prove what Vinegar sends. Whether `sandbox.filesystem.denyWrite`
