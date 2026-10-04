@@ -47,7 +47,7 @@
       "Read(//**/.config/gh/**)",
       "Read(//**/.netrc)",
       "Read(//**/.env)",
-      "Read(//**/.claude.json)",
+      "Read(//**/.claude.json*)",
       "Read(~/Library/**)",
       "Read(~/.local/share/opencode/**)",
       "Read(~/src/**)",

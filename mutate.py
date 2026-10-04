@@ -173,14 +173,14 @@ MUTATIONS = [
 
     # --- what the reviewer runs under ----------------------------------
     ("claude-settings",
-     '           "--settings", reviewer_settings(path),',
+     '           "--settings", reviewer_settings(path, config["repos"]),',
      "           "),
     # Both of these carry the line above them, because the severity pass
     # sends the same two flags and the bare text now matches twice.
     ("setting-sources",
-     '           "--settings", reviewer_settings(path),\n'
+     '           "--settings", reviewer_settings(path, config["repos"]),\n'
      '           "--setting-sources", "",',
-     '           "--settings", reviewer_settings(path),'),
+     '           "--settings", reviewer_settings(path, config["repos"]),'),
     ("strict-mcp-config",
      '           "--setting-sources", "",\n'
      '           "--strict-mcp-config"]',
@@ -193,7 +193,7 @@ MUTATIONS = [
      "                         timeout=left, env=reviewing)"),
     # The read denies added 2026-10-03. Each is pinned in DENY_ALWAYS, so
     # dropping one from the tuple lets a file without it start.
-    ("deny-always-claude-json", '    "Read(//**/.claude.json)",\n', ""),
+    ("deny-always-claude-json", '    "Read(//**/.claude.json*)",\n', ""),
     ("deny-always-library", '    "Read(~/Library/**)",\n', ""),
     ("deny-always-opencode", '    "Read(~/.local/share/opencode/**)",\n', ""),
     ("deny-always-src", '    "Read(~/src/**)",\n', ""),
@@ -202,22 +202,51 @@ MUTATIONS = [
      "                reads.append(rule)",
      "                pass"),
     ("own-checkout-stays-readable",
-     "        if os.path.realpath(path) == own:\n            continue",
+     "        if is_workspace(path):\n            continue",
      "        if False:\n            continue"),
     ("other-checkouts-by-resolved-path",
-     "        for form in (path, os.path.realpath(path)):\n            rule = ",
-     "        for form in (path,):\n            rule = "),
-    ("own-checkout-by-resolved-path",
-     "    own = os.path.realpath(workspace)",
-     "    own = workspace"),
+     '        for form in forms(path):\n            rule = "Read(/%s/**)" % form',
+     '        for form in [path]:\n            rule = "Read(/%s/**)" % form'),
+    ("own-checkout-by-inode",
+     "            return os.path.samefile(path, workspace)",
+     "            return path == workspace"),
+    ("polled-repos-denied",
+     "    for path in entries + [checkout_path(repo) for repo in repos]:",
+     "    for path in entries:"),
+    ("review-passes-polled-repos",
+     '           "--settings", reviewer_settings(path, config["repos"]),',
+     '           "--settings", reviewer_settings(path),'),
+    ("sandbox-denies-checkout-reads",
+     "        denyRead=forms(CHECKOUT_DIR), allowRead=own)",
+     "        allowRead=own)"),
+    ("sandbox-allows-own-checkout",
+     "        denyRead=forms(CHECKOUT_DIR), allowRead=own)",
+     "        denyRead=forms(CHECKOUT_DIR))"),
+    ("sandbox-allows-spelling-on-disk",
+     "            own += [form for form in forms(path) if form not in own]",
+     "            pass"),
+    ("home-denies-by-resolved-path",
+     '    for place in denied_homes():\n        rule = "Read(/%s/**)" % place',
+     '    for place in ():\n        rule = "Read(/%s/**)" % place'),
+    ("denied-homes-resolved-form",
+     "            for form in (place, os.path.realpath(place)):",
+     "            for form in (place,):"),
+    ("checkouts-refused-under-denied-homes",
+     "            if real == place.lower() or real.startswith(place.lower() + os.sep):",
+     "            if False:"),
+    ("linked-checkouts-refused-under-denied-homes",
+     "    for path in [CHECKOUT_DIR] + entries:",
+     "    for path in [CHECKOUT_DIR]:"),
     ("checkout-denies-added-to-file-denies",
      '    reads = settings["permissions"]["deny"]\n',
      '    reads = settings["permissions"]["deny"] = []\n'),
     ("checkout-denies-before-first-clone",
      "    try:\n"
-     "        names = sorted(os.listdir(CHECKOUT_DIR))\n"
+     "        entries = [os.path.join(CHECKOUT_DIR, name)\n"
+     "                   for name in sorted(os.listdir(CHECKOUT_DIR))]\n"
      "    except FileNotFoundError:",
-     "    names = sorted(os.listdir(CHECKOUT_DIR))\n"
+     "    entries = [os.path.join(CHECKOUT_DIR, name)\n"
+     "               for name in sorted(os.listdir(CHECKOUT_DIR))]\n"
      "    if False:"),
 
     # --- which pull requests are reviewed at all -----------------------

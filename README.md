@@ -196,6 +196,8 @@ either direction: a checkout the rule covers, or a `VINEGAR_HOME` it does not.
 Both fail silently otherwise. The first reviews from API fetches while
 `permission_denials` stays empty; the second leaves the key readable, and
 silence there means the protection was never applied rather than that it held.
+Checkouts under `~/src`, `~/Library` or `~/.local/share/opencode`, which every
+review is also denied, are refused the same way.
 
 ### Configuration
 
@@ -693,7 +695,7 @@ nothing. Saying it once is cheaper, and it leaves `permission_denials` closer
 to what it is for, which is the denials worth acting on.
 
 Reads are path-denied for `~/.vinegar`, `~/.claude`, `~/.ssh`, `~/.aws`,
-`~/.gnupg`, `~/.config/gh`, `.netrc`, `.env`, `.claude.json`, `~/Library`,
+`~/.gnupg`, `~/.config/gh`, `.netrc`, `.env`, `.claude.json*`, `~/Library`,
 `~/.local/share/opencode` and `~/src`. Without that, the App's own private
 key is a file the reviewer can read, and that key is the one credential that
 is **not** scoped to a single repository. The last four are Claude Code's MCP
@@ -707,15 +709,21 @@ these paths even when their arguments do not name them. Measured on 2.1.285
 with harmless files: Read was refused, `cat` of each file failed in the
 kernel, and a `grep -r` over a parent directory skipped the denied one.
 
-**Every other checkout is denied too, and Vinegar adds those rules itself.**
-A review of a public repository could otherwise read the private clone
-beside it and quote it into a finding posted in public. The file cannot
-carry these rules, because it cannot name the one checkout that must stay
-readable, and a deny cannot be carved out by an allow. So each review gets a
-`Read(//<checkouts>/<owner>__<repo>/**)` rule for every checkout but its own,
-in both the written and the resolved form. A checkout cloned while a review
-runs is covered from the next review on. A hand-run with the file alone does
-not carry them.
+**Every other checkout is denied too, and Vinegar adds those rules itself.** A
+review of a public repository could otherwise read the private clone beside it
+and quote it into a finding posted in public, or list the checkout directory
+and publish the names of the private repositories. The file cannot carry these
+rules, because it cannot name the one checkout that must stay readable. So each
+review's sandbox refuses every read under the checkout directory except its own
+workspace, the narrower path, which the sandbox lets win: that covers listing
+the directory and a clone made while the review runs. The Read tool is not
+sandboxed, so it gets a `Read(//<checkouts>/<owner>__<repo>/**)` rule for every
+checkout on disk and every repository Vinegar polls, cloned or not, in both the
+written and the resolved form. The workspace is told apart by inode, because
+APFS ignores case. Measured on 2.1.285 with harmless files: `ls` of the
+checkout directory, a sibling checkout and a directory made after the review
+started were all refused, while `cat`, `git` and `grep -r` worked in the
+workspace. A hand-run with the file alone does not carry these rules.
 
 The twelve path denies are pinned in `DENY_ALWAYS` and re-checked before every
 review, not just at startup, because losing one is unrecoverable in a way the
@@ -730,7 +738,11 @@ That is why clones live in `~/.vinegar-checkouts/` rather than under
 everything you later put inside it, including the repository the reviewer is
 supposed to read. Keep the deny broad and keep the checkout out of it, rather
 than narrowing the rule to name each secret: the next secret added to
-`~/.vinegar` would not be named.
+`~/.vinegar` would not be named. Vinegar refuses to start with a checkout
+directory, or a clone linked into it, that resolves under one of those
+directories. The home directories are denied by the path each resolves to as
+well: measured, a deny on a symlink's path refuses `cat` through the link and
+not `cat` of the target's own path.
 
 ### What the permission rules cannot do
 

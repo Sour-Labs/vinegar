@@ -72,13 +72,14 @@ DENY_HOME = "Read(//**/.vinegar/**)"
 #
 # The last four had no rule before 2026-10-03. `.claude.json` holds Claude
 # Code's MCP server configuration, which can carry tokens, and `.claude/**`
-# does not match it. `~/Library` is where macOS applications keep their
-# logins: the Vercel CLI's token and the Claude app's cookies are both
-# there. opencode keeps its provider keys under `~/.local/share/opencode`,
-# and the rest of `~/.local/share` is left alone because Claude Code's own
-# install lives there. `~/src` is the operator's own working copies,
-# private repositories among them: a review of `bad-wallet-client` read
-# three files from `~/src/btc-wallet-kmp`.
+# does not match it; the trailing `*` takes the backup copies Claude Code
+# has written beside it under other names. `~/Library` is where macOS
+# applications keep their logins: the Vercel CLI's token and the Claude
+# app's cookies are both there. opencode keeps its provider keys under
+# `~/.local/share/opencode`, and the rest of `~/.local/share` is left alone
+# because Claude Code's own install lives there. `~/src` is the operator's
+# own working copies, private repositories among them: a review of
+# `bad-wallet-client` read three files from `~/src/btc-wallet-kmp`.
 DENY_ALWAYS = (
     DENY_HOME,
     "Read(//**/.claude/**)",
@@ -88,11 +89,32 @@ DENY_ALWAYS = (
     "Read(//**/.config/gh/**)",
     "Read(//**/.netrc)",
     "Read(//**/.env)",
-    "Read(//**/.claude.json)",
+    "Read(//**/.claude.json*)",
     "Read(~/Library/**)",
     "Read(~/.local/share/opencode/**)",
     "Read(~/src/**)",
 )
+
+
+def denied_homes():
+    """The directories DENY_ALWAYS denies under the home directory.
+
+    Each in the form written and the form it resolves to. Measured on
+    2.1.285: with a Read deny on a symlink's path only, `cat` through the
+    link was refused and `cat` of the target's own path was not, so a
+    `~/src` that links to another volume would stay readable there.
+    check_paths() refuses a checkout under any of them, and
+    reviewer_settings() denies the resolved forms by name.
+    """
+    places = []
+    for rule in DENY_ALWAYS:
+        if rule.startswith("Read(~/") and rule.endswith("/**)"):
+            place = os.path.expanduser(rule[len("Read("):-len("/**)")])
+            for form in (place, os.path.realpath(place)):
+                if form not in places:
+                    places.append(form)
+    return places
+
 
 # And the one key that would make all of them moot. `bypassPermissions`
 # ignores the allow and deny lists entirely, so a single word here undoes
@@ -1855,6 +1877,29 @@ def check_paths():
             "still covered)." % (HOME, DENIED_COMPONENT, DENIED_COMPONENT,
                                  DENIED_COMPONENT))
 
+    # The same refusal for the other directories every review is denied.
+    # A checkout under `~/src` or `~/Library` is one the reviewer cannot
+    # open, which is the silent failure above, and the rule is pinned, so
+    # it cannot be dropped to make room. The entries as well as the
+    # directory: a clone symlinked to an existing working copy in `~/src`,
+    # to save cloning it again, resolves under the deny. checkout() makes
+    # only real directories, so the symlinks that matter are there now.
+    try:
+        entries = [os.path.join(CHECKOUT_DIR, name)
+                   for name in os.listdir(CHECKOUT_DIR)]
+    except FileNotFoundError:
+        entries = []
+    for path in [CHECKOUT_DIR] + entries:
+        real = os.path.realpath(path).lower()
+        for place in denied_homes():
+            if real == place.lower() or real.startswith(place.lower() + os.sep):
+                sys.exit(
+                    "%s resolves under %s, which every review is denied, so "
+                    "reviews would run without their own checkout and report "
+                    "nothing wrong. Keep checkouts out of it: point "
+                    "VINEGAR_CHECKOUTS elsewhere, or replace the link with a "
+                    "clone." % (path, place))
+
     # And everything the settings file has to say, checked here so it is
     # said at startup rather than first discovered on a pull request. The
     # same call runs again for every review, which is where it matters:
@@ -1976,8 +2021,9 @@ def load_settings():
     if extra:
         sys.exit(
             "review-settings.json sets sandbox.%s, which Vinegar does not "
-            "send: it builds that stanza itself for every review, so the "
-            "key would change what a hand-run does and nothing else. "
+            "take from this file: it builds that stanza itself for every "
+            "review, so the key would change what a hand-run does and "
+            "nothing else. "
             "Remove it, or change reviewer_settings() if the daemon should "
             "carry it too." % ", sandbox.".join(extra))
     # The network rule is pinned like the flags, not merely permitted. The
@@ -1994,13 +2040,14 @@ def load_settings():
     return settings
 
 
-def reviewer_settings(workspace):
+def reviewer_settings(workspace, repos=()):
     """The settings the reviewer runs under: the file, plus this checkout.
 
     `workspace` is the directory the review runs in, which review() has
     and this cannot derive: it is CHECKOUT_DIR/<owner>__<repo>, and any
     part of that may be a symlink pointing somewhere neither this
-    function nor CHECKOUT_DIR would name.
+    function nor CHECKOUT_DIR would name. `repos` is every repository
+    Vinegar polls, whose checkouts the reviewer may not read.
 
     Passed to `claude --settings` as JSON rather than as a path, because
     the one rule that cannot live in the file is the one that matters
@@ -2062,32 +2109,66 @@ def reviewer_settings(workspace):
         ((name, wanted) for name, wanted, _ in SANDBOX_RULES),
         filesystem={"denyWrite": denied},
         network=dict(SANDBOX_NETWORK))
-    # And no read of any other checkout. A review of a public repository
-    # could read the private clone beside it and quote it into a finding
-    # posted in public: measured on 2.1.285, a file in a sibling checkout
-    # was readable by Read and by `cat`. Built here because the file cannot
-    # name the one checkout that must stay readable, and a permission rule
-    # cannot carve it out of a broader one, since a deny beats an allow.
-    # Claude Code applies these in the sandbox too, like DENY_ALWAYS. Both
-    # forms of each path, for the reason the write denies give; the
-    # workspace is recognised by where it resolves to. A checkout cloned
-    # while this review runs is not covered until the next review.
-    own = os.path.realpath(workspace)
-    reads = settings["permissions"]["deny"]
+
+    # Which entries of CHECKOUT_DIR are the workspace is told by inode, not
+    # by name. APFS ignores case, so `o__API` and `o__api` are one
+    # directory, and a name compared as a string would deny the review its
+    # own checkout.
+    def is_workspace(path):
+        try:
+            return os.path.samefile(path, workspace)
+        except OSError:
+            # One of them is not on disk, so only the name can say.
+            return os.path.realpath(path) == os.path.realpath(workspace)
+
+    def forms(path):
+        resolved = os.path.realpath(path)
+        return [path] if resolved == path else [path, resolved]
+
     try:
-        names = sorted(os.listdir(CHECKOUT_DIR))
+        entries = [os.path.join(CHECKOUT_DIR, name)
+                   for name in sorted(os.listdir(CHECKOUT_DIR))]
     except FileNotFoundError:
         # No checkouts yet, so none to deny. Raising would end the review
         # as an ordinary failure, already charged as an attempt.
-        names = []
-    for name in names:
-        path = os.path.join(CHECKOUT_DIR, name)
-        if os.path.realpath(path) == own:
+        entries = []
+    own = forms(workspace)
+    for path in entries:
+        if is_workspace(path):
+            own += [form for form in forms(path) if form not in own]
+
+    # Reads under CHECKOUT_DIR are refused but in the workspace, the
+    # narrower path, which the sandbox lets win. A review of a public
+    # repository could otherwise read the private clone beside it and quote
+    # it into a finding posted in public, or list the directory and publish
+    # the names of the private repositories. It also covers a clone made
+    # while this review runs. Measured on 2.1.285: `ls` of the directory, a
+    # sibling checkout and a directory made after the review started were
+    # all refused, while `cat`, `git` and `grep -r` worked in the workspace.
+    settings["sandbox"]["filesystem"].update(
+        denyRead=forms(CHECKOUT_DIR), allowRead=own)
+
+    # The Read tool is not sandboxed, so the same checkouts are denied to it
+    # by name: every one on disk, and every repository Vinegar polls,
+    # cloned or not, so that a clone made during this review is covered
+    # too. A permission rule cannot carve the workspace out of a broader
+    # one, since a deny beats an allow. Claude Code applies these in the
+    # sandbox as well, like DENY_ALWAYS. Both forms of each path, for the
+    # reason the write denies give.
+    reads = settings["permissions"]["deny"]
+    for path in entries + [checkout_path(repo) for repo in repos]:
+        if is_workspace(path):
             continue
-        for form in (path, os.path.realpath(path)):
+        for form in forms(path):
             rule = "Read(/%s/**)" % form
             if rule not in reads:
                 reads.append(rule)
+    # And the home directories DENY_ALWAYS names, by the path each resolves
+    # to as well: see denied_homes().
+    for place in denied_homes():
+        rule = "Read(/%s/**)" % place
+        if rule not in reads:
+            reads.append(rule)
     return json.dumps(settings)
 
 
@@ -2518,6 +2599,13 @@ def skip_reason(pr, config):
     return None
 
 
+def checkout_path(repo):
+    """Where `repo` is cloned. One spelling, because reviewer_settings()
+    denies the reviewer every checkout but its own by this path, including
+    ones not cloned yet."""
+    return os.path.join(CHECKOUT_DIR, repo.replace("/", "__"))
+
+
 def checkout(repo, pr, env):
     """Put a detached checkout on the pull request's head commit.
 
@@ -2525,7 +2613,7 @@ def checkout(repo, pr, env):
     checkout matches that branch. Otherwise it fetches each file over the API,
     which costs more and reviews worse.
     """
-    path = os.path.join(CHECKOUT_DIR, repo.replace("/", "__"))
+    path = checkout_path(repo)
 
     # What a killed run leaves behind, cleared before it can wedge every
     # future poll. A SIGKILL during a fetch leaves `.git/index.lock`, and
@@ -5846,7 +5934,7 @@ def review(path, repo, pr, config, env, tokens, resent=False, check=None,
            "--append-system-prompt", reviewer_brief(pr, config, since,
                                                     blockers),
            "--output-format", "stream-json", "--verbose",
-           "--settings", reviewer_settings(path),
+           "--settings", reviewer_settings(path, config["repos"]),
            "--setting-sources", "",
            "--strict-mcp-config"]
 
