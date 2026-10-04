@@ -99,21 +99,43 @@ DENY_ALWAYS = (
 def denied_homes():
     """The directories DENY_ALWAYS denies under the home directory.
 
-    Each in the form written and the form it resolves to. Measured on
+    As pairs of the form written and the form it resolves to. Measured on
     2.1.285: with a Read deny on a symlink's path only, `cat` through the
     link was refused and `cat` of the target's own path was not, so a
     `~/src` that links to another volume would stay readable there.
-    check_paths() refuses a checkout under any of them, and
-    reviewer_settings() denies the resolved forms by name.
+    check_paths() refuses a checkout under either form, and
+    reviewer_settings() denies a resolved form that differs by name.
     """
     places = []
     for rule in DENY_ALWAYS:
         if rule.startswith("Read(~/") and rule.endswith("/**)"):
             place = os.path.expanduser(rule[len("Read("):-len("/**)")])
-            for form in (place, os.path.realpath(place)):
-                if form not in places:
-                    places.append(form)
+            places.append((place, os.path.realpath(place)))
     return places
+
+
+def denied_by(path, homes):
+    """The DENY_ALWAYS rule that denies `path` as a directory, or None.
+
+    `homes` is what denied_homes() answers, asked once by the caller.
+
+    By the path it resolves to, and without regard to case, since APFS
+    ignores it: refusing more than a rule covers is the safe direction to
+    be wrong in. The rules that name a file, such as `.env`, are left out,
+    because a checkout is a directory.
+    """
+    real = os.path.realpath(path).lower()
+    for rule in DENY_ALWAYS:
+        if rule.startswith("Read(//**/") and rule.endswith("/**)"):
+            name = rule[len("Read(//**/"):-len("/**)")].lower()
+            if os.sep + name + os.sep in real + os.sep:
+                return rule
+    for pair in homes:
+        for place in pair:
+            place = place.lower()
+            if real == place or real.startswith(place + os.sep):
+                return pair[0]
+    return None
 
 
 # And the one key that would make all of them moot. `bypassPermissions`
@@ -157,9 +179,13 @@ SANDBOX_RULES = (
 SANDBOX_NETWORK = {"allowedDomains": []}
 
 # Every key the file's own sandbox stanza may carry, at both levels.
-# reviewer_settings() sends these and nothing else, so a key outside this
+# reviewer_settings() builds the stanza from these, so a key outside this
 # set changes what a hand-run does while leaving the daemon untouched —
-# which makes the file describe something Vinegar does not do.
+# which makes the file describe something Vinegar does not do. It also
+# adds `filesystem.denyRead` and `allowRead`, which the file may not carry:
+# they name the one checkout each review may read, which no fixed file can,
+# and a `denyRead` on the checkouts without that carve-out would leave a
+# hand-run unable to read its own.
 # `filesystem` needs its own set: checking only the top level accepted a
 # `filesystem.allowWrite` that hands a hand-run the whole disk.
 SANDBOX_KEYS = frozenset(
@@ -1877,28 +1903,33 @@ def check_paths():
             "still covered)." % (HOME, DENIED_COMPONENT, DENIED_COMPONENT,
                                  DENIED_COMPONENT))
 
-    # The same refusal for the other directories every review is denied.
-    # A checkout under `~/src` or `~/Library` is one the reviewer cannot
-    # open, which is the silent failure above, and the rule is pinned, so
-    # it cannot be dropped to make room. The entries as well as the
-    # directory: a clone symlinked to an existing working copy in `~/src`,
-    # to save cloning it again, resolves under the deny. checkout() makes
-    # only real directories, so the symlinks that matter are there now.
+    # The same refusal for every directory DENY_ALWAYS denies, and for each
+    # clone as well as the directory holding them. A checkout under `~/src`
+    # or `~/Library` is one the reviewer cannot open, which is the silent
+    # failure above, and the rules are pinned, so none can be dropped to
+    # make room. A clone symlinked to an existing working copy, in `~/src`
+    # or in `~/.vinegar`, to save cloning it again, resolves under a deny.
+    # checkout() makes only real directories, so the links that matter are
+    # there now.
     try:
         entries = [os.path.join(CHECKOUT_DIR, name)
                    for name in os.listdir(CHECKOUT_DIR)]
     except FileNotFoundError:
         entries = []
+    except OSError as err:
+        sys.exit("%s cannot be listed (%s), and every checkout is cloned "
+                 "into it. Point VINEGAR_CHECKOUTS at a directory."
+                 % (CHECKOUT_DIR, err))
+    homes = denied_homes()
     for path in [CHECKOUT_DIR] + entries:
-        real = os.path.realpath(path).lower()
-        for place in denied_homes():
-            if real == place.lower() or real.startswith(place.lower() + os.sep):
-                sys.exit(
-                    "%s resolves under %s, which every review is denied, so "
-                    "reviews would run without their own checkout and report "
-                    "nothing wrong. Keep checkouts out of it: point "
-                    "VINEGAR_CHECKOUTS elsewhere, or replace the link with a "
-                    "clone." % (path, place))
+        rule = denied_by(path, homes)
+        if rule:
+            sys.exit(
+                "%s resolves under %s, which every review is denied, so "
+                "reviews would run without their own checkout and report "
+                "nothing wrong. Keep checkouts out of it: point "
+                "VINEGAR_CHECKOUTS elsewhere, or replace the link with a "
+                "clone." % (path, rule))
 
     # And everything the settings file has to say, checked here so it is
     # said at startup rather than first discovered on a pull request. The
@@ -2040,7 +2071,7 @@ def load_settings():
     return settings
 
 
-def reviewer_settings(workspace, repos=()):
+def reviewer_settings(workspace, repos):
     """The settings the reviewer runs under: the file, plus this checkout.
 
     `workspace` is the directory the review runs in, which review() has
@@ -2132,10 +2163,10 @@ def reviewer_settings(workspace, repos=()):
         # No checkouts yet, so none to deny. Raising would end the review
         # as an ordinary failure, already charged as an attempt.
         entries = []
+    mine = [path for path in entries if is_workspace(path)]
     own = forms(workspace)
-    for path in entries:
-        if is_workspace(path):
-            own += [form for form in forms(path) if form not in own]
+    for path in mine:
+        own += [form for form in forms(path) if form not in own]
 
     # Reads under CHECKOUT_DIR are refused but in the workspace, the
     # narrower path, which the sandbox lets win. A review of a public
@@ -2156,18 +2187,19 @@ def reviewer_settings(workspace, repos=()):
     # sandbox as well, like DENY_ALWAYS. Both forms of each path, for the
     # reason the write denies give.
     reads = settings["permissions"]["deny"]
-    for path in entries + [checkout_path(repo) for repo in repos]:
-        if is_workspace(path):
-            continue
+    polled = [checkout_path(repo) for repo in repos]
+    others = ([path for path in entries if path not in mine]
+              + [path for path in polled if not is_workspace(path)])
+    for path in others:
         for form in forms(path):
             rule = "Read(/%s/**)" % form
             if rule not in reads:
                 reads.append(rule)
     # And the home directories DENY_ALWAYS names, by the path each resolves
-    # to as well: see denied_homes().
-    for place in denied_homes():
-        rule = "Read(/%s/**)" % place
-        if rule not in reads:
+    # to where that differs: see denied_homes().
+    for written, resolved in denied_homes():
+        rule = "Read(/%s/**)" % resolved
+        if resolved != written and rule not in reads:
             reads.append(rule)
     return json.dumps(settings)
 

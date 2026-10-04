@@ -196,8 +196,9 @@ either direction: a checkout the rule covers, or a `VINEGAR_HOME` it does not.
 Both fail silently otherwise. The first reviews from API fetches while
 `permission_denials` stays empty; the second leaves the key readable, and
 silence there means the protection was never applied rather than that it held.
-Checkouts under `~/src`, `~/Library` or `~/.local/share/opencode`, which every
-review is also denied, are refused the same way.
+A checkout directory, or a clone linked into it, that resolves under any other
+directory the reviewer is denied (`~/src`, `~/Library`, `.ssh` and the rest)
+is refused the same way.
 
 ### Configuration
 
@@ -720,10 +721,12 @@ the directory and a clone made while the review runs. The Read tool is not
 sandboxed, so it gets a `Read(//<checkouts>/<owner>__<repo>/**)` rule for every
 checkout on disk and every repository Vinegar polls, cloned or not, in both the
 written and the resolved form. The workspace is told apart by inode, because
-APFS ignores case. Measured on 2.1.285 with harmless files: `ls` of the
-checkout directory, a sibling checkout and a directory made after the review
-started were all refused, while `cat`, `git` and `grep -r` worked in the
-workspace. A hand-run with the file alone does not carry these rules.
+APFS ignores case. Measured on macOS with Claude Code 2.1.285 and harmless
+files: `ls` of the checkout directory, a sibling checkout and a directory made
+after the review started were all refused, while `cat`, `git` and `grep -r`
+worked in the workspace. Linux is not measured; the Claude Code docs state the
+narrower-path rule for the sandbox in general. A hand-run with the file alone
+does not carry these rules.
 
 The twelve path denies are pinned in `DENY_ALWAYS` and re-checked before every
 review, not just at startup, because losing one is unrecoverable in a way the
@@ -739,10 +742,10 @@ everything you later put inside it, including the repository the reviewer is
 supposed to read. Keep the deny broad and keep the checkout out of it, rather
 than narrowing the rule to name each secret: the next secret added to
 `~/.vinegar` would not be named. Vinegar refuses to start with a checkout
-directory, or a clone linked into it, that resolves under one of those
-directories. The home directories are denied by the path each resolves to as
-well: measured, a deny on a symlink's path refuses `cat` through the link and
-not `cat` of the target's own path.
+directory, or a clone linked into it, that resolves under any directory the
+reviewer is denied. The home directories are denied by the path each resolves
+to as well: measured, a deny on a symlink's path refuses `cat` through the link
+and not `cat` of the target's own path.
 
 ### What the permission rules cannot do
 
