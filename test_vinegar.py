@@ -1867,6 +1867,23 @@ vinegar.announce("o/r#12", exploding_callback)
 check("a posting failure cannot escape and cost a re-review",
       boom == [1] and not posted, (boom, posted))
 
+# The reviewer's settings name every checkout but its own, so they list
+# CHECKOUT_DIR. Before the first clone there is no such directory, and a
+# raise there ends the review as an ordinary failure, already charged.
+_cd_real = vinegar.CHECKOUT_DIR
+vinegar.CHECKOUT_DIR = os.path.join(_home, "no-checkouts-yet")
+try:
+    _first = json.loads(vinegar.reviewer_settings(ROOT, ()))["permissions"]["deny"]
+except OSError as err:
+    _first = "raised %r" % err
+finally:
+    vinegar.CHECKOUT_DIR = _cd_real
+check("the reviewer's settings are built before any checkout exists",
+      isinstance(_first, list) and vinegar.DENY_HOME in _first, _first)
+# The reviews below run with a checkout directory, as every real one does:
+# checkout() makes it first.
+os.makedirs(vinegar.CHECKOUT_DIR, exist_ok=True)
+
 # The same thing through review(), which is where it actually matters:
 # handle_pr does not wrap the call, so anything escaping leaves no state and
 # the pull request is re-reviewed at full cost on every poll from then on.
@@ -2071,6 +2088,17 @@ del claude_run.calls[:]
 _ran(ROOT, "o/r", PR, CONFIG, None, {})
 check("a config that pins no model passes no model flag",
       "--model" not in claude_run.calls[0], claude_run.calls[0])
+# The repositories the config polls reach the reviewer's settings, so a
+# checkout another worker clones during this review is denied already.
+_ran(ROOT, "o/r", PR, dict(CONFIG, repos=["o/r", "o/elsewhere"]), None, {})
+# Read without indexing, so a mutation that drops the flag fails this
+# check rather than aborting the run.
+_args = claude_run.saw
+_sent_deny = (json.loads(_args[_args.index("--settings") + 1])
+              ["permissions"]["deny"] if "--settings" in _args else [])
+check("the review denies the checkout of every repository it polls",
+      "Read(/%s/**)" % os.path.join(vinegar.CHECKOUT_DIR, "o__elsewhere")
+      in _sent_deny, _sent_deny[-4:])
 
 claude_run.stream = _answers(stream(NOT_FOUND),
                              stream(call(FINDINGS[:4]), result_event()))
@@ -2520,7 +2548,9 @@ check("a missing private-key deny rule refuses to start",
 # review able to quote `~/.ssh/id_ed25519` into a published finding.
 _settings_real = vinegar.SETTINGS_PATH
 for _rule in ("Read(//**/.ssh/**)", "Read(//**/.config/gh/**)",
-              "Read(//**/.aws/**)", "Read(//**/.netrc)"):
+              "Read(//**/.aws/**)", "Read(//**/.netrc)",
+              "Read(//**/.claude.json*)", "Read(~/Library/**)",
+              "Read(~/.local/share/opencode/**)", "Read(~/src/**)"):
     _short = json.load(open(_settings_real))
     _short["permissions"]["deny"] = [r for r in
                                      _short["permissions"]["deny"]
@@ -2647,7 +2677,7 @@ def _built_with(sandbox, permissions=None, raw=None):
     """The settings reviewer_settings() sends when the file holds this."""
     _settings_file(sandbox, permissions, raw)
     try:
-        return json.loads(vinegar.reviewer_settings(_workspace))
+        return json.loads(vinegar.reviewer_settings(_workspace, ()))
     finally:
         # In a finally like _with_sandbox above, because reviewer_settings()
         # can exit: without it one failure leaves this global pointing at a
@@ -2659,7 +2689,7 @@ def _sending(sandbox, permissions=None, raw=None):
     """What reviewer_settings() says when it refuses to send anything."""
     _settings_file(sandbox, permissions, raw)
     try:
-        vinegar.reviewer_settings(_workspace)
+        vinegar.reviewer_settings(_workspace, ())
         return "sent"
     except SystemExit as err:
         return str(err)
@@ -2766,7 +2796,7 @@ check("a settings file that is not an object is refused with a sentence",
 # reviewer through a TLS-terminating proxy that `gh` will not trust.
 _said = _sending(dict(_good, credentials={"files": []}))
 check("a sandbox key Vinegar does not send is refused",
-      "does not send" in _said, _said)
+      "does not take" in _said, _said)
 
 # The path the kernel judges the write by, not the one that was typed.
 # Measured against the real binary: a sandbox given only the symlink path
@@ -2778,7 +2808,7 @@ if not os.path.islink(_link_root):
 _cd = vinegar.CHECKOUT_DIR
 vinegar.CHECKOUT_DIR = _link_root
 try:
-    _linked = json.loads(vinegar.reviewer_settings(_link_root))["sandbox"][
+    _linked = json.loads(vinegar.reviewer_settings(_link_root, ()))["sandbox"][
         "filesystem"]["denyWrite"]
 finally:
     vinegar.CHECKOUT_DIR = _cd
@@ -2802,13 +2832,208 @@ _linked_repo = os.path.join(vinegar.CHECKOUT_DIR, "linked__repo")
 os.makedirs(vinegar.CHECKOUT_DIR, exist_ok=True)
 if not os.path.islink(_linked_repo):
     os.symlink(_real_repo, _linked_repo)
-_sent = json.loads(vinegar.reviewer_settings(_linked_repo))["sandbox"]
+_sent = json.loads(vinegar.reviewer_settings(_linked_repo, ()))["sandbox"]
 check("the workspace itself is denied, not only the directory above it",
       _linked_repo in _sent["filesystem"]["denyWrite"],
       json.dumps(_sent["filesystem"]))
 check("a symlinked workspace is denied by the path it resolves to",
       os.path.realpath(_real_repo) in _sent["filesystem"]["denyWrite"],
       json.dumps(_sent["filesystem"]))
+
+# No read of any other checkout. A review of a public repository could
+# otherwise read the private clone beside it and quote it into a finding
+# posted in public: measured on 2.1.285, a harmless file in a sibling
+# checkout came back through both Read and `cat`.
+_own = os.path.join(vinegar.CHECKOUT_DIR, "o__r")
+_other = os.path.join(vinegar.CHECKOUT_DIR, "o__private")
+for _dir in (_own, _other):
+    os.makedirs(_dir, exist_ok=True)
+
+
+def _reads_denied(workspace, repos=()):
+    """The permission rules sent for a review that runs in `workspace`."""
+    return json.loads(vinegar.reviewer_settings(workspace, repos))[
+        "permissions"]["deny"]
+
+
+def _names(rules, path):
+    """The rules among these that would cover `path`, in either form."""
+    forms = {path, os.path.realpath(path)}
+    return [rule for rule in rules
+            if any(rule == "Read(/%s/**)" % form for form in forms)]
+
+
+_deny = _reads_denied(_own)
+check("another checkout is denied to the reviewer",
+      _names(_deny, _other) != [], _deny[-6:])
+check("the checkout under review stays readable",
+      _names(_deny, _own) == [], _names(_deny, _own))
+# The symlinked clone beside it, which resolves outside CHECKOUT_DIR. A
+# rule on the link alone leaves the files readable by the path they live at.
+check("another checkout is denied by the path it resolves to",
+      "Read(/%s/**)" % os.path.realpath(_real_repo) in _deny, _deny[-6:])
+# And the same clone as the one under review. Compared by the path written,
+# the link and its target look like two checkouts, and the review would be
+# denied its own files.
+_deny = _reads_denied(_linked_repo)
+check("a workspace reached through a symlink stays readable",
+      _names(_deny, _linked_repo) == [] and _names(_deny, _real_repo) == [],
+      _names(_deny, _linked_repo) + _names(_deny, _real_repo))
+check("the other checkouts are still denied from a symlinked workspace",
+      _names(_deny, _own) != [], _deny[-6:])
+# Added to the file's rules, not put in place of them.
+check("the file's own read denies still go with the checkout denies",
+      all(rule in _deny for rule in vinegar.DENY_ALWAYS), _deny[:4])
+# Every repository Vinegar polls, cloned or not. Built from the disk alone,
+# a clone made by another worker during this review was readable for the
+# whole of it, which with `parallel_repos` above 1 is a first review of any
+# repository not yet cloned.
+_deny = _reads_denied(_own, ["o/r", "o/later"])
+check("a repository not cloned yet is denied to the reviewer already",
+      _names(_deny, os.path.join(vinegar.CHECKOUT_DIR, "o__later")) != [],
+      _deny[-6:])
+check("the repository under review is not denied by being polled",
+      _names(_deny, _own) == [], _names(_deny, _own))
+# APFS ignores case, so another spelling of the same name is the same
+# directory. Compared as strings it reads as a sibling, and the review is
+# denied its own checkout. Only checkable where the disk ignores case.
+if os.path.isdir(os.path.join(vinegar.CHECKOUT_DIR, "O__R")):
+    _deny = _reads_denied(_own, ["o/R"])
+    check("a polled name spelled with other capitals is still the review's",
+          _names(_deny, os.path.join(vinegar.CHECKOUT_DIR, "o__R")) == [],
+          _deny[-6:])
+    _upper = os.path.join(vinegar.CHECKOUT_DIR, "O__R")
+    _deny = _reads_denied(_upper)
+    check("a workspace spelled with other capitals is not denied as a sibling",
+          _names(_deny, _own) == [], _names(_deny, _own))
+    _box = json.loads(vinegar.reviewer_settings(_upper, ()))["sandbox"]
+    check("the sandbox lets the workspace be read by its spelling on disk",
+          _own in _box["filesystem"].get("allowRead", []),
+          _box["filesystem"].get("allowRead"))
+# The sandbox half: every read under CHECKOUT_DIR is refused but in the
+# workspace. That is what stops `ls` of the directory publishing the names
+# of the private repositories, and it covers a clone made mid-review.
+_box = json.loads(vinegar.reviewer_settings(_own, ()))["sandbox"]["filesystem"]
+check("the sandbox refuses reads under the checkout directory",
+      vinegar.CHECKOUT_DIR in _box.get("denyRead", []), _box.get("denyRead"))
+check("the sandbox lets the review read its own checkout",
+      _own in _box.get("allowRead", []) and
+      os.path.realpath(_own) in _box.get("allowRead", []),
+      _box.get("allowRead"))
+check("the checkout directory itself is not allowed back",
+      vinegar.CHECKOUT_DIR not in _box.get("allowRead", []),
+      _box.get("allowRead"))
+# The polled repositories cannot be left out by a caller that forgets them:
+# with a default, a second caller would quietly lose the cover for a clone
+# made mid-review.
+try:
+    vinegar.reviewer_settings(_own)
+    _left_out = "sent"
+except TypeError:
+    _left_out = "refused"
+check("the reviewer's settings cannot be built without the polled repositories",
+      _left_out == "refused", _left_out)
+# Another name for the workspace, which every disk can make, unlike a
+# spelling in other capitals. Compared by name, the alias reads as a
+# sibling and the review is denied its own files by the path they resolve
+# to; the sandbox has to allow reading by the alias too.
+_alias = os.path.join(vinegar.CHECKOUT_DIR, "alias__r")
+if not os.path.islink(_alias):
+    os.symlink(_own, _alias)
+try:
+    _deny = _reads_denied(_own)
+    _box = json.loads(vinegar.reviewer_settings(_own, ()))["sandbox"]
+finally:
+    os.remove(_alias)
+check("another name for the workspace is not denied as a sibling",
+      _names(_deny, _alias) == [] and _names(_deny, _own) == [],
+      _names(_deny, _alias) + _names(_deny, _own))
+check("the sandbox lets the workspace be read by another of its names",
+      _alias in _box["filesystem"].get("allowRead", []),
+      _box["filesystem"].get("allowRead"))
+
+# A home directory DENY_ALWAYS names, linked to another volume. Measured:
+# a deny on a link's path refuses `cat` through the link and not `cat` of
+# the target's own path, so the resolved form has to be named too.
+_fake_home = os.path.join(_home, "fake-home")
+os.makedirs(os.path.join(_fake_home, "real-src", "o__clone"), exist_ok=True)
+if not os.path.islink(os.path.join(_fake_home, "src")):
+    os.symlink(os.path.join(_fake_home, "real-src"),
+               os.path.join(_fake_home, "src"))
+_real_home = os.environ["HOME"]
+# Resolved first: the temp root is itself reached through a symlink on
+# macOS, which would make every directory under it look linked.
+os.environ["HOME"] = os.path.realpath(_fake_home)
+try:
+    _deny = _reads_denied(_own)
+finally:
+    os.environ["HOME"] = _real_home
+check("a linked home directory is denied by the path it resolves to",
+      "Read(/%s/**)" % os.path.realpath(os.path.join(_fake_home, "real-src"))
+      in _deny, _deny[-6:])
+# Only where the resolved form differs: the written one is already in the
+# file, and a second spelling of it on every review says nothing new.
+check("a home directory that is not a link adds no rule of its own",
+      "Read(/%s/**)" % os.path.join(os.path.realpath(_fake_home), "Library")
+      not in _deny,
+      _deny[-6:])
+
+
+def _starts_with_checkouts(path):
+    """What check_paths says with CHECKOUT_DIR at `path` and HOME faked."""
+    _was = vinegar.CHECKOUT_DIR
+    vinegar.CHECKOUT_DIR = path
+    os.environ["HOME"] = _fake_home
+    try:
+        vinegar.check_paths()
+        return "started"
+    except SystemExit as err:
+        return str(err)
+    except Exception as err:
+        return "raised %r" % err
+    finally:
+        os.environ["HOME"] = _real_home
+        vinegar.CHECKOUT_DIR = _was
+
+
+# A checkout under a directory every review is denied is one the reviewer
+# cannot open, which reviews then run without and report nothing about.
+_co_ok = os.path.join(_fake_home, "checkouts")
+os.makedirs(_co_ok, exist_ok=True)
+_said = _starts_with_checkouts(_co_ok)
+check("checkouts outside the denied home directories start",
+      _said == "started", _said)
+_said = _starts_with_checkouts(os.path.join(_fake_home, "src", "checkouts"))
+check("checkouts under a denied home directory refuse to start",
+      "which every review is denied" in _said, _said)
+# And one clone linked into it to save cloning again.
+if not os.path.islink(os.path.join(_co_ok, "o__clone")):
+    os.symlink(os.path.join(_fake_home, "src", "o__clone"),
+               os.path.join(_co_ok, "o__clone"))
+_said = _starts_with_checkouts(_co_ok)
+check("a checkout linked into a denied home directory refuses to start",
+      "o__clone" in _said and "which every review is denied" in _said, _said)
+# Every directory DENY_ALWAYS denies, not only the home ones. A clone
+# linked into `~/.vinegar` to save cloning it again on an upgrade is denied
+# to every review by `Read(//**/.vinegar/**)`, and so is one under `.ssh`.
+for _component in (".vinegar", ".ssh"):
+    _stash = os.path.join(_fake_home, "stash" + _component, _component, "o__big")
+    os.makedirs(_stash, exist_ok=True)
+    _co_linked = os.path.join(_fake_home, "checkouts" + _component)
+    os.makedirs(_co_linked, exist_ok=True)
+    if not os.path.islink(os.path.join(_co_linked, "o__big")):
+        os.symlink(_stash, os.path.join(_co_linked, "o__big"))
+    _said = _starts_with_checkouts(_co_linked)
+    check("a checkout linked under a %s directory refuses to start" % _component,
+          "o__big" in _said and _component in _said
+          and "which every review is denied" in _said, _said)
+# A checkout directory that cannot be listed is a sentence, not a
+# traceback launchd restarts into every thirty seconds.
+_not_a_dir = os.path.join(_fake_home, "checkouts-file")
+open(_not_a_dir, "w").close()
+_said = _starts_with_checkouts(_not_a_dir)
+check("a checkout directory that is a file is refused with a sentence",
+      "cannot be listed" in _said, _said)
 
 # What these checks cannot reach, said plainly rather than left implied.
 # They prove what Vinegar sends. Whether `sandbox.filesystem.denyWrite`
@@ -2822,7 +3047,7 @@ check("a symlinked workspace is denied by the path it resolves to",
 #
 #   claude -p 'Run exactly: git show -s --format=%B --output=./x.txt HEAD' \
 #     --settings "$(python3 -c 'import vinegar, os;
-#         print(vinegar.reviewer_settings(os.getcwd()))')" \
+#         print(vinegar.reviewer_settings(os.getcwd(), []))')" \
 #     --setting-sources "" --strict-mcp-config --model claude-haiku-4-5
 #
 # Then: `git log` exits 0, the write exits 128 with "Operation not

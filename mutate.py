@@ -173,14 +173,14 @@ MUTATIONS = [
 
     # --- what the reviewer runs under ----------------------------------
     ("claude-settings",
-     '           "--settings", reviewer_settings(path),',
+     '           "--settings", reviewer_settings(path, config["repos"]),',
      "           "),
     # Both of these carry the line above them, because the severity pass
     # sends the same two flags and the bare text now matches twice.
     ("setting-sources",
-     '           "--settings", reviewer_settings(path),\n'
+     '           "--settings", reviewer_settings(path, config["repos"]),\n'
      '           "--setting-sources", "",',
-     '           "--settings", reviewer_settings(path),'),
+     '           "--settings", reviewer_settings(path, config["repos"]),'),
     ("strict-mcp-config",
      '           "--setting-sources", "",\n'
      '           "--strict-mcp-config"]',
@@ -191,6 +191,82 @@ MUTATIONS = [
     ("review-cwd",
      "                         cwd=path, timeout=left, env=reviewing)",
      "                         timeout=left, env=reviewing)"),
+    # The read denies added 2026-10-03. Each is pinned in DENY_ALWAYS, so
+    # dropping one from the tuple lets a file without it start.
+    ("deny-always-claude-json", '    "Read(//**/.claude.json*)",\n', ""),
+    ("deny-always-library", '    "Read(~/Library/**)",\n', ""),
+    ("deny-always-opencode", '    "Read(~/.local/share/opencode/**)",\n', ""),
+    ("deny-always-src", '    "Read(~/src/**)",\n', ""),
+    # And every other checkout, built per review.
+    ("other-checkouts-read-denied",
+     "                reads.append(rule)",
+     "                pass"),
+    ("own-checkout-stays-readable",
+     "    mine = [path for path in entries if is_workspace(path)]",
+     "    mine = []"),
+    ("own-checkout-not-denied-as-polled",
+     "              + [path for path in polled if not is_workspace(path)])",
+     "              + polled)"),
+    ("other-checkouts-by-resolved-path",
+     '        for form in forms(path):\n            rule = "Read(/%s/**)" % form',
+     '        for form in [path]:\n            rule = "Read(/%s/**)" % form'),
+    ("own-checkout-by-inode",
+     "            return os.path.samefile(path, workspace)",
+     "            return path == workspace"),
+    ("polled-repos-denied",
+     "    polled = [checkout_path(repo) for repo in repos]",
+     "    polled = []"),
+    ("polled-repos-required",
+     "def reviewer_settings(workspace, repos):",
+     "def reviewer_settings(workspace, repos=()):"),
+    ("review-passes-polled-repos",
+     '           "--settings", reviewer_settings(path, config["repos"]),',
+     '           "--settings", reviewer_settings(path, ()),'),
+    ("sandbox-denies-checkout-reads",
+     "        denyRead=forms(CHECKOUT_DIR), allowRead=own)",
+     "        allowRead=own)"),
+    ("sandbox-allows-own-checkout",
+     "        denyRead=forms(CHECKOUT_DIR), allowRead=own)",
+     "        denyRead=forms(CHECKOUT_DIR))"),
+    ("sandbox-allows-spelling-on-disk",
+     "        own += [form for form in forms(path) if form not in own]",
+     "        pass"),
+    ("home-denies-by-resolved-path",
+     "    for written, resolved in denied_homes():\n"
+     '        rule = "Read(/%s/**)" % resolved',
+     "    for written, resolved in ():\n"
+     '        rule = "Read(/%s/**)" % resolved'),
+    ("home-denies-only-where-resolved-differs",
+     "        if resolved != written and rule not in reads:",
+     "        if rule not in reads:"),
+    ("denied-homes-resolved-form",
+     "            places.append((place, os.path.realpath(place)))",
+     "            places.append((place, place))"),
+    ("checkouts-refused-under-denied-homes",
+     "            if real == place or real.startswith(place + os.sep):",
+     "            if False:"),
+    ("checkouts-refused-under-denied-dirs",
+     "            if os.sep + name + os.sep in real + os.sep:",
+     "            if False:"),
+    ("unlistable-checkouts-refused-with-a-sentence",
+     "    except OSError as err:\n"
+     '        sys.exit("%s cannot be listed (%s), and every checkout is cloned "',
+     "    except FileExistsError as err:\n"
+     '        sys.exit("%s cannot be listed (%s), and every checkout is cloned "'),
+    ("linked-checkouts-refused-under-denied-homes",
+     "    for path in [CHECKOUT_DIR] + entries:",
+     "    for path in [CHECKOUT_DIR]:"),
+    ("checkout-denies-added-to-file-denies",
+     '    reads = settings["permissions"]["deny"]\n',
+     '    reads = settings["permissions"]["deny"] = []\n'),
+    ("checkout-denies-before-first-clone",
+     "    try:\n"
+     "        entries = [os.path.join(CHECKOUT_DIR, name)\n"
+     "                   for name in sorted(os.listdir(CHECKOUT_DIR))]\n"
+     "    except FileNotFoundError:",
+     "    entries = [os.path.join(CHECKOUT_DIR, name)\n"
+     "               for name in sorted(os.listdir(CHECKOUT_DIR))]\n"
+     "    if False:"),
 
     # --- which pull requests are reviewed at all -----------------------
     ("skip-drafts",
