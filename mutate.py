@@ -1312,15 +1312,30 @@ MUTATIONS = [
      '            and str(was.get("external_id") or DEPLOYMENT) == DEPLOYMENT]'),
     # Opening it is the one call here that parses a reply GitHub sent.
     ("check-opened-inside-the-try",
-     "        check = open_check(key, repo, pr, config, env, blockers)\n"
+     "        check = open_check(key, repo, pr, config,\n"
+     "                           posting_env(key, config, repo, tokens, env) or env,\n"
+     "                           blockers)\n"
      "        try:",
      "        try:"),
+    # Opened on a token minted where it runs, not on the checkout's (#17).
+    ("check-opened-on-a-fresh-token",
+     "                           posting_env(key, config, repo, tokens, env) or env,\n"
+     "                           blockers)",
+     "                           env,\n"
+     "                           blockers)"),
     # The hand-run path: reachable by no check and anchored by no
     # mutation until the second pass said so.
     ("check-hand-run-opens-one",
-     "                hand = open_check(args.pr, repo, pr, config, env, "
-     "blockers)",
+     "                hand = open_check(\n"
+     "                    args.pr, repo, pr, config,\n"
+     "                    posting_env(args.pr, config, repo, tokens, env) or env,\n"
+     "                    blockers)",
      "                hand = None"),
+    ("check-hand-run-opens-on-a-fresh-token",
+     "                    posting_env(args.pr, config, repo, tokens, env) or env,\n"
+     "                    blockers)",
+     "                    env,\n"
+     "                    blockers)"),
     ("check-hand-run-closes-it",
      "                close_check(args.pr, hand, ended_title(outcome),",
      "                (lambda *a, **k: None)(args.pr, hand, ended_title(outcome),"),
@@ -1345,7 +1360,10 @@ MUTATIONS = [
     # constant intact, so the check that the clone gets longer than the
     # fetch was covered by neither of the two entries above it.
     ("clone-timeout-value", "CLONE_TIMEOUT = 1800", "CLONE_TIMEOUT = 60"),
-    ("checkout-grace-value", "CHECKOUT_GRACE = 1500", "CHECKOUT_GRACE = 60"),
+    ("checkout-grace-value", "CHECKOUT_GRACE = 1800", "CHECKOUT_GRACE = 60"),
+    # The base fetch is the step a hand-kept count left out.
+    ("checkout-grace-counts-the-base-fetch",
+     "CHECKOUT_GRACE = 1800", "CHECKOUT_GRACE = 1500"),
     ("efforts-ultra",
      'EFFORTS = ("low", "medium", "high", "xhigh", "max")',
      'EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")'),
@@ -2330,8 +2348,16 @@ MUTATIONS = [
     # Opened before triage ran, so left alone it announces the ceiling for
     # the whole of a review running lower.
     ("retitle-corrects-the-checks-list",
-     "        retitle_check(label, check, chosen, blockers, env)",
+     "        retitle_check(label, check, chosen, blockers,\n"
+     "                      posting_env(label, config, repo, tokens, env) or env)",
      "        pass"),
+    # On a token minted where it runs, because triage has run since the
+    # checkout's was minted (#17).
+    ("retitle-on-a-fresh-token",
+     "        retitle_check(label, check, chosen, blockers,\n"
+     "                      posting_env(label, config, repo, tokens, env) or env)",
+     "        retitle_check(label, check, chosen, blockers,\n"
+     "                      env)"),
     ("retitle-uses-the-chosen-effort",
      '                  "title": "Reviewing at %s effort%s" % (\n'
      '                      effort, ", blockers only" if blockers else ""),\n'
@@ -2434,22 +2460,18 @@ MUTATIONS = [
     ("narrowed-round-is-declared",
      "                             config, narrowed=bool(since))",
      "                             config)"),
-    # The token has to outlive the triage pass as well as the clone, and
-    # not the review (issue #17).
-    ("reserve-counts-the-triage-pass",
-     "    return CHECKOUT_GRACE + (SHAPE_TIMEOUT + DIFF_TIMEOUT\n"
-     '                             if config["triage_model"] else 0)',
-     "    return CHECKOUT_GRACE"),
-    ("reserve-counts-nothing-when-triage-is-off",
-     '                             if config["triage_model"] else 0)',
-     "                             if True else 0)"),
+    # The checkout's token outlives the checkout and not the review (#17),
+    # and a hand run's outlives the read of the pull request before it.
     ("grace-leaves-out-the-review",
-     '                             if config["triage_model"] else 0)',
-     '                             if config["triage_model"] else 0)'
-     ' + config["review_timeout"]'),
-    # Past the hour a token lives the cache can never serve one.
+     "    env = github_env(config, repo, tokens, good_for=CHECKOUT_GRACE)",
+     "    env = github_env(config, repo, tokens,\n"
+     '                     good_for=CHECKOUT_GRACE + config["review_timeout"])'),
+    ("hand-run-grace-counts-the-read",
+     "                             good_for=LIST_TIMEOUT + CHECKOUT_GRACE)",
+     "                             good_for=CHECKOUT_GRACE)"),
+    # Close to the hour a token lives the cache barely serves one.
     ("grace-inside-token-life",
-     "CHECKOUT_GRACE = 1500", "CHECKOUT_GRACE = 3500"),
+     "CHECKOUT_GRACE = 1800", "CHECKOUT_GRACE = 3500"),
 
     # --- a login that fails, which is not a failed review ---------------
     # Three attempts seconds apart cannot outlast it, and three pull

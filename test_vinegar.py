@@ -3465,27 +3465,6 @@ check("a model name starts",
 check("the shipped default starts",
       _config_with(severity_model=vinegar.DEFAULTS["severity_model"])
       == "started", vinegar.DEFAULTS["severity_model"])
-# What the token must outlive before the review starts: the clone, and then
-# the triage pass, which runs before retitle_check() renames the checks
-# entry on this token. Leaving triage out understated it by four minutes.
-check("the grace counts the triage pass when it will run",
-      vinegar.checkout_grace(dict(vinegar.DEFAULTS, triage_model="sonnet"))
-      == vinegar.CHECKOUT_GRACE + vinegar.SHAPE_TIMEOUT + vinegar.DIFF_TIMEOUT,
-      vinegar.checkout_grace(dict(vinegar.DEFAULTS, triage_model="sonnet")))
-check("the grace counts nothing for a pass that will not run",
-      vinegar.checkout_grace(dict(vinegar.DEFAULTS, triage_model=None))
-      == vinegar.CHECKOUT_GRACE)
-# Not the review, which is issue #17. The reviewer holds no GitHub
-# credential, so after the review this token is only the posting's
-# fallback, and asking for the review as well left the cache about a
-# minute of each token's hour: a fresh mint for every review. Two
-# timeouts far apart, so the review coming back into the sum cannot leave
-# the two graces equal.
-check("the checkout token is not asked to outlive the review",
-      vinegar.checkout_grace(dict(vinegar.DEFAULTS, review_timeout=60))
-      == vinegar.checkout_grace(dict(vinegar.DEFAULTS, review_timeout=7200)),
-      (vinegar.checkout_grace(dict(vinegar.DEFAULTS, review_timeout=60)),
-       vinegar.checkout_grace(dict(vinegar.DEFAULTS, review_timeout=7200))))
 # The only upper bound on review_timeout. One review holds its
 # repository's poll thread, so an extra zero parks it for hours while the
 # watchdog reads the pid and calls it healthy.
@@ -4158,20 +4137,21 @@ check("the posting mints a token with time to finish posting",
 # threaded through three call sites and changes no decision anywhere.
 check("the posting grace is long enough to cover a slow post",
       vinegar.POST_GRACE >= vinegar.POST_TIMEOUT, vinegar.POST_GRACE)
-# The checkout runs on this token, so the grace has to outlast what the
-# checkout can actually spend. The head fetch alone is FETCH_TIMEOUT; a
-# grace under that hands out a token that dies during the fetch it was
-# minted to survive.
-check("the checkout grace outlasts the fetch it has to survive",
-      vinegar.CHECKOUT_GRACE >= vinegar.FETCH_TIMEOUT, vinegar.CHECKOUT_GRACE)
-# And it stays inside a token's life, or the cache can never serve one and
-# every call mints a fresh token. Nothing fails when it does: it is silent,
-# and it once ran at about 1440 tokens a day per open pull request. Asked
-# with the triage pass on, which is the larger grace.
-_triaged = dict(CONFIG, triage_model="sonnet")
-check("the checkout grace stays inside a token's life",
-      vinegar.checkout_grace(_triaged) < vinegar.TOKEN_LIFE,
-      (vinegar.checkout_grace(_triaged), vinegar.TOKEN_LIFE))
+# The checkout runs on this token, so the grace has to outlast what a
+# checkout of a repository cloned before can spend: the usability probe and
+# four local steps at DIFF_TIMEOUT, and the head and base fetches at
+# FETCH_TIMEOUT. The base fetch is the step a hand-kept count left out.
+check("the checkout grace outlasts every step of a checkout",
+      vinegar.CHECKOUT_GRACE
+      >= 5 * vinegar.DIFF_TIMEOUT + 2 * vinegar.FETCH_TIMEOUT,
+      vinegar.CHECKOUT_GRACE)
+# And it leaves the cache at least half of each token's hour. Past the hour
+# the cache can never serve one, and close to it, where issue #17 found it,
+# every review mints a fresh token. Nothing fails when it does: it is
+# silent, and it once ran at about 1440 tokens a day per open pull request.
+check("the cache serves a checkout token for half its hour",
+      vinegar.TOKEN_LIFE - vinegar.CHECKOUT_GRACE >= vinegar.TOKEN_LIFE // 2,
+      (vinegar.CHECKOUT_GRACE, vinegar.TOKEN_LIFE))
 vinegar.github_env = _real_env
 
 # --- reviewer_brief ------------------------------------------------------
@@ -4627,19 +4607,36 @@ _disk = [asked["output"]["title"] for how, _, asked in checked
 check("recording that fails still finishes the indicator",
       _disk == ["The review failed and will be tried again"], _disk)
 
-# The credentials above were asked to cover the checkout and the review,
-# so on a full-length review they can be spent by the time this runs.
-# Closing on them was a 401 exactly when the indicator most needs closing.
+# The credentials above were asked to cover the checkout alone, so after a
+# review they can be spent by the time this runs. Closing on them was a 401
+# exactly when the indicator most needs closing.
+_graces = []
+
+
 def _env_for(config, repo, tokens, good_for=0):
+    _graces.append(good_for)
     return {"GH_TOKEN": "post" if good_for == vinegar.POST_GRACE else "stale"}
 
 
 _env_kept = vinegar.github_env
 vinegar.github_env = _env_for
+del check_envs[:]
+del _graces[:]
 _fresh = _indicator_after(vinegar.FAILED, 0)
 vinegar.github_env = _env_kept
 check("the indicator is closed on freshly minted credentials",
       check_envs and check_envs[-1] == "post", check_envs)
+# Opened on them too. The steps between the checkout and the opening were
+# outside any grace a hand-kept sum gave the checkout's token, which is why
+# the opening mints its own.
+check("the indicator is opened on freshly minted credentials",
+      len(check_envs) >= 2 and check_envs[:2] == ["post", "post"],
+      check_envs)
+# And the checkout's token is asked to outlive the checkout and nothing
+# else, the review least of all: with the review in it the cache served a
+# token for about a minute of its hour, a fresh mint per review (#17).
+check("the checkout token is asked to outlive only the checkout",
+      _graces[:1] == [vinegar.CHECKOUT_GRACE], _graces)
 
 # Put back exactly what this block borrowed, and nothing else. A
 # reset_stubs() here restored `checkout` and `save_state` to the genuine
@@ -6341,13 +6338,25 @@ vinegar.run = fake_run
 _pr_kw = {}
 _pr_real = (vinegar.review, vinegar.find_pr, vinegar.checkout,
             vinegar.github_env, sys.argv)
+_pr_open_real = vinegar.open_check
 os.makedirs(os.environ["VINEGAR_HOME"], exist_ok=True)
 with open(os.path.join(os.environ["VINEGAR_HOME"], "config.json"), "w") as h:
     json.dump({"repos": ["o/r"]}, h)
 vinegar.review = lambda *a, **k: _pr_kw.update(k) or (vinegar.DONE, True, True)
 vinegar.find_pr = lambda repo, number, env: PR_LIVE
 vinegar.checkout = lambda repo, pr, env: ROOT
-vinegar.github_env = lambda *a, **k: None
+_pr_graces = []
+_pr_opened = []
+
+
+def _pr_env(*a, **k):
+    _pr_graces.append(k.get("good_for"))
+    return ({"GH_TOKEN": "post"} if k.get("good_for") == vinegar.POST_GRACE
+            else None)
+
+
+vinegar.github_env = _pr_env
+vinegar.open_check = lambda *a, **k: _pr_opened.append(a[4])
 sys.argv = ["vinegar.py", "--pr", "o/r#12"]
 try:
     vinegar.main()
@@ -6356,6 +6365,7 @@ except SystemExit as err:
 finally:
     (vinegar.review, vinegar.find_pr, vinegar.checkout,
      vinegar.github_env, sys.argv) = _pr_real
+    vinegar.open_check = _pr_open_real
 # Deliberately not `resent`: a person running --pr has asked for a review
 # and expects to see one. Asking first makes the stated reason for a
 # second run — trying another model — impossible, because the first run's
@@ -6363,6 +6373,14 @@ finally:
 # and discarded.
 check("a --pr run posts what it reviewed rather than deferring",
       _pr_kw.get("resent") in (None, False), _pr_kw)
+# The read of the pull request runs on the checkout's token here, ahead of
+# the checkout, so the grace asked for counts it as well.
+check("a --pr run's token outlives the read and the checkout",
+      vinegar.LIST_TIMEOUT + vinegar.CHECKOUT_GRACE in _pr_graces,
+      _pr_graces)
+check("a --pr run opens its indicator on freshly minted credentials",
+      _pr_opened and (_pr_opened[0] or {}).get("GH_TOKEN") == "post",
+      _pr_opened)
 
 
 def _hand_scoped(entry, argv=("vinegar.py", "--pr", "o/r#12"), review=None):
@@ -10055,6 +10073,17 @@ _patched = [(c, b) for c, b in _sent
 check("the checks list is corrected to the effort triage settled on",
       _patched and "PATCH" in _patched[0][0]
       and "Reviewing at low effort" in _patched[0][1], _patched)
+# On a token minted where it runs. The checkout's token was asked to
+# outlive only the checkout, and the triage pass has run since.
+_retitle_envs = []
+_retitle_kept = (vinegar.retitle_check, vinegar.github_env)
+vinegar.retitle_check = lambda label, check, effort, blockers, env: (
+    _retitle_envs.append((env or {}).get("GH_TOKEN")))
+vinegar.github_env = _env_for
+_posts()
+vinegar.retitle_check, vinegar.github_env = _retitle_kept
+check("the checks list is corrected on freshly minted credentials",
+      _retitle_envs == ["post"], _retitle_envs)
 
 check("a dry run posts no note",
       not [c for c, _ in _posts(comment=False)
