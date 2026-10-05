@@ -2665,7 +2665,8 @@ def _settings_file(sandbox, permissions=None, raw=None):
         else:
             doc = {"permissions": permissions if permissions is not None
                    else {"allow": [vinegar.REPORT_TOOL],
-                         "deny": list(vinegar.DENY_ALWAYS)}}
+                         "deny": list(vinegar.DENY_ALWAYS)},
+                   "bashOutputMaxChars": vinegar.BASH_OUTPUT_MAX}
             if sandbox is not _absent:
                 doc["sandbox"] = sandbox
             json.dump(doc, handle)
@@ -2749,6 +2750,22 @@ check("the settings sent pin the network closed",
 _said = _sending(dict(_good, network={"allowedDomains": ["api.github.com"]}))
 check("a file that opens a domain is refused",
       "sandbox.network" in _said, _said)
+# Past 30,000 characters a Bash result is saved under ~/.claude, which the
+# reviewer is denied: 43 reviews lost a `git diff` of up to 114,922
+# characters that way. The shipped file, because it is what is sent.
+_sent = json.loads(vinegar.reviewer_settings(_workspace, ()))
+check("the settings sent keep a large diff inline",
+      _sent.get("bashOutputMaxChars") == 128000,
+      _sent.get("bashOutputMaxChars"))
+_minimal = {"permissions": {"allow": [vinegar.REPORT_TOOL],
+                            "deny": list(vinegar.DENY_ALWAYS)},
+            "sandbox": _good}
+_said = _sending(None, raw=json.dumps(_minimal))
+check("a file that leaves out the output limit is refused",
+      "bashOutputMaxChars" in _said, _said)
+_said = _sending(None, raw=json.dumps(dict(_minimal, bashOutputMaxChars=30000)))
+check("a file with a smaller output limit is refused",
+      "bashOutputMaxChars" in _said, _said)
 
 # The read side is re-checked on the same schedule the write side is
 # rebuilt on. Validating once at startup and forwarding blindly per review
@@ -3592,6 +3609,11 @@ check("the paths as configured are still accepted",
 check("the environment asks for the tool contract",
       (claude_run.env or {}).get("CLAUDE_CODE_REPORT_FINDINGS") == "1",
       sorted(claude_run.env or {})[:5])
+# zsh, the macOS login shell, refuses a command whose glob matches nothing,
+# so `grep -rn x --include=*.kt .` never ran: 136 commands in 109 reviews.
+check("the reviewer's Bash runs in bash, not the login shell",
+      (claude_run.env or {}).get("CLAUDE_CODE_SHELL") == "/bin/bash",
+      (claude_run.env or {}).get("CLAUDE_CODE_SHELL"))
 
 # The reviewer is given no GitHub credential, and this is a leak rather
 # than tidiness. The environment handed to review() is the one checkout()
@@ -4249,7 +4271,21 @@ check("brief says the network is closed rather than leaving it to be found",
 # Measured across the three rounds of PR #24, six of sixteen denied commands
 # were `sed`, `find` and `awk` doing what Read, Grep and Glob already do.
 check("brief names the tools rather than leaving the denials to be found",
-      "Read, Grep and Glob" in brief and "`python3`" in brief, brief)
+      "`git grep`" in brief and "`python3`" in brief, brief)
+# And only tools it has. Claude Code 2.1.285 has no Grep or Glob tool, and
+# its error for one points at `find`, which is denied; `rg` is not
+# installed in the reviewer's shell.
+check("brief names no tool the reviewer does not have",
+      "Grep" not in brief and "Glob" not in brief and "`rg`" not in brief,
+      brief)
+# Claude Code makes a `.claude/` in every checkout, and it is read-denied,
+# so every recursive search reports it. git still reads a tracked file there.
+check("brief says how to read what is under .claude",
+      "`git show HEAD:<path>`" in brief, brief)
+# About ten posted reviews said they could not check the conventions in a
+# file that belongs to whoever runs the daemon, not to the repository.
+check("brief puts the user's own CLAUDE.md out of scope",
+      "`~/.claude/CLAUDE.md` is out of scope" in brief, brief)
 # Separate, because it is a different failure. Told only which commands are
 # denied, a reviewer plans a review around running the tests: three rounds
 # of PR #24 each reached for `python3 test_vinegar.py` and each spent a turn

@@ -191,6 +191,16 @@ MUTATIONS = [
     ("review-cwd",
      "                         cwd=path, timeout=left, env=reviewing)",
      "                         timeout=left, env=reviewing)"),
+    # zsh refused a glob that matched nothing in 109 reviews; bash runs it.
+    ("reviewer-runs-bash",
+     '    reviewing = dict(env, CLAUDE_CODE_REPORT_FINDINGS="1",\n'
+     '                     CLAUDE_CODE_SHELL="/bin/bash")',
+     '    reviewing = dict(env, CLAUDE_CODE_REPORT_FINDINGS="1")'),
+    # A Bash result over 30,000 characters is saved where the reviewer is
+    # denied, so a file without the limit loses every large diff.
+    ("bash-output-max-checked",
+     '    if settings.get("bashOutputMaxChars") != BASH_OUTPUT_MAX:',
+     "    if False:"),
     # The read denies added 2026-10-03. Each is pinned in DENY_ALWAYS, so
     # dropping one from the tuple lets a file without it start.
     ("deny-always-claude-json", '    "Read(//**/.claude.json*)",\n', ""),
@@ -1427,16 +1437,40 @@ MUTATIONS = [
     # of PR #24's sixteen were sed, find and awk doing what Read, Grep and
     # Glob already do; most of the rest were python3 running the suite.
     ("brief-names-the-read-tools",
-     '        "it. Use Read, Grep and Glob to read this checkout: `sed`, `awk`, "\n'
+     '        "it. Read files with the Read tool, and search with `grep -rn`, "\n'
+     '        "`git grep`, `git ls-files` and `ls` through Bash. `sed`, `awk`, "\n'
      '        "`find` and every interpreter, `python3` among them, are denied, so "\n'
      '        "reaching for one costs a turn and returns nothing. You cannot run "',
      '        "it. You cannot run "'),
+    # And only tools it has: 2.1.285 has no Grep or Glob tool, and `rg` is
+    # not installed in the reviewer's shell.
+    ("brief-names-no-grep-tool",
+     '        "it. Read files with the Read tool, and search with `grep -rn`, "',
+     '        "it. Use Read, Grep and Glob, and search with `grep -rn`, "'),
+    ("brief-names-no-rg",
+     '        "it. Read files with the Read tool, and search with `grep -rn`, "',
+     '        "it. Read files with the Read tool, and search with `rg`, `grep -rn`, "'),
     # Separate, because it is a different failure: told only which commands
     # are denied, a reviewer plans a review around running the tests.
     ("brief-says-the-code-cannot-be-run",
      '        "reaching for one costs a turn and returns nothing. You cannot run "\n'
-     '        "this repository\'s tests or any of its code. Do not substitute a "',
-     '        "reaching for one costs a turn and returns nothing. Do not substitute a "'),
+     '        "this repository\'s tests or any of its code. Nothing under "',
+     '        "reaching for one costs a turn and returns nothing. Nothing under "'),
+    # Every recursive search reports the `.claude/` Claude Code makes in the
+    # checkout; git still reads a tracked file there.
+    ("brief-reads-dot-claude-through-git",
+     '        "this repository\'s tests or any of its code. Nothing under "\n'
+     '        "`.claude/` can be read directly: a search reports it as not "\n'
+     '        "permitted and still returns every other match, while "\n'
+     '        "`git show HEAD:<path>` reads a tracked file there and "\n'
+     '        "`git grep <pattern> HEAD` searches them. The user-level "',
+     '        "this repository\'s tests or any of its code. The user-level "'),
+    # About ten posted reviews said they could not check its conventions.
+    ("brief-user-claude-md-out-of-scope",
+     '        "`git grep <pattern> HEAD` searches them. The user-level "\n'
+     '        "`~/.claude/CLAUDE.md` is out of scope for this review, so do not "\n'
+     '        "try to read it or report that you could not. Do not substitute a "',
+     '        "`git grep <pattern> HEAD` searches them. Do not substitute a "'),
     ("brief-may-read-anything",
      '        "`git diff %s..HEAD` is the review scope. Read anything in '
      'the "',

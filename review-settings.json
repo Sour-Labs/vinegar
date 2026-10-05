@@ -105,5 +105,6 @@
     "network": {
       "allowedDomains": []
     }
-  }
+  },
+  "bashOutputMaxChars": 128000
 }

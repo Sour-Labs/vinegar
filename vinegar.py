@@ -192,6 +192,15 @@ SANDBOX_KEYS = frozenset(
     [name for name, _, _ in SANDBOX_RULES] + ["filesystem", "network"])
 SANDBOX_FS_KEYS = frozenset(["denyWrite"])
 
+# How much of a Bash result the reviewer gets inline, at the documented
+# maximum. Past Claude Code's default of 30,000 characters the result is
+# saved under ~/.claude/projects/ instead, and `Read(//**/.claude/**)` then
+# refuses the read back, so the reviewer never sees it. Measured from
+# 2026-09-01 to 2026-10-03: 43 reviews lost a `git diff` that way, 30,387 to
+# 114,922 characters long. Narrowing that deny is not the fix, because it
+# guards every other session's records.
+BASH_OUTPUT_MAX = 128000
+
 # abspath, not just expanduser, so a trailing slash or a relative path cannot
 # make either of these look like it sits somewhere it does not.
 HOME = os.path.abspath(
@@ -2068,6 +2077,14 @@ def load_settings():
             "domain would make that false — while also failing, since the "
             "sandbox terminates TLS and `gh` will not trust it."
             % json.dumps(SANDBOX_NETWORK))
+    # Sent as the file says it, so the file has to say it. Left out, every
+    # diff over the default goes to a file the reviewer is denied.
+    if settings.get("bashOutputMaxChars") != BASH_OUTPUT_MAX:
+        sys.exit(
+            "review-settings.json must set bashOutputMaxChars to %d. A "
+            "smaller limit saves a large `git diff` under ~/.claude, which "
+            "the reviewer is denied, so it reviews without reading it."
+            % BASH_OUTPUT_MAX)
     return settings
 
 
@@ -3037,6 +3054,19 @@ def reviewer_brief(pr, config, since=None, blockers=False):
     a review around running the tests and discovers three times that it
     cannot. It is also true rather than tactful, and the transcript of a
     review that says so is worth more than one that quietly did less.
+
+    The tools it names are the ones it has. Claude Code 2.1.285 has no
+    Grep or Glob tool, and naming them sent the reviewer to an error that
+    points at `find`, which is denied. `rg` is not named either: it is not
+    installed in the reviewer's shell, although the allow list has it.
+
+    `.claude/` is read-denied, and Claude Code makes one in every directory
+    it runs in, so every recursive search reports it as not permitted. Said
+    up front, that reads as the deny it is rather than a failed search, and
+    a tracked file there is still reachable through git. The user-level
+    CLAUDE.md sits behind the same deny and belongs to whoever runs the
+    daemon, not to the repository: about ten posted reviews said they could
+    not check its conventions.
     """
     base = pr["baseRefName"]
     # Named as what it is in each case. Calling the base diff "the review
@@ -3053,10 +3083,17 @@ def reviewer_brief(pr, config, since=None, blockers=False):
         "clone carries even when the branch itself was not fetched, and say "
         "in your summary that you used it. %s You have "
         "no network: `gh` cannot reach GitHub from here, so do not reach for "
-        "it. Use Read, Grep and Glob to read this checkout: `sed`, `awk`, "
+        "it. Read files with the Read tool, and search with `grep -rn`, "
+        "`git grep`, `git ls-files` and `ls` through Bash. `sed`, `awk`, "
         "`find` and every interpreter, `python3` among them, are denied, so "
         "reaching for one costs a turn and returns nothing. You cannot run "
-        "this repository's tests or any of its code. Do not substitute a "
+        "this repository's tests or any of its code. Nothing under "
+        "`.claude/` can be read directly: a search reports it as not "
+        "permitted and still returns every other match, while "
+        "`git show HEAD:<path>` reads a tracked file there and "
+        "`git grep <pattern> HEAD` searches them. The user-level "
+        "`~/.claude/CLAUDE.md` is out of scope for this review, so do not "
+        "try to read it or report that you could not. Do not substitute a "
         "branch of your own choosing, and do not assume `main`.%s\n\n"
         "Post nothing to GitHub yourself. Report every finding through the "
         "%s tool, including when you found none, and give `file` relative to "
@@ -5994,7 +6031,14 @@ def review(path, repo, pr, config, env, tokens, resent=False, check=None,
     # The caller's `env` is left alone, because posting_env() falls back
     # to it when minting a fresh token fails, and that fallback is what
     # gets a finished review onto the pull request during a GitHub blip.
-    reviewing = dict(env, CLAUDE_CODE_REPORT_FINDINGS="1")
+    #
+    # And bash rather than the login shell, which on macOS is zsh. zsh
+    # refuses a command whose glob matches nothing, so `grep -rn x
+    # --include=*.kt .` fails before grep runs: measured from 2026-09-01 to
+    # 2026-10-03, 136 commands in 109 reviews, about half never searched
+    # again. bash passes the word through and the grep runs.
+    reviewing = dict(env, CLAUDE_CODE_REPORT_FINDINGS="1",
+                     CLAUDE_CODE_SHELL="/bin/bash")
     for carried in ("GH_TOKEN", "GITHUB_TOKEN"):
         reviewing.pop(carried, None)
 
