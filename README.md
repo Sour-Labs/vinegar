@@ -690,14 +690,41 @@ are what remain, and a review that wants more than those says so: a refused
 after every run.
 
 The reviewer is told this up front rather than left to find it out. The brief
-names Read, Grep and Glob as how it reads a checkout, says `sed`, `awk`, `find`
-and the interpreters are denied, and says plainly that it cannot run the
-repository's tests or any of its code. Measured across the three rounds of
-PR #24: sixteen denied commands, about six of them `sed`, `find` and `awk`
-doing what Read, Grep and Glob already do, and most of the rest `python3`
-trying to run the suite three separate times. Each cost a turn and returned
-nothing. Saying it once is cheaper, and it leaves `permission_denials` closer
-to what it is for, which is the denials worth acting on.
+names Read, and `git grep -n <pattern> HEAD` first, then `grep -rn
+--exclude-dir=.claude`, `git ls-files` and `ls` through Bash, as how it reads
+a checkout. It says `sed`, `awk`, `find` and the interpreters are denied, and
+says plainly that it cannot run the repository's tests or any of its code. It
+names no Grep or Glob tool, because Claude Code 2.1.285 has none. It also says
+that `.claude/` cannot be read directly, though `git show HEAD:<path>` reads a
+tracked file there, and that the user-level `~/.claude/CLAUDE.md` is out of
+scope. Measured across the three rounds of PR #24: sixteen denied commands,
+about six of them `sed`, `find` and `awk` doing what Read, Grep and Glob
+already do, and most of the rest `python3` trying to run the suite three
+separate times. Each cost a turn and returned nothing. Saying it once is
+cheaper, and it leaves `permission_denials` closer to what it is for, which is
+the denials worth acting on.
+
+Two more settings make the reviewer's commands do what it asks. Its Bash runs
+in `/bin/bash`, set with `CLAUDE_CODE_SHELL`, because zsh, the macOS login
+shell, refuses a command whose glob matches nothing: `grep -rn x
+--include=*.kt .` failed that way 136 times in 109 reviews from 2026-09-01 to
+2026-10-03. And `review-settings.json` sets `bashOutputMaxChars` to 128000,
+the documented maximum, and Vinegar refuses to run without it. Past the
+default of 30,000 characters a result is saved under `~/.claude`, which the
+reviewer is denied, so in the same period 43 reviews never saw a large `git
+diff`.
+
+That limit covers only a command that succeeds. Claude Code keeps about
+10,000 characters of a failed command's output, the start and the end, and
+saves nothing. Claude Code also makes a `.claude/` in the directory it runs
+in, which the reviewer is denied, so a recursive `grep` over the checkout
+exits 2: measured, the same search returned 10,040 characters, and 103,920
+with `--exclude-dir=.claude`. Every other denied name does the same, a tracked
+`.env` included, and `--exclude-dir` cannot skip a file. That is why the brief
+names `git grep -n <pattern> HEAD` first. It reads the commit rather than the
+files, so no denied path can fail it, and it reaches what `.claude/` tracks:
+in a checkout tracking a `.env` and a `.claude/` file it returned 108,463
+characters at exit 0, where the grep returned 10,040.
 
 Reads are path-denied for `~/.vinegar`, `~/.claude`, `~/.ssh`, `~/.aws`,
 `~/.gnupg`, `~/.config/gh`, `.netrc`, `.env`, `.claude.json*`, `~/Library`,
@@ -712,7 +739,8 @@ These bind Bash as well as Read. Claude Code applies Read deny rules in the
 sandbox too, so `cat`, `grep -r` and `git` get "Operation not permitted" on
 these paths even when their arguments do not name them. Measured on 2.1.285
 with harmless files: Read was refused, `cat` of each file failed in the
-kernel, and a `grep -r` over a parent directory skipped the denied one.
+kernel, and a `grep -r` over a parent directory skipped the denied one but
+exited 2, which cuts its output short (see above).
 
 **Every other checkout is denied too, and Vinegar adds those rules itself.** A
 review of a public repository could otherwise read the private clone beside it
