@@ -1437,47 +1437,57 @@ MUTATIONS = [
     # of PR #24's sixteen were sed, find and awk doing what Read, Grep and
     # Glob already do; most of the rest were python3 running the suite.
     ("brief-names-the-read-tools",
-     '        "it. Read files with the Read tool, and search with "\n'
-     '        "`grep -rn --exclude-dir=.claude`, `git grep`, `git ls-files` and "\n'
-     '        "`ls` through Bash. `sed`, `awk`, "\n'
+     '        "it. Read files with the Read tool. Search with "\n'
+     '        "`git grep -n <pattern> HEAD`, which reads the commit rather than "\n'
+     '        "the files, so it searches `.claude/` too and no denied path can "\n'
+     '        "fail it. `grep -rn --exclude-dir=.claude`, `git ls-files` and `ls` "\n'
+     '        "also work through Bash. `sed`, `awk`, "\n'
      '        "`find` and every interpreter, `python3` among them, are denied, so "\n'
      '        "reaching for one costs a turn and returns nothing. You cannot run "',
      '        "it. You cannot run "'),
     # And only tools it has: 2.1.285 has no Grep or Glob tool, and `rg` is
     # not installed in the reviewer's shell.
     ("brief-names-no-grep-tool",
-     '        "it. Read files with the Read tool, and search with "',
-     '        "it. Use Read, Grep and Glob, and search with "'),
+     '        "it. Read files with the Read tool. Search with "',
+     '        "it. Read files with the Read, Grep and Glob tools. Search with "'),
     ("brief-names-no-rg",
-     '        "it. Read files with the Read tool, and search with "',
-     '        "it. Read files with the Read tool, and search with `rg`, "'),
+     '        "it. Read files with the Read tool. Search with "',
+     '        "it. Read files with the Read tool. Search with `rg` or "'),
+    # Against HEAD, git grep reads blobs, so no denied path can fail it: a
+    # grep over the same files exited 2 on a tracked `.env`.
+    ("brief-searches-the-commit",
+     '        "`git grep -n <pattern> HEAD`, which reads the commit rather than "',
+     '        "`git grep -n <pattern>`, which reads the commit rather than "'),
     # A grep that reaches the `.claude/` Claude Code makes exits 2, and a
     # failed command keeps only about 10,000 characters of its output.
     ("brief-greps-without-dot-claude",
-     '        "`grep -rn --exclude-dir=.claude`, `git grep`, `git ls-files` and "',
-     '        "`grep -rn`, `git grep`, `git ls-files` and "'),
+     '        "fail it. `grep -rn --exclude-dir=.claude`, `git ls-files` and `ls` "',
+     '        "fail it. `grep -rn`, `git ls-files` and `ls` "'),
     # Separate, because it is a different failure: told only which commands
     # are denied, a reviewer plans a review around running the tests.
     ("brief-says-the-code-cannot-be-run",
      '        "reaching for one costs a turn and returns nothing. You cannot run "\n'
-     '        "this repository\'s tests or any of its code. Nothing under "',
-     '        "reaching for one costs a turn and returns nothing. Nothing under "'),
-    # Every recursive search reports the `.claude/` Claude Code makes in the
-    # checkout; git still reads a tracked file there.
+     '        "this repository\'s tests or any of its code. Files under "',
+     '        "reaching for one costs a turn and returns nothing. Files under "'),
+    # Claude Code makes a `.claude/` in the checkout and it is read-denied;
+    # git still reads a tracked file there.
     ("brief-reads-dot-claude-through-git",
-     '        "this repository\'s tests or any of its code. Nothing under "\n'
-     '        "`.claude/` can be read directly. A search that reaches it fails, "\n'
-     '        "and only the start and end of a failed command\'s output come "\n'
-     '        "back, so keep it out of every recursive grep. "\n'
-     '        "`git show HEAD:<path>` reads a tracked file there and "\n'
-     '        "`git grep <pattern> HEAD` searches them. The user-level "',
-     '        "this repository\'s tests or any of its code. The user-level "'),
+     '        "this repository\'s tests or any of its code. Files under "\n'
+     '        "`.claude/` cannot be read directly, but `git show HEAD:<path>` "\n'
+     '        "reads one. A `grep -r` that reaches a denied path fails, and only "',
+     '        "this repository\'s tests or any of its code. A `grep -r` that reaches a denied path fails, and only "'),
+    # Told only to exclude `.claude`, a reviewer has no reason to read a
+    # cut-off result as cut off.
+    ("brief-says-a-failed-grep-is-cut",
+     '        "reads one. A `grep -r` that reaches a denied path fails, and only "\n'
+     '        "the start and end of a failed command\'s output come back. The "',
+     '        "reads one. The "'),
     # About ten posted reviews said they could not check its conventions.
     ("brief-user-claude-md-out-of-scope",
-     '        "`git grep <pattern> HEAD` searches them. The user-level "\n'
-     '        "`~/.claude/CLAUDE.md` is out of scope for this review, so do not "\n'
-     '        "try to read it or report that you could not. Do not substitute a "',
-     '        "`git grep <pattern> HEAD` searches them. Do not substitute a "'),
+     '        "the start and end of a failed command\'s output come back. The "\n'
+     '        "user-level `~/.claude/CLAUDE.md` is out of scope for this review, "\n'
+     '        "so do not try to read it or report that you could not. Do not "',
+     '        "the start and end of a failed command\'s output come back. Do not "'),
     ("brief-may-read-anything",
      '        "`git diff %s..HEAD` is the review scope. Read anything in '
      'the "',

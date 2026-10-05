@@ -3066,11 +3066,15 @@ def reviewer_brief(pr, config, since=None, blockers=False):
     than a line of noise: Claude Code keeps only about 10,000 characters of
     a failed command's output, the start and the end, whatever
     BASH_OUTPUT_MAX says. Measured on 2.1.285: one search returned 10,040
-    characters, and 103,920 with `--exclude-dir=.claude`. A tracked file
-    there is still reachable through git. The user-level
-    CLAUDE.md sits behind the same deny and belongs to whoever runs the
-    daemon, not to the repository: about ten posted reviews said they could
-    not check its conventions.
+    characters, and 103,920 with `--exclude-dir=.claude`. Every other name
+    the deny list covers does the same, a tracked `.env` included, and
+    `--exclude-dir` cannot skip a file. So `git grep <pattern> HEAD` comes
+    first: it reads blobs rather than files, so no denied path can fail
+    it, and it reaches what `.claude/` tracks. In a checkout tracking both,
+    it returned 108,463 characters at exit 0 where the grep returned
+    10,040. The user-level CLAUDE.md sits behind the same deny and belongs
+    to whoever runs the daemon, not to the repository: about ten posted
+    reviews said they could not check its conventions.
     """
     base = pr["baseRefName"]
     # Named as what it is in each case. Calling the base diff "the review
@@ -3087,20 +3091,21 @@ def reviewer_brief(pr, config, since=None, blockers=False):
         "clone carries even when the branch itself was not fetched, and say "
         "in your summary that you used it. %s You have "
         "no network: `gh` cannot reach GitHub from here, so do not reach for "
-        "it. Read files with the Read tool, and search with "
-        "`grep -rn --exclude-dir=.claude`, `git grep`, `git ls-files` and "
-        "`ls` through Bash. `sed`, `awk`, "
+        "it. Read files with the Read tool. Search with "
+        "`git grep -n <pattern> HEAD`, which reads the commit rather than "
+        "the files, so it searches `.claude/` too and no denied path can "
+        "fail it. `grep -rn --exclude-dir=.claude`, `git ls-files` and `ls` "
+        "also work through Bash. `sed`, `awk`, "
         "`find` and every interpreter, `python3` among them, are denied, so "
         "reaching for one costs a turn and returns nothing. You cannot run "
-        "this repository's tests or any of its code. Nothing under "
-        "`.claude/` can be read directly. A search that reaches it fails, "
-        "and only the start and end of a failed command's output come "
-        "back, so keep it out of every recursive grep. "
-        "`git show HEAD:<path>` reads a tracked file there and "
-        "`git grep <pattern> HEAD` searches them. The user-level "
-        "`~/.claude/CLAUDE.md` is out of scope for this review, so do not "
-        "try to read it or report that you could not. Do not substitute a "
-        "branch of your own choosing, and do not assume `main`.%s\n\n"
+        "this repository's tests or any of its code. Files under "
+        "`.claude/` cannot be read directly, but `git show HEAD:<path>` "
+        "reads one. A `grep -r` that reaches a denied path fails, and only "
+        "the start and end of a failed command's output come back. The "
+        "user-level `~/.claude/CLAUDE.md` is out of scope for this review, "
+        "so do not try to read it or report that you could not. Do not "
+        "substitute a branch of your own choosing, and do not assume "
+        "`main`.%s\n\n"
         "Post nothing to GitHub yourself. Report every finding through the "
         "%s tool, including when you found none, and give `file` relative to "
         "the repository root. Vinegar reads that call and posts the whole "

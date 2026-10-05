@@ -4271,7 +4271,12 @@ check("brief says the network is closed rather than leaving it to be found",
 # Measured across the three rounds of PR #24, six of sixteen denied commands
 # were `sed`, `find` and `awk` doing what Read, Grep and Glob already do.
 check("brief names the tools rather than leaving the denials to be found",
-      "`git grep`" in brief and "`python3`" in brief, brief)
+      "`git ls-files`" in brief and "`python3`" in brief, brief)
+# `git grep` against HEAD reads blobs, so no denied path in the checkout can
+# fail it: 108,463 characters at exit 0 where a grep over the same files
+# exited 2 on a tracked `.env` and came back cut to 10,040.
+check("brief sends searches to the commit, which no denied path can fail",
+      "`git grep -n <pattern> HEAD`" in brief, brief)
 # And only tools it has. Claude Code 2.1.285 has no Grep or Glob tool, and
 # its error for one points at `find`, which is denied; `rg` is not
 # installed in the reviewer's shell.
@@ -4281,9 +4286,12 @@ check("brief names no tool the reviewer does not have",
 # Claude Code makes a `.claude/` in every checkout, and it is read-denied,
 # so every recursive search reports it. git still reads a tracked file there.
 # A grep that reaches it exits 2, and a failed command keeps only about
-# 10,000 characters of its output: 10,040 against 103,920 without it.
+# 10,000 characters of its output: measured, 10,040 characters without
+# `--exclude-dir=.claude` and 103,920 with it.
 check("brief keeps .claude out of a recursive grep",
       "`grep -rn --exclude-dir=.claude`" in brief, brief)
+check("brief says a grep that reaches a denied path comes back cut short",
+      "only the start and end" in brief, brief)
 check("brief says how to read what is under .claude",
       "`git show HEAD:<path>`" in brief, brief)
 # About ten posted reviews said they could not check the conventions in a
