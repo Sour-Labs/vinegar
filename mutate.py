@@ -1437,19 +1437,25 @@ MUTATIONS = [
     # of PR #24's sixteen were sed, find and awk doing what Read, Grep and
     # Glob already do; most of the rest were python3 running the suite.
     ("brief-names-the-read-tools",
-     '        "it. Read files with the Read tool, and search with `grep -rn`, "\n'
-     '        "`git grep`, `git ls-files` and `ls` through Bash. `sed`, `awk`, "\n'
+     '        "it. Read files with the Read tool, and search with "\n'
+     '        "`grep -rn --exclude-dir=.claude`, `git grep`, `git ls-files` and "\n'
+     '        "`ls` through Bash. `sed`, `awk`, "\n'
      '        "`find` and every interpreter, `python3` among them, are denied, so "\n'
      '        "reaching for one costs a turn and returns nothing. You cannot run "',
      '        "it. You cannot run "'),
     # And only tools it has: 2.1.285 has no Grep or Glob tool, and `rg` is
     # not installed in the reviewer's shell.
     ("brief-names-no-grep-tool",
-     '        "it. Read files with the Read tool, and search with `grep -rn`, "',
-     '        "it. Use Read, Grep and Glob, and search with `grep -rn`, "'),
+     '        "it. Read files with the Read tool, and search with "',
+     '        "it. Use Read, Grep and Glob, and search with "'),
     ("brief-names-no-rg",
-     '        "it. Read files with the Read tool, and search with `grep -rn`, "',
-     '        "it. Read files with the Read tool, and search with `rg`, `grep -rn`, "'),
+     '        "it. Read files with the Read tool, and search with "',
+     '        "it. Read files with the Read tool, and search with `rg`, "'),
+    # A grep that reaches the `.claude/` Claude Code makes exits 2, and a
+    # failed command keeps only about 10,000 characters of its output.
+    ("brief-greps-without-dot-claude",
+     '        "`grep -rn --exclude-dir=.claude`, `git grep`, `git ls-files` and "',
+     '        "`grep -rn`, `git grep`, `git ls-files` and "'),
     # Separate, because it is a different failure: told only which commands
     # are denied, a reviewer plans a review around running the tests.
     ("brief-says-the-code-cannot-be-run",
@@ -1460,8 +1466,9 @@ MUTATIONS = [
     # checkout; git still reads a tracked file there.
     ("brief-reads-dot-claude-through-git",
      '        "this repository\'s tests or any of its code. Nothing under "\n'
-     '        "`.claude/` can be read directly: a search reports it as not "\n'
-     '        "permitted and still returns every other match, while "\n'
+     '        "`.claude/` can be read directly. A search that reaches it fails, "\n'
+     '        "and only the start and end of a failed command\'s output come "\n'
+     '        "back, so keep it out of every recursive grep. "\n'
      '        "`git show HEAD:<path>` reads a tracked file there and "\n'
      '        "`git grep <pattern> HEAD` searches them. The user-level "',
      '        "this repository\'s tests or any of its code. The user-level "'),

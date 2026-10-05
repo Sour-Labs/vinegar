@@ -4280,6 +4280,10 @@ check("brief names no tool the reviewer does not have",
       brief)
 # Claude Code makes a `.claude/` in every checkout, and it is read-denied,
 # so every recursive search reports it. git still reads a tracked file there.
+# A grep that reaches it exits 2, and a failed command keeps only about
+# 10,000 characters of its output: 10,040 against 103,920 without it.
+check("brief keeps .claude out of a recursive grep",
+      "`grep -rn --exclude-dir=.claude`" in brief, brief)
 check("brief says how to read what is under .claude",
       "`git show HEAD:<path>`" in brief, brief)
 # About ten posted reviews said they could not check the conventions in a

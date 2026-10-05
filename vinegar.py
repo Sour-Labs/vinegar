@@ -198,7 +198,8 @@ SANDBOX_FS_KEYS = frozenset(["denyWrite"])
 # refuses the read back, so the reviewer never sees it. Measured from
 # 2026-09-01 to 2026-10-03: 43 reviews lost a `git diff` that way, 30,387 to
 # 114,922 characters long. Narrowing that deny is not the fix, because it
-# guards every other session's records.
+# guards every other session's records. It covers only a command that
+# succeeds; reviewer_brief() deals with the one that fails.
 BASH_OUTPUT_MAX = 128000
 
 # abspath, not just expanduser, so a trailing slash or a relative path cannot
@@ -3061,9 +3062,12 @@ def reviewer_brief(pr, config, since=None, blockers=False):
     installed in the reviewer's shell, although the allow list has it.
 
     `.claude/` is read-denied, and Claude Code makes one in every directory
-    it runs in, so every recursive search reports it as not permitted. Said
-    up front, that reads as the deny it is rather than a failed search, and
-    a tracked file there is still reachable through git. The user-level
+    it runs in, so a recursive grep that reaches it exits 2. That costs more
+    than a line of noise: Claude Code keeps only about 10,000 characters of
+    a failed command's output, the start and the end, whatever
+    BASH_OUTPUT_MAX says. Measured on 2.1.285: one search returned 10,040
+    characters, and 103,920 with `--exclude-dir=.claude`. A tracked file
+    there is still reachable through git. The user-level
     CLAUDE.md sits behind the same deny and belongs to whoever runs the
     daemon, not to the repository: about ten posted reviews said they could
     not check its conventions.
@@ -3083,13 +3087,15 @@ def reviewer_brief(pr, config, since=None, blockers=False):
         "clone carries even when the branch itself was not fetched, and say "
         "in your summary that you used it. %s You have "
         "no network: `gh` cannot reach GitHub from here, so do not reach for "
-        "it. Read files with the Read tool, and search with `grep -rn`, "
-        "`git grep`, `git ls-files` and `ls` through Bash. `sed`, `awk`, "
+        "it. Read files with the Read tool, and search with "
+        "`grep -rn --exclude-dir=.claude`, `git grep`, `git ls-files` and "
+        "`ls` through Bash. `sed`, `awk`, "
         "`find` and every interpreter, `python3` among them, are denied, so "
         "reaching for one costs a turn and returns nothing. You cannot run "
         "this repository's tests or any of its code. Nothing under "
-        "`.claude/` can be read directly: a search reports it as not "
-        "permitted and still returns every other match, while "
+        "`.claude/` can be read directly. A search that reaches it fails, "
+        "and only the start and end of a failed command's output come "
+        "back, so keep it out of every recursive grep. "
         "`git show HEAD:<path>` reads a tracked file there and "
         "`git grep <pattern> HEAD` searches them. The user-level "
         "`~/.claude/CLAUDE.md` is out of scope for this review, so do not "

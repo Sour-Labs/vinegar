@@ -690,18 +690,19 @@ are what remain, and a review that wants more than those says so: a refused
 after every run.
 
 The reviewer is told this up front rather than left to find it out. The brief
-names Read, and `grep`, `git grep`, `git ls-files` and `ls` through Bash, as
-how it reads a checkout, says `sed`, `awk`, `find` and the interpreters are
-denied, and says plainly that it cannot run the repository's tests or any of
-its code. It names no Grep or Glob tool, because Claude Code 2.1.285 has none.
-It also says that `.claude/` cannot be read directly, though `git show
-HEAD:<path>` reads a tracked file there, and that the user-level
-`~/.claude/CLAUDE.md` is out of scope. Measured across the three rounds of
-PR #24: sixteen denied commands, about six of them `sed`, `find` and `awk`
-doing what Read, Grep and Glob already do, and most of the rest `python3`
-trying to run the suite three separate times. Each cost a turn and returned
-nothing. Saying it once is cheaper, and it leaves `permission_denials` closer
-to what it is for, which is the denials worth acting on.
+names Read, and `grep -rn --exclude-dir=.claude`, `git grep`, `git ls-files`
+and `ls` through Bash, as how it reads a checkout, says `sed`, `awk`, `find`
+and the interpreters are denied, and says plainly that it cannot run the
+repository's tests or any of its code. It names no Grep or Glob tool, because
+Claude Code 2.1.285 has none. It also says that `.claude/` cannot be read
+directly, though `git show HEAD:<path>` reads a tracked file there, and that
+the user-level `~/.claude/CLAUDE.md` is out of scope. Measured across the
+three rounds of PR #24: sixteen denied commands, about six of them `sed`,
+`find` and `awk` doing what Read, Grep and Glob already do, and most of the
+rest `python3` trying to run the suite three separate times. Each cost a turn
+and returned nothing. Saying it once is cheaper, and it leaves
+`permission_denials` closer to what it is for, which is the denials worth
+acting on.
 
 Two more settings make the reviewer's commands do what it asks. Its Bash runs
 in `/bin/bash`, set with `CLAUDE_CODE_SHELL`, because zsh, the macOS login
@@ -712,6 +713,13 @@ the documented maximum, and Vinegar refuses to run without it. Past the
 default of 30,000 characters a result is saved under `~/.claude`, which the
 reviewer is denied, so in the same period 43 reviews never saw a large `git
 diff`.
+
+That limit covers only a command that succeeds. Claude Code keeps about
+10,000 characters of a failed command's output, the start and the end, and
+saves nothing. Claude Code also makes a `.claude/` in the directory it runs
+in, which the reviewer is denied, so a recursive `grep` over the checkout
+exits 2. That is why the brief says to pass `--exclude-dir=.claude`: measured,
+the same search returned 10,040 characters without it and 103,920 with it.
 
 Reads are path-denied for `~/.vinegar`, `~/.claude`, `~/.ssh`, `~/.aws`,
 `~/.gnupg`, `~/.config/gh`, `.netrc`, `.env`, `.claude.json*`, `~/Library`,
