@@ -94,7 +94,7 @@ EXPECT = {
 # Hoisted because writing it out five times is five anchors to repair the
 # next time one of its terms moves, and threading `whole` through this
 # file already broke six.
-CLEAN = "    clean = findings == [] and whole and landed and not resent"
+CLEAN = "    clean = findings == [] and whole and posted == POSTED"
 # Hoisted for the same reason, and the tail of it is the text each of its
 # mutants keeps.
 FOUND = "reaches_blocker(findings)"
@@ -126,8 +126,40 @@ MUTATIONS = [
     ("already-posted-gate",
      "        if already_posted(label, repo, pr, env, verb):\n"
      '            log("%s: the review is already on the pull request" % label)\n'
-     "            return POSTED",
+     "            return found",
      "        pass"),
+
+    # --- a review found already up is not one this run sent (#27) -------
+    ("found-up-before-sending-is-already",
+     "    if resent and already_posted(label, repo, pr, env, verb):\n"
+     '        log("%s: the review is already on the pull request" % label)\n'
+     "        return ALREADY",
+     "    if resent and already_posted(label, repo, pr, env, verb):\n"
+     '        log("%s: the review is already on the pull request" % label)\n'
+     "        return POSTED"),
+    ("a-retry-cannot-vouch-for-what-it-found",
+     "    found = ALREADY if resent else POSTED", "    found = POSTED"),
+    ("a-first-attempt-vouches-for-its-own",
+     "    found = ALREADY if resent else POSTED", "    found = ALREADY"),
+    ("found-before-the-resend-is-found",
+     "        if already_posted(label, repo, pr, env, verb):\n"
+     '            log("%s: the review is already on the pull request" % label)\n'
+     "            return found",
+     "        if already_posted(label, repo, pr, env, verb):\n"
+     '            log("%s: the review is already on the pull request" % label)\n'
+     "            return POSTED"),
+    ("found-after-the-resend-is-found",
+     "            return found if already_posted(",
+     "            return POSTED if already_posted("),
+    ("already-is-on-the-pull-request",
+     "    landed = posted in (POSTED, ALREADY)",
+     "    landed = posted == POSTED"),
+    ("already-covers-and-reaches",
+     "                blockers=blockers, whole=whole)) in (POSTED, ALREADY):",
+     "                blockers=blockers, whole=whole)) == POSTED:"),
+    ("already-is-a-give-up-said",
+     "                        announced=said in (POSTED, ALREADY) or spent,",
+     "                        announced=said == POSTED or spent,"),
 
     # --- token life ----------------------------------------------------
     ("good-for-expiry",
@@ -1143,25 +1175,30 @@ MUTATIONS = [
     ("check-conclusion-is-used",
      '"status": "completed", "conclusion": conclusion,',
      '"status": "completed", "conclusion": "success",'),
-    # Green is the one ending that is a pass. Six entries: one for the
-    # constant, one for claiming it always, and one per term of `clean`,
-    # which is an unreadable answer, a killed run, a review that never
-    # landed, and a retry whose posting was an earlier attempt's.
+    # Green is the one ending that is a pass. Seven entries: one for the
+    # constant, one for claiming it always, one per way of reporting
+    # nothing without being clean (an unreadable answer, a killed run, a
+    # review that never landed, a review found already up), and one for
+    # withholding it from a retry that posted its own review.
     ("check-clean-is-a-pass",
      'CHECK_CLEAN = "success"', 'CHECK_CLEAN = "neutral"'),
     ("check-green-only-when-nothing-was-found",
      CLEAN, "    clean = True"),
     ("check-green-not-for-an-unreadable-answer",
      CLEAN,
-     "    clean = not findings and whole and landed and not resent"),
+     "    clean = not findings and whole and posted == POSTED"),
     ("check-green-not-for-a-killed-run",
-     CLEAN, "    clean = findings == [] and landed and not resent"),
+     CLEAN, "    clean = findings == [] and posted == POSTED"),
     ("check-green-not-for-a-review-that-never-landed",
-     CLEAN, "    clean = findings == [] and whole and not resent"),
-    # post_review answers POSTED without posting when a retry finds the
-    # review already up, and that earlier review is the one on the commit.
+     CLEAN, "    clean = findings == [] and whole"),
+    # A review found already up may be an earlier attempt's, and that is
+    # the review on the commit.
     ("check-green-not-for-a-retry-that-posted-nothing",
      CLEAN, "    clean = findings == [] and whole and landed"),
+    ("check-green-for-a-retry-that-posted-its-own",
+     CLEAN,
+     "    clean = findings == [] and whole and posted == POSTED "
+     "and not resent"),
     # Red is the ending that found a blocker. Six entries: one for the
     # constant, one for never failing, one for failing on any tier, and
     # one per term of `clean` that must not reach it, because a blocker
@@ -1526,15 +1563,15 @@ MUTATIONS = [
      "    deliver(text, findings, \" \".join(notes) or None, whole=True)"),
     ("covered-needs-the-post-to-land",
      "                note, resent=resent, check=check, since=since,\n"
-     "                blockers=blockers, whole=whole)) == POSTED:",
+     "                blockers=blockers, whole=whole)) in (POSTED, ALREADY):",
      "                note, resent=resent, check=check, since=since,\n"
      "                blockers=blockers, whole=whole)) or True:"),
     # `whole` is passed rather than read off the note for the reason
     # deliver's own comment gives, and finish() now needs it for the tick
     # as well as the title.
     ("check-whole-reaches-finish",
-     "                blockers=blockers, whole=whole)) == POSTED:",
-     "                blockers=blockers)) == POSTED:"),
+     "                blockers=blockers, whole=whole)) in (POSTED, ALREADY):",
+     "                blockers=blockers)) in (POSTED, ALREADY):"),
     # The two the third review found anchored by nothing.
     ("load-state-drops-the-entry",
      '                    del done["reviewed_sha"]',

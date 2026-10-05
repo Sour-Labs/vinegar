@@ -373,6 +373,15 @@ LOGIN_RETRY = 600
 # a 5xx, where the review may be up and a resend can duplicate it.
 POSTED, REFUSED, THROTTLED, UNSURE = "posted", "refused", "throttled", "unsure"
 
+# What post_review() answers when the pull request carries a Vinegar review
+# of this commit that this run cannot say it sent: a retry found one up,
+# before sending or after a send it could not confirm. That review may be
+# an earlier attempt's, whose findings this run knows nothing about, so
+# finish() must not tick the check on this run's findings. To every other
+# caller it is as good as POSTED: the pull request carries the review.
+# Issue #27.
+ALREADY = "already"
+
 # How many times a FAILED pull request is retried before it is left alone. The
 # point is to survive a rate-limit window without turning a permanent failure
 # into a review every minute forever.
@@ -5145,12 +5154,14 @@ def post_review(label, repo, pr, path, text, findings, config, env,
                 blockers=False):
     """Turn what the reviewer reported into one review on the pull request.
 
-    Answers POSTED when the pull request carries the review, THROTTLED
-    when a limit refused it and it should be tried again unchanged, and
-    False when it did not land for any other reason.
+    Answers POSTED when this run put the review on the pull request,
+    ALREADY when the pull request carries a Vinegar review of this commit
+    that this run cannot say it sent, THROTTLED when a limit refused it and
+    it should be tried again unchanged, and False when it did not land for
+    any other reason.
 
-    Named rather than true-or-false because there are three answers and
-    they need three different things done about them. Smuggling the third
+    Named rather than true-or-false because there are four answers and
+    they need different things done about them. Smuggling THROTTLED
     through a two-state contract meant a caller testing truthiness read
     "rate limited, try again later" as "posted", and deleted the saved
     review it had just promised to resend.
@@ -5180,9 +5191,16 @@ def post_review(label, repo, pr, path, text, findings, config, env,
     # reads is separated from the next by a submit_review that may have
     # landed, so a cached answer would be exactly the stale one that
     # produces the duplicate the read exists to prevent.
+    #
+    # What a review found by the two reads after a send stands for. A first
+    # attempt can only find its own, sent by a request it could not
+    # confirm. A retry may find an earlier attempt's instead, because the
+    # read above answers "no" when it cannot tell, and nothing here can say
+    # which of the two it found.
+    found = ALREADY if resent else POSTED
     if resent and already_posted(label, repo, pr, env, verb):
         log("%s: the review is already on the pull request" % label)
-        return POSTED
+        return ALREADY
 
     if findings is None:
         log("%s: %s, posting its text as the review" % (
@@ -5228,7 +5246,7 @@ def post_review(label, repo, pr, path, text, findings, config, env,
                 label, len(payload.get("comments", ()))))
             return POSTED
         if settled == UNSURE:
-            return POSTED if already_posted(
+            return found if already_posted(
                 label, repo, pr, env, verb) else False
         # THROTTLED passes through. Flattening it to False here undid the
         # distinction the callers were just taught to make: a limit met
@@ -5252,7 +5270,7 @@ def post_review(label, repo, pr, path, text, findings, config, env,
         # is worse than one review, silence is worse than both.
         if already_posted(label, repo, pr, env, verb):
             log("%s: the review is already on the pull request" % label)
-            return POSTED
+            return found
         log("%s: the post may not have landed and nothing is up, so it is "
             "sent again" % label)
         settled = submit_review(label, repo, pr, payload, env)
@@ -5481,13 +5499,13 @@ def finish(label, repo, pr, path, text, findings, config, env, tokens,
     # silence the README forbids, reached by the one path that had no
     # retry of its own. The give-up has its own bounded retry and is
     # never marked.
-    # `== POSTED`, not truthiness. THROTTLED is a string and every string
-    # is true, so a rate-limited post — which had just logged that the
-    # review is safe and will be sent again — deleted the marker that was
-    # the only thing able to send it. Named once and read three times
-    # below, so the next ending added here cannot get the comparison right
-    # in two places and wrong in the third.
-    landed = posted == POSTED
+    # Named, not truthiness. THROTTLED is a string and every string is
+    # true, so a rate-limited post, which had just logged that the review
+    # is safe and will be sent again, deleted the marker that was the
+    # only thing able to send it. Named once and read three times below,
+    # so the next ending added here cannot get the comparison right in two
+    # places and wrong in the third. ALREADY is on the pull request too.
+    landed = posted in (POSTED, ALREADY)
     #
     # `not preserve` as well, because the give-up writes no marker, so
     # forgetting one on its way out could only ever delete somebody
@@ -5560,23 +5578,13 @@ def finish(label, repo, pr, path, text, findings, config, env, tokens,
     # the tick to every clean review on a deployment whose pinned model
     # stopped routing.
     #
-    # `not resent`, and it is deliberately broader than the case it
-    # defends. post_review answers POSTED without posting when a retry
-    # finds the review already up, and that earlier review is the one on
-    # the commit, so a retry reporting nothing would tick a commit whose
-    # visible review is full of findings. Nothing here can tell that retry
-    # from one that did its own posting, because both answers are POSTED,
-    # so every retry loses the tick rather than the one that should.
-    #
-    # `resent` is `attempts > 1`, so what that costs is the tick on a
-    # clean review whose first attempt failed before posting anything. A
-    # grey mark beside "No findings" is what every clean review looked
-    # like before this existed, so the cost is a tick withheld and never a
-    # claim that is false. Issue #27 is the answer that would narrow it:
-    # post_review saying which of the two happened, which reaches the
-    # `covered` logic that decides narrowing and is why it is not done
-    # here.
-    clean = findings == [] and whole and landed and not resent
+    # `== POSTED` and not `landed`. A retry that finds a review already up
+    # answers ALREADY, and that review may be an earlier attempt's, so a
+    # retry reporting nothing would tick a commit whose visible review is
+    # full of findings. Only this run's own send earns the tick. Before
+    # issue #27 the two answers were one, and every retry lost the tick,
+    # including one whose first attempt failed before posting anything.
+    clean = findings == [] and whole and posted == POSTED
     # Red off the same tiers the title counts, for every ending, for the
     # reason CHECK_BLOCKED gives.
     blocked = reaches_blocker(findings)
@@ -6101,14 +6109,18 @@ def review(path, repo, pr, config, env, tokens, resent=False, check=None,
         if announce(label, lambda: finish(
                 label, repo, pr, path, text, findings, config, env, tokens,
                 note, resent=resent, check=check, since=since,
-                blockers=blockers, whole=whole)) == POSTED:
-            # Four, and none of them is implied by another. POSTED says the
-            # pull request carries it. `whole` says the reviewer reached the
-            # end of the scope, and it is passed in rather than read off
-            # `note`: a note also carries the fallback-model notice, which
-            # is information about the run and not a statement that it was
-            # cut short, so deriving it there turned the narrowing off for
-            # good on any deployment whose pinned model stopped routing.
+                blockers=blockers, whole=whole)) in (POSTED, ALREADY):
+            # Four, and none of them is implied by another. POSTED or
+            # ALREADY says the pull request carries it. ALREADY counts as it
+            # did when it was spelled POSTED: read as anything less, the
+            # next pass re-reads a scope the author has a review of and
+            # counts no round for it (issue #27). `whole` says the reviewer
+            # reached the end of the scope, and it is passed in rather than
+            # read off `note`: a note also carries the fallback-model
+            # notice, which is information about the run and not a
+            # statement that it was cut short, so deriving it there turned
+            # the narrowing off for good on any deployment whose pinned
+            # model stopped routing.
             # `findings is not None` says findings were reported at all,
             # since a run can end cleanly having narrated instead of
             # calling the reporting tool, and its prose reaching the pull
@@ -7190,8 +7202,10 @@ def spend_announce(key, config, state, head, attempts, tries, said):
         log("%s: the give-up could not be posted in %d attempts, so it "
             "stays in this log only" % (key, tries))
     was = state.get(key, {})
+    # ALREADY is a give-up a retry found up, which is the give-up said.
     entry = state_entry(head, FAILED, attempts,
-                        announced=said == POSTED or spent, tries=tries,
+                        announced=said in (POSTED, ALREADY) or spent,
+                        tries=tries,
                         **dict(carry_forward(was),
                                **reviewed_through(False, head, was),
                                **rounds_done(False, was)))
