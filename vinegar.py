@@ -388,61 +388,56 @@ MAX_ATTEMPTS = 3
 # immediate retry costs only the wait.
 FAILED_RETRY = 600
 
-# Seconds of token life reserved for the checkout, on top of the review's own
-# budget. One token covers both and the checkout runs first: a clone of a
-# large repository over a slow link is minutes, so asking only for
-# `review_timeout` can hand back a token that dies part-way through the
-# review, taking with it the `gh` calls the review makes to read the pull
-# request.
+# Seconds of token life reserved for the checkout. The token minted for a
+# review is used by the clone and the fetch, and then by the checks entry:
+# open_check() creates it once the checkout is done, and retitle_check()
+# renames it after the triage pass, which checkout_grace() reserves for as
+# well. A clone of a large repository over a slow link is minutes, so a
+# token asked for nothing could die part-way through it.
 #
 # 1500 covers the checkout that runs every time: the usability probe and the
 # four local steps at DIFF_TIMEOUT each, plus the head fetch at its whole
 # FETCH_TIMEOUT. It does **not** cover a first clone that runs its full
-# CLONE_TIMEOUT, and cannot: that would need 1800 more, and the sum below is
-# capped far tighter than that.
+# CLONE_TIMEOUT, which would need 1800 more. What is left uncovered is one
+# review, on one repository, on the poll that first clones it, and it is
+# retried. That is the trade: the alternative was a clone bounded tightly
+# enough to fit the budget, which costs that repository every review rather
+# than its first.
 #
-# The cap is the hour a GitHub token lives. The cache serves one only while
-# `now + good_for < expires`, so once `CHECKOUT_GRACE + review_timeout`
-# reaches 3600 no token can ever satisfy it and every call mints a fresh one.
-# At 1500 plus the shipped `review_timeout` of 1800 that leaves 300 seconds
-# of each token's life in which the cache still dedupes, where 600 left
-# 1200. That is the accepted cost of the raise: more minting, in exchange for
-# a token that survives the checkout it was minted for. load_config refuses a
-# `review_timeout` that pushes the sum over the cap, because crossing it is
-# otherwise silent and once ran at roughly 1440 tokens a day per open pull
-# request without anyone noticing.
-#
-# What is left uncovered is one review, on one repository, on the poll that
-# first clones it, and it is retried. That is the trade: the alternative was
-# a clone bounded tightly enough to fit the budget, which costs that
-# repository every review rather than its first.
-#
-# It deliberately does not have to cover the posting as well. That happens
-# after a review which may have consumed the entire `review_timeout`, and at
-# the timeouts people actually configure no obtainable token is guaranteed to
-# survive that far. POST_GRACE asks for a fresh one at that point instead.
+# It does not cover the review, and it used to. The reason given was the
+# `gh` calls the reviewer made on this token, which stopped in PR #11: the
+# reviewer is handed no GitHub credential and has no network. The posting
+# mints its own token on POST_GRACE, so after the review this one is only
+# posting_env()'s fallback for when that mint fails, and after a long review
+# the fallback may have expired. Issue #17 weighed that against what the
+# review cost in the sum: the cache serves a token only while
+# `now + good_for < expires`, which at the shipped `review_timeout` left it
+# about a minute of each token's hour, so every review minted a fresh token
+# to keep alive a spare that matters only while GitHub is already failing.
+# Without the review the cache serves a token for about half its hour.
 CHECKOUT_GRACE = 1500
 
 # The hour a GitHub installation token lives. Not a tunable: it is GitHub's
-# number, named here because two things are measured against it.
+# number. The token cache expires each token on it, and checkout_grace() has
+# to stay well inside it or the cache can never serve one.
 TOKEN_LIFE = 3600
 
 # The longest one review may be allowed to hold the poll thread. A ceiling
 # on `review_timeout`, not a timeout itself.
 #
-# It exists because the token-life check above used to refuse rather than
-# say, and that refusal was incidentally load_config's only upper bound on
-# `review_timeout`. Downgrading it to a warning removed the bound, leaving
-# `isinstance(value, int)` and `value > 0`. An operator answering repeated
-# "killed after 1800s" lines with an extra zero would then start a daemon
-# that parks on one review for five hours: nothing else listed, nothing
-# else reviewed, and the watchdog calling it healthy throughout, because it
-# reads the pid and a quiet log is what a quiet week looks like too.
+# It exists because nothing else bounds `review_timeout` from above:
+# load_config checks only `isinstance(value, int)` and `value > 0`. A
+# token-life refusal once did it by accident, and that refusal is gone. An
+# operator answering repeated "killed after 1800s" lines with an extra zero
+# would then start a daemon that parks on one review for five hours:
+# nothing else listed, nothing else reviewed, and the watchdog calling it
+# healthy throughout, because it reads the pid and a quiet log is what a
+# quiet week looks like too.
 #
-# Refused rather than said, unlike the check above, and the difference is
-# the point: a daemon that parks is running wrongly, not expensively. Two
-# hours is roughly nine times the slowest review measured here, so a value
-# past it is a typo rather than an intent.
+# Refused rather than said, and the difference is the point: a daemon that
+# parks is running wrongly, not expensively. Two hours is roughly nine
+# times the slowest review measured here, so a value past it is a typo
+# rather than an intent.
 #
 # It is not the whole hold any more, and load_config's message says so.
 # Three other subprocesses share the thread: the triage pass runs before
@@ -1108,31 +1103,24 @@ DEFAULTS = {
 }
 
 
-def review_reserve(config):
-    """Everything the token must survive before the review even starts.
+def checkout_grace(config):
+    """Token life the checkout and the triage pass need between them.
 
     The clone, and then the triage pass, which is two subprocesses on the
-    same thread between the checkout and the review. Leaving triage out
-    understated the requirement by SHAPE_TIMEOUT + DIFF_TIMEOUT: at the
-    default review_timeout that took the margin against a token expiring
-    from 300 seconds to 60, and the warning below went on measuring
-    against the smaller sum, so it stayed quiet about it.
+    same thread before retitle_check() renames the checks entry on this
+    token. Leaving triage out understated the requirement by SHAPE_TIMEOUT
+    + DIFF_TIMEOUT.
 
     Nothing is reserved for a pass that will not run, so an install with
-    `triage_model` null asks for exactly what it asked for before.
-    """
-    return CHECKOUT_GRACE + (SHAPE_TIMEOUT + DIFF_TIMEOUT
-                             if config["triage_model"] else 0)
-
-
-def checkout_grace(config):
-    """Token life the checkout, the triage and the review need between them.
+    `triage_model` null asks for CHECKOUT_GRACE alone. Nothing is reserved
+    for the review either, and CHECKOUT_GRACE says why.
 
     Both the daemon and the `--pr` path ask for this, and each used to spell
     the sum out with a comment saying it had to match the other. Drift shows
     up only under a slow clone, at review time, on a real pull request.
     """
-    return review_reserve(config) + config["review_timeout"]
+    return CHECKOUT_GRACE + (SHAPE_TIMEOUT + DIFF_TIMEOUT
+                             if config["triage_model"] else 0)
 
 
 def utc_stamp():
@@ -1325,7 +1313,7 @@ def installation_token(app, repo, cache, good_for=0):
                         jwt, payload={"repositories": [repo.partition("/")[2]]})
 
     # GitHub issues these for an hour.
-    cache[repo] = (minted["token"], time.time() + 60 * 60)
+    cache[repo] = (minted["token"], time.time() + TOKEN_LIFE)
     return minted["token"]
 
 
@@ -1660,11 +1648,11 @@ def load_config(path):
 
     # The numbers, because they are read as numbers. A hand-edited
     # `"review_timeout": "1800"` is accepted by JSON and by every check
-    # above it, and then raises TypeError inside checkout_grace on every
-    # pull request on every poll: nothing reviewed, MAX_ATTEMPTS never
-    # reached, no give-up posted, and the pull requests silent. This is
-    # the file operators actually edit, and load_state guards the same
-    # class for the one they are only told to edit.
+    # above it, and then raises TypeError at the review_timeout ceiling
+    # below: a traceback on every start that names no setting, where this
+    # names the one to fix. This is the file operators actually edit, and
+    # load_state guards the same class for the one they are only told to
+    # edit.
     units = {"max_changed_lines": "lines", "parallel_repos": "repositories"}
     for name in ("poll_interval", "review_timeout", "max_changed_lines",
                  "parallel_repos"):
@@ -1680,8 +1668,8 @@ def load_config(path):
     # was that the loop exits on a non-number, which is exactly what makes
     # here correct: `"parallel_repos": "4"` never reaches this line, so
     # the guards were three lines defending a state the loop had already
-    # refused. The token-life warning below reads `review_timeout` after
-    # the same loop with no guard at all, for the same reason.
+    # refused. The review_timeout ceiling below reads `review_timeout`
+    # after the same loop with no guard at all, for the same reason.
     if config["parallel_repos"] > MAX_PARALLEL_REPOS:
         sys.exit("%s: parallel_repos must be at most %d. Each one is a "
                  "whole reviewer with its own clone beside it, so the "
@@ -1689,7 +1677,7 @@ def load_config(path):
                  "how many repositories are watched: the ones over the "
                  "width wait for a worker" % (path, MAX_PARALLEL_REPOS))
 
-    # Said, not refused, like the token-life warning. A width above the
+    # Said, not refused. A width above the
     # number of repositories is clamped by poll_width(), and the startup
     # line prints the clamped number and stays silent at one, so a
     # single-repository install that set `parallel_repos: 4` read a line
@@ -1789,44 +1777,6 @@ def load_config(path):
                  "reviewed meanwhile and the watchdog reads a parked daemon "
                  "as a healthy one."
                  % (path, MAX_REVIEW_TIMEOUT, SEVERITY_TIMEOUT))
-
-    # Said, not refused. The cache serves a token only while
-    # `now + good_for < expires`, so once the checkout and the review
-    # together ask for a token's whole life no cached token can satisfy it:
-    # every review mints a fresh one and then runs past the hour that token
-    # lives.
-    #
-    # What that costs is a mint per review and a dead fallback, not a broken
-    # review. Since the reviewer is handed no GitHub credential and has no
-    # network, nothing it does needs the token, and the posting mints its
-    # own. What is left holding it is posting_env()'s fallback, used only
-    # when that fresh mint fails, and past the cap it would be expired.
-    # Every other refusal in this function stops a daemon that would run
-    # *wrongly*; taking one down over a token bill is the worse trade, and
-    # it was a refusal for one day whose first catch was the deploy of the
-    # change that added it.
-    #
-    # Only with an App. Without one github_env() returns None before
-    # installation_token() is reached, so nothing mints and there is nothing
-    # to say; the shipped config.example.json has no App, so the warning
-    # would otherwise greet the documented starting configuration with a
-    # cost it cannot incur.
-    #
-    # `>=`, because the cache condition is a strict `<`: asking for exactly
-    # a token's life already fails it. The message says "at least" to match.
-    #
-    # No rate is quoted. The mint happens once per review that actually
-    # runs, not once per poll — handle_pr reaches it only past the DONE,
-    # give-up and skip returns — so a per-day figure derived from
-    # `poll_interval` overstates it by about three orders of magnitude.
-    if config.get("github_app") and checkout_grace(config) >= TOKEN_LIFE:
-        log("%s: review_timeout is %d, and with the %ds the checkout "
-            "reserves that asks for at least the %ds a GitHub token lives. "
-            "No cached token can satisfy it, so every review mints a fresh "
-            "one and then runs on a token that can expire before it "
-            "finishes. Set it under %d to use the cache."
-            % (path, config["review_timeout"], review_reserve(config),
-               TOKEN_LIFE, TOKEN_LIFE - review_reserve(config)))
 
     # A misconfigured App is caught here rather than at the first review, which
     # is minutes later and on a real pull request.
@@ -5022,9 +4972,10 @@ def posting_env(label, config, repo, tokens, fallback):
     Minting here is a live API call, and the endpoint it calls is one
     handle_pr() already documents as prone to transient 5xx. Letting that
     decide the fate of a finished review is the wrong trade: the token the
-    run has been using is in scope and, at any `review_timeout` short of the
-    hour a token lives, usually has time left on it. A one-second network
-    blip should not cost a review that is sitting there ready to post.
+    run has been using is in scope and, after a review of ordinary length,
+    usually has time left on it. After a long one it may not, and
+    CHECKOUT_GRACE says why that was accepted. A one-second network blip
+    should not cost a review that is sitting there ready to post.
     """
     if not config["comment"]:
         return None
@@ -7457,26 +7408,20 @@ def handle_pr(repo, pr, config, state, tokens):
     # rather than for every pull request the pass looks at.
     #
     # Still per review rather than once per pass: a pass can run for hours, and
-    # a token minted at the top of it would expire under a later review, whose
-    # comments would then fail to post. What is asked for covers the checkout
-    # as well, because that runs first and on this one token.
+    # a token minted at the top of it would expire under a later review's
+    # checkout. What is asked for covers the checkout and the triage pass, and
+    # not the review: checkout_grace() and CHECKOUT_GRACE say why.
     #
     # Asking before the checks above meant minting for every open pull request
     # on every poll, including the ones that return one line later as already
     # reviewed, and a transient 5xx on that endpoint took the pull request out
-    # of the pass. Whether anything deduplicated it depended on a setting that
-    # looks unrelated: the cache serves a token only while
-    # `now + good_for < expires`, so once `good_for` reaches the hour a token
-    # lives, no token can ever satisfy it and every call is a fresh mint. At the
-    # shipped `review_timeout` of 1800 the cache did dedupe, for the first half
-    # of each token's life. Raising it to 3600 turned that off silently, which
-    # is how this ran at roughly 1440 tokens a day per open pull request without
-    # anyone noticing.
-    #
-    # That ceiling still applies to the sum below. Set `review_timeout` high
-    # enough and no obtainable token can outlast the review, which is worth
-    # knowing when revisiting it: past that point the guarantee is gone rather
-    # than merely expensive.
+    # of the pass. Whether anything deduplicated it depends on `good_for`: the
+    # cache serves a token only while `now + good_for < expires`, so once
+    # `good_for` reaches the hour a token lives, no token can ever satisfy it
+    # and every call is a fresh mint. While `review_timeout` was part of it,
+    # raising that to 3600 turned the cache off silently, which is how this
+    # ran at roughly 1440 tokens a day per open pull request without anyone
+    # noticing.
     env = github_env(config, repo, tokens,
                      good_for=checkout_grace(config))
 
@@ -7887,9 +7832,9 @@ def main():
             if (not number.isascii() or not number.isdigit()
                     or not REPO_NAME.match(repo)):
                 sys.exit("--pr wants owner/repo#number, got %s" % args.pr)
-            # The same sum handle_pr() asks for, and for the same reason: one
-            # token covers the checkout and the review that follows it. The
-            # posting asks for its own, in review().
+            # The same grace handle_pr() asks for, and for the same reason:
+            # one token covers the checkout and the triage pass after it. The
+            # posting asks for its own.
             env = github_env(config, repo, tokens,
                              good_for=checkout_grace(config))
             pr = find_pr(repo, number, env)

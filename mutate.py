@@ -329,29 +329,7 @@ MUTATIONS = [
      '                           "%ds" % (key_path, DIFF_TIMEOUT))',
      "    except subprocess.TimeoutExpired:\n"
      "        raise"),
-    ("token-cap-silent",
-     '    if config.get("github_app") and checkout_grace(config) >= TOKEN_LIFE:',
-     "    if False:"),
-    ("token-cap-cries-wolf",
-     '    if config.get("github_app") and checkout_grace(config) >= TOKEN_LIFE:',
-     "    if True:"),
-    # The boundary itself. A sum of exactly a token's life already fails the
-    # cache's strict `<`, so `>` would start that one config in silence.
-    ("token-cap-boundary",
-     '    if config.get("github_app") and checkout_grace(config) >= TOKEN_LIFE:',
-     '    if config.get("github_app") and checkout_grace(config) > TOKEN_LIFE:'),
-    # Without an App nothing mints, so the warning would name a cost that
-    # cannot be incurred, on the configuration the README ships.
-    ("token-cap-no-app-guard",
-     '    if config.get("github_app") and checkout_grace(config) >= TOKEN_LIFE:',
-     "    if checkout_grace(config) >= TOKEN_LIFE:"),
-    ("token-cap-no-remedy",
-     '               TOKEN_LIFE, TOKEN_LIFE - review_reserve(config)))',
-     '               TOKEN_LIFE, 0))'),
-    ("token-cap-refuses",
-     '        log("%s: review_timeout is %d, and with the %ds the checkout "',
-     '        sys.exit("%s: review_timeout is %d, and with the %ds the checkout "'),
-    # The ceiling the downgraded refusal used to provide by accident.
+    # The only upper bound on review_timeout.
     ("review-timeout-ceiling",
      '    if config["review_timeout"] > MAX_REVIEW_TIMEOUT:',
      "    if False:"),
@@ -2456,8 +2434,8 @@ MUTATIONS = [
     ("narrowed-round-is-declared",
      "                             config, narrowed=bool(since))",
      "                             config)"),
-    # The token has to outlive the triage pass as well as the clone and
-    # the review, and the warning has to measure against the same sum.
+    # The token has to outlive the triage pass as well as the clone, and
+    # not the review (issue #17).
     ("reserve-counts-the-triage-pass",
      "    return CHECKOUT_GRACE + (SHAPE_TIMEOUT + DIFF_TIMEOUT\n"
      '                             if config["triage_model"] else 0)',
@@ -2465,6 +2443,13 @@ MUTATIONS = [
     ("reserve-counts-nothing-when-triage-is-off",
      '                             if config["triage_model"] else 0)',
      "                             if True else 0)"),
+    ("grace-leaves-out-the-review",
+     '                             if config["triage_model"] else 0)',
+     '                             if config["triage_model"] else 0)'
+     ' + config["review_timeout"]'),
+    # Past the hour a token lives the cache can never serve one.
+    ("grace-inside-token-life",
+     "CHECKOUT_GRACE = 1500", "CHECKOUT_GRACE = 3500"),
 
     # --- a login that fails, which is not a failed review ---------------
     # Three attempts seconds apart cannot outlast it, and three pull
