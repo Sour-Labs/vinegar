@@ -1386,8 +1386,71 @@ MUTATIONS = [
     # The reuse lookup's query. Dropping the status filter adopts a
     # completed run, and a completed run cannot be reopened.
     ("check-reuse-asks-for-running-only",
-     '        "commits/%s/check-runs?check_name=%s&status=in_progress"',
-     '        "commits/%s/check-runs?check_name=%s"'),
+     '    found = our_checks(label, repo, sha, config, env, "in_progress")',
+     '    found = our_checks(label, repo, sha, config, env, "completed")'),
+
+    # --- a resent review corrects its checks entry (issue #28) ---------
+    # The marker records the conclusion a landed post gets, a term at a
+    # time, beneath the commit it names.
+    ("resend-marker-records-the-conclusion",
+     '            write_atomic(marker, "%s\\n%s\\n" % (pr["headRefOid"], earned))',
+     '            write_atomic(marker, "%s\\n" % pr["headRefOid"])'),
+    ("resend-earns-red-on-a-blocker",
+     "    earned = (CHECK_BLOCKED if reaches_blocker(findings)",
+     "    earned = (CHECK_CONCLUSION if reaches_blocker(findings)"),
+    ("resend-earns-green-for-a-clean-review",
+     "              else CHECK_CLEAN if findings == [] and whole",
+     "              else CHECK_CONCLUSION if findings == [] and whole"),
+    ("resend-earns-no-green-for-a-killed-run",
+     "              else CHECK_CLEAN if findings == [] and whole",
+     "              else CHECK_CLEAN if findings == []"),
+    ("resend-earns-no-green-for-an-unreadable-answer",
+     "              else CHECK_CLEAN if findings == [] and whole",
+     "              else CHECK_CLEAN if not findings and whole"),
+    # Read whole, a two-line marker names no commit, and handle_pr forgets
+    # the saved review as left over.
+    ("mark-reads-only-the-commit",
+     "            # The first line only: read_earned() owns the second.\n"
+     "            return handle.readline().strip() or None",
+     "            # The first line only: read_earned() owns the second.\n"
+     "            return handle.read().strip() or None"),
+    ("earned-reads-the-second-line",
+     "            handle.readline()\n"
+     "            return handle.readline().strip() or None",
+     "            return handle.readline().strip() or None"),
+    # Only a send of the resend's own earns the conclusion, and a review
+    # found up is landed all the same.
+    ("resend-already-up-earns-nothing",
+     "                settled = ALREADY", "                settled = POSTED"),
+    ("resend-found-up-is-landed",
+     "            landed = settled in (POSTED, ALREADY)",
+     "            landed = settled == POSTED"),
+    ("resend-corrects-only-once-landed",
+     '            if landed and config.get("github_app"):',
+     '            if config.get("github_app"):'),
+    ("resend-corrects-only-with-an-app",
+     '            if landed and config.get("github_app"):',
+     "            if landed:"),
+    # What the correction sends: the finished run, the summary that says
+    # where the review is, its own tally, and its own conclusion when
+    # nothing was earned.
+    ("resend-corrects-the-finished-run",
+     '    found = our_checks(label, repo, sha, config, env, "completed")',
+     '    found = our_checks(label, repo, sha, config, env, "in_progress")'),
+    ("resend-entry-says-on-the-pull-request",
+     '                "The review is on the pull request.",\n',
+     '                "",\n'),
+    ("resend-keeps-the-tally",
+     '                run["output"]["title"], env,',
+     '                "Corrected", env,'),
+    ("resend-keeps-the-run-conclusion",
+     '                earned or run["conclusion"])',
+     "                earned or CHECK_CONCLUSION)"),
+    ("resend-says-when-there-is-nothing-to-correct",
+     "    if not found:\n"
+     '        log("%s: found no finished checks entry to correct" % label)',
+     "    if False:\n"
+     '        log("%s: found no finished checks entry to correct" % label)'),
 
     # --- constants -----------------------------------------------------
     ("max-attempts", "MAX_ATTEMPTS = 3", "MAX_ATTEMPTS = 99"),
@@ -2072,8 +2135,8 @@ MUTATIONS = [
     ("running-checks-hides-a-failed-read",
      "    if said is None:\n"
      "        return None\n"
-     '    return [was.get("id") for was in said.get("check_runs") or []',
-     '    return [was.get("id") for was in (said or {}).get("check_runs") or []'),
+     '    return [was for was in said.get("check_runs") or []',
+     '    return [was for was in (said or {}).get("check_runs") or []'),
     # `failure` makes the stuck merge the outcome rather than the thing
     # being repaired, on a check that read nothing and reported nothing.
     ("sweep-closes-as-a-failure",
