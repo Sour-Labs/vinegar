@@ -7947,10 +7947,12 @@ def _ours(conclusion):
 def _refused(sha, findings=()):
     """Leave a review of `sha` saved and marked, as a refused post does."""
     at = dict(PR_LIVE, headRefOid=sha)
+    vinegar.run = _run_and_tier
     fake_run.rc, fake_run.post_err = 1, "HTTP 500"
     vinegar.finish(L, "o/r", at, ROOT, "words", list(findings), CONFIG, None,
                    {}, whole=True)
     fake_run.rc, fake_run.post_err = 0, ""
+    vinegar.run = fake_run
     return at, vinegar.unposted_path("o/r", at)
 
 
@@ -8001,9 +8003,9 @@ check("the entry corrected is the finished one at the reviewed commit",
       and _earn_patch and _earn_patch[0][0].endswith("check-runs/31"),
       (_earn_get, _earn_patch))
 
-# A review found already up may be an earlier attempt's, so only a send of
-# the resend's own earns the conclusion, as in finish(). The entry still
-# says where the review is.
+# A review found already up may be an earlier attempt's, so the resend
+# closes the entry as finish() closes a post that found it up: the tally,
+# the summary, and no tick.
 PR_UP, _up_marker = _refused("ea3cea3cea3c")
 _up_patch = _resent(PR_UP, _ours("neutral"),
                     look=vinegar.BODY_MARK + " reviewed `ea3cea3` ...\n")
@@ -8013,11 +8015,19 @@ check("a resend that found the review already up does not tick it",
 check("a resend that found the review already up still corrects the entry",
       _up_patch and _up_patch[0][1]["output"]["summary"]
       == "The review is on the pull request.", _up_patch)
-check("a resend that found the review already up keeps the run's title",
-      _up_patch and _up_patch[0][1]["output"]["title"] == BACKSTOP_TITLE,
+check("a resend that found the review already up carries the tally",
+      _up_patch and _up_patch[0][1]["output"]["title"] == "No findings",
       _up_patch)
 check("a resend that found the review already up clears its mark",
       not os.path.exists(_up_marker), _up_marker)
+# Only the tick is withheld. A blocker fails the check on every ending
+# finish() has, a review found up among them.
+PR_UP_RED, _up_red_marker = _refused("ea3dea3dea3d", _tier_found)
+_up_red_patch = _resent(PR_UP_RED, _ours("neutral"),
+                        look=vinegar.BODY_MARK + " reviewed `ea3dea3` ...\n")
+check("a resend that found the review already up still fails on a blocker",
+      _up_red_patch and _up_red_patch[0][1]["conclusion"] == "failure",
+      _up_red_patch)
 
 # A marker written before the conclusion was recorded holds the commit
 # alone, and the run keeps the conclusion it was closed with.

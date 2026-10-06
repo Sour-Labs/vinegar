@@ -1445,8 +1445,8 @@ it cannot tell whose review it found.
 saying the review did not reach the pull request, and a later poll sends the
 saved transcript. When that send lands, the entry says the review is on the
 pull request, and a clean review gets the tick it earned (issue #28). A resend
-that finds a Vinegar review already up corrects the words and keeps the
-conclusion, for the reason above.
+that finds a Vinegar review already up corrects the words and gets no tick, for
+the reason above. A blocker still fails it, as on every other ending.
 
 The closed entry carries both narrowings, so ``No findings in what was added
 since `0123456`, asked for blockers only`` is not the same six characters as a

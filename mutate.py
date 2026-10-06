@@ -1417,9 +1417,9 @@ MUTATIONS = [
     # Read whole, a two-line marker names no commit, and handle_pr forgets
     # the saved review as left over.
     ("mark-reads-only-the-commit",
-     "            # The first line only: read_earned() owns the second.\n"
+     "            # third.\n"
      "            return handle.readline().strip() or None",
-     "            # The first line only: read_earned() owns the second.\n"
+     "            # third.\n"
      "            return handle.read().strip() or None"),
     ("earned-reads-the-second-line",
      "            handle.readline()\n"
@@ -1428,8 +1428,8 @@ MUTATIONS = [
     ("earned-reads-the-third-line",
      "            return conclusion, handle.readline().strip() or None",
      "            return conclusion, None"),
-    # Only a send of the resend's own earns the conclusion, and a review
-    # found up is landed all the same.
+    # Only a send of the resend's own earns the tick, a blocker fails
+    # either way, and a review found up is landed all the same.
     ("resend-already-up-earns-nothing",
      "                settled = ALREADY", "                settled = POSTED"),
     ("resend-found-up-is-landed",
@@ -1441,13 +1441,19 @@ MUTATIONS = [
     ("resend-corrects-only-with-an-app",
      '            if landed and config.get("github_app"):',
      "            if landed:"),
-    ("resend-earns-only-by-its-own-send",
-     "                              read_earned(marker) if settled == POSTED\n"
-     "                              else (None, None))",
-     "                              read_earned(marker))"),
+    ("resend-earns-the-tick-only-by-its-own-send",
+     "                if conclusion == CHECK_CLEAN and settled != POSTED:\n"
+     "                    conclusion = CHECK_CONCLUSION",
+     "                if False:\n"
+     "                    conclusion = CHECK_CONCLUSION"),
+    ("resend-withholds-only-the-tick",
+     "                if conclusion == CHECK_CLEAN and settled != POSTED:\n"
+     "                    conclusion = CHECK_CONCLUSION",
+     "                if settled != POSTED:\n"
+     "                    conclusion = CHECK_CONCLUSION"),
     # What the correction sends: the finished run, the summary that says
     # where the review is, the recorded tally, and the run's own title and
-    # conclusion when nothing was earned.
+    # conclusion when the marker recorded none.
     ("resend-corrects-the-finished-run",
      '    found = our_checks(label, repo, sha, config, env, "completed")',
      '    found = our_checks(label, repo, sha, config, env, "in_progress")'),

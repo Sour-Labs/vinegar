@@ -4922,7 +4922,7 @@ def close_check(label, check, title, env, summary="",
     check["closed"] = settled is not None
 
 
-def correct_check(label, repo, sha, config, env, earned):
+def correct_check(label, repo, sha, config, env, conclusion, title):
     """Say in the checks list that a resent review is on the pull request.
 
     finish() closed the entry saying the review did not reach the pull
@@ -4936,22 +4936,18 @@ def correct_check(label, repo, sha, config, env, earned):
     Finished runs only. A running one belongs to a review still writing to
     it, and closing it here would end that review's indicator early.
 
-    `earned` is the conclusion and the title finish() recorded in the
-    marker, and the caller passes them only when its own send is what
-    landed the review. The title matters as much as the conclusion: a
-    run that handle_pr()'s backstop or the sweep closed says the review
-    failed or was interrupted, and a green tick under that title
-    contradicts itself. Otherwise the run keeps both, for the reason
-    finish()'s `clean` gives: a review found already up may be an earlier
-    attempt's, and a marker written before they were recorded has none
-    to give.
+    `conclusion` and `title` are what finish() recorded in the marker,
+    and the title matters as much as the conclusion: a run that
+    handle_pr()'s backstop or the sweep closed says the review failed or
+    was interrupted, which the summary below contradicts. A marker
+    written before they were recorded gives None for both, and the run
+    keeps its own.
     """
     found = our_checks(label, repo, sha, config, env, "completed")
     if not found:
         log("%s: found no finished checks entry to correct" % label)
         return
     run = found[0]
-    conclusion, title = earned
     close_check(label, {"repo": repo, "id": run["id"], "closed": False},
                 title or run["output"]["title"], env,
                 "The review is on the pull request.",
@@ -5667,7 +5663,8 @@ def read_mark(path):
             # more "written for another commit" than a permission error
             # is, and that is the answer that deletes the saved review.
             #
-            # The first line only: read_earned() owns the second.
+            # The first line only: read_earned() owns the second and the
+            # third.
             return handle.readline().strip() or None
     except OSError:
         return None
@@ -5808,9 +5805,15 @@ def repost(key, repo, pr, config, state, tokens, done, marker, sha):
             # Only with an App, because only an App's runs exist to find,
             # and our_checks() matches on its id.
             if landed and config.get("github_app"):
+                conclusion, title = read_earned(marker)
+                # Closed the way finish() closes a post that found the
+                # review already up: the tally and no tick, because that
+                # review may be an earlier attempt's. A blocker still
+                # fails, as it does on every ending there.
+                if conclusion == CHECK_CLEAN and settled != POSTED:
+                    conclusion = CHECK_CONCLUSION
                 correct_check(key, repo, at["headRefOid"], config, env,
-                              read_earned(marker) if settled == POSTED
-                              else (None, None))
+                              conclusion, title)
             if settled == THROTTLED and waive(key, "the posting", waived):
                 waived += 1
                 tries -= 1
