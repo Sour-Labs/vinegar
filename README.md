@@ -224,7 +224,7 @@ Every key in `config.example.json`:
 | `skip_bots` | `true` | Skip pull requests opened by bots. |
 | `skip_forks` | `true` | Skip pull requests whose head branch lives in a fork. Read the next section before you turn this off. |
 | `authors` | `[]` | Only review these GitHub logins. Empty means anyone who passes the checks above. |
-| `review_timeout` | `1800` | Kill a review that runs longer than this many seconds. The GitHub token a review runs on has to outlive the clone, the triage pass and this together, so raising it far enough makes every review mint a fresh token; Vinegar says so at startup when it does. |
+| `review_timeout` | `1800` | Kill a review that runs longer than this many seconds. |
 | `severity_model` | `"haiku"` | Model that tiers the findings before they are posted. Null posts them in the order the reviewer reported them. See below. |
 | `triage_model` | `"sonnet"` | Model that reads the diff before the review and decides how much effort it earns. Null reviews everything at `effort`. It can only ever lower the effort, never raise it. See "The triage pass". |
 | `github_app` | `null` | Post as a GitHub App instead of as you. See below. |

@@ -361,29 +361,7 @@ MUTATIONS = [
      '                           "%ds" % (key_path, DIFF_TIMEOUT))',
      "    except subprocess.TimeoutExpired:\n"
      "        raise"),
-    ("token-cap-silent",
-     '    if config.get("github_app") and checkout_grace(config) >= TOKEN_LIFE:',
-     "    if False:"),
-    ("token-cap-cries-wolf",
-     '    if config.get("github_app") and checkout_grace(config) >= TOKEN_LIFE:',
-     "    if True:"),
-    # The boundary itself. A sum of exactly a token's life already fails the
-    # cache's strict `<`, so `>` would start that one config in silence.
-    ("token-cap-boundary",
-     '    if config.get("github_app") and checkout_grace(config) >= TOKEN_LIFE:',
-     '    if config.get("github_app") and checkout_grace(config) > TOKEN_LIFE:'),
-    # Without an App nothing mints, so the warning would name a cost that
-    # cannot be incurred, on the configuration the README ships.
-    ("token-cap-no-app-guard",
-     '    if config.get("github_app") and checkout_grace(config) >= TOKEN_LIFE:',
-     "    if checkout_grace(config) >= TOKEN_LIFE:"),
-    ("token-cap-no-remedy",
-     '               TOKEN_LIFE, TOKEN_LIFE - review_reserve(config)))',
-     '               TOKEN_LIFE, 0))'),
-    ("token-cap-refuses",
-     '        log("%s: review_timeout is %d, and with the %ds the checkout "',
-     '        sys.exit("%s: review_timeout is %d, and with the %ds the checkout "'),
-    # The ceiling the downgraded refusal used to provide by accident.
+    # The only upper bound on review_timeout.
     ("review-timeout-ceiling",
      '    if config["review_timeout"] > MAX_REVIEW_TIMEOUT:',
      "    if False:"),
@@ -1371,15 +1349,30 @@ MUTATIONS = [
      '            and str(was.get("external_id") or DEPLOYMENT) == DEPLOYMENT]'),
     # Opening it is the one call here that parses a reply GitHub sent.
     ("check-opened-inside-the-try",
-     "        check = open_check(key, repo, pr, config, env, blockers)\n"
+     "        check = open_check(key, repo, pr, config,\n"
+     "                           posting_env(key, config, repo, tokens, env) or env,\n"
+     "                           blockers)\n"
      "        try:",
      "        try:"),
+    # Opened on a token minted where it runs, not on the checkout's (#17).
+    ("check-opened-on-a-fresh-token",
+     "                           posting_env(key, config, repo, tokens, env) or env,\n"
+     "                           blockers)",
+     "                           env,\n"
+     "                           blockers)"),
     # The hand-run path: reachable by no check and anchored by no
     # mutation until the second pass said so.
     ("check-hand-run-opens-one",
-     "                hand = open_check(args.pr, repo, pr, config, env, "
-     "blockers)",
+     "                hand = open_check(\n"
+     "                    args.pr, repo, pr, config,\n"
+     "                    posting_env(args.pr, config, repo, tokens, env) or env,\n"
+     "                    blockers)",
      "                hand = None"),
+    ("check-hand-run-opens-on-a-fresh-token",
+     "                    posting_env(args.pr, config, repo, tokens, env) or env,\n"
+     "                    blockers)",
+     "                    env,\n"
+     "                    blockers)"),
     ("check-hand-run-closes-it",
      "                close_check(args.pr, hand, ended_title(outcome),",
      "                (lambda *a, **k: None)(args.pr, hand, ended_title(outcome),"),
@@ -1404,7 +1397,10 @@ MUTATIONS = [
     # constant intact, so the check that the clone gets longer than the
     # fetch was covered by neither of the two entries above it.
     ("clone-timeout-value", "CLONE_TIMEOUT = 1800", "CLONE_TIMEOUT = 60"),
-    ("checkout-grace-value", "CHECKOUT_GRACE = 1500", "CHECKOUT_GRACE = 60"),
+    # The value, and the base fetch in it, which is the step a hand-kept
+    # count left out. Any lower value fails the same check.
+    ("checkout-grace-counts-the-base-fetch",
+     "CHECKOUT_GRACE = 1800", "CHECKOUT_GRACE = 1500"),
     ("efforts-ultra",
      'EFFORTS = ("low", "medium", "high", "xhigh", "max")',
      'EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")'),
@@ -2374,9 +2370,9 @@ MUTATIONS = [
     # what a mutation has to do to be readable.
     ("note-only-when-triage-answered",
      "    if shaped is not None:\n"
-     "        # The indicator was opened before this ran, so it is carrying the",
+     "        # One token for both calls below, minted here, because the",
      "    if shaped is not None and False:\n"
-     "        # The indicator was opened before this ran, so it is carrying the"),
+     "        # One token for both calls below, minted here, because the"),
     # The note is worth posting and is not worth a review.
     ("note-failure-is-swallowed",
      '    except Exception as err:\n'
@@ -2389,8 +2385,13 @@ MUTATIONS = [
     # Opened before triage ran, so left alone it announces the ceiling for
     # the whole of a review running lower.
     ("retitle-corrects-the-checks-list",
-     "        retitle_check(label, check, chosen, blockers, env)",
+     "        retitle_check(label, check, chosen, blockers, fresh)",
      "        pass"),
+    # On a token minted where it runs, because triage has run since the
+    # checkout's was minted (#17).
+    ("retitle-on-a-fresh-token",
+     "        fresh = posting_env(label, config, repo, tokens, env) or env",
+     "        fresh = env"),
     ("retitle-uses-the-chosen-effort",
      '                  "title": "Reviewing at %s effort%s" % (\n'
      '                      effort, ", blockers only" if blockers else ""),\n'
@@ -2493,15 +2494,18 @@ MUTATIONS = [
     ("narrowed-round-is-declared",
      "                             config, narrowed=bool(since))",
      "                             config)"),
-    # The token has to outlive the triage pass as well as the clone and
-    # the review, and the warning has to measure against the same sum.
-    ("reserve-counts-the-triage-pass",
-     "    return CHECKOUT_GRACE + (SHAPE_TIMEOUT + DIFF_TIMEOUT\n"
-     '                             if config["triage_model"] else 0)',
-     "    return CHECKOUT_GRACE"),
-    ("reserve-counts-nothing-when-triage-is-off",
-     '                             if config["triage_model"] else 0)',
-     "                             if True else 0)"),
+    # The checkout's token outlives the checkout and not the review (#17).
+    # The hand run's grace is not here: its cache is always empty, so the
+    # value decides nothing and no check could tell a mutant from it.
+    ("grace-leaves-out-the-review",
+     "    # noticing.\n"
+     "    env = github_env(config, repo, tokens, good_for=CHECKOUT_GRACE)",
+     "    # noticing.\n"
+     "    env = github_env(config, repo, tokens,\n"
+     '                     good_for=CHECKOUT_GRACE + config["review_timeout"])'),
+    # Close to the hour a token lives the cache barely serves one.
+    ("grace-inside-token-life",
+     "CHECKOUT_GRACE = 1800", "CHECKOUT_GRACE = 3500"),
 
     # --- a login that fails, which is not a failed review ---------------
     # Three attempts seconds apart cannot outlast it, and three pull
