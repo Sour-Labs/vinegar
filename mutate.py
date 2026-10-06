@@ -1360,8 +1360,8 @@ MUTATIONS = [
     # constant intact, so the check that the clone gets longer than the
     # fetch was covered by neither of the two entries above it.
     ("clone-timeout-value", "CLONE_TIMEOUT = 1800", "CLONE_TIMEOUT = 60"),
-    ("checkout-grace-value", "CHECKOUT_GRACE = 1800", "CHECKOUT_GRACE = 60"),
-    # The base fetch is the step a hand-kept count left out.
+    # The value, and the base fetch in it, which is the step a hand-kept
+    # count left out. Any lower value fails the same check.
     ("checkout-grace-counts-the-base-fetch",
      "CHECKOUT_GRACE = 1800", "CHECKOUT_GRACE = 1500"),
     ("efforts-ultra",
@@ -2333,9 +2333,9 @@ MUTATIONS = [
     # what a mutation has to do to be readable.
     ("note-only-when-triage-answered",
      "    if shaped is not None:\n"
-     "        # The indicator was opened before this ran, so it is carrying the",
+     "        # One token for both calls below, minted here, because the",
      "    if shaped is not None and False:\n"
-     "        # The indicator was opened before this ran, so it is carrying the"),
+     "        # One token for both calls below, minted here, because the"),
     # The note is worth posting and is not worth a review.
     ("note-failure-is-swallowed",
      '    except Exception as err:\n'
@@ -2348,16 +2348,13 @@ MUTATIONS = [
     # Opened before triage ran, so left alone it announces the ceiling for
     # the whole of a review running lower.
     ("retitle-corrects-the-checks-list",
-     "        retitle_check(label, check, chosen, blockers,\n"
-     "                      posting_env(label, config, repo, tokens, env) or env)",
+     "        retitle_check(label, check, chosen, blockers, fresh)",
      "        pass"),
     # On a token minted where it runs, because triage has run since the
     # checkout's was minted (#17).
     ("retitle-on-a-fresh-token",
-     "        retitle_check(label, check, chosen, blockers,\n"
-     "                      posting_env(label, config, repo, tokens, env) or env)",
-     "        retitle_check(label, check, chosen, blockers,\n"
-     "                      env)"),
+     "        fresh = posting_env(label, config, repo, tokens, env) or env",
+     "        fresh = env"),
     ("retitle-uses-the-chosen-effort",
      '                  "title": "Reviewing at %s effort%s" % (\n'
      '                      effort, ", blockers only" if blockers else ""),\n'
@@ -2460,15 +2457,15 @@ MUTATIONS = [
     ("narrowed-round-is-declared",
      "                             config, narrowed=bool(since))",
      "                             config)"),
-    # The checkout's token outlives the checkout and not the review (#17),
-    # and a hand run's outlives the read of the pull request before it.
+    # The checkout's token outlives the checkout and not the review (#17).
+    # The hand run's grace is not here: its cache is always empty, so the
+    # value decides nothing and no check could tell a mutant from it.
     ("grace-leaves-out-the-review",
+     "    # noticing.\n"
      "    env = github_env(config, repo, tokens, good_for=CHECKOUT_GRACE)",
+     "    # noticing.\n"
      "    env = github_env(config, repo, tokens,\n"
      '                     good_for=CHECKOUT_GRACE + config["review_timeout"])'),
-    ("hand-run-grace-counts-the-read",
-     "                             good_for=LIST_TIMEOUT + CHECKOUT_GRACE)",
-     "                             good_for=CHECKOUT_GRACE)"),
     # Close to the hour a token lives the cache barely serves one.
     ("grace-inside-token-life",
      "CHECKOUT_GRACE = 1800", "CHECKOUT_GRACE = 3500"),

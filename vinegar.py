@@ -502,11 +502,11 @@ PR_LIMIT = 50
 PR_FIELDS = ("number,title,headRefOid,baseRefName,isDraft,author,additions,"
              "deletions,isCrossRepository,url")
 
-# Seconds of token life asked for immediately before the review is posted.
-# The token minted at the top cannot be relied on here: it has to survive the
-# checkout and the whole review first, and `review_timeout` alone can consume
-# more life than a token has. Whatever is left at that point, this asks for a
-# usable token now, when the only work remaining is one or two API calls.
+# Seconds of token life asked for by each call to GitHub after the checkout:
+# the checks entry, the triage note and the posting. The token minted at the
+# top is asked to outlive only the checkout (CHECKOUT_GRACE), so whatever is
+# left of it by then, this asks for a usable token now, when the work
+# remaining is one or two API calls.
 POST_GRACE = 300
 
 # Seconds a fetch may take. Generous because it is the network and a
@@ -4949,23 +4949,28 @@ def submit_review(label, repo, pr, payload, env):
 
 
 def posting_env(label, config, repo, tokens, fallback):
-    """Credentials for the posting: a fresh token, or the review's own.
+    """Credentials for a call after the checkout: a fresh token, or the
+    one minted for the checkout.
+
+    Every call to GitHub after the checkout comes here, the checks entry
+    and the triage note as well as the posting, because the checkout's
+    token is asked to outlive only the checkout (CHECKOUT_GRACE).
 
     Minting here is a live API call, and the endpoint it calls is one
     handle_pr() already documents as prone to transient 5xx. Letting that
-    decide the fate of a finished review is the wrong trade: the token the
-    run has been using is in scope and, after a review of ordinary length,
-    usually has time left on it. After a long one it may not, and
-    CHECKOUT_GRACE says why that was accepted. A one-second network blip
-    should not cost a review that is sitting there ready to post.
+    decide the fate of a finished review is the wrong trade: the checkout's
+    token is in scope and, after a review of ordinary length, usually has
+    time left on it. After a long one it may not, and CHECKOUT_GRACE says
+    why that was accepted. A one-second network blip should not cost a
+    review that is sitting there ready to post.
     """
     if not config["comment"]:
         return None
     try:
         return github_env(config, repo, tokens, good_for=POST_GRACE)
     except Exception as err:
-        log("%s: could not mint a token to post with (%s), using the one the "
-            "review ran on" % (label, err))
+        log("%s: could not mint a fresh token (%s), so this call uses the one "
+            "minted for the checkout" % (label, err))
         return fallback
 
 
@@ -5895,12 +5900,14 @@ def review(path, repo, pr, config, env, tokens, resent=False, check=None,
     # noise on the pull request: the checks list already carries the
     # effort and the log already carries the reason.
     if shaped is not None:
+        # One token for both calls below, minted here, because the
+        # checkout's was asked to outlive only the checkout: CHECKOUT_GRACE
+        # says why. Once, so a mint that fails costs one attempt and one
+        # log line rather than two.
+        fresh = posting_env(label, config, repo, tokens, env) or env
         # The indicator was opened before this ran, so it is carrying the
-        # ceiling rather than what triage settled on. On a token minted
-        # here, because the checkout's was asked to outlive only the
-        # checkout: CHECKOUT_GRACE says why.
-        retitle_check(label, check, chosen, blockers,
-                      posting_env(label, config, repo, tokens, env) or env)
+        # ceiling rather than what triage settled on.
+        retitle_check(label, check, chosen, blockers, fresh)
         # On `comment`, never on posting_env() answering None. None means
         # the dry run *and* it means no App is configured, in which case
         # every other caller runs on the ambient environment through the
@@ -5908,7 +5915,7 @@ def review(path, repo, pr, config, env, tokens, resent=False, check=None,
         # any install that authenticates as a person.
         if config["comment"]:
             post_note(label, repo, pr, note_body(pr, shaped, chosen, why),
-                      posting_env(label, config, repo, tokens, env) or env)
+                      fresh)
 
     prompt = "/code-review %s %d" % (config["effort"], pr["number"])
 
@@ -7820,11 +7827,10 @@ def main():
             if (not number.isascii() or not number.isdigit()
                     or not REPO_NAME.match(repo)):
                 sys.exit("--pr wants owner/repo#number, got %s" % args.pr)
-            # The grace handle_pr() asks for, and for the same reason, plus
-            # the read of the pull request that comes first on this token
-            # here. Everything after the checkout mints its own.
-            env = github_env(config, repo, tokens,
-                             good_for=LIST_TIMEOUT + CHECKOUT_GRACE)
+            # The grace handle_pr() asks for, so the two paths read alike.
+            # Here it decides nothing: `tokens` is empty, so this always
+            # mints a token with its whole hour left.
+            env = github_env(config, repo, tokens, good_for=CHECKOUT_GRACE)
             pr = find_pr(repo, number, env)
             reason = skip_reason(pr, config)
             if reason:
