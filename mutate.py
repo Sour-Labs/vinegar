@@ -1391,10 +1391,17 @@ MUTATIONS = [
 
     # --- a resent review corrects its checks entry (issue #28) ---------
     # The marker records the conclusion a landed post gets, a term at a
-    # time, beneath the commit it names.
+    # time, and its title, beneath the commit it names.
     ("resend-marker-records-the-conclusion",
-     '            write_atomic(marker, "%s\\n%s\\n" % (pr["headRefOid"], earned))',
-     '            write_atomic(marker, "%s\\n" % pr["headRefOid"])'),
+     '            write_atomic(marker, "%s\\n%s\\n%s\\n" % (\n'
+     '                pr["headRefOid"], earned, title))',
+     '            write_atomic(marker, "%s\\n" % (\n'
+     '                pr["headRefOid"]))'),
+    ("resend-marker-records-the-title",
+     '            write_atomic(marker, "%s\\n%s\\n%s\\n" % (\n'
+     '                pr["headRefOid"], earned, title))',
+     '            write_atomic(marker, "%s\\n%s\\n" % (\n'
+     '                pr["headRefOid"], earned))'),
     ("resend-earns-red-on-a-blocker",
      "    earned = (CHECK_BLOCKED if reaches_blocker(findings)",
      "    earned = (CHECK_CONCLUSION if reaches_blocker(findings)"),
@@ -1416,8 +1423,11 @@ MUTATIONS = [
      "            return handle.read().strip() or None"),
     ("earned-reads-the-second-line",
      "            handle.readline()\n"
-     "            return handle.readline().strip() or None",
-     "            return handle.readline().strip() or None"),
+     "            conclusion = handle.readline().strip() or None",
+     "            conclusion = handle.readline().strip() or None"),
+    ("earned-reads-the-third-line",
+     "            return conclusion, handle.readline().strip() or None",
+     "            return conclusion, None"),
     # Only a send of the resend's own earns the conclusion, and a review
     # found up is landed all the same.
     ("resend-already-up-earns-nothing",
@@ -1431,21 +1441,28 @@ MUTATIONS = [
     ("resend-corrects-only-with-an-app",
      '            if landed and config.get("github_app"):',
      "            if landed:"),
+    ("resend-earns-only-by-its-own-send",
+     "                              read_earned(marker) if settled == POSTED\n"
+     "                              else (None, None))",
+     "                              read_earned(marker))"),
     # What the correction sends: the finished run, the summary that says
-    # where the review is, its own tally, and its own conclusion when
-    # nothing was earned.
+    # where the review is, the recorded tally, and the run's own title and
+    # conclusion when nothing was earned.
     ("resend-corrects-the-finished-run",
      '    found = our_checks(label, repo, sha, config, env, "completed")',
      '    found = our_checks(label, repo, sha, config, env, "in_progress")'),
     ("resend-entry-says-on-the-pull-request",
      '                "The review is on the pull request.",\n',
      '                "",\n'),
-    ("resend-keeps-the-tally",
-     '                run["output"]["title"], env,',
-     '                "Corrected", env,'),
+    ("resend-carries-the-recorded-title",
+     '                title or run["output"]["title"], env,',
+     '                run["output"]["title"], env,'),
+    ("resend-keeps-the-run-title",
+     '                title or run["output"]["title"], env,',
+     '                title or "Corrected", env,'),
     ("resend-keeps-the-run-conclusion",
-     '                earned or run["conclusion"])',
-     "                earned or CHECK_CONCLUSION)"),
+     '                conclusion or run["conclusion"])',
+     "                conclusion or CHECK_CONCLUSION)"),
     ("resend-says-when-there-is-nothing-to-correct",
      "    if not found:\n"
      '        log("%s: found no finished checks entry to correct" % label)',

@@ -7890,11 +7890,12 @@ reset_stubs()
 
 
 def _earned_and_landed(findings, sha, whole=True):
-    """The conclusion the marker records, and the one a landed post gets.
+    """What the marker records, and what the close of a landed post says.
 
-    finish() works the first out before it posts and closes the entry with
-    the second afterwards, two expressions apart, so each ending is run
-    twice: refused, to read the marker, and landed, to read the close.
+    Each is a conclusion and a title. finish() records the first before it
+    posts and closes the entry with the second afterwards, so each ending
+    is run twice: refused, to read the marker, and landed, to read the
+    close.
     """
     at = dict(PR_LIVE, headRefOid=sha)
     marker = vinegar.unposted_path("o/r", at)
@@ -7911,8 +7912,8 @@ def _earned_and_landed(findings, sha, whole=True):
                    check={"repo": "o/r", "id": 5, "closed": False})
     vinegar.run = fake_run
     vinegar.forget(marker)
-    closed = [asked["conclusion"] for how, _, asked in checked
-              if how == "PATCH"]
+    closed = [(asked["conclusion"], asked["output"]["title"])
+              for how, _, asked in checked if how == "PATCH"]
     return earned, closed[0] if closed else None
 
 
@@ -7928,15 +7929,19 @@ for _ending, _findings, _whole, _sha, _want in (
          "ea04ea04ea04", "neutral")):
     _pair = _earned_and_landed(_findings, _sha, _whole)
     check("the marker of %s records what a landed post gets" % _ending,
-          _pair == (_want, _want), _pair)
+          _pair[0] == _pair[1] and _pair[0][0] == _want, _pair)
+
+
+# Closed by handle_pr's backstop, as when the posting raised: the title is
+# not the tally, so a correction that kept it would put a green tick under
+# words saying the review never arrived.
+BACKSTOP_TITLE = vinegar.ended_title(vinegar.DONE)
 
 
 def _ours(conclusion):
     return {"id": 31, "app": {"id": 77}, "status": "completed",
             "conclusion": conclusion,
-            "output": {"title": "No findings",
-                       "summary": "The review did not reach the pull "
-                                  "request. The log says where it is saved."}}
+            "output": {"title": BACKSTOP_TITLE, "summary": BACKSTOP_TITLE}}
 
 
 def _refused(sha, findings=()):
@@ -7973,7 +7978,8 @@ PR_EARN, _earn_marker = _refused("ea2bea2bea2b")
 # over from a run no longer recorded.
 check("a marker carrying a conclusion still names its commit",
       vinegar.read_mark(_earn_marker) == PR_EARN["headRefOid"]
-      and vinegar.read_earned(_earn_marker) == vinegar.CHECK_CLEAN,
+      and vinegar.read_earned(_earn_marker)
+      == (vinegar.CHECK_CLEAN, "No findings"),
       open(_earn_marker).read())
 _earn_patch = _resent(PR_EARN, _ours("neutral"))
 _earn_get = [where for how, where, _ in checked if how == "GET"]
@@ -7984,7 +7990,7 @@ check("a resent clean review gets the tick it earned",
 check("a resent review's entry says the review is on the pull request",
       _earn_patch and _earn_patch[0][1]["output"]["summary"]
       == "The review is on the pull request.", _earn_patch)
-check("the corrected entry keeps the tally it was closed with",
+check("a resent review's entry carries its tally, whoever closed it",
       _earn_patch
       and _earn_patch[0][1]["output"]["title"] == "No findings", _earn_patch)
 # Finished runs only, at the commit the saved review is of. A running one
@@ -8007,6 +8013,9 @@ check("a resend that found the review already up does not tick it",
 check("a resend that found the review already up still corrects the entry",
       _up_patch and _up_patch[0][1]["output"]["summary"]
       == "The review is on the pull request.", _up_patch)
+check("a resend that found the review already up keeps the run's title",
+      _up_patch and _up_patch[0][1]["output"]["title"] == BACKSTOP_TITLE,
+      _up_patch)
 check("a resend that found the review already up clears its mark",
       not os.path.exists(_up_marker), _up_marker)
 
@@ -8017,8 +8026,9 @@ _refused(PR_OLD["headRefOid"])
 with open(vinegar.unposted_path("o/r", PR_OLD), "w") as h:
     h.write("%s\n" % PR_OLD["headRefOid"])
 _old_patch = _resent(PR_OLD, _ours("failure"))
-check("an older marker's resend keeps the run's own conclusion",
-      _old_patch and _old_patch[0][1]["conclusion"] == "failure", _old_patch)
+check("an older marker's resend keeps the run's own conclusion and title",
+      _old_patch and _old_patch[0][1]["conclusion"] == "failure"
+      and _old_patch[0][1]["output"]["title"] == BACKSTOP_TITLE, _old_patch)
 
 # Corrected only once the review is up.
 PR_AGAIN_REFUSED, _ar_marker = _refused("ea5eea5eea5e")
