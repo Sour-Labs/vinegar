@@ -1433,14 +1433,13 @@ and one that never reached the pull request. A review that ran to the end on the
 fallback model is not one of them, and says so: it carries a note, and a note is
 not the same as being cut short.
 
-**A retried review never gets the tick**, whether or not it deserved one.
-`post_review` answers the same thing when it posts and when it finds an earlier
-attempt's review already up, and in the second case the findings on that commit
-are the earlier attempt's, so a retry reporting nothing would tick a commit
-carrying a review full of them. Nothing can tell the two apart today, so both
-lose the tick. The cost is a grey mark on a clean review whose first attempt
-failed before posting, which is what every clean review looked like until now.
-Issue #27 is the narrower answer.
+**A retried review gets the tick only for a review it posted itself.** A retry
+that finds a Vinegar review of the commit already up may have found an earlier
+attempt's, whose findings are not the retry's, so a retry reporting nothing
+would tick a commit carrying a review full of them. `post_review` answers that
+case apart from a post of its own (issue #27), and it closes grey. So does a
+retry that could not confirm its own send and then found a review up, because
+it cannot tell whose review it found.
 
 The closed entry carries both narrowings, so ``No findings in what was added
 since `0123456`, asked for blockers only`` is not the same six characters as a

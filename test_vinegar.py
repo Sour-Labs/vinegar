@@ -4954,6 +4954,11 @@ del posted[:]
 vinegar.handle_pr("o/r", PR_LIVE, CONFIG, _gc_state, {})
 check("a give-up already up is not repeated after a crash",
       not posted, (len(posted), _gc_state))
+# And it counts as said. The rediscovery is a retry, so it answers ALREADY,
+# and read as unsaid it would be asked again on every poll until the
+# budget ran out.
+check("a give-up found already up is recorded as said",
+      _gc_state[L].get("announced") is True, _gc_state)
 
 # The give-up writes no marker, so anything it forgets on its way out can
 # only be somebody else's — a saved review still waiting to be sent.
@@ -5328,6 +5333,19 @@ claude_run.stream = stream(call(FINDINGS[:1]), result_event())
 _cov_whole = vinegar.review(ROOT, "o/r", PR, CONFIG, None, {})
 check("a review that finished and posted answers that it covered its scope",
       _cov_whole == (vinegar.DONE, True, True), _cov_whole)
+
+# A retry that found its review already up still covered its scope and
+# reached the author. Issue #27 warned that a new answer read as "not
+# posted" would make the next pass re-read the scope and count no round.
+reset_stubs()
+vinegar.run = claude_run
+vinegar.save_transcript = stub_transcript
+claude_run.stream = stream(call(FINDINGS[:1]), result_event())
+fake_run.look_out = vinegar.BODY_MARK + " reviewed `a1b2c3d` ...\n"
+_cov_found = vinegar.review(ROOT, "o/r", PR, CONFIG, None, {}, resent=True)
+fake_run.look_out = ""
+check("a retry that found its review up still covered its scope",
+      _cov_found == (vinegar.DONE, True, True), _cov_found)
 
 # A run cut off part-way still posts what it had, and still answers DONE.
 reset_stubs()
@@ -6101,6 +6119,41 @@ check("a timed-out post that landed is not sent twice",
 fake_run.look_out = ""
 vinegar.run = fake_run
 
+# What a review found after an unconfirmed send stands for depends on who
+# could have sent it. A first attempt can only have found its own. A retry
+# may have found an earlier attempt's, because its read before sending
+# answers "no" when it cannot tell, so it answers ALREADY and finish()
+# withholds the tick (issue #27). The reads are answered in turn, so both
+# sites that read after a send are reached: before the resend, and after.
+_reads = []
+
+
+def found_on_read(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
+    if cmd[:2] == ["gh", "api"] and "-X" in cmd:
+        _reads.append(cmd)
+        up = len(_reads) >= found_on_read.at
+        return subprocess.CompletedProcess(
+            cmd, 0, vinegar.BODY_MARK + " reviewed `a1b2c3d` ...\n"
+            if up else "", "")
+    return fake_run(cmd, cwd, timeout, env, stdin_text)
+
+
+vinegar.run = found_on_read
+fake_run.rc, fake_run.post_err = 1, "HTTP 502"
+_found_answers = []
+for _resent, _at in ((False, 1), (False, 2), (True, 2), (True, 3)):
+    del _reads[:]
+    found_on_read.at = _at
+    _found_answers.append(vinegar.post_review(
+        L, "o/r", PR, ROOT, "clean", [], CONFIG, None, resent=_resent))
+check("a first attempt that finds its unsure send up says POSTED",
+      _found_answers[:2] == [vinegar.POSTED, vinegar.POSTED], _found_answers)
+check("a retry that finds a review up after sending says ALREADY",
+      _found_answers[2:] == [vinegar.ALREADY, vinegar.ALREADY],
+      _found_answers)
+fake_run.rc, fake_run.post_err = 0, "HTTP 422"
+vinegar.run = fake_run
+
 # The duplicate check answering "no" because it could not tell must say so:
 # that answer is what resends, and the resend is what duplicates.
 _ap_logged = []
@@ -6363,7 +6416,7 @@ fake_run.look_out = "%s gave up on `a1b2c3d` at high effort\n" % (
 del _rs_posts[:]
 _said = vinegar.give_up(L, "o/r", PR, CONFIG, 3, {}, tries=1)
 check("a give-up already up is not announced a second time",
-      _said == vinegar.POSTED and not _rs_posts, (_said, len(_rs_posts)))
+      _said == vinegar.ALREADY and not _rs_posts, (_said, len(_rs_posts)))
 del _rs_posts[:]
 _said = vinegar.give_up(L, "o/r", PR, CONFIG, 3, {}, tries=0)
 check("the first announcement does not pay for that read",
@@ -6376,9 +6429,14 @@ vinegar.run = watch_posts
 fake_run.look_out = "%s reviewed `a1b2c3d` at high effort\n" % (
     vinegar.BODY_MARK)
 del _rs_posts[:]
-vinegar.post_review(L, "o/r", PR, ROOT, "x", [], CONFIG, None, resent=True)
+_said = vinegar.post_review(L, "o/r", PR, ROOT, "x", [], CONFIG, None,
+                            resent=True)
 check("a re-run against a reviewed commit does not post twice",
       not _rs_posts, len(_rs_posts))
+# And says that it did not, so finish() can tell a review this run sent
+# from one it found. Issue #27.
+check("a review found already up is answered apart from one posted",
+      _said == vinegar.ALREADY, _said)
 # And it asks before doing the work it would throw away: routing findings
 # means a full `git diff` over the pull request, which is the same reason
 # the dry-run check sits above the routing rather than below it.
@@ -7251,13 +7309,42 @@ check("a review whose output could not be read is not a pass",
 _titled([], note="killed at 30 minutes", sha="ba00ba00ba00", whole=False)
 check("a review that found nothing before it was killed is not a pass",
       _conclusions[-1] == "neutral", _conclusions[-1])
-# post_review answers POSTED without posting when a retry finds the review
-# already up, so the review on that commit is the earlier attempt's. A
-# retry that itself reports nothing would tick a commit whose visible
-# review is full of findings.
+# A retry that finds a review already up answers ALREADY, and the review on
+# that commit may be the earlier attempt's. A retry that itself reports
+# nothing would tick a commit whose visible review is full of findings.
+fake_run.look_out = vinegar.BODY_MARK + " reviewed `bb00bb0` ...\n"
 _titled([], sha="bb00bb00bb00", resent=True)
-check("a retry that posted nothing new is not a pass",
+fake_run.look_out = ""
+check("a retry that found a review already up is not a pass",
       _conclusions[-1] == "neutral", _conclusions[-1])
+# A retry that found nothing up and posted its own clean review has earned
+# the tick, which it was denied while the two answers were one (#27).
+_titled([], sha="bb10bb10bb10", resent=True)
+check("a retry that posted its own clean review is a pass",
+      _conclusions[-1] == "success", _conclusions[-1])
+# A review found up is on the pull request all the same: the mark that
+# would send this run's transcript over it is cleared, and the checks entry
+# says the review is there. The mark is laid first, so a finish() that
+# kept it is seen keeping it.
+PR_FOUND = dict(PR_LIVE, headRefOid="f0f0f0f0f0f0")
+_found_marker = vinegar.unposted_path("o/r", PR_FOUND)
+os.makedirs(vinegar.REVIEW_DIR, exist_ok=True)
+with open(_found_marker, "w") as h:
+    h.write("%s\n" % PR_FOUND["headRefOid"])
+fake_run.look_out = vinegar.BODY_MARK + " reviewed `f0f0f0f` ...\n"
+del checked[:]
+_found_said = vinegar.finish(
+    L, "o/r", PR_FOUND, ROOT, "words", [], CONFIG, None, {}, resent=True,
+    whole=True, check={"repo": "o/r", "id": 7, "closed": False})
+fake_run.look_out = ""
+_found_patch = [asked for how, _, asked in checked if how == "PATCH"]
+check("a review found already up clears the mark that would resend it",
+      _found_said == vinegar.ALREADY and not os.path.exists(_found_marker),
+      (_found_said, os.path.exists(_found_marker)))
+check("a review found already up is said to be on the pull request",
+      _found_patch and _found_patch[0]["output"]["summary"]
+      == "The review is on the pull request.", _found_patch)
+vinegar.forget(_found_marker)
 # The fallback-model notice again, on the conclusion this time: the tick
 # would have been denied to every clean review wherever the pinned model
 # had stopped routing.
