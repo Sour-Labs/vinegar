@@ -4694,9 +4694,19 @@ def running_checks(label, repo, sha, config, env):
     it is one function. open_check() asks so that a retry reuses the
     indicator an earlier attempt left rather than adding a second one;
     sweep_checks() asks so that a startup closes the ones nobody is coming
-    back for. Written out twice they could disagree about which runs are
-    Vinegar's, and the way that shows is a sweep closing another App's
-    check run.
+    back for.
+    """
+    found = our_checks(label, repo, sha, config, env, "in_progress")
+    return None if found is None else [was.get("id") for was in found]
+
+
+def our_checks(label, repo, sha, config, env, status):
+    """This deployment's check runs at `sha` whose status is `status`.
+
+    The one definition of which runs are Vinegar's. running_checks() asks
+    for the running ones and correct_check() for the finished ones.
+    Written out twice they could disagree about which runs are Vinegar's,
+    and the way that shows is a sweep closing another App's check run.
 
     `.get("id")` as well as the app, not just membership. A reply with no
     id, from a truncated body or one check_api answered as `{}`, would
@@ -4714,11 +4724,12 @@ def running_checks(label, repo, sha, config, env):
     The App is not enough on its own, and `DEPLOYMENT` is the rest of it.
     Two Vinegars on one machine under different VINEGAR_HOMEs
     authenticate as the same App, so their runs are indistinguishable on
-    the wire, and both of the things this function serves are wrong across
-    that line: a sweep closing the other one's live indicator, and a reuse
-    adopting a run another process is still writing to. The lock cannot
-    separate them, because it is per home. This can, because open_check()
-    stamps the home that made the run.
+    the wire, and every caller here is wrong across that line: a sweep
+    closing the other one's live indicator, a reuse adopting a run another
+    process is still writing to, and a resend rewriting the entry the
+    other one finished. The lock cannot separate them, because it is per
+    home. This can, because open_check() stamps the home that made the
+    run.
 
     A run carrying no `external_id` at all is treated as this
     deployment's. Those are the ones written before the stamp existed, and
@@ -4729,8 +4740,8 @@ def running_checks(label, repo, sha, config, env):
     """
     said = check_api(
         label, repo,
-        "commits/%s/check-runs?check_name=%s&status=in_progress"
-        % (sha, CHECK_NAME), "GET", None, env)
+        "commits/%s/check-runs?check_name=%s&status=%s"
+        % (sha, CHECK_NAME, status), "GET", None, env)
     # None for a call that did not answer, an empty list for one that
     # answered nothing. open_check() cannot tell them apart and does not
     # need to, because both mean "no run to adopt" and it creates one
@@ -4740,7 +4751,7 @@ def running_checks(label, repo, sha, config, env):
     # request on every start.
     if said is None:
         return None
-    return [was.get("id") for was in said.get("check_runs") or []
+    return [was for was in said.get("check_runs") or []
             if str((was.get("app") or {}).get("id"))
             == str(config["github_app"].get("app_id")) and was.get("id")
             and str(was.get("external_id") or DEPLOYMENT) == DEPLOYMENT]
@@ -4909,6 +4920,38 @@ def close_check(label, check, title, env, summary="",
             "output": {"title": title[:255], "summary": summary or title}},
         env)
     check["closed"] = settled is not None
+
+
+def correct_check(label, repo, sha, config, env, conclusion, title):
+    """Say in the checks list that a resent review is on the pull request.
+
+    finish() closed the entry saying the review did not reach the pull
+    request, and repost() runs on a later poll holding no handle to it, so
+    the entry is found again on the commit. Measured for issue #28 with
+    the App's token: a completed run takes a new conclusion and a new
+    output, unlike the move back to in_progress that open_check()
+    describes, and the listing by name answers only the newest run of
+    that name, which is the one the pull request shows.
+
+    Finished runs only. A running one belongs to a review still writing to
+    it, and closing it here would end that review's indicator early.
+
+    `conclusion` and `title` are what finish() recorded in the marker,
+    and the title matters as much as the conclusion: a run that
+    handle_pr()'s backstop or the sweep closed says the review failed or
+    was interrupted, which the summary below contradicts. A marker
+    written before they were recorded gives None for both, and the run
+    keeps its own.
+    """
+    found = our_checks(label, repo, sha, config, env, "completed")
+    if not found:
+        log("%s: found no finished checks entry to correct" % label)
+        return
+    run = found[0]
+    close_check(label, {"repo": repo, "id": run["id"], "closed": False},
+                title or run["output"]["title"], env,
+                "The review is on the pull request.",
+                conclusion or run["conclusion"])
 
 
 def submit_review(label, repo, pr, payload, env):
@@ -5404,62 +5447,12 @@ def finish(label, repo, pr, path, text, findings, config, env, tokens,
         wrote = save_or_log(label, lambda: log("%s: transcript at %s" % (
             label, save_transcript(repo, pr, text, findings, note, since,
                                    blockers))))
-    # Marked before the posting, not after. Written afterwards it was
-    # skipped entirely by anything that raised out of post_review — `gh`
-    # missing from PATH, a fork that cannot allocate — so a transcript
-    # that was safely on disk had nothing pointing at it and could never
-    # be sent, while the log told the operator nothing had been saved and
-    # invited them to pay for the review again. Optimistic and then
-    # cleared is the safe order: the worst a stale marker costs is one
-    # extra send, and already_posted answers that.
-    marker = unposted_path(repo, pr)
-    if config["comment"] and not preserve and wrote:
-        # Its own guard, not save_or_log's. That one's message says the
-        # transcript was not saved, which here is false and misleading:
-        # the transcript is safely on disk and what failed is the note
-        # saying it still needs sending.
-        try:
-            write_atomic(marker, "%s\n" % pr["headRefOid"])
-        except OSError as err:
-            log("%s: the review is saved but cannot be marked for sending "
-                "again: %s" % (label, err))
-
-    # Hoisted, because the indicator is finished on these too. They are
-    # freshly minted where the review's own may be an hour old by now.
-    sending = posting_env(label, config, repo, tokens, env)
-    posted = post_review(label, repo, pr, path, text, findings, config,
-                         sending, note, verb, resent, since=since,
-                         blockers=blockers)
-    # Cleared once it is on the pull request. What is left behind says a
-    # review is saved and waiting, which is what handle_pr acts on: the
-    # outcome is recorded DONE either way, `review_on_push` is false, and
-    # without this the pull request was never looked at again — the
-    # silence the README forbids, reached by the one path that had no
-    # retry of its own. The give-up has its own bounded retry and is
-    # never marked.
-    # Named, not truthiness. THROTTLED is a string and every string is
-    # true, so a rate-limited post, which had just logged that the review
-    # is safe and will be sent again, deleted the marker that was the
-    # only thing able to send it. Named once and read three times below,
-    # so the next ending added here cannot get the comparison right in two
-    # places and wrong in the third. ALREADY is on the pull request too.
-    landed = posted in (POSTED, ALREADY)
-    #
-    # `not preserve` as well, because the give-up writes no marker, so
-    # forgetting one on its way out could only ever delete somebody
-    # else's.
-    if landed and not preserve:
-        forget(marker)
-
-    # The indicator is finished here, for the reason the two lines at the
-    # top of this function are here: every route to the pull request
-    # leaves from finish(), and this is the only one of them that knows
-    # both how many findings there were and whether they landed. Closing
-    # it in review() instead would have had to say "reviewed" without
-    # being able to say what was found.
-    #
-    # Counted off `findings`, which triage() has already tiered, so the
-    # checks list carries the same tally as the comment.
+    # The title the indicator closes with, worked out before the posting
+    # because the marker records it too: repost() keeps nothing else of
+    # this run, and a run that a backstop or the sweep closed carries
+    # some other title. Counted off `findings`, which triage() has
+    # already tiered, so the checks list carries the same tally as the
+    # comment.
     if findings is None:
         # Not "no findings". The reviewer said something Vinegar could not
         # read, and a checks list saying the change is clean would be the
@@ -5504,6 +5497,68 @@ def finish(label, repo, pr, path, text, findings, config, env, tokens,
     # titled as one that was cut short.
     if not whole:
         title = "%s, and the review did not finish" % title
+    # Marked before the posting, not after. Written afterwards it was
+    # skipped entirely by anything that raised out of post_review — `gh`
+    # missing from PATH, a fork that cannot allocate — so a transcript
+    # that was safely on disk had nothing pointing at it and could never
+    # be sent, while the log told the operator nothing had been saved and
+    # invited them to pay for the review again. Optimistic and then
+    # cleared is the safe order: the worst a stale marker costs is one
+    # extra send, and already_posted answers that.
+    marker = unposted_path(repo, pr)
+    # The conclusion this review earns if a later repost() is what lands
+    # it, recorded beneath the commit with the title. It is the conclusion
+    # the close below gives when this run's own post lands, worked out
+    # before the posting because the marker is.
+    earned = (CHECK_BLOCKED if reaches_blocker(findings)
+              else CHECK_CLEAN if findings == [] and whole
+              else CHECK_CONCLUSION)
+    if config["comment"] and not preserve and wrote:
+        # Its own guard, not save_or_log's. That one's message says the
+        # transcript was not saved, which here is false and misleading:
+        # the transcript is safely on disk and what failed is the note
+        # saying it still needs sending.
+        try:
+            write_atomic(marker, "%s\n%s\n%s\n" % (
+                pr["headRefOid"], earned, title))
+        except OSError as err:
+            log("%s: the review is saved but cannot be marked for sending "
+                "again: %s" % (label, err))
+
+    # Hoisted, because the indicator is finished on these too. They are
+    # freshly minted where the review's own may be an hour old by now.
+    sending = posting_env(label, config, repo, tokens, env)
+    posted = post_review(label, repo, pr, path, text, findings, config,
+                         sending, note, verb, resent, since=since,
+                         blockers=blockers)
+    # Cleared once it is on the pull request. What is left behind says a
+    # review is saved and waiting, which is what handle_pr acts on: the
+    # outcome is recorded DONE either way, `review_on_push` is false, and
+    # without this the pull request was never looked at again — the
+    # silence the README forbids, reached by the one path that had no
+    # retry of its own. The give-up has its own bounded retry and is
+    # never marked.
+    # Named, not truthiness. THROTTLED is a string and every string is
+    # true, so a rate-limited post, which had just logged that the review
+    # is safe and will be sent again, deleted the marker that was the
+    # only thing able to send it. Named once and read three times below,
+    # so the next ending added here cannot get the comparison right in two
+    # places and wrong in the third. ALREADY is on the pull request too.
+    landed = posted in (POSTED, ALREADY)
+    #
+    # `not preserve` as well, because the give-up writes no marker, so
+    # forgetting one on its way out could only ever delete somebody
+    # else's.
+    if landed and not preserve:
+        forget(marker)
+
+    # The indicator is finished here, for the reason the two lines at the
+    # top of this function are here: every route to the pull request
+    # leaves from finish(), and this is the only one of them that knows
+    # both how many findings there were and whether they landed. Closing
+    # it in review() instead would have had to say "reviewed" without
+    # being able to say what was found.
+    #
     # Green only for the ending that is a pass, and every term here is one
     # way of reporting nothing without being clean.
     #
@@ -5607,9 +5662,28 @@ def read_mark(path):
             # write, a filesystem fault, an operator clearing it — is no
             # more "written for another commit" than a permission error
             # is, and that is the answer that deletes the saved review.
-            return handle.read().strip() or None
+            #
+            # The first line only: read_earned() owns the second and the
+            # third.
+            return handle.readline().strip() or None
     except OSError:
         return None
+
+
+def read_earned(path):
+    """The conclusion and the title finish() recorded in a marker.
+
+    None for each when the marker was written before they were recorded,
+    holding the commit alone, or cannot be read. correct_check() then
+    leaves the run's own as they are.
+    """
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            handle.readline()
+            conclusion = handle.readline().strip() or None
+            return conclusion, handle.readline().strip() or None
+    except OSError:
+        return None, None
 
 
 def repost(key, repo, pr, config, state, tokens, done, marker, sha):
@@ -5719,7 +5793,7 @@ def repost(key, repo, pr, config, state, tokens, done, marker, sha):
             # ("the saved review is on the pull request") then read as
             # confirmation that this attempt was what put it there.
             if already_posted(key, repo, at, env):
-                settled = POSTED
+                settled = ALREADY
             else:
                 log("%s: posting the review that was refused earlier "
                     "(attempt %d of %d)" % (key, tries, MAX_ATTEMPTS))
@@ -5727,7 +5801,19 @@ def repost(key, repo, pr, config, state, tokens, done, marker, sha):
                     key, repo, at,
                     {"event": "COMMENT", "commit_id": at["headRefOid"],
                      "body": opening + body}, env)
-            landed = settled == POSTED
+            landed = settled in (POSTED, ALREADY)
+            # Only with an App, because only an App's runs exist to find,
+            # and our_checks() matches on its id.
+            if landed and config.get("github_app"):
+                conclusion, title = read_earned(marker)
+                # Closed the way finish() closes a post that found the
+                # review already up: the tally and no tick, because that
+                # review may be an earlier attempt's. A blocker still
+                # fails, as it does on every ending there.
+                if conclusion == CHECK_CLEAN and settled != POSTED:
+                    conclusion = CHECK_CONCLUSION
+                correct_check(key, repo, at["headRefOid"], config, env,
+                              conclusion, title)
             if settled == THROTTLED and waive(key, "the posting", waived):
                 waived += 1
                 tries -= 1

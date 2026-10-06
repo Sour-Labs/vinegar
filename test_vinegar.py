@@ -7881,6 +7881,193 @@ check("a saved review survives the head moving on",
       posted[0][1]["commit_id"] if posted else "nothing posted")
 fake_run.rc, fake_run.post_err = 0, "HTTP 422"
 
+# --- a resent review corrects its checks entry (issue #28) ----------------
+# A refused post closes the entry grey, saying the review did not reach the
+# pull request, and a later poll's repost() lands it holding no handle. The
+# conclusion the review earned rides in the marker, so the resend can find
+# the entry on the commit and give it what the close could not.
+reset_stubs()
+
+
+def _earned_and_landed(findings, sha, whole=True):
+    """What the marker records, and what the close of a landed post says.
+
+    Each is a conclusion and a title. finish() records the first before it
+    posts and closes the entry with the second afterwards, so each ending
+    is run twice: refused, to read the marker, and landed, to read the
+    close.
+    """
+    at = dict(PR_LIVE, headRefOid=sha)
+    marker = vinegar.unposted_path("o/r", at)
+    vinegar.run = _run_and_tier
+    fake_run.rc, fake_run.post_err = 1, "HTTP 500"
+    vinegar.finish(L, "o/r", at, ROOT, "words", findings, CONFIG, None, {},
+                   whole=whole)
+    earned = vinegar.read_earned(marker)
+    vinegar.forget(marker)
+    fake_run.rc, fake_run.post_err = 0, ""
+    del checked[:]
+    vinegar.finish(L, "o/r", at, ROOT, "words", findings, CONFIG, None, {},
+                   whole=whole,
+                   check={"repo": "o/r", "id": 5, "closed": False})
+    vinegar.run = fake_run
+    vinegar.forget(marker)
+    closed = [(asked["conclusion"], asked["output"]["title"])
+              for how, _, asked in checked if how == "PATCH"]
+    return earned, closed[0] if closed else None
+
+
+for _ending, _findings, _whole, _sha, _want in (
+        ("a clean review", [], True, "ea00ea00ea00", "success"),
+        ("a review that found a blocker", _tier_found, True, "ea01ea01ea01",
+         "failure"),
+        ("a review whose worst finding is not a blocker", _tier_found[:1],
+         True, "ea02ea02ea02", "neutral"),
+        ("a review whose output could not be read", None, True,
+         "ea03ea03ea03", "neutral"),
+        ("a review that found nothing before it was killed", [], False,
+         "ea04ea04ea04", "neutral")):
+    _pair = _earned_and_landed(_findings, _sha, _whole)
+    check("the marker of %s records what a landed post gets" % _ending,
+          _pair[0] == _pair[1] and _pair[0][0] == _want, _pair)
+
+
+# Closed by handle_pr's backstop, as when the posting raised: the title is
+# not the tally, so a correction that kept it would put a green tick under
+# words saying the review never arrived.
+BACKSTOP_TITLE = vinegar.ended_title(vinegar.DONE)
+
+
+def _ours(conclusion):
+    return {"id": 31, "app": {"id": 77}, "status": "completed",
+            "conclusion": conclusion,
+            "output": {"title": BACKSTOP_TITLE, "summary": BACKSTOP_TITLE}}
+
+
+def _refused(sha, findings=()):
+    """Leave a review of `sha` saved and marked, as a refused post does."""
+    at = dict(PR_LIVE, headRefOid=sha)
+    vinegar.run = _run_and_tier
+    fake_run.rc, fake_run.post_err = 1, "HTTP 500"
+    vinegar.finish(L, "o/r", at, ROOT, "words", list(findings), CONFIG, None,
+                   {}, whole=True)
+    fake_run.rc, fake_run.post_err = 0, ""
+    vinegar.run = fake_run
+    return at, vinegar.unposted_path("o/r", at)
+
+
+def _resent(at, run, config=CHK_CONFIG, look="", env=CHK_ENV):
+    """Resend `at`'s saved review through handle_pr. Answers the PATCHes."""
+    fake_run.check_open = {"check_runs": [run] if run else []}
+    fake_run.look_out = look
+    del checked[:]
+    del posted[:]
+    env_was = vinegar.github_env
+    vinegar.github_env = lambda *a, **k: env
+    vinegar.handle_pr("o/r", at, config,
+                      {vinegar.pr_key("o/r", at): {
+                          "outcome": vinegar.DONE, "sha": at["headRefOid"],
+                          "attempts": 1}}, {})
+    vinegar.github_env = env_was
+    fake_run.check_open = {"check_runs": []}
+    fake_run.look_out = ""
+    return [(where, asked) for how, where, asked in checked if how == "PATCH"]
+
+
+PR_EARN, _earn_marker = _refused("ea2bea2bea2b")
+# The commit stays the marker's first line. Read whole, the marker named a
+# commit nobody reviewed, and handle_pr forgot the saved review as left
+# over from a run no longer recorded.
+check("a marker carrying a conclusion still names its commit",
+      vinegar.read_mark(_earn_marker) == PR_EARN["headRefOid"]
+      and vinegar.read_earned(_earn_marker)
+      == (vinegar.CHECK_CLEAN, "No findings"),
+      open(_earn_marker).read())
+_earn_patch = _resent(PR_EARN, _ours("neutral"))
+_earn_get = [where for how, where, _ in checked if how == "GET"]
+check("a resent clean review gets the tick it earned",
+      len(posted) == 1 and _earn_patch
+      and _earn_patch[0][1]["conclusion"] == "success",
+      (len(posted), _earn_patch))
+check("a resent review's entry says the review is on the pull request",
+      _earn_patch and _earn_patch[0][1]["output"]["summary"]
+      == "The review is on the pull request.", _earn_patch)
+check("a resent review's entry carries its tally, whoever closed it",
+      _earn_patch
+      and _earn_patch[0][1]["output"]["title"] == "No findings", _earn_patch)
+# Finished runs only, at the commit the saved review is of. A running one
+# belongs to a review still writing to it.
+check("the entry corrected is the finished one at the reviewed commit",
+      _earn_get and "status=completed" in _earn_get[0]
+      and PR_EARN["headRefOid"] in _earn_get[0]
+      and _earn_patch and _earn_patch[0][0].endswith("check-runs/31"),
+      (_earn_get, _earn_patch))
+
+# A review found already up may be an earlier attempt's, so the resend
+# closes the entry as finish() closes a post that found it up: the tally,
+# the summary, and no tick.
+PR_UP, _up_marker = _refused("ea3cea3cea3c")
+_up_patch = _resent(PR_UP, _ours("neutral"),
+                    look=vinegar.BODY_MARK + " reviewed `ea3cea3` ...\n")
+check("a resend that found the review already up does not tick it",
+      not posted and _up_patch
+      and _up_patch[0][1]["conclusion"] == "neutral", (posted, _up_patch))
+check("a resend that found the review already up still corrects the entry",
+      _up_patch and _up_patch[0][1]["output"]["summary"]
+      == "The review is on the pull request.", _up_patch)
+check("a resend that found the review already up carries the tally",
+      _up_patch and _up_patch[0][1]["output"]["title"] == "No findings",
+      _up_patch)
+check("a resend that found the review already up clears its mark",
+      not os.path.exists(_up_marker), _up_marker)
+# Only the tick is withheld. A blocker fails the check on every ending
+# finish() has, a review found up among them.
+PR_UP_RED, _up_red_marker = _refused("ea3dea3dea3d", _tier_found)
+_up_red_patch = _resent(PR_UP_RED, _ours("neutral"),
+                        look=vinegar.BODY_MARK + " reviewed `ea3dea3` ...\n")
+check("a resend that found the review already up still fails on a blocker",
+      _up_red_patch and _up_red_patch[0][1]["conclusion"] == "failure",
+      _up_red_patch)
+
+# A marker written before the conclusion was recorded holds the commit
+# alone, and the run keeps the conclusion it was closed with.
+PR_OLD = dict(PR_LIVE, headRefOid="ea4dea4dea4d")
+_refused(PR_OLD["headRefOid"])
+with open(vinegar.unposted_path("o/r", PR_OLD), "w") as h:
+    h.write("%s\n" % PR_OLD["headRefOid"])
+_old_patch = _resent(PR_OLD, _ours("failure"))
+check("an older marker's resend keeps the run's own conclusion and title",
+      _old_patch and _old_patch[0][1]["conclusion"] == "failure"
+      and _old_patch[0][1]["output"]["title"] == BACKSTOP_TITLE, _old_patch)
+
+# Corrected only once the review is up.
+PR_AGAIN_REFUSED, _ar_marker = _refused("ea5eea5eea5e")
+fake_run.rc, fake_run.post_err = 1, "HTTP 500"
+_ar_patch = _resent(PR_AGAIN_REFUSED, _ours("neutral"))
+fake_run.rc, fake_run.post_err = 0, ""
+check("a resend refused again leaves the entry as it was",
+      not _ar_patch, _ar_patch)
+vinegar.forget(_ar_marker)
+
+# Without an App there are no runs, and our_checks() matches on the App.
+PR_NOAPP, _na_marker = _refused("ea6fea6fea6f")
+_resent(PR_NOAPP, _ours("neutral"), config=CONFIG, env=None)
+check("without an App a resend asks the checks API nothing",
+      len(posted) == 1 and not checked, (len(posted), checked))
+
+# No finished entry to correct is said, and the resend still ends as one
+# that landed.
+PR_NORUN, _nr_marker = _refused("ea7aea7aea7a")
+_nr_log = []
+vinegar.log = _nr_log.append
+_nr_patch = _resent(PR_NORUN, None)
+vinegar.log = lambda message: None
+check("a resend with no finished entry to correct says so and still lands",
+      not _nr_patch and not os.path.exists(_nr_marker)
+      and any("found no finished checks entry" in m for m in _nr_log)
+      and not any("could not be sent" in m for m in _nr_log), _nr_log)
+reset_stubs()
+
 vinegar.REVIEW_DIR = _tx_real
 
 # What finish() actually hands the transcript, which only the recorder sees.

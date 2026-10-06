@@ -1386,8 +1386,94 @@ MUTATIONS = [
     # The reuse lookup's query. Dropping the status filter adopts a
     # completed run, and a completed run cannot be reopened.
     ("check-reuse-asks-for-running-only",
-     '        "commits/%s/check-runs?check_name=%s&status=in_progress"',
-     '        "commits/%s/check-runs?check_name=%s"'),
+     '    found = our_checks(label, repo, sha, config, env, "in_progress")',
+     '    found = our_checks(label, repo, sha, config, env, "completed")'),
+
+    # --- a resent review corrects its checks entry (issue #28) ---------
+    # The marker records the conclusion a landed post gets, a term at a
+    # time, and its title, beneath the commit it names.
+    ("resend-marker-records-the-conclusion",
+     '            write_atomic(marker, "%s\\n%s\\n%s\\n" % (\n'
+     '                pr["headRefOid"], earned, title))',
+     '            write_atomic(marker, "%s\\n" % (\n'
+     '                pr["headRefOid"]))'),
+    ("resend-marker-records-the-title",
+     '            write_atomic(marker, "%s\\n%s\\n%s\\n" % (\n'
+     '                pr["headRefOid"], earned, title))',
+     '            write_atomic(marker, "%s\\n%s\\n" % (\n'
+     '                pr["headRefOid"], earned))'),
+    ("resend-earns-red-on-a-blocker",
+     "    earned = (CHECK_BLOCKED if reaches_blocker(findings)",
+     "    earned = (CHECK_CONCLUSION if reaches_blocker(findings)"),
+    ("resend-earns-green-for-a-clean-review",
+     "              else CHECK_CLEAN if findings == [] and whole",
+     "              else CHECK_CONCLUSION if findings == [] and whole"),
+    ("resend-earns-no-green-for-a-killed-run",
+     "              else CHECK_CLEAN if findings == [] and whole",
+     "              else CHECK_CLEAN if findings == []"),
+    ("resend-earns-no-green-for-an-unreadable-answer",
+     "              else CHECK_CLEAN if findings == [] and whole",
+     "              else CHECK_CLEAN if not findings and whole"),
+    # Read whole, a two-line marker names no commit, and handle_pr forgets
+    # the saved review as left over.
+    ("mark-reads-only-the-commit",
+     "            # third.\n"
+     "            return handle.readline().strip() or None",
+     "            # third.\n"
+     "            return handle.read().strip() or None"),
+    ("earned-reads-the-second-line",
+     "            handle.readline()\n"
+     "            conclusion = handle.readline().strip() or None",
+     "            conclusion = handle.readline().strip() or None"),
+    ("earned-reads-the-third-line",
+     "            return conclusion, handle.readline().strip() or None",
+     "            return conclusion, None"),
+    # Only a send of the resend's own earns the tick, a blocker fails
+    # either way, and a review found up is landed all the same.
+    ("resend-already-up-earns-nothing",
+     "                settled = ALREADY", "                settled = POSTED"),
+    ("resend-found-up-is-landed",
+     "            landed = settled in (POSTED, ALREADY)",
+     "            landed = settled == POSTED"),
+    ("resend-corrects-only-once-landed",
+     '            if landed and config.get("github_app"):',
+     '            if config.get("github_app"):'),
+    ("resend-corrects-only-with-an-app",
+     '            if landed and config.get("github_app"):',
+     "            if landed:"),
+    ("resend-earns-the-tick-only-by-its-own-send",
+     "                if conclusion == CHECK_CLEAN and settled != POSTED:\n"
+     "                    conclusion = CHECK_CONCLUSION",
+     "                if False:\n"
+     "                    conclusion = CHECK_CONCLUSION"),
+    ("resend-withholds-only-the-tick",
+     "                if conclusion == CHECK_CLEAN and settled != POSTED:\n"
+     "                    conclusion = CHECK_CONCLUSION",
+     "                if settled != POSTED:\n"
+     "                    conclusion = CHECK_CONCLUSION"),
+    # What the correction sends: the finished run, the summary that says
+    # where the review is, the recorded tally, and the run's own title and
+    # conclusion when the marker recorded none.
+    ("resend-corrects-the-finished-run",
+     '    found = our_checks(label, repo, sha, config, env, "completed")',
+     '    found = our_checks(label, repo, sha, config, env, "in_progress")'),
+    ("resend-entry-says-on-the-pull-request",
+     '                "The review is on the pull request.",\n',
+     '                "",\n'),
+    ("resend-carries-the-recorded-title",
+     '                title or run["output"]["title"], env,',
+     '                run["output"]["title"], env,'),
+    ("resend-keeps-the-run-title",
+     '                title or run["output"]["title"], env,',
+     '                title or "Corrected", env,'),
+    ("resend-keeps-the-run-conclusion",
+     '                conclusion or run["conclusion"])',
+     "                conclusion or CHECK_CONCLUSION)"),
+    ("resend-says-when-there-is-nothing-to-correct",
+     "    if not found:\n"
+     '        log("%s: found no finished checks entry to correct" % label)',
+     "    if False:\n"
+     '        log("%s: found no finished checks entry to correct" % label)'),
 
     # --- constants -----------------------------------------------------
     ("max-attempts", "MAX_ATTEMPTS = 3", "MAX_ATTEMPTS = 99"),
@@ -2072,8 +2158,8 @@ MUTATIONS = [
     ("running-checks-hides-a-failed-read",
      "    if said is None:\n"
      "        return None\n"
-     '    return [was.get("id") for was in said.get("check_runs") or []',
-     '    return [was.get("id") for was in (said or {}).get("check_runs") or []'),
+     '    return [was for was in said.get("check_runs") or []',
+     '    return [was for was in (said or {}).get("check_runs") or []'),
     # `failure` makes the stuck merge the outcome rather than the thing
     # being repaired, on a check that read nothing and reported nothing.
     ("sweep-closes-as-a-failure",
