@@ -119,6 +119,7 @@
     "enabled": true,
     "failIfUnavailable": true,
     "allowUnsandboxedCommands": false,
+    "autoAllowBashIfSandboxed": false,
     "filesystem": {
       "denyWrite": [
         "~/.vinegar-checkouts"

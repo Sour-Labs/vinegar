@@ -1236,6 +1236,8 @@ check("the severity pass is handed no tool it could act with",
 check("the severity pass runs sandboxed with no network",
       _box.get("enabled") is True and _box.get("failIfUnavailable") is True
       and (_box.get("network") or {}).get("allowedDomains") == [], _box)
+check("the severity pass does not approve sandboxed commands on sight",
+      _box.get("autoAllowBashIfSandboxed") is False, _box)
 # Measured, and the reason the comment beside these settings no longer
 # calls the sandbox a general write boundary: with the sandbox on and no
 # `filesystem` stanza, a permitted Write wrote inside the working
@@ -2688,7 +2690,7 @@ def _with_sandbox(sandbox):
 
 
 _good = {"enabled": True, "failIfUnavailable": True,
-         "allowUnsandboxedCommands": False}
+         "allowUnsandboxedCommands": False, "autoAllowBashIfSandboxed": False}
 # Bound once each: `check` evaluates its detail argument whether or not the
 # condition fails, so calling the helper there ran check_paths() a second
 # time and reported a different execution than the one asserted on.
@@ -2708,7 +2710,7 @@ _said = _with_sandbox(dict(_good, enabled="true"))
 check("a quoted true is not an enabled sandbox",
       "sandbox.enabled" in _said, _said)
 # And `1 == True` in Python, so comparing with `==` accepts a number where
-# a flag belongs. `is` is what makes these three keys mean what they say.
+# a flag belongs. `is` is what makes these four keys mean what they say.
 _said = _with_sandbox(dict(_good, enabled=1))
 check("a sandbox enabled with 1 rather than true refuses to start",
       "sandbox.enabled" in _said, _said)
@@ -2723,6 +2725,17 @@ check("a sandbox allowed to be unavailable refuses to start",
 _said = _with_sandbox(dict(_good, allowUnsandboxedCommands=True))
 check("letting commands run unsandboxed refuses to start",
       "allowUnsandboxedCommands" in _said, _said)
+# True is Claude Code's default, and true means the sandbox approves every
+# command on sight: the allow list gates nothing, and a deny by name is
+# passed by a case-folded, absolute-path, wrapped or scripted spelling, each
+# measured. So the key left out is as bad as the key set true.
+_said = _with_sandbox(dict(_good, autoAllowBashIfSandboxed=True))
+check("a sandbox that approves commands on sight refuses to start",
+      "autoAllowBashIfSandboxed" in _said, _said)
+_said = _with_sandbox({name: value for name, value in _good.items()
+                       if name != "autoAllowBashIfSandboxed"})
+check("a stanza that leaves auto-allow to its default refuses to start",
+      "autoAllowBashIfSandboxed" in _said, _said)
 # A stanza that is not an object at all must produce that same sentence.
 # Truthy and unguarded, it reached a .get outside the try that guards the
 # read, so launchd restarted into a traceback every 30 seconds.
@@ -2803,9 +2816,14 @@ for _label, _stanza in (("nulls the filesystem", dict(_good, filesystem=None)),
     check("a settings file that %s still denies the checkout" % _label,
           vinegar.CHECKOUT_DIR in _sent["filesystem"]["denyWrite"],
           json.dumps(_sent["filesystem"]))
+# Built from SANDBOX_RULES, so the key reaches what the reviewer runs under
+# and not only the file check_paths() reads.
+_sent = _built_with(_good)["sandbox"]
+check("the settings sent make the allow list gate Bash",
+      _sent.get("autoAllowBashIfSandboxed") is False, json.dumps(_sent))
 # Every key that can turn confinement off is set here, so one left in the
-# file cannot ride along beside three keys that still read true, true,
-# false. Checking only the top level accepted a `filesystem.allowWrite`,
+# file cannot ride along beside four keys that still read true, true,
+# false, false. Checking only the top level accepted a `filesystem.allowWrite`,
 # which hands a hand-run the whole disk while the daemon looks fine — and
 # the README said such a key was refused, so the file was the one telling
 # the truth about a promise the code did not keep.
@@ -4457,6 +4475,16 @@ check("a re-review has somewhere to go if the commit does not resolve",
 check("a first review's brief is left exactly as it was measured working",
       "refs/heads/release-2...HEAD` is the review scope" in brief
       and "re-review" not in brief, brief)
+# With the allow list gating Bash again, four shapes reviews had used are
+# refused, each costing a turn the reviewer cannot see coming: `git -C`, a
+# `cd` before git, an unquoted glob after `git grep`, and a context count
+# written `-A12` (measured 2026-10-07 on 2.1.285: the quoted glob and `-A 12`
+# ran where the bare glob and `-A12` did not; two dry-run reviews lost two
+# commands to the last).
+check("the brief names the shapes the allow list refuses",
+      "`git -C <dir>`" in brief and "`cd` before a git command" in brief
+      and "quote globs as `-- '*.kt'`" in brief and "write `-A 12`" in brief,
+      brief)
 # checkout() carries on when the base refresh fails, so a clone can hold
 # the head with neither base ref present. Telling the reviewer to report
 # that it could not establish the scope, while the paragraph after it hands

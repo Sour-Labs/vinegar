@@ -97,9 +97,10 @@ DENY_ALWAYS = (
 )
 
 # The macOS tools the reviewer may not run, pinned for the same reason.
-# With the sandbox on, the allow list no longer gates Bash: a command that
-# is neither allowed nor denied runs (measured on 2.1.221, and the README
-# says so), so the deny list is the whole of what stops one. None of the
+# Until SANDBOX_RULES pinned autoAllowBashIfSandboxed false, the sandbox
+# approved every command on sight and the deny list was the whole of what
+# stopped one; now the allow list gates Bash again and these are defence
+# in depth behind it. None of the
 # path denies above covers a secret that is not a file. On a Mac the `gh`
 # login and the Claude login live in the login keychain. `gh auth token`
 # prints the first; `git credential fill` runs whatever helper the host's
@@ -130,12 +131,13 @@ DENY_ALWAYS = (
 # -O./x.sh`; and `git -C . rev-parse` ran, so a global option before the
 # subcommand defeats any `git <subcommand>` deny. Claude Code's own
 # analyser refused `env security ...`, `source ./x.sh`,
-# `GIT_EXTERNAL_DIFF=./x.sh git diff` and a `git -c alias` wrapper. The
-# boundary that closes the class is the allow list gating Bash again
-# (issue #51); until then this list is defence in depth. Whether a
-# sandboxed command can unlock a keychain item from a headless launchd
-# session is not measured either way. The denies are right regardless:
-# nothing a review needs talks to any of these.
+# `GIT_EXTERNAL_DIFF=./x.sh git diff` and a `git -c alias` wrapper.
+# Measured again the same day with autoAllowBashIfSandboxed false: every
+# spelling that had run came back "This command requires approval", so
+# the allow list is the boundary and this list is defence in depth behind
+# it. Whether a sandboxed command can unlock a keychain item from a
+# headless launchd session is not measured either way. The denies are
+# right regardless: nothing a review needs talks to any of these.
 DENY_COMMANDS = (
     "Bash(security:*)",
     "Bash(gh auth:*)",
@@ -224,15 +226,38 @@ PERMISSION_MODE = "default"
 # flag and is the command every review gets its diff from, and `git
 # blame`, `sort -o` and `uniq in out` all write files too. A rule that
 # cannot see flags cannot be the boundary; the sandbox can.
+#
+# The fourth key is what makes the allow list mean anything. Claude Code's
+# default, once the sandbox is on, is to approve every sandboxed command
+# on sight: measured on 2.1.221, `env` was refused without the sandbox and
+# ran with it, and on 2.1.285 so did `SECURITY list-keychains`,
+# `/usr/bin/security`, `arch -arm64 ...`, a script committed to the
+# checkout, `git grep -O<script>` and `git -C . rev-parse`, each past a
+# deny by name. With the key false a sandboxed command goes through the
+# regular permission flow, which under `-p` refuses whatever the allow
+# list and Claude Code's built-in read-only set do not cover: measured on
+# 2.1.285, every spelling above and `printenv PATH` came back "This
+# command requires approval", while `date`, `git grep -n <pattern> HEAD`
+# and `cat f | wc -l` ran either way.
 SANDBOX_RULES = (
     ("enabled", True,
-     "nothing else confines what the reviewer writes"),
+     "nothing else confines what the reviewer writes: without the sandbox "
+     "it can write any file the daemon user can, including this program, "
+     "through `git show --output=`, which the allow list matches as an "
+     "ordinary read"),
     ("failIfUnavailable", True,
      "a sandbox that cannot start would otherwise be skipped and the "
      "review would run unconfined, saying nothing about it"),
     ("allowUnsandboxedCommands", False,
      "a command that may ask to run outside the sandbox is a command "
      "the sandbox does not cover"),
+    ("autoAllowBashIfSandboxed", False,
+     "with it true the sandbox approves every command on sight and the "
+     "allow list gates nothing, so a command on neither list runs and a "
+     "deny by name is passed by a case-folded, absolute-path, wrapped or "
+     "scripted spelling; with it false, every command the allow list and "
+     "Claude Code's read-only set do not cover is refused, which closed "
+     "each of those spellings when measured"),
 )
 
 # The network rule, pinned rather than assumed. Measured: with the sandbox
@@ -2106,11 +2131,8 @@ def load_settings():
     for name, wanted, why in SANDBOX_RULES:
         if sandbox.get(name) is not wanted:
             sys.exit(
-                "review-settings.json must set sandbox.%s to %s, because %s. "
-                "Without the sandbox the reviewer can write any file the "
-                "daemon user can, including this program, through "
-                "`git show --output=`, which the allow list matches as an "
-                "ordinary read." % (name, str(wanted).lower(), why))
+                "review-settings.json must set sandbox.%s to %s, because %s."
+                % (name, str(wanted).lower(), why))
 
     # And nothing in that stanza beyond what reviewer_settings() sends.
     # The daemon's own reviews are safe either way, since it builds the
@@ -2206,7 +2228,7 @@ def reviewer_settings(workspace, repos):
     # stanza weakened and nothing would refuse or say so — the failure
     # that looks exactly like a successful review. Overwriting also drops
     # any key that is not checked, since an `allowWrite` left in the file
-    # would widen what three validated keys still describe as closed, and
+    # would widen what four validated keys still describe as closed, and
     # means a hand-edited `"sandbox": null` cannot raise out of here into
     # a give-up comment about a local typo.
     # The workspace as well as the directory holding it, and the resolved
@@ -3181,7 +3203,12 @@ def reviewer_brief(pr, config, since=None, blockers=False):
         "fail it. `grep -rn --exclude-dir=.claude`, `git ls-files` and `ls` "
         "also work through Bash. `sed`, `awk`, "
         "`find` and every interpreter, `python3` among them, are denied, so "
-        "reaching for one costs a turn and returns nothing. You cannot run "
+        "reaching for one costs a turn and returns nothing. Only the allowed "
+        "commands and Claude Code's read-only set run at all: `git -C <dir>`, "
+        "a `cd` before a git command, an unquoted glob after `git grep` and "
+        "a context count written `-A12` are each refused, so quote globs as "
+        "`-- '*.kt'`, write `-A 12`, and run git from "
+        "the checkout root. You cannot run "
         "this repository's tests or any of its code. Files under "
         "`.claude/` cannot be read directly, but `git show HEAD:<path>` "
         "reads one. A `grep -r` that reaches a denied path fails, and only "
@@ -6216,10 +6243,12 @@ def review(path, repo, pr, config, env, tokens, resent=False, check=None,
     #
     # Without the token, and this is the whole of a credential leak rather
     # than tidiness. The environment handed in here is the one checkout()
-    # used, so it carries the App installation token, and enabling the
-    # sandbox stopped the allow list gating Bash at all: measured, `env`
-    # is refused without the sandbox and runs with it, with nothing in
-    # `permission_denials`. So the reviewer could print the token, and a
+    # used, so it carries the App installation token, and at the time the
+    # sandbox approved every command on sight (autoAllowBashIfSandboxed
+    # was unset, so true): measured, `env` was refused without the sandbox
+    # and ran with it, with nothing in `permission_denials`. SANDBOX_RULES
+    # pins that key false now, and the strip stays as the second wall. So
+    # the reviewer could print the token, and a
     # reviewer reading an attacker-authored branch publishes what it is
     # told to — finding text goes to the pull request verbatim. Measured
     # end to end with a fake token: `env | grep GH_TOKEN` printed the
