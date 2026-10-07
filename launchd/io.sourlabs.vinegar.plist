@@ -19,13 +19,22 @@
   </array>
 
   <!-- launchd starts with a bare PATH, so `claude`, `gh`, and `git` have to
-       be findable here or every review fails at the first subprocess. -->
+       be findable here or every review fails at the first subprocess.
+       ~/.vinegar/bin comes first so that a copy of Claude Code put there is
+       the one the reviews run, where the native install's background
+       updates cannot move it: see "Pinning Claude Code" in the README. It
+       costs nothing while the directory does not exist. DISABLE_AUTOUPDATER
+       keeps the daemon's own `claude` runs from moving ~/.local/bin/claude
+       in the background; it stops nothing else, which is why the copy is
+       the pin. -->
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
-    <string>/Users/YOUR_USERNAME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <string>/Users/YOUR_USERNAME/.vinegar/bin:/Users/YOUR_USERNAME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     <key>HOME</key>
     <string>/Users/YOUR_USERNAME</string>
+    <key>DISABLE_AUTOUPDATER</key>
+    <string>1</string>
   </dict>
 
   <key>RunAtLoad</key>

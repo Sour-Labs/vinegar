@@ -2731,6 +2731,31 @@ MUTATIONS = [
     ("failed-review-ends-the-turn",
      "    return outcome != LOGGED_OUT",
      "    return outcome == DONE"),
+
+    # --- which claude runs the reviews is said, and a change is said -----
+    # The native install moves ~/.local/bin/claude under the daemon, and
+    # every measured behaviour in vinegar.py is of one version.
+    ("claude-release-asked-at-start",
+     "    config = load_config(args.config)\n    note_claude_release()",
+     "    config = load_config(args.config)"),
+    ("claude-release-asked-per-review",
+     "    label = pr_key(repo, pr)\n    note_claude_release(label)",
+     "    label = pr_key(repo, pr)"),
+    ("claude-release-bounded",
+     '    result = run(["claude", "--version"], timeout=VERSION_TIMEOUT)',
+     '    result = run(["claude", "--version"])'),
+    ("claude-release-said-once",
+     "    if release == _claude_seen:\n        return",
+     "    if release == _claude_seen:\n        pass"),
+    ("claude-release-change-said",
+     "    if _claude_seen is None:\n        log(",
+     "    if True:\n        log("),
+    ("claude-release-remembered",
+     "    _claude_seen = release",
+     "    pass"),
+    ("claude-release-failure-logged",
+     '        log("%scannot tell which claude will run: %s" % (who, err))',
+     "        pass"),
 ]
 
 
