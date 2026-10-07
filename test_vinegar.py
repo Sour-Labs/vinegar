@@ -2568,6 +2568,34 @@ for _rule in ("Read(//**/.ssh/**)", "Read(//**/.config/gh/**)",
         vinegar.SETTINGS_PATH = _settings_real
     check("dropping %s refuses to start" % _rule,
           "must deny" in _denied and _rule in _denied, _denied)
+# And the commands that reach what no path deny can: the login keychain,
+# where the gh and Claude logins live on a Mac, and processes outside the
+# sandbox. With the sandbox on the allow list no longer gates Bash, so the
+# deny list is all that stands between a reviewer reading an attacker's
+# branch and `security find-generic-password -w -s gh:github.com`.
+# Spelled out rather than read off DENY_COMMANDS, so that dropping a name
+# from the tuple is a check that fails and not a check that is skipped.
+for _rule in ("Bash(security:*)", "Bash(open:*)", "Bash(osascript:*)",
+              "Bash(defaults:*)", "Bash(mdfind:*)", "Bash(launchctl:*)",
+              "Bash(shortcuts:*)", "Bash(automator:*)", "Bash(sqlite3:*)",
+              "Bash(pbcopy:*)", "Bash(pbpaste:*)"):
+    _short = json.load(open(_settings_real))
+    _short["permissions"]["deny"] = [r for r in
+                                     _short["permissions"]["deny"]
+                                     if r != _rule]
+    _p = os.path.join(_home, "short-deny.json")
+    with open(_p, "w") as h:
+        json.dump(_short, h)
+    vinegar.SETTINGS_PATH = _p
+    try:
+        vinegar.load_settings()
+        _denied = "started"
+    except SystemExit as err:
+        _denied = str(err)
+    finally:
+        vinegar.SETTINGS_PATH = _settings_real
+    check("dropping %s refuses to start" % _rule,
+          "must deny" in _denied and _rule in _denied, _denied)
 # And the one word that would make all of them decorative.
 _bypass = json.load(open(_settings_real))
 _bypass["permissions"]["defaultMode"] = "bypassPermissions"
@@ -2665,7 +2693,8 @@ def _settings_file(sandbox, permissions=None, raw=None):
         else:
             doc = {"permissions": permissions if permissions is not None
                    else {"allow": [vinegar.REPORT_TOOL],
-                         "deny": list(vinegar.DENY_ALWAYS)},
+                         "deny": list(vinegar.DENY_ALWAYS
+                                      + vinegar.DENY_COMMANDS)},
                    "bashOutputMaxChars": vinegar.BASH_OUTPUT_MAX}
             if sandbox is not _absent:
                 doc["sandbox"] = sandbox
@@ -2758,7 +2787,8 @@ check("the settings sent keep a large diff inline",
       _sent.get("bashOutputMaxChars") == 128000,
       _sent.get("bashOutputMaxChars"))
 _minimal = {"permissions": {"allow": [vinegar.REPORT_TOOL],
-                            "deny": list(vinegar.DENY_ALWAYS)},
+                            "deny": list(vinegar.DENY_ALWAYS
+                                         + vinegar.DENY_COMMANDS)},
             "sandbox": _good}
 _said = _sending(None, raw=json.dumps(_minimal))
 check("a file that leaves out the output limit is refused",

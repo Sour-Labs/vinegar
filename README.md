@@ -654,6 +654,16 @@ reviewer can run reaches the network or writes outside a temporary directory,
 and it is handed no credential (see below), which is what the confinement now
 rests on.
 
+That is also why the deny list names the macOS tools a review has no use
+for. The `gh` login and the Claude login on a Mac live in the login keychain,
+not in a file, so no read deny covers them, and `security
+find-generic-password -w` prints them. `open` hands a URL to LaunchServices
+and `osascript` sends AppleEvents, both to processes outside the sandbox, so
+either carries data out past the closed network. `defaults`, `mdfind`,
+`launchctl`, `shortcuts`, `automator`, `sqlite3`, `pbcopy` and `pbpaste` are
+denied for the same shape of reason, and `DENY_COMMANDS` in `vinegar.py` says
+which for each. Vinegar refuses to start when the file has dropped one.
+
 The same file turns on Claude Code's sandbox, which is what actually confines
 writes. The permission rules cannot: they match the start of a command and
 never see the flags after it, so `git show --output=<file>` reads to them
@@ -932,6 +942,12 @@ findings, and a review talked into reporting nothing reads as a clean one.
 
 **So a clean review is not proof of a clean pull request**, and that is the
 residual risk to hold on to rather than the memory files.
+
+**The login keychain, past the deny.** `security` is denied by name, and so is
+everything else listed above that talks to a service outside the sandbox.
+Whether a command not named there could reach a keychain item from a headless
+launchd session is not measured, so read the deny as closing the obvious
+route and not as proof that no route is left.
 
 ### So what is the boundary
 

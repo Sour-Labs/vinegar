@@ -239,6 +239,24 @@ MUTATIONS = [
     ("deny-always-library", '    "Read(~/Library/**)",\n', ""),
     ("deny-always-opencode", '    "Read(~/.local/share/opencode/**)",\n', ""),
     ("deny-always-src", '    "Read(~/src/**)",\n', ""),
+    # The command denies added 2026-10-06, pinned in DENY_COMMANDS the
+    # same way. The keychain, LaunchServices, AppleEvents and the rest
+    # answer for things no path deny covers, and with the sandbox on the
+    # deny list is the only thing that stops a command.
+    ("deny-commands-security", '    "Bash(security:*)",\n', ""),
+    ("deny-commands-open", '    "Bash(open:*)",\n', ""),
+    ("deny-commands-osascript", '    "Bash(osascript:*)",\n', ""),
+    ("deny-commands-defaults", '    "Bash(defaults:*)",\n', ""),
+    ("deny-commands-mdfind", '    "Bash(mdfind:*)",\n', ""),
+    ("deny-commands-launchctl", '    "Bash(launchctl:*)",\n', ""),
+    ("deny-commands-shortcuts", '    "Bash(shortcuts:*)",\n', ""),
+    ("deny-commands-automator", '    "Bash(automator:*)",\n', ""),
+    ("deny-commands-sqlite3", '    "Bash(sqlite3:*)",\n', ""),
+    ("deny-commands-pbcopy", '    "Bash(pbcopy:*)",\n', ""),
+    ("deny-commands-pbpaste", '    "Bash(pbpaste:*)",\n', ""),
+    ("deny-commands-checked",
+     "    for rule in DENY_COMMANDS:",
+     "    for rule in ():"),
     # And every other checkout, built per review.
     ("other-checkouts-read-denied",
      "                reads.append(rule)",

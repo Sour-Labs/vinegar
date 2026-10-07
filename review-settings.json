@@ -89,7 +89,18 @@
       "Bash(pip3:*)",
       "Bash(make:*)",
       "Bash(docker:*)",
-      "Bash(claude:*)"
+      "Bash(claude:*)",
+      "Bash(security:*)",
+      "Bash(open:*)",
+      "Bash(osascript:*)",
+      "Bash(defaults:*)",
+      "Bash(mdfind:*)",
+      "Bash(launchctl:*)",
+      "Bash(shortcuts:*)",
+      "Bash(automator:*)",
+      "Bash(sqlite3:*)",
+      "Bash(pbcopy:*)",
+      "Bash(pbpaste:*)"
     ],
     "ask": []
   },

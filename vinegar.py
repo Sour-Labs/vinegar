@@ -95,6 +95,40 @@ DENY_ALWAYS = (
     "Read(~/src/**)",
 )
 
+# The macOS tools the reviewer may not run, pinned for the same reason.
+# With the sandbox on, the allow list no longer gates Bash: a command that
+# is neither allowed nor denied runs (measured on 2.1.221, and the README
+# says so), so the deny list is the whole of what stops one. None of the
+# path denies above covers a secret that is not a file. On a Mac the `gh`
+# login and the Claude login live in the login keychain, which `security
+# find-generic-password -w` prints, and a reviewer reading an
+# attacker-authored branch publishes what it is told to. `open` hands a
+# URL to LaunchServices and `osascript` sends AppleEvents, both to
+# processes outside the sandbox, so either carries data out past the
+# closed network. `defaults` reads preferences through cfprefsd and
+# `mdfind` searches through Spotlight, which answer for files the read
+# denies cover; `launchctl`, `shortcuts` and `automator` start work in
+# processes the sandbox does not hold; `sqlite3` runs shell commands from
+# its own prompt, around the shell denies; and the pasteboard is the
+# operator's, in both directions.
+#
+# Whether a sandboxed command can unlock a keychain item from a headless
+# launchd session is not measured. The deny is right either way: nothing a
+# review needs talks to any of these.
+DENY_COMMANDS = (
+    "Bash(security:*)",
+    "Bash(open:*)",
+    "Bash(osascript:*)",
+    "Bash(defaults:*)",
+    "Bash(mdfind:*)",
+    "Bash(launchctl:*)",
+    "Bash(shortcuts:*)",
+    "Bash(automator:*)",
+    "Bash(sqlite3:*)",
+    "Bash(pbcopy:*)",
+    "Bash(pbpaste:*)",
+)
+
 
 def denied_homes():
     """The directories DENY_ALWAYS denies under the home directory.
@@ -1958,6 +1992,15 @@ def load_settings():
                 "key into a finding this program then publishes, and %s is "
                 "missing. Add it to permissions.deny."
                 % (rule, rule))
+    # And the commands that reach a secret no path can deny, or a process
+    # the sandbox does not hold. DENY_COMMANDS says why each is there.
+    for rule in DENY_COMMANDS:
+        if rule not in denied:
+            sys.exit(
+                "review-settings.json must deny %s. With the sandbox on, "
+                "only the deny list stops a command, and this one reaches "
+                "the login keychain or a process outside the sandbox. Add "
+                "it to permissions.deny." % rule)
     # And the word that would make every rule above decorative.
     mode = permissions.get("defaultMode", PERMISSION_MODE)
     if mode != PERMISSION_MODE:
