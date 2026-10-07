@@ -129,7 +129,9 @@ Vinegar keeps its own state under `~/.vinegar`: `config.json`, `state.json`
 (the head commit it last handled per pull request), and `reviews/`. A run that
 posts nothing uses `state.json.dry` and `reviews.dry/` instead. A review that
 GitHub refused leaves a `.unposted` marker beside its transcript, and a later
-poll sends that transcript rather than reviewing again.
+poll sends that transcript rather than reviewing again. Those attempts are
+ten minutes apart, and one that GitHub did not answer is not counted against
+them.
 
 There are tests, and they need nothing installed:
 
