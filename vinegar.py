@@ -58,10 +58,11 @@ DENY_HOME = "Read(//**/.vinegar/**)"
 # branch could then read `~/.ssh/id_ed25519` and quote it into a finding
 # Vinegar publishes on a public pull request.
 #
-# These and not the rest of the file. The allow list is meant to be tuned,
-# and the write denials are backed by the sandbox now; what cannot be
-# recovered from is a credential read, because the finding carrying it is
-# already public by the time anyone notices.
+# These, and the command denies in DENY_COMMANDS below, and not the rest
+# of the file. The allow list is meant to be tuned, and the write denials
+# are backed by the sandbox now; what cannot be recovered from is a
+# credential read, because the finding carrying it is already public by
+# the time anyone notices.
 #
 # Every one of these binds Bash as well as Read. Claude Code merges Read
 # deny rules into the sandbox, so `cat`, `grep -r` and `git` get
@@ -100,23 +101,37 @@ DENY_ALWAYS = (
 # is neither allowed nor denied runs (measured on 2.1.221, and the README
 # says so), so the deny list is the whole of what stops one. None of the
 # path denies above covers a secret that is not a file. On a Mac the `gh`
-# login and the Claude login live in the login keychain, which `security
-# find-generic-password -w` prints, and a reviewer reading an
-# attacker-authored branch publishes what it is told to. `open` hands a
-# URL to LaunchServices and `osascript` sends AppleEvents, both to
-# processes outside the sandbox, so either carries data out past the
-# closed network. `defaults` reads preferences through cfprefsd and
-# `mdfind` searches through Spotlight, which answer for files the read
-# denies cover; `launchctl`, `shortcuts` and `automator` start work in
-# processes the sandbox does not hold; `sqlite3` runs shell commands from
-# its own prompt, around the shell denies; and the pasteboard is the
-# operator's, in both directions.
+# login and the Claude login live in the login keychain. `gh auth token`
+# prints the first; `git credential fill` runs the helper checkout() writes
+# into every workspace, which is gh again, and the osxkeychain helper
+# reads the same keychain; `security find-generic-password -w` prints
+# either login. A reviewer reading an attacker-authored branch publishes
+# what it is told to. `open` hands a URL to LaunchServices and `osascript`
+# sends AppleEvents, both to processes outside the sandbox, so either
+# carries data out past the closed network. `defaults` reads preferences
+# through cfprefsd and `mdfind` searches through Spotlight, which answer
+# for files the read denies cover; `launchctl`, `shortcuts` and
+# `automator` start work in processes the sandbox does not hold; `sqlite3`
+# runs shell commands from its own prompt, around the shell denies; and
+# the pasteboard is the operator's, in both directions. The last group is
+# every shell and interpreter stock macOS ships that the file did not
+# already name, each of which runs any of the others by proxy.
 #
-# Whether a sandboxed command can unlock a keychain item from a headless
-# launchd session is not measured. The deny is right either way: nothing a
-# review needs talks to any of these.
+# A name deny stops the direct spelling and no more. Measured on 2.1.285
+# under this file: `SECURITY list-keychains` and `/usr/bin/security
+# list-keychains` both ran, because APFS folds case and the rule matches
+# the command as written, while `env security ...` and a `git -c alias`
+# wrapper were refused by Claude Code's own analyser. The boundary that
+# closes the class is the allow list gating Bash again (issue #51); until
+# then this list is defence in depth. Whether a sandboxed command can
+# unlock a keychain item from a headless launchd session is not measured
+# either way. The denies are right regardless: nothing a review needs
+# talks to any of these.
 DENY_COMMANDS = (
     "Bash(security:*)",
+    "Bash(gh auth:*)",
+    "Bash(git credential:*)",
+    "Bash(git credential-osxkeychain:*)",
     "Bash(open:*)",
     "Bash(osascript:*)",
     "Bash(defaults:*)",
@@ -127,6 +142,14 @@ DENY_COMMANDS = (
     "Bash(sqlite3:*)",
     "Bash(pbcopy:*)",
     "Bash(pbpaste:*)",
+    "Bash(dash:*)",
+    "Bash(ksh:*)",
+    "Bash(csh:*)",
+    "Bash(tcsh:*)",
+    "Bash(ruby:*)",
+    "Bash(swift:*)",
+    "Bash(expect:*)",
+    "Bash(tclsh:*)",
 )
 
 
@@ -1998,9 +2021,9 @@ def load_settings():
         if rule not in denied:
             sys.exit(
                 "review-settings.json must deny %s. With the sandbox on, "
-                "only the deny list stops a command, and this one reaches "
-                "the login keychain or a process outside the sandbox. Add "
-                "it to permissions.deny." % rule)
+                "only the deny list stops a command, and DENY_COMMANDS in "
+                "vinegar.py says why this one is there. Add it to "
+                "permissions.deny." % rule)
     # And the word that would make every rule above decorative.
     mode = permissions.get("defaultMode", PERMISSION_MODE)
     if mode != PERMISSION_MODE:

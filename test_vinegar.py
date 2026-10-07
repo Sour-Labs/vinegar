@@ -2546,40 +2546,28 @@ check("a missing private-key deny rule refuses to start",
 # key's rule used to be checked, out of 47 in the file, so deleting the
 # ssh or gh-config rule while editing left every check passing and a
 # review able to quote `~/.ssh/id_ed25519` into a published finding.
+# And every command deny in DENY_COMMANDS: with the sandbox on the allow
+# list no longer gates Bash, so the deny list is all that stands between a
+# reviewer reading an attacker's branch and `gh auth token`.
+# Both tuples spelled out rather than read off the constants, so that
+# dropping a name from a constant is a check that fails and not a check
+# that is skipped.
 _settings_real = vinegar.SETTINGS_PATH
-for _rule in ("Read(//**/.ssh/**)", "Read(//**/.config/gh/**)",
-              "Read(//**/.aws/**)", "Read(//**/.netrc)",
-              "Read(//**/.claude.json*)", "Read(~/Library/**)",
-              "Read(~/.local/share/opencode/**)", "Read(~/src/**)"):
-    _short = json.load(open(_settings_real))
-    _short["permissions"]["deny"] = [r for r in
-                                     _short["permissions"]["deny"]
-                                     if r != _rule]
-    _p = os.path.join(_home, "short-deny.json")
-    with open(_p, "w") as h:
-        json.dump(_short, h)
-    vinegar.SETTINGS_PATH = _p
-    try:
-        vinegar.load_settings()
-        _denied = "started"
-    except SystemExit as err:
-        _denied = str(err)
-    finally:
-        vinegar.SETTINGS_PATH = _settings_real
-    check("dropping %s refuses to start" % _rule,
-          "must deny" in _denied and _rule in _denied, _denied)
-# And the commands that reach what no path deny can: the login keychain,
-# where the gh and Claude logins live on a Mac, and processes outside the
-# sandbox. With the sandbox on the allow list no longer gates Bash, so the
-# deny list is all that stands between a reviewer reading an attacker's
-# branch and `security find-generic-password -w -s gh:github.com`.
-# Spelled out rather than read off DENY_COMMANDS, so that dropping a name
-# from the tuple is a check that fails and not a check that is skipped.
-for _rule in ("Bash(security:*)", "Bash(open:*)", "Bash(osascript:*)",
-              "Bash(defaults:*)", "Bash(mdfind:*)", "Bash(launchctl:*)",
-              "Bash(shortcuts:*)", "Bash(automator:*)", "Bash(sqlite3:*)",
-              "Bash(pbcopy:*)", "Bash(pbpaste:*)"):
-    _short = json.load(open(_settings_real))
+for _rule in (("Read(//**/.ssh/**)", "Read(//**/.config/gh/**)",
+               "Read(//**/.aws/**)", "Read(//**/.netrc)",
+               "Read(//**/.claude.json*)", "Read(~/Library/**)",
+               "Read(~/.local/share/opencode/**)", "Read(~/src/**)")
+              + ("Bash(security:*)", "Bash(gh auth:*)",
+                 "Bash(git credential:*)",
+                 "Bash(git credential-osxkeychain:*)", "Bash(open:*)",
+                 "Bash(osascript:*)", "Bash(defaults:*)", "Bash(mdfind:*)",
+                 "Bash(launchctl:*)", "Bash(shortcuts:*)",
+                 "Bash(automator:*)", "Bash(sqlite3:*)", "Bash(pbcopy:*)",
+                 "Bash(pbpaste:*)", "Bash(dash:*)", "Bash(ksh:*)",
+                 "Bash(csh:*)", "Bash(tcsh:*)", "Bash(ruby:*)",
+                 "Bash(swift:*)", "Bash(expect:*)", "Bash(tclsh:*)")):
+    with open(_settings_real) as h:
+        _short = json.load(h)
     _short["permissions"]["deny"] = [r for r in
                                      _short["permissions"]["deny"]
                                      if r != _rule]
@@ -2929,8 +2917,10 @@ check("a workspace reached through a symlink stays readable",
 check("the other checkouts are still denied from a symlinked workspace",
       _names(_deny, _own) != [], _deny[-6:])
 # Added to the file's rules, not put in place of them.
-check("the file's own read denies still go with the checkout denies",
-      all(rule in _deny for rule in vinegar.DENY_ALWAYS), _deny[:4])
+check("the file's own read and command denies go with the checkout denies",
+      all(rule in _deny
+          for rule in vinegar.DENY_ALWAYS + vinegar.DENY_COMMANDS),
+      _deny[:4])
 # Every repository Vinegar polls, cloned or not. Built from the disk alone,
 # a clone made by another worker during this review was readable for the
 # whole of it, which with `parallel_repos` above 1 is a first review of any

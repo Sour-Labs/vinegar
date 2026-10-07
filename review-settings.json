@@ -91,6 +91,9 @@
       "Bash(docker:*)",
       "Bash(claude:*)",
       "Bash(security:*)",
+      "Bash(gh auth:*)",
+      "Bash(git credential:*)",
+      "Bash(git credential-osxkeychain:*)",
       "Bash(open:*)",
       "Bash(osascript:*)",
       "Bash(defaults:*)",
@@ -100,7 +103,15 @@
       "Bash(automator:*)",
       "Bash(sqlite3:*)",
       "Bash(pbcopy:*)",
-      "Bash(pbpaste:*)"
+      "Bash(pbpaste:*)",
+      "Bash(dash:*)",
+      "Bash(ksh:*)",
+      "Bash(csh:*)",
+      "Bash(tcsh:*)",
+      "Bash(ruby:*)",
+      "Bash(swift:*)",
+      "Bash(expect:*)",
+      "Bash(tclsh:*)"
     ],
     "ask": []
   },

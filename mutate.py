@@ -244,6 +244,10 @@ MUTATIONS = [
     # answer for things no path deny covers, and with the sandbox on the
     # deny list is the only thing that stops a command.
     ("deny-commands-security", '    "Bash(security:*)",\n', ""),
+    ("deny-commands-gh-auth", '    "Bash(gh auth:*)",\n', ""),
+    ("deny-commands-git-credential", '    "Bash(git credential:*)",\n', ""),
+    ("deny-commands-git-credential-osxkeychain",
+     '    "Bash(git credential-osxkeychain:*)",\n', ""),
     ("deny-commands-open", '    "Bash(open:*)",\n', ""),
     ("deny-commands-osascript", '    "Bash(osascript:*)",\n', ""),
     ("deny-commands-defaults", '    "Bash(defaults:*)",\n', ""),
@@ -254,6 +258,16 @@ MUTATIONS = [
     ("deny-commands-sqlite3", '    "Bash(sqlite3:*)",\n', ""),
     ("deny-commands-pbcopy", '    "Bash(pbcopy:*)",\n', ""),
     ("deny-commands-pbpaste", '    "Bash(pbpaste:*)",\n', ""),
+    # The shells and interpreters stock macOS ships that the file did not
+    # name, each of which runs the rest by proxy.
+    ("deny-commands-dash", '    "Bash(dash:*)",\n', ""),
+    ("deny-commands-ksh", '    "Bash(ksh:*)",\n', ""),
+    ("deny-commands-csh", '    "Bash(csh:*)",\n', ""),
+    ("deny-commands-tcsh", '    "Bash(tcsh:*)",\n', ""),
+    ("deny-commands-ruby", '    "Bash(ruby:*)",\n', ""),
+    ("deny-commands-swift", '    "Bash(swift:*)",\n', ""),
+    ("deny-commands-expect", '    "Bash(expect:*)",\n', ""),
+    ("deny-commands-tclsh", '    "Bash(tclsh:*)",\n', ""),
     ("deny-commands-checked",
      "    for rule in DENY_COMMANDS:",
      "    for rule in ():"),

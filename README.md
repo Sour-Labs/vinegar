@@ -656,13 +656,25 @@ rests on.
 
 That is also why the deny list names the macOS tools a review has no use
 for. The `gh` login and the Claude login on a Mac live in the login keychain,
-not in a file, so no read deny covers them, and `security
-find-generic-password -w` prints them. `open` hands a URL to LaunchServices
-and `osascript` sends AppleEvents, both to processes outside the sandbox, so
-either carries data out past the closed network. `defaults`, `mdfind`,
-`launchctl`, `shortcuts`, `automator`, `sqlite3`, `pbcopy` and `pbpaste` are
-denied for the same shape of reason, and `DENY_COMMANDS` in `vinegar.py` says
-which for each. Vinegar refuses to start when the file has dropped one.
+not in a file, so no read deny covers them: `gh auth token` prints the first,
+`git credential fill` runs the helper Vinegar writes into every checkout,
+which is `gh` again, and `security find-generic-password -w` prints either.
+`open` hands a URL to LaunchServices and `osascript` sends AppleEvents, both
+to processes outside the sandbox, so either carries data out past the closed
+network. `defaults`, `mdfind`, `launchctl`, `shortcuts`, `automator`,
+`sqlite3`, `pbcopy` and `pbpaste` are denied for the same shape of reason,
+and so is every shell and interpreter stock macOS ships that the list did
+not already name, since each runs the others by proxy. `DENY_COMMANDS` in
+`vinegar.py` says which for each, and Vinegar refuses to start when the file
+has dropped one.
+
+A name deny stops the direct spelling and no more. Measured on 2.1.285 under
+this file: `SECURITY list-keychains` and `/usr/bin/security list-keychains`
+both ran, because APFS folds case and the rule matches the command as
+written, while `env security ...` and a `git -c alias` wrapper were refused
+by Claude Code's own analyser. The boundary that closes the whole class is
+the allow list gating Bash again, `autoAllowBashIfSandboxed` set to false,
+which is issue #51. Until then, read this list as defence in depth.
 
 The same file turns on Claude Code's sandbox, which is what actually confines
 writes. The permission rules cannot: they match the start of a command and
@@ -770,10 +782,11 @@ worked in the workspace. Linux is not measured; the Claude Code docs state the
 narrower-path rule for the sandbox in general. A hand-run with the file alone
 does not carry these rules.
 
-The twelve path denies are pinned in `DENY_ALWAYS` and re-checked before every
-review, not just at startup, because losing one is unrecoverable in a way the
-rest of the file is not: the finding carrying a private key is already
-published by the time anyone reads it. `permissions.defaultMode` is pinned for
+The twelve path denies are pinned in `DENY_ALWAYS`, the command denies in
+`DENY_COMMANDS`, and both are re-checked before every review, not just at
+startup, because losing one is unrecoverable in a way the rest of the file is
+not: the finding carrying a private key is already published by the time
+anyone reads it. `permissions.defaultMode` is pinned for
 the same reason: `bypassPermissions` ignores the allow and deny lists
 entirely, so one word there would undo every rule in the file without touching
 one of them. The allow list itself is meant to be tuned and is not pinned.
@@ -943,11 +956,13 @@ findings, and a review talked into reporting nothing reads as a clean one.
 **So a clean review is not proof of a clean pull request**, and that is the
 residual risk to hold on to rather than the memory files.
 
-**The login keychain, past the deny.** `security` is denied by name, and so is
-everything else listed above that talks to a service outside the sandbox.
-Whether a command not named there could reach a keychain item from a headless
-launchd session is not measured, so read the deny as closing the obvious
-route and not as proof that no route is left.
+**The login keychain, past the deny.** `security`, `gh auth` and `git
+credential` are denied by name, and so is everything else listed above that
+talks to a service outside the sandbox. A name deny stops the direct spelling
+only: a case-folded or absolute-path spelling runs, as measured above, and
+whether a sandboxed command can reach a keychain item from a headless launchd
+session is not measured. Read the deny as defence in depth, and issue #51 as
+the fix.
 
 ### So what is the boundary
 
