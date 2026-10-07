@@ -102,9 +102,10 @@ DENY_ALWAYS = (
 # says so), so the deny list is the whole of what stops one. None of the
 # path denies above covers a secret that is not a file. On a Mac the `gh`
 # login and the Claude login live in the login keychain. `gh auth token`
-# prints the first; `git credential fill` runs the helper checkout() writes
-# into every workspace, which is gh again, and the osxkeychain helper
-# reads the same keychain; `security find-generic-password -w` prints
+# prints the first; `git credential fill` runs whatever helper the host's
+# git names, on a Mac the osxkeychain one, which reads the same keychain
+# (checkout() used to write a gh helper into every workspace's .git/config
+# too, and no longer does); `security find-generic-password -w` prints
 # either login. A reviewer reading an attacker-authored branch publishes
 # what it is told to. `open` hands a URL to LaunchServices and `osascript`
 # sends AppleEvents, both to processes outside the sandbox, so either
@@ -114,19 +115,27 @@ DENY_ALWAYS = (
 # `automator` start work in processes the sandbox does not hold; `sqlite3`
 # runs shell commands from its own prompt, around the shell denies; and
 # the pasteboard is the operator's, in both directions. The last group is
-# every shell and interpreter stock macOS ships that the file did not
-# already name, each of which runs any of the others by proxy.
+# the shells and interpreters found on one host beside the ones the file
+# already named, each of which runs any of the others by proxy. It is not
+# every one: `perl5.34`, `irb`, `erb`, `lldb`, `vim` and `ex` are on the
+# same host and not denied, and no list of names can be complete.
 #
 # A name deny stops the direct spelling and no more. Measured on 2.1.285
-# under this file: `SECURITY list-keychains` and `/usr/bin/security
-# list-keychains` both ran, because APFS folds case and the rule matches
-# the command as written, while `env security ...` and a `git -c alias`
-# wrapper were refused by Claude Code's own analyser. The boundary that
-# closes the class is the allow list gating Bash again (issue #51); until
-# then this list is defence in depth. Whether a sandboxed command can
-# unlock a keychain item from a headless launchd session is not measured
-# either way. The denies are right regardless: nothing a review needs
-# talks to any of these.
+# under this file, with harmless probes: `SECURITY list-keychains`,
+# `/usr/bin/security list-keychains` and `arch -arm64 security
+# list-keychains` all ran, because APFS folds case and the rule matches
+# the command as written; `xcrun security ...` got past the deny too (and
+# then failed on a sandbox cache write); a script committed to the
+# checkout that calls security ran as `./x.sh` and through `git grep
+# -O./x.sh`; and `git -C . rev-parse` ran, so a global option before the
+# subcommand defeats any `git <subcommand>` deny. Claude Code's own
+# analyser refused `env security ...`, `source ./x.sh`,
+# `GIT_EXTERNAL_DIFF=./x.sh git diff` and a `git -c alias` wrapper. The
+# boundary that closes the class is the allow list gating Bash again
+# (issue #51); until then this list is defence in depth. Whether a
+# sandboxed command can unlock a keychain item from a headless launchd
+# session is not measured either way. The denies are right regardless:
+# nothing a review needs talks to any of these.
 DENY_COMMANDS = (
     "Bash(security:*)",
     "Bash(gh auth:*)",
@@ -2727,18 +2736,31 @@ def checkout(repo, pr, env):
         if result.returncode != 0:
             raise RuntimeError("clone failed: %s" % result.stderr.strip())
 
+    # What the two fetches below authenticate with, on their command line
+    # rather than in the workspace's .git/config. It is what makes `git
+    # fetch` use GH_TOKEN. Every pass used to write it into the config, and
+    # the reviewer runs git in that workspace: a `git credential fill`
+    # spelled past the deny list ran gh, which answers from the operator's
+    # own login, broader than the stripped App token. Passed per command,
+    # the config names no helper. What earlier passes wrote is cleared on
+    # every pass until each checkout has been through one; git answers 5
+    # when there is nothing to clear, which is the state wanted, so only a
+    # hang is an error here.
+    helper = "credential.https://github.com.helper"
+    with_gh = ["git", "-c", helper + "=!gh auth git-credential"]
+    try:
+        run(["git", "config", "--local", "--unset-all", helper], cwd=path,
+            env=env, timeout=DIFF_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("git config --unset-all %s did not finish within "
+                           "%ds" % (helper, DIFF_TIMEOUT))
+
     # The tree is cleaned before the checkout, not after. A review killed by
     # its timeout can leave the tree dirty, and then `git checkout` refuses to
     # overwrite the leftovers, which would wedge this repo on every later poll.
-    #
-    # The credential helper is set on every pass rather than once at clone
-    # time. It is what makes `git fetch` use GH_TOKEN, so if it ever fails to
-    # write, a private repo stops fetching until someone finds a config write
-    # that failed days earlier.
-    steps = (["git", "config", "--local",
-              "credential.https://github.com.helper", "!gh auth git-credential"],
-             ["git", "fetch", "--quiet", "origin",
-              "pull/%d/head" % pr["number"]],
+    fetch = with_gh + ["fetch", "--quiet", "origin",
+                       "pull/%d/head" % pr["number"]]
+    steps = (fetch,
              ["git", "reset", "--quiet", "--hard"],
              ["git", "clean", "-qfd"],
              ["git", "checkout", "--quiet", "--detach", pr["headRefOid"]])
@@ -2754,7 +2776,7 @@ def checkout(repo, pr, env):
         # answering they block in the kernel for ever, parking the one
         # poll thread while the watchdog sees a live pid and calls it
         # healthy.
-        bound = FETCH_TIMEOUT if step[:2] == ["git", "fetch"] else DIFF_TIMEOUT
+        bound = FETCH_TIMEOUT if step is fetch else DIFF_TIMEOUT
         try:
             result = run(step, cwd=path, env=env, timeout=bound)
         except subprocess.TimeoutExpired:
@@ -2796,8 +2818,8 @@ def checkout(repo, pr, env):
     # while the watchdog saw a live pid and called it healthy. Non-fatal
     # either way: a stale base widens the diff, it does not lose the review.
     try:
-        result = run(["git", "fetch", "--quiet", "--force", "origin",
-                      "%s:%s" % (base, base)], cwd=path, env=env,
+        result = run(with_gh + ["fetch", "--quiet", "--force", "origin",
+                                "%s:%s" % (base, base)], cwd=path, env=env,
                      timeout=FETCH_TIMEOUT)
     except subprocess.TimeoutExpired:
         log("%s#%d: base %s not refreshed after %ds, the diff may include "

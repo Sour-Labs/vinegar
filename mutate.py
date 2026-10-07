@@ -239,6 +239,11 @@ MUTATIONS = [
     ("deny-always-library", '    "Read(~/Library/**)",\n', ""),
     ("deny-always-opencode", '    "Read(~/.local/share/opencode/**)",\n', ""),
     ("deny-always-src", '    "Read(~/src/**)",\n', ""),
+    # The three older read denies the suite's spelled-out loop left out
+    # until 2026-10-07, so dropping any of them from DENY_ALWAYS passed.
+    ("deny-always-claude-dir", '    "Read(//**/.claude/**)",\n', ""),
+    ("deny-always-gnupg", '    "Read(//**/.gnupg/**)",\n', ""),
+    ("deny-always-env", '    "Read(//**/.env)",\n', ""),
     # The command denies added 2026-10-06, pinned in DENY_COMMANDS the
     # same way. The keychain, LaunchServices, AppleEvents and the rest
     # answer for things no path deny covers, and with the sandbox on the
@@ -406,6 +411,39 @@ MUTATIONS = [
      '                "again" % repo)\n'
      "            shutil.rmtree(path, ignore_errors=True)",
      "        pass"),
+    # The credential helper rides on each fetch's command line and is not
+    # written into the workspace's .git/config, where the reviewer runs
+    # git. Persisted, a `git credential fill` spelled past the deny list
+    # ran gh under the operator's own login.
+    ("head-fetch-carries-the-helper",
+     '    fetch = with_gh + ["fetch", "--quiet", "origin",\n'
+     '                       "pull/%d/head" % pr["number"]]',
+     '    fetch = ["git", "fetch", "--quiet", "origin",\n'
+     '             "pull/%d/head" % pr["number"]]'),
+    ("base-fetch-carries-the-helper",
+     '        result = run(with_gh + ["fetch", "--quiet", "--force", "origin",\n'
+     '                                "%s:%s" % (base, base)], cwd=path, env=env,',
+     '        result = run(["git", "fetch", "--quiet", "--force", "origin",\n'
+     '                      "%s:%s" % (base, base)], cwd=path, env=env,'),
+    ("helper-not-written-into-the-workspace",
+     '        run(["git", "config", "--local", "--unset-all", helper], cwd=path,\n',
+     '        run(["git", "config", "--local", helper, "!gh auth git-credential"],\n'
+     '            cwd=path,\n'),
+    ("helper-written-by-earlier-passes-is-unset",
+     '        run(["git", "config", "--local", "--unset-all", helper], cwd=path,\n'
+     '            env=env, timeout=DIFF_TIMEOUT)\n',
+     '        pass\n'),
+    # git answers 5 when there is nothing to unset, which every checkout
+    # does once one pass has cleared it.
+    ("nothing-to-unset-is-not-a-failed-checkout",
+     '        run(["git", "config", "--local", "--unset-all", helper], cwd=path,\n'
+     '            env=env, timeout=DIFF_TIMEOUT)\n',
+     '        if run(["git", "config", "--local", "--unset-all", helper],\n'
+     '               cwd=path, env=env, timeout=DIFF_TIMEOUT).returncode != 0:\n'
+     '            raise RuntimeError("nothing to unset")\n'),
+    ("fetch-gets-the-network-budget",
+     "        bound = FETCH_TIMEOUT if step is fetch else DIFF_TIMEOUT",
+     "        bound = DIFF_TIMEOUT"),
 
     # --- the poll loop surviving one bad thing -------------------------
     ("poll-listing-guard",
