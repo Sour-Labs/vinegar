@@ -576,6 +576,10 @@ def co_run(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
         return subprocess.CompletedProcess(cmd, 0, "", "")
     if cmd[:2] == ["git", "rev-parse"]:
         return subprocess.CompletedProcess(cmd, co_run.usable, "", "not a repo")
+    if cmd[:4] == ["git", "config", "--local", "--unset-all"]:
+        # Nothing to unset, as in every checkout once one pass has cleared
+        # it. git answers 5, and checkout() must not read that as failure.
+        return subprocess.CompletedProcess(cmd, 5, "", "")
     return subprocess.CompletedProcess(cmd, 0, "", "")
 
 
@@ -589,8 +593,19 @@ os.makedirs(os.path.join(_co_path, ".git"))
 _co_stale = os.path.join(_co_path, ".git", "index.lock")
 open(_co_stale, "w").close()
 del _co_ran[:]
+
+
+def _co_checkout():
+    """checkout() of o/r under co_run. A RuntimeError is a failed check
+    with the message as its detail, not a raise that cuts the run short."""
+    try:
+        return vinegar.checkout("o/r", PR, None)
+    except RuntimeError as err:
+        return str(err)
+
+
 check("checkout returns the path it prepared",
-      vinegar.checkout("o/r", PR, None) == _co_path, _co_path)
+      _co_checkout() == _co_path, _co_path)
 check("a lock left by a killed run is cleared, not inherited",
       not os.path.exists(_co_stale), _co_stale)
 # The head fetch reaches the network and the local steps do not. One bound
@@ -598,15 +613,30 @@ check("a lock left by a killed run is cleared, not inherited",
 # a local step parks the poll thread on a filesystem that stops answering,
 # and the local budget on the fetch turned a slow repository into a pull
 # request that was never reviewed and never given up on.
-_co_fetch = [t for c, _w, t in _co_ran if c[:2] == ["git", "fetch"]]
+_co_fetch = [t for c, _w, t in _co_ran if "fetch" in c]
 _co_local = [t for c, _w, t in _co_ran if c[:2] == ["git", "reset"]]
 check("the head fetch is given the network budget",
       _co_fetch and _co_fetch[0] == vinegar.FETCH_TIMEOUT, _co_fetch)
 check("the local steps are bounded as well, and more tightly",
       _co_local and _co_local[0] == vinegar.DIFF_TIMEOUT, _co_local)
-check("the credential helper is written on every pass, not only at clone",
-      any(c[:3] == ["git", "config", "--local"] for c, _w, _t in _co_ran),
-      [c[:3] for c, _w, _t in _co_ran])
+# The credential helper rides on each fetch's command line and is not
+# written into the workspace's .git/config, where the reviewer runs git.
+# Persisted there, a `git credential fill` spelled past the deny list ran
+# gh, which answers from the operator's own login. Every pass wrote it
+# before, so every pass clears it.
+_co_fetches = [c for c, _w, _t in _co_ran if "fetch" in c]
+_co_config = [c for c, _w, _t in _co_ran if c[:2] == ["git", "config"]]
+check("every fetch carries the gh credential helper on its command line",
+      _co_fetches and all(
+          c[1:3] == ["-c", "credential.https://github.com.helper="
+                           "!gh auth git-credential"]
+          for c in _co_fetches), _co_fetches)
+check("no pass writes a credential helper into the workspace config",
+      all("--unset-all" in c for c in _co_config), _co_config)
+check("the helper earlier passes wrote is unset on every pass",
+      any(c[2:5] == ["--local", "--unset-all",
+                     "credential.https://github.com.helper"]
+          for c in _co_config), _co_config)
 # Every git step in the checkout it prepared, not wherever the daemon sits.
 # run() defaults cwd to None, so dropping it does not fail: `git reset
 # --quiet --hard` and `git clean -qfd` run somewhere else. Under launchd
@@ -622,7 +652,7 @@ check("every git step runs inside the checkout it prepared",
 # the clone because .git exists uses that repository for ever.
 co_run.usable = 1
 del _co_ran[:]
-vinegar.checkout("o/r", PR, None)
+_co_checkout()
 check("a checkout git cannot open is cloned again rather than reused",
       any(c[:3] == ["gh", "repo", "clone"] for c, _w, _t in _co_ran),
       [c[:3] for c, _w, _t in _co_ran])
@@ -682,7 +712,7 @@ check("a clone that hangs leaves nothing behind to be mistaken for a repo",
 co_run.usable = 0
 vinegar.run = co_run
 del _co_ran[:]
-vinegar.checkout("o/r", PR, None)
+_co_checkout()
 check("the poll after a hung clone clones again rather than limping on",
       any(c[:3] == ["gh", "repo", "clone"] for c, _w, _t in _co_ran),
       [c[:3] for c, _w, _t in _co_ran])
@@ -2572,12 +2602,31 @@ check("a missing private-key deny rule refuses to start",
 # key's rule used to be checked, out of 47 in the file, so deleting the
 # ssh or gh-config rule while editing left every check passing and a
 # review able to quote `~/.ssh/id_ed25519` into a published finding.
+# And every command deny in DENY_COMMANDS: with the sandbox on the allow
+# list no longer gates Bash, so the deny list is all that stands between a
+# reviewer reading an attacker's branch and `gh auth token`.
+# Both tuples spelled out rather than read off the constants, so that
+# dropping a name from a constant is a check that fails and not a check
+# that is skipped. Every rule in each, except DENY_HOME, which the check
+# above covers.
 _settings_real = vinegar.SETTINGS_PATH
-for _rule in ("Read(//**/.ssh/**)", "Read(//**/.config/gh/**)",
-              "Read(//**/.aws/**)", "Read(//**/.netrc)",
-              "Read(//**/.claude.json*)", "Read(~/Library/**)",
-              "Read(~/.local/share/opencode/**)", "Read(~/src/**)"):
-    _short = json.load(open(_settings_real))
+for _rule in (("Read(//**/.claude/**)", "Read(//**/.ssh/**)",
+               "Read(//**/.aws/**)", "Read(//**/.gnupg/**)",
+               "Read(//**/.config/gh/**)", "Read(//**/.netrc)",
+               "Read(//**/.env)", "Read(//**/.claude.json*)",
+               "Read(~/Library/**)", "Read(~/.local/share/opencode/**)",
+               "Read(~/src/**)")
+              + ("Bash(security:*)", "Bash(gh auth:*)",
+                 "Bash(git credential:*)",
+                 "Bash(git credential-osxkeychain:*)", "Bash(open:*)",
+                 "Bash(osascript:*)", "Bash(defaults:*)", "Bash(mdfind:*)",
+                 "Bash(launchctl:*)", "Bash(shortcuts:*)",
+                 "Bash(automator:*)", "Bash(sqlite3:*)", "Bash(pbcopy:*)",
+                 "Bash(pbpaste:*)", "Bash(dash:*)", "Bash(ksh:*)",
+                 "Bash(csh:*)", "Bash(tcsh:*)", "Bash(ruby:*)",
+                 "Bash(swift:*)", "Bash(expect:*)", "Bash(tclsh:*)")):
+    with open(_settings_real) as h:
+        _short = json.load(h)
     _short["permissions"]["deny"] = [r for r in
                                      _short["permissions"]["deny"]
                                      if r != _rule]
@@ -2691,7 +2740,8 @@ def _settings_file(sandbox, permissions=None, raw=None):
         else:
             doc = {"permissions": permissions if permissions is not None
                    else {"allow": [vinegar.REPORT_TOOL],
-                         "deny": list(vinegar.DENY_ALWAYS)},
+                         "deny": list(vinegar.DENY_ALWAYS
+                                      + vinegar.DENY_COMMANDS)},
                    "bashOutputMaxChars": vinegar.BASH_OUTPUT_MAX}
             if sandbox is not _absent:
                 doc["sandbox"] = sandbox
@@ -2784,7 +2834,8 @@ check("the settings sent keep a large diff inline",
       _sent.get("bashOutputMaxChars") == 128000,
       _sent.get("bashOutputMaxChars"))
 _minimal = {"permissions": {"allow": [vinegar.REPORT_TOOL],
-                            "deny": list(vinegar.DENY_ALWAYS)},
+                            "deny": list(vinegar.DENY_ALWAYS
+                                         + vinegar.DENY_COMMANDS)},
             "sandbox": _good}
 _said = _sending(None, raw=json.dumps(_minimal))
 check("a file that leaves out the output limit is refused",
@@ -2925,8 +2976,11 @@ check("a workspace reached through a symlink stays readable",
 check("the other checkouts are still denied from a symlinked workspace",
       _names(_deny, _own) != [], _deny[-6:])
 # Added to the file's rules, not put in place of them.
-check("the file's own read denies still go with the checkout denies",
-      all(rule in _deny for rule in vinegar.DENY_ALWAYS), _deny[:4])
+check("the file's own read and command denies go with the checkout denies",
+      all(rule in _deny
+          for rule in vinegar.DENY_ALWAYS + vinegar.DENY_COMMANDS),
+      [rule for rule in vinegar.DENY_ALWAYS + vinegar.DENY_COMMANDS
+       if rule not in _deny])
 # Every repository Vinegar polls, cloned or not. Built from the disk alone,
 # a clone made by another worker during this review was readable for the
 # whole of it, which with `parallel_repos` above 1 is a first review of any

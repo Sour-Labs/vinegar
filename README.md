@@ -690,8 +690,8 @@ request is attacker-controlled.
 
 `review-settings.json` allows reading and searching, a fixed list of read-only
 `git` and `gh` subcommands, and the text utilities a review pipes through. It
-denies writing and editing files, fetching the web, every shell and
-interpreter, and anything that changes state.
+denies writing and editing files, fetching the web, the shells and
+interpreters it names, and anything that changes state.
 
 **Denials bind; the allow list does not, once the sandbox is on.** Measured on
 2.1.221: `env` is refused without the sandbox and runs with it, recorded in
@@ -703,6 +703,38 @@ and the deny list plus the sandbox as what actually stops it. Nothing the
 reviewer can run reaches the network or writes outside a temporary directory,
 and it is handed no credential (see below), which is what the confinement now
 rests on.
+
+That is also why the deny list names the macOS tools a review has no use
+for. The `gh` login and the Claude login on a Mac live in the login keychain,
+not in a file, so no read deny covers them: `gh auth token` prints the first,
+`git credential fill` runs whatever helper the host's git names, which on a
+Mac is the osxkeychain one, and `security find-generic-password -w` prints
+either. (Vinegar used to write a `gh` helper into every checkout's
+`.git/config` as well; the fetch now carries it on its command line, so the
+workspace the reviewer runs git in names no helper.) `open` hands a URL to
+LaunchServices and `osascript` sends AppleEvents, both to processes outside
+the sandbox, so either carries data out past the closed network. `defaults`,
+`mdfind`, `launchctl`, `shortcuts`, `automator`, `sqlite3`, `pbcopy` and
+`pbpaste` are denied for the same shape of reason, and so are the shells and
+interpreters found on one host beside the ones the list already named, since
+each runs the others by proxy. That is not every one (`perl5.34`, `irb`,
+`erb`, `lldb`, `vim` and `ex` are on the same host and not denied), and no
+list of names can be. `DENY_COMMANDS` in `vinegar.py` says which for each,
+and Vinegar refuses to start when the file has dropped one.
+
+A name deny stops the direct spelling and no more. Measured on 2.1.285 under
+this file, with harmless probes: `SECURITY list-keychains`,
+`/usr/bin/security list-keychains` and `arch -arm64 security list-keychains`
+all ran, because APFS folds case and the rule matches the command as
+written; `xcrun security ...` got past the deny too (it then failed on a
+sandbox cache write); a script committed to the checkout that calls
+`security` ran as `./x.sh` and through `git grep -O./x.sh`; and `git -C .
+rev-parse` ran, so a global option before the subcommand defeats any `git
+<subcommand>` deny. Claude Code's own analyser refused `env security ...`,
+`source ./x.sh`, `GIT_EXTERNAL_DIFF=./x.sh git diff` and a `git -c alias`
+wrapper. The boundary that closes the whole class is the allow list gating
+Bash again, `autoAllowBashIfSandboxed` set to false, which is issue #51.
+Until then, read this list as defence in depth.
 
 The same file turns on Claude Code's sandbox, which is what actually confines
 writes. The permission rules cannot: they match the start of a command and
@@ -810,10 +842,11 @@ worked in the workspace. Linux is not measured; the Claude Code docs state the
 narrower-path rule for the sandbox in general. A hand-run with the file alone
 does not carry these rules.
 
-The twelve path denies are pinned in `DENY_ALWAYS` and re-checked before every
-review, not just at startup, because losing one is unrecoverable in a way the
-rest of the file is not: the finding carrying a private key is already
-published by the time anyone reads it. `permissions.defaultMode` is pinned for
+The twelve path denies are pinned in `DENY_ALWAYS`, the command denies in
+`DENY_COMMANDS`, and both are re-checked before every review, not just at
+startup, because losing one is unrecoverable in a way the rest of the file is
+not: the finding carrying a private key is already published by the time
+anyone reads it. `permissions.defaultMode` is pinned for
 the same reason: `bypassPermissions` ignores the allow and deny lists
 entirely, so one word there would undo every rule in the file without touching
 one of them. The allow list itself is meant to be tuned and is not pinned.
@@ -982,6 +1015,14 @@ findings, and a review talked into reporting nothing reads as a clean one.
 
 **So a clean review is not proof of a clean pull request**, and that is the
 residual risk to hold on to rather than the memory files.
+
+**The login keychain, past the deny.** `security`, `gh auth` and `git
+credential` are denied by name, and so are the other tools listed above. A
+name deny stops the direct spelling only: a case-folded or absolute-path
+spelling, a wrapper like `arch`, a script committed to the branch, or a git
+global option before the subcommand all run, as measured above, and whether
+a sandboxed command can reach a keychain item from a headless launchd session
+is not measured. Read the deny as defence in depth, and issue #51 as the fix.
 
 ### So what is the boundary
 
