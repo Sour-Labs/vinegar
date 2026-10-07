@@ -568,6 +568,11 @@ LIST_TIMEOUT = 120
 # unanswered socket would otherwise hold it for as long as TCP allows.
 POST_TIMEOUT = 60
 
+# Seconds `claude --version` may take. It prints one line and exits, so
+# anything past a few seconds is a binary that cannot start, and the poll
+# thread must not wait on it any longer than on a socket.
+VERSION_TIMEOUT = 30
+
 # Seconds the severity pass may take. Measured on haiku across four saved
 # reviews of ten to thirteen findings: 25s to 65s. This is roughly four
 # times the worst of those.
@@ -1183,6 +1188,53 @@ def priced(event):
     cost = event.get("total_cost_usd")
     return ", %.2f USD equivalent" % cost if isinstance(
         cost, (int, float)) and not isinstance(cost, bool) else ""
+
+
+# Which `claude` ran the last review, as "<version> at <path>", or None
+# before the first. In memory, so a restart says it again. Asked on every
+# review because the binary changes under the daemon with no restart: the
+# native install updates itself in the background, and the operator's own
+# interactive sessions move ~/.local/bin/claude to each new release while
+# the daemon polls. Every measured behaviour in this file is of one
+# version, and a review that behaved differently after a release had
+# nothing in the log to blame.
+_claude_seen = None
+
+
+def claude_release():
+    """Which `claude` the reviews run: its version, and its resolved path.
+
+    Raises when it cannot be asked. The caller logs that and goes on,
+    because the review's own `claude` call fails next with its own
+    sentence, and a version line is not worth a review.
+    """
+    result = run(["claude", "--version"], timeout=VERSION_TIMEOUT)
+    said = both_streams(result, 200)
+    if result.returncode != 0 or not said:
+        raise OSError("`claude --version` exited %d saying %r"
+                      % (result.returncode, said))
+    found = shutil.which("claude")
+    where = os.path.realpath(found) if found else "an unresolved path"
+    return "%s at %s" % (said, where)
+
+
+def note_claude_release(label=None):
+    """Say which `claude` the reviews run, once, and again when it changes."""
+    global _claude_seen
+    who = "%s: " % label if label else ""
+    try:
+        release = claude_release()
+    except (OSError, subprocess.SubprocessError) as err:
+        log("%scannot tell which claude will run: %s" % (who, err))
+        return
+    if release == _claude_seen:
+        return
+    if _claude_seen is None:
+        log("%sthe reviewer is claude %s" % (who, release))
+    else:
+        log("%sthe reviewer is now claude %s, and was %s"
+            % (who, release, _claude_seen))
+    _claude_seen = release
 
 
 def b64url(raw):
@@ -5971,6 +6023,7 @@ def review(path, repo, pr, config, env, tokens, resent=False, check=None,
     """
     env = env or os.environ
     label = pr_key(repo, pr)
+    note_claude_release(label)
 
     # Triage runs here because what it decides is the word in the prompt on
     # the next line, and because a checkout already exists by now.
@@ -7867,6 +7920,7 @@ def main():
 
     check_paths()
     config = load_config(args.config)
+    note_claude_release()
     if args.dry_run:
         config["comment"] = False
 

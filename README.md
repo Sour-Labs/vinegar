@@ -521,6 +521,54 @@ Input/output error`, which says nothing about the actual cause.
 The plist sets `PATH` explicitly because launchd starts with a bare one, and
 a daemon that cannot find `claude` fails at the first review.
 
+### Pinning Claude Code
+
+The native install of Claude Code updates itself. `~/.local/bin/claude` is a
+symlink into `~/.local/share/claude/versions/`, and any session, your own
+interactive ones included, moves it to the newest release in the background.
+The daemon then runs that release on its next review, with no restart and
+nothing in the log to say so. Every measured behaviour in this README is of
+one version, and five releases landed on the machine this was written on in
+one month. The headless documentation also says that `--bare`, which never
+reads an OAuth login, "will become the default for `-p` in a future
+release"; on that day every review ends in a login failure.
+
+So pin the daemon to a copy of the binary that nothing moves:
+
+```sh
+mkdir -p ~/.vinegar/bin
+cp "$(readlink -f "$(which claude)")" ~/.vinegar/bin/claude
+~/.vinegar/bin/claude --version
+```
+
+A copy and not a symlink, because the installer deletes versions it thinks
+unused from `versions/`, and it does not know about yours. The template plist
+puts `~/.vinegar/bin` first on `PATH`, so the daemon runs that copy while
+your own shell keeps the launcher and its updates. It also sets
+`DISABLE_AUTOUPDATER=1`, which stops the daemon's own `claude` runs from
+checking for updates and nothing else, which is why the copy is the pin. A
+review runs the copy from under `~/.vinegar` without trouble: measured on
+2.1.285, a sandboxed `git rev-parse` through Bash answered the same from
+there as from the launcher.
+
+Vinegar logs which `claude` it runs at startup, and again when a review
+finds a different one:
+
+```
+the reviewer is claude 2.1.285 (Claude Code) at /Users/you/.vinegar/bin/claude
+```
+
+To move the pin, copy the new version beside the old one and rename it over
+the old one, so that a review in progress keeps the file it has open:
+
+```sh
+cp "$(readlink -f "$(which claude)")" ~/.vinegar/bin/claude.new
+mv ~/.vinegar/bin/claude.new ~/.vinegar/bin/claude
+```
+
+Then rerun the probes in "What the reviewer is allowed to do" against the
+new version. The behaviours they check are the ones a release can change.
+
 That login requirement is not only about installing it. A LaunchAgent runs
 only inside a logged-in session, so on a machine with FileVault enabled
 Vinegar does not come back on its own after a reboot: the disk waits to be

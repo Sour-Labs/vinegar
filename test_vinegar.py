@@ -139,7 +139,16 @@ def all_advisory(prompt):
                             re.findall(r"^\[(\d+)\] ", prompt, re.M))})
 
 
+version_asked = []
+
+
 def fake_run(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
+    # The version ask, answered before the test below indexes a third
+    # argument this call does not have.
+    if cmd[:2] == ["claude", "--version"]:
+        version_asked.append((cmd, timeout))
+        return subprocess.CompletedProcess(cmd, fake_run.version_rc,
+                                           fake_run.version, "")
     # The severity pass, answered rather than refused. triage() swallows
     # every failure by design, so a stub that raises here is invisible:
     # every finish()-driven section below would exercise the untiered
@@ -218,6 +227,8 @@ fake_run.scope_rc = 0
 fake_run.merges = ""
 fake_run.merge_rc = 0
 fake_run.post_err = "HTTP 422"
+fake_run.version = "9.9.9 (Claude Code)\n"
+fake_run.version_rc = 0
 GENUINE_RUN = vinegar.run
 vinegar.run = fake_run
 # Kept before the silencing, like the two above it. GENUINE holds whatever
@@ -270,6 +281,12 @@ def reset_stubs():
     # review runs, and its checks pass or fail about a review nobody made.
     vinegar._login_failed_at = None
     vinegar._failed_at.clear()
+    # Said once per process, so a section that reads the line needs the
+    # process to have forgotten it.
+    vinegar._claude_seen = None
+    fake_run.version = "9.9.9 (Claude Code)\n"
+    fake_run.version_rc = 0
+    del version_asked[:]
     del posted[:]
     del looked[:]
     del checked[:]
@@ -1934,6 +1951,8 @@ def claude_run(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
     # check about the review command actually reading the severity call
     # that ran after it, which is exactly what happened when the severity
     # pass was first added and eight of them failed at once.
+    if cmd[:2] == ["claude", "--version"]:
+        return fake_run(cmd, cwd, timeout, env, stdin_text)
     if cmd[0] == "claude" and cmd[2].startswith("/code-review"):
         claude_run.saw, claude_run.env = cmd, env
         claude_run.cwd, claude_run.timeout = cwd, timeout
@@ -2085,9 +2104,15 @@ check("the review runs on the model the config pins",
 # selected. A literal `--model None` reaching argv is a 404 on every review
 # of every repository.
 del claude_run.calls[:]
+del version_asked[:]
 _ran(ROOT, "o/r", PR, CONFIG, None, {})
 check("a config that pins no model passes no model flag",
       "--model" not in claude_run.calls[0], claude_run.calls[0])
+# Asked on every review, not only at startup: the binary can change
+# between two polls with no restart.
+check("every review asks which claude runs it",
+      any(cmd[:2] == ["claude", "--version"] for cmd, _ in version_asked),
+      version_asked)
 # The repositories the config polls reach the reviewer's settings, so a
 # checkout another worker clones during this review is denied already.
 _ran(ROOT, "o/r", PR, dict(CONFIG, repos=["o/r", "o/elsewhere"]), None, {})
@@ -6415,6 +6440,7 @@ def _pr_env(*a, **k):
 
 vinegar.github_env = _pr_env
 vinegar.open_check = lambda *a, **k: _pr_opened.append(a[4])
+del version_asked[:]
 sys.argv = ["vinegar.py", "--pr", "o/r#12"]
 try:
     vinegar.main()
@@ -6424,6 +6450,38 @@ finally:
     (vinegar.review, vinegar.find_pr, vinegar.checkout,
      vinegar.github_env, sys.argv) = _pr_real
     vinegar.open_check = _pr_open_real
+# Which `claude` runs the reviews is said at startup and on every change,
+# because the native install moves ~/.local/bin/claude under the daemon:
+# five releases landed on the deployment in one month, and a review that
+# behaved differently after one had nothing in the log to blame.
+check("starting up asks which claude will run the reviews",
+      any(cmd[:2] == ["claude", "--version"] for cmd, _ in version_asked),
+      version_asked)
+reset_stubs()
+_cr_said = []
+vinegar.log = _cr_said.append
+vinegar.note_claude_release("o/r#12")
+check("the version ask is bounded",
+      bool(version_asked)
+      and version_asked[-1][1] == vinegar.VERSION_TIMEOUT, version_asked)
+check("which claude runs the reviews is said",
+      any("the reviewer is claude 9.9.9 (Claude Code) at " in m
+          for m in _cr_said), _cr_said)
+del _cr_said[:]
+vinegar.note_claude_release("o/r#12")
+check("and not said again while it is the same one", not _cr_said, _cr_said)
+fake_run.version = "9.9.10 (Claude Code)\n"
+vinegar.note_claude_release("o/r#12")
+check("a claude that changed under the daemon is said, with the one before",
+      any("the reviewer is now claude 9.9.10 (Claude Code)" in m
+          and "was 9.9.9 (Claude Code)" in m for m in _cr_said), _cr_said)
+del _cr_said[:]
+fake_run.version_rc, fake_run.version = 1, ""
+vinegar.note_claude_release("o/r#12")
+check("a claude that cannot be asked is said and stops nothing",
+      any("cannot tell which claude will run" in m for m in _cr_said),
+      _cr_said)
+reset_stubs()
 # Deliberately not `resent`: a person running --pr has asked for a review
 # and expects to see one. Asking first makes the stated reason for a
 # second run — trying another model — impossible, because the first run's
@@ -10195,6 +10253,8 @@ def _reviewed_at(answer, ceiling="xhigh", since=None):
     def run(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
         if cmd[0] == "git":
             return subprocess.CompletedProcess(cmd, 0, DIFF, "")
+        if cmd[:2] == ["claude", "--version"]:
+            return subprocess.CompletedProcess(cmd, 0, fake_run.version, "")
         if cmd[2].startswith("/code-review"):
             ran.append(cmd[2])
             raise subprocess.TimeoutExpired("claude", 1)
@@ -10306,6 +10366,8 @@ def _posts(comment=True, model="sonnet", rc=0, answer=_SHAPE_OK, boom=None):
             if boom:
                 raise boom
             return subprocess.CompletedProcess(cmd, rc, "{}", "boom")
+        if cmd[:2] == ["claude", "--version"]:
+            return subprocess.CompletedProcess(cmd, 0, fake_run.version, "")
         if cmd[2].startswith("/code-review"):
             raise subprocess.TimeoutExpired("claude", 1)
         return subprocess.CompletedProcess(
@@ -10366,14 +10428,14 @@ check("a triage that could not be read posts no note",
 # The note is worth posting and is not worth a review.
 check("a note refused by GitHub does not stop the review",
       any(c[2].startswith("/code-review")
-          for c, _ in _posts(rc=1) if c[0] == "claude"),
+          for c, _ in _posts(rc=1) if c[0] == "claude" and len(c) > 2),
       [c for c, _ in _posts(rc=1)])
 # The other half of the same rule. A refusal answers a return code; a
 # network that never answers raises, and that path swallows separately.
 check("a note whose posting times out does not stop the review",
       any(c[2].startswith("/code-review")
           for c, _ in _posts(boom=subprocess.TimeoutExpired("gh", 30))
-          if c[0] == "claude"),
+          if c[0] == "claude" and len(c) > 2),
       [c for c, _ in _posts(boom=subprocess.TimeoutExpired("gh", 30))])
 
 reached_the_end.append(True)
