@@ -2215,14 +2215,17 @@ def reviewer_settings(workspace, repos):
     return json.dumps(settings)
 
 
-def waive(key, what, waived):
-    """Whether a rate-limited attempt is forgiven rather than counted.
+def waive(key, what, waived, why="is rate limited"):
+    """Whether an attempt GitHub did not judge is forgiven rather than
+    counted.
 
     A limit refuses without judging the request and lifts on its own
     clock, so counting it spent a budget on time passing: three polls a
     minute apart against a limit that resets hourly abandoned finished
-    work. Bounded all the same, because a caller that returns straight
-    after this would otherwise be pinned on one pull request for ever.
+    work. An answer that never came is the same shape, and `why` says
+    which of the two it was. Bounded all the same, because a caller that
+    returns straight after this would otherwise be pinned on one pull
+    request for ever.
 
     Both budgets that can meet a limit ask here, rather than each
     spelling the rule out, which is how the two came to say it in two
@@ -2230,9 +2233,9 @@ def waive(key, what, waived):
     """
     if waived >= MAX_ATTEMPTS:
         return False
-    log("%s: %s is rate limited, so this attempt is not counted against "
-        "the %d (%d of %d such waivers)" % (
-            key, what, MAX_ATTEMPTS, waived + 1, MAX_ATTEMPTS))
+    log("%s: %s %s, so this attempt is not counted against the %d "
+        "(%d of %d such waivers)" % (
+            key, what, why, MAX_ATTEMPTS, waived + 1, MAX_ATTEMPTS))
     return True
 
 
@@ -5866,7 +5869,17 @@ def repost(key, repo, pr, config, state, tokens, done, marker, sha):
                     conclusion = CHECK_CONCLUSION
                 correct_check(key, repo, at["headRefOid"], config, env,
                               conclusion, title)
-            if settled == THROTTLED and waive(key, "the posting", waived):
+            # UNSURE as well as THROTTLED. A timeout, a 5xx or an answer
+            # with no status in it is GitHub not judging the request, and
+            # counting it spent the budget on GitHub's downtime: the
+            # incident of 2026-09-30 answered "unexpected end of JSON
+            # input" to two of the three. The read above asks whether an
+            # unconfirmed send landed before every attempt, so a waived
+            # UNSURE cannot duplicate the review.
+            if settled in (THROTTLED, UNSURE) and waive(
+                    key, "the posting", waived,
+                    "is rate limited" if settled == THROTTLED
+                    else "got no answer from GitHub"):
                 waived += 1
                 tries -= 1
                 give_up_on_it = False
@@ -5915,6 +5928,7 @@ def repost(key, repo, pr, config, state, tokens, done, marker, sha):
         entry = dict(done, post_tries=tries)
         if waived:
             entry["post_waivers"] = waived
+        hold_posts(key)
     remember(state, key, entry)
 
 
@@ -7276,6 +7290,7 @@ def spend_announce(key, config, state, head, attempts, tries, said):
         if waive(key, "the give-up", waived):
             remember(state, key, dict(state.get(key, {}),
                                       announce_waivers=waived + 1))
+            hold_posts(key)
             return
         said = False
     tries += 1
@@ -7283,6 +7298,9 @@ def spend_announce(key, config, state, head, attempts, tries, said):
     if not said and spent:
         log("%s: the give-up could not be posted in %d attempts, so it "
             "stays in this log only" % (key, tries))
+    elif not said:
+        # Spaced like the resend of a saved review, for the same reason.
+        hold_posts(key)
     was = state.get(key, {})
     # ALREADY is a give-up a retry found up, which is the give-up said.
     entry = state_entry(head, FAILED, attempts,
@@ -7347,6 +7365,28 @@ _login_failed_at = None
 # clock and in memory for the same reason. Each key is written only by the
 # worker holding that pull request's repository.
 _failed_at = {}
+
+# When each pull request's last attempt to post what was already written
+# did not land, by key, on the same clock and in memory for the same
+# reason: a saved review, or the give-up that says there is none. Those
+# attempts are spaced like review attempts, and were not: on 2026-09-30
+# two of the three resends of a review that had cost 2.32 USD went inside
+# 81 seconds of one GitHub incident, and one more minute of it would have
+# left the review on disk with nothing ever sending it.
+_post_failed_at = {}
+
+
+def hold_posts(key):
+    """Make the next attempt to post to this pull request wait FAILED_RETRY."""
+    _post_failed_at[key] = time.monotonic()
+    log("%s: the next attempt to post waits at least %ds"
+        % (key, FAILED_RETRY))
+
+
+def posts_held(key):
+    """Whether this pull request is still inside that wait."""
+    return (key in _post_failed_at
+            and time.monotonic() - _post_failed_at[key] < FAILED_RETRY)
 
 
 def login_failed(key):
@@ -7445,6 +7485,11 @@ def handle_pr(repo, pr, config, state, tokens):
                 cleared.pop("unposted", None)
                 remember(state, key, cleared)
         elif marker and done.get("post_tries", 0) < MAX_ATTEMPTS:
+            # Not inside the wait the last attempt set. A saved review is
+            # finished work, and three polls a minute apart fit inside one
+            # GitHub incident.
+            if posts_held(key):
+                return False
             repost(key, repo, pr, config, state, tokens, done, marker,
                    saved_sha)
             return False
@@ -7480,6 +7525,10 @@ def handle_pr(repo, pr, config, state, tokens):
             # which is a dry run's whole output; coming back here every
             # poll to re-say it would be the log spam the bound forbids.
             if not done.get("announced") and config["comment"]:
+                # Not inside the wait the last attempt set, for the reason
+                # the resend of a saved review waits.
+                if posts_held(key):
+                    return False
                 # Its own token, minted here. posting_env() falls back to
                 # what it is given, and this path had nothing to give: the
                 # give-up would have gone out under the operator's own

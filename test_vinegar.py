@@ -287,6 +287,7 @@ def reset_stubs():
     fake_run.version = "9.9.9 (Claude Code)\n"
     fake_run.version_rc = 0
     del version_asked[:]
+    vinegar._post_failed_at.clear()
     del posted[:]
     del looked[:]
     del checked[:]
@@ -4938,12 +4939,24 @@ _ga_throttle = {L: {"outcome": vinegar.FAILED, "sha": PR["headRefOid"],
                     "attempts": vinegar.MAX_ATTEMPTS}}
 fake_run.rc = 1
 fake_run.post_err = "gh: API rate limit exceeded (HTTP 403)"
-for _ in range(vinegar.MAX_ATTEMPTS):
+# A waived attempt sets the wait like a counted one: the limit lifts on
+# its own clock, and asking again a minute later only meets it again.
+del posted[:]
+vinegar.handle_pr("o/r", PR_LIVE, CONFIG, _ga_throttle, {})
+_ga_first = len(posted)
+vinegar.handle_pr("o/r", PR_LIVE, CONFIG, _ga_throttle, {})
+check("a rate-limited give-up waits before it is tried again",
+      _ga_first == 1 and len(posted) == 1, (_ga_first, len(posted)))
+# Each poll below stands for one far enough past the last to be outside
+# that wait.
+for _ in range(vinegar.MAX_ATTEMPTS - 1):
+    vinegar._post_failed_at.clear()
     vinegar.handle_pr("o/r", PR_LIVE, CONFIG, _ga_throttle, {})
 check("a rate-limited give-up does not spend its budget",
       _ga_throttle[L].get("announced") is not True
       and _ga_throttle[L].get("announce_tries") is None, _ga_throttle)
 for _ in range(vinegar.MAX_ATTEMPTS * 2):
+    vinegar._post_failed_at.clear()
     vinegar.handle_pr("o/r", PR_LIVE, CONFIG, _ga_throttle, {})
 check("a give-up throttled for ever still ends",
       _ga_throttle[L].get("announced") is True, _ga_throttle)
@@ -4952,6 +4965,17 @@ fake_run.rc, fake_run.post_err = 0, "HTTP 422"
 # A give-up whose announcement never landed must not be marked as said,
 # or the pull request stays silent for ever on the strength of one bad
 # minute at GitHub.
+
+
+def _past_the_wait(key):
+    """Put `key`'s last failed post FAILED_RETRY behind, as a later poll
+    finds it. An assignment rather than `-=`, so a guard that never
+    recorded the time fails a check instead of raising here."""
+    vinegar._post_failed_at[key] = (
+        vinegar._post_failed_at.get(key, time.monotonic())
+        - vinegar.FAILED_RETRY - 1)
+
+
 _gf_state = {L: {"outcome": vinegar.FAILED, "sha": PR["headRefOid"],
                  "attempts": vinegar.MAX_ATTEMPTS}}
 _real_post_for_gu = vinegar.post_review
@@ -4960,11 +4984,25 @@ del posted[:]
 vinegar.handle_pr("o/r", PR_LIVE, CONFIG, _gf_state, {})
 check("a give-up that did not reach GitHub is not marked as said",
       _gf_state[L].get("announced") is not True, _gf_state)
-vinegar.post_review = lambda *a, **k: (_ for _ in ()).throw(
-    RuntimeError("GitHub is unreachable"))
+# And not said again on the very next poll. Three polls a minute apart
+# fit inside one GitHub incident, which is how a saved review's resend
+# budget was two-thirds spent inside 81 seconds on 2026-09-30.
+_gf_again = []
+vinegar.post_review = lambda *a, **k: _gf_again.append(1) or False
 vinegar.handle_pr("o/r", PR_LIVE, CONFIG, _gf_state, {})
+check("a give-up that did not land is not said again inside the wait",
+      not _gf_again, _gf_again)
+# The second attempt, once the wait is over, is the one that raises.
+_past_the_wait(L)
+vinegar.post_review = lambda *a, **k: _gf_again.append(1) or (
+    _ for _ in ()).throw(RuntimeError("GitHub is unreachable"))
+vinegar.handle_pr("o/r", PR_LIVE, CONFIG, _gf_state, {})
+check("and is tried again once the wait is over",
+      len(_gf_again) == 1, _gf_again)
 check("a give-up whose posting raised is not marked as said",
       _gf_state[L].get("announced") is not True, _gf_state)
+vinegar._post_failed_at.clear()
+vinegar._post_failed_at.clear()
 vinegar.post_review = _real_post_for_gu
 vinegar.handle_pr("o/r", PR_LIVE, CONFIG, _gf_state, {})
 check("the give-up is retried on a later poll until it lands",
@@ -4979,6 +5017,7 @@ vinegar.post_review = lambda *a, **k: False
 _gb_posts = 0
 for _ in range(8):
     _before = _gb_state[L].get("announce_tries", 0)
+    vinegar._post_failed_at.clear()
     vinegar.handle_pr("o/r", PR_LIVE, CONFIG, _gb_state, {})
     if _gb_state[L].get("announce_tries", 0) != _before:
         _gb_posts += 1
@@ -5015,6 +5054,8 @@ vinegar.handle_pr("o/r", PR_LIVE, CONFIG, _gm_state, {})
 check("a token that cannot be minted counts as an attempt",
       not posted and _gm_state[L].get("announce_tries") == 1,
       (len(posted), _gm_state))
+# That attempt set the wait, and the sections below stand for later polls.
+vinegar._post_failed_at.clear()
 # The give-up rebuilds the entry like every other path, so it carries the
 # rounds already spent or hands them all back. rounds_done()'s docstring
 # names this case by name: a pull request that reaches MAX_ATTEMPTS once,
@@ -5067,6 +5108,7 @@ check("a dry run's own give-up leaves the announce state alone",
       and _di_state[L].get("announce_tries") is None, _di_state)
 vinegar.review, vinegar.checkout = _di_review, _di_checkout
 del posted[:]
+vinegar._post_failed_at.clear()
 vinegar.handle_pr("o/r", PR_LIVE, CONFIG, _gd_state, {})
 check("the live daemon still announces after a dry run looked",
       len(posted) == 1, (len(posted), _gd_state))
@@ -7410,6 +7452,59 @@ check("every repost asks whether the review is already up",
 check("a posted review clears the mark",
       not os.path.exists(_lost_marker), _lost_marker)
 
+# A send GitHub never answered is not a refusal. In the incident of
+# 2026-09-30 the first two resends failed with "unexpected end of JSON
+# input" inside 81 seconds and the third landed; one more minute of it and
+# the budget would have gone on GitHub's downtime, with the paid-for review
+# left on disk for ever. So an UNSURE answer is waived like a rate limit,
+# and every attempt that did not land makes the next one wait FAILED_RETRY,
+# the way a failed review's attempts wait.
+_posted_before, _looked_before = list(posted), list(looked)
+vinegar.save_transcript("o/r", PR_LOST, "Findings from the refused run.", [])
+with open(_lost_marker, "w") as h:
+    h.write("%s\n" % PR_LOST["headRefOid"])
+_unsure_state = {_lost_key: {"outcome": vinegar.DONE,
+                             "sha": PR_LOST["headRefOid"], "attempts": 1,
+                             "unposted": True}}
+fake_run.rc, fake_run.post_err = 1, "HTTP 502 Bad Gateway"
+_unsure_said = []
+vinegar.log = _unsure_said.append
+del posted[:]
+vinegar.handle_pr("o/r", PR_LOST, CONFIG, _unsure_state, {})
+check("a resend GitHub did not answer is waived, not counted",
+      len(posted) == 1
+      and _unsure_state[_lost_key].get("post_tries", 0) == 0
+      and _unsure_state[_lost_key].get("post_waivers") == 1
+      and os.path.exists(_lost_marker),
+      (len(posted), _unsure_state, os.path.exists(_lost_marker)))
+check("and says the next attempt waits",
+      any("the next attempt to post waits at least %ds"
+          % vinegar.FAILED_RETRY in m for m in _unsure_said), _unsure_said)
+vinegar.handle_pr("o/r", PR_LOST, CONFIG, _unsure_state, {})
+check("a saved review is not resent again inside the wait",
+      len(posted) == 1, len(posted))
+_past_the_wait(_lost_key)
+vinegar.handle_pr("o/r", PR_LOST, CONFIG, _unsure_state, {})
+check("and is resent once the wait is over", len(posted) == 2, len(posted))
+# Bounded like the rate-limit waiver it shares a budget with, or a GitHub
+# that answers nothing for a day would be asked for ever.
+vinegar._post_failed_at.clear()
+_unsure_state[_lost_key]["post_waivers"] = vinegar.MAX_ATTEMPTS
+vinegar.handle_pr("o/r", PR_LOST, CONFIG, _unsure_state, {})
+check("the waiver for an unanswered send is bounded",
+      _unsure_state[_lost_key].get("post_tries") == 1, _unsure_state)
+# A refusal GitHub judged is still counted on the spot.
+vinegar._post_failed_at.clear()
+fake_run.post_err = "HTTP 422 Unprocessable Entity"
+vinegar.handle_pr("o/r", PR_LOST, CONFIG, _unsure_state, {})
+check("a refusal GitHub judged is still counted",
+      _unsure_state[_lost_key].get("post_tries") == 2, _unsure_state)
+vinegar.log = lambda message: None
+fake_run.post_err = "HTTP 422"
+vinegar._post_failed_at.clear()
+vinegar.forget(_lost_marker)
+posted[:], looked[:] = _posted_before, _looked_before
+
 # The same cleanup on the ordinary path: a review that posts must clear a
 # mark an earlier attempt at the same commit left, or the next poll sends
 # the transcript over a review that is already up. Checked without going
@@ -7471,6 +7566,7 @@ _bound_state = {_lost_key: {"outcome": vinegar.DONE,
 _bound_posts = 0
 for _ in range(6):
     del posted[:]
+    vinegar._post_failed_at.clear()
     vinegar.handle_pr("o/r", PR_LOST, CONFIG, _bound_state, {})
     _bound_posts += len(posted)
 check("a review that can never post stops being retried",
@@ -7503,6 +7599,9 @@ vinegar.handle_pr("o/r", PR_LOST, CONFIG, _launder, {})
 check("the repost budget is not handed back by the give-up",
       _launder[_lost_key].get("post_tries") == vinegar.MAX_ATTEMPTS,
       _launder)
+# That give-up was refused and set the wait; the sections below stand for
+# polls after it.
+vinegar._post_failed_at.clear()
 PR_SKIP = dict(PR_LOST, number=77, isDraft=True)
 _skip_key = vinegar.pr_key("o/r", PR_SKIP)
 _launder_skip = {_skip_key: {"outcome": vinegar.FAILED,
@@ -7608,6 +7707,8 @@ check("a marker left by a killed run is sent, not deleted",
       len(posted) == 1
       and "Findings from the killed run." in posted[0][1]["body"],
       (len(posted), _killed_state))
+# Refused, so it set the wait; the sections below stand for later polls.
+vinegar._post_failed_at.clear()
 
 # Answering "" for a marker that cannot be opened made it identical to a
 # marker for another commit, and the caller's answer to that is to delete
@@ -7635,6 +7736,7 @@ check("an unreadable marker keeps the review rather than dropping it",
       len(posted) == 1
       and "Findings behind a bad marker." in posted[0][1]["body"],
       (len(posted), _bad_state))
+vinegar._post_failed_at.clear()
 vinegar.forget(_lost_marker)
 
 # An entry the operator deleted, with a marker that cannot be read: the
@@ -7701,6 +7803,7 @@ def _no_gh(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
 
 vinegar.run = _no_gh
 for _ in range(4):
+    vinegar._post_failed_at.clear()
     vinegar.handle_pr("o/r", PR_LOST, CONFIG, _raise_state, {})
 vinegar.run = fake_run
 # A rate limit refuses the request without judging it, and resets on its
@@ -7714,6 +7817,7 @@ _rl_state = {_lost_key: {"outcome": vinegar.DONE,
 fake_run.rc = 1
 fake_run.post_err = "gh: API rate limit exceeded (HTTP 403)"
 for _ in range(vinegar.MAX_ATTEMPTS):
+    vinegar._post_failed_at.clear()
     vinegar.handle_pr("o/r", PR_LOST, CONFIG, _rl_state, {})
 check("a rate-limited repost does not spend the budget",
       _rl_state[_lost_key].get("post_tries", 0) == 0
@@ -7722,6 +7826,7 @@ check("a rate-limited repost does not spend the budget",
 # an endless refund pins the pull request there and it is never reviewed
 # at a new head, never re-skipped and never abandoned.
 for _ in range(vinegar.MAX_ATTEMPTS * 2):
+    vinegar._post_failed_at.clear()
     vinegar.handle_pr("o/r", PR_LOST, CONFIG, _rl_state, {})
 check("a throttle that never lifts still ends",
       not os.path.exists(_lost_marker)
@@ -8020,6 +8125,8 @@ def _resent(at, run, config=CHK_CONFIG, look="", env=CHK_ENV):
     fake_run.look_out = look
     del checked[:]
     del posted[:]
+    # Each resend stands for a poll outside the wait the last one set.
+    vinegar._post_failed_at.clear()
     env_was = vinegar.github_env
     vinegar.github_env = lambda *a, **k: env
     vinegar.handle_pr("o/r", at, config,

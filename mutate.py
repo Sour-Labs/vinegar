@@ -2756,6 +2756,40 @@ MUTATIONS = [
     ("claude-release-failure-logged",
      '        log("%scannot tell which claude will run: %s" % (who, err))',
      "        pass"),
+
+    # --- a post that did not land waits before the next attempt ----------
+    # Unspaced, three polls a minute apart fit inside one GitHub incident:
+    # two of three resends went inside 81 seconds on 2026-09-30.
+    ("resend-waits",
+     "            if posts_held(key):\n                return False\n"
+     "            repost(",
+     "            repost("),
+    ("resend-wait-recorded",
+     "    _post_failed_at[key] = time.monotonic()",
+     "    pass"),
+    ("resend-wait-ends",
+     "            and time.monotonic() - _post_failed_at[key] < FAILED_RETRY)",
+     "            and FAILED_RETRY)"),
+    ("resend-wait-logged",
+     '    log("%s: the next attempt to post waits at least %ds"',
+     '    (lambda *a: None)("%s: the next attempt to post waits at least %ds"'),
+    ("resend-wait-set-on-failure",
+     '            entry["post_waivers"] = waived\n        hold_posts(key)',
+     '            entry["post_waivers"] = waived'),
+    ("unsure-resend-waived",
+     "            if settled in (THROTTLED, UNSURE) and waive(",
+     "            if settled == THROTTLED and waive("),
+    ("give-up-waits",
+     "                if posts_held(key):\n                    return False\n",
+     ""),
+    ("give-up-wait-set-on-failure",
+     "    elif not said:\n"
+     "        # Spaced like the resend of a saved review, for the same reason.\n"
+     "        hold_posts(key)",
+     "    elif not said:\n        pass"),
+    ("give-up-wait-set-on-waiver",
+     "            hold_posts(key)\n            return\n        said = False",
+     "            return\n        said = False"),
 ]
 
 
