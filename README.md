@@ -716,17 +716,23 @@ lost two commands to the last shape, which the brief now names.
 when the file drops it.
 
 An allow rule still cannot see flags, so the boundary is the allow list
-together with Claude Code's reading of each command, and the list has to
-name only commands whose flags cannot run a program or read past the
-checkout. Measured on 2.1.285: with `Bash(sort:*)` in the list,
+together with Claude Code's reading of each command, and the list should
+name only commands whose flags cannot run a program; keeping reads inside
+the checkout is the job of the read denies, which the kernel enforces, not
+of the list. Measured on 2.1.285: with `Bash(sort:*)` in the list,
 `sort --compress-program=./x.sh big.txt` was approved, and with `Bash(jq:*)`,
 `jq -n env` printed the daemon's environment; without those rules both came
 back "requires approval", and plain `sort` still ran through the read-only
 set. So neither is allowed, and nor is `rg`, which is not installed in the
-reviewer's shell. A few entries would make Bash arbitrary again whatever
-else the file says, and `load_settings()` refuses them by name: a bare
-`Bash`, `Bash(git:*)`, `Bash(gh:*)` and `Bash(git grep:*)`, the last because
-`git grep -O<cmd>` runs a command while the plain form needs no rule.
+reviewer's shell. The `gh` entries carry `--web`, which runs a browser, and
+`--jq`, which is a jq; both sit behind a `gh` that has no network and were
+not measured. A few entries would make Bash arbitrary again whatever else
+the file says, and `load_settings()` refuses them: a bare `Bash`, `git`,
+`gh` and `git grep`, in any spelling of the wildcard, as a shorter prefix
+(`Bash(g*)`), or followed by an option (`Bash(git -C:*)`,
+`Bash(git grep -n:*)`), because `git grep -O<cmd>` runs a command while the
+plain form needs no rule. A `git grep` rule that fixes the pattern is fine:
+git reads options before the pattern only, so no `-O` can follow it.
 The deny list and the sandbox stay behind all of it: nothing the reviewer can
 run reaches the network or writes outside a temporary directory, and it is
 handed no credential (see below).
@@ -878,9 +884,9 @@ anyone reads it. `permissions.defaultMode` is pinned for
 the same reason: `bypassPermissions` ignores the allow and deny lists
 entirely, so one word there would undo every rule in the file without touching
 one of them. The allow list itself is meant to be tuned and is not pinned,
-apart from the four entries `load_settings()` refuses because each would make
-Bash arbitrary again: a bare `Bash`, `Bash(git:*)`, `Bash(gh:*)` and
-`Bash(git grep:*)`, in either spelling Claude Code accepts.
+apart from the entries `load_settings()` refuses because each would make Bash
+arbitrary again: a bare `Bash`, and a wildcard on `git`, `gh` or `git grep`,
+on a shorter prefix of one of them, or on one of them followed by an option.
 
 That is why clones live in `~/.vinegar-checkouts/` rather than under
 `~/.vinegar`, `~/src` or `~/Library`. A blanket deny on a directory catches

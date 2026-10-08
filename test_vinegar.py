@@ -2823,23 +2823,31 @@ check("the settings sent make the allow list gate Bash",
       _sent.get("autoAllowBashIfSandboxed") is False, json.dumps(_sent))
 # With the allow list gating Bash, a few entries would hand it back whatever
 # else the file says, and the obvious fix for a reviewer losing turns to
-# `-A12` is one of them: `Bash(git grep:*)` cannot see `-O<cmd>`. Each is
-# refused by name, in both spellings Claude Code accepts, and the shipped
-# file still starts (the check above this section).
+# `-A12` is one of them: `Bash(git grep:*)` cannot see `-O<cmd>`. Refused on
+# what the wildcard has to see first, so every spelling of the same grant
+# is refused: the `:*` and ` *` forms, the space-less `git*`, a shorter
+# prefix that grants git and gh at once, and an option after the name,
+# which for `git grep` is where `-O` would sit. Spelled out rather than
+# derived from ALLOW_NEVER, so a name dropped from it fails here.
 _never = {"deny": list(vinegar.DENY_ALWAYS + vinegar.DENY_COMMANDS)}
-for _rule, _ in vinegar.ALLOW_NEVER:
+for _rule in ("Bash", "Bash(*)", "Bash(:*)",
+              "Bash(git:*)", "Bash(git *)", "Bash(git*)", "Bash(g*)",
+              "Bash(git -C:*)", "Bash(git --no-pager *)",
+              "Bash(gh:*)", "Bash(gh*)", "Bash(gh -R:*)",
+              "Bash(git grep:*)", "Bash(git grep*)", "Bash(git gr*)",
+              "Bash(git grep -n:*)", "Bash(git grep -n -A 12 *)"):
     _said = _sending(_good, permissions=dict(
         _never, allow=[vinegar.REPORT_TOOL, _rule]))
     check("allowing %s refuses to start" % _rule,
           "allows %s" % _rule in _said, _said)
-for _spelt in ("Bash(*)", "Bash(git *)", "Bash(gh *)", "Bash(git grep *)"):
-    _said = _sending(_good, permissions=dict(
-        _never, allow=[vinegar.REPORT_TOOL, _spelt]))
-    check("allowing %s, the other spelling, refuses to start" % _spelt,
-          "allows %s" % _spelt in _said, _said)
 # A neighbour of a refused entry is not refused: the subcommand rules the
-# file ships, and a `git grep` rule narrowed to a file, are the operator's.
-for _ok in ("Bash(git diff:*)", "Bash(gh pr view:*)", "Bash(git grep -n x HEAD)"):
+# file ships, a `git grep` rule with no wildcard, one that fixes the pattern
+# (git reads options before the pattern only, so no `-O` can follow it:
+# measured, `git grep foo -n` fails on `-n` as a revision), and a wildcard
+# on another program that merely shares letters with git are the operator's.
+for _ok in ("Bash(git diff:*)", "Bash(gh pr view:*)", "Bash(git grep -n x HEAD)",
+            "Bash(git grep harmless *)",
+            "Bash(grep:*)", "Bash(gr*)", "Bash(github-linguist:*)"):
     _said = _sending(_good, permissions=dict(
         _never, allow=[vinegar.REPORT_TOOL, _ok]))
     check("allowing %s still starts" % _ok, _said == "sent", _said)

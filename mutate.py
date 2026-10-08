@@ -1036,20 +1036,25 @@ MUTATIONS = [
      '    "sandbox": dict(\n'
      "        ((name, wanted) for name, wanted, _ in SANDBOX_RULES\n"
      '         if name != "autoAllowBashIfSandboxed"),'),
-    # The allow entries that would hand Bash back: the check, and the
-    # reading of the other spelling Claude Code accepts.
+    # The allow entries that would hand Bash back: the check itself, then
+    # each way of spelling the same grant, one clause at a time.
     ("allow-never-checked",
-     "        why = dict(ALLOW_NEVER).get(allow_canonical(rule))\n"
-     "        if why:",
-     "        why = None\n"
-     "        if why:"),
-    ("allow-never-other-spelling",
-     '    if rule == "Bash(*)":\n'
-     '        return "Bash"\n'
-     '    if rule.startswith("Bash(") and rule.endswith(" *)"):\n'
-     '        return rule[:-3] + ":*)"\n'
-     "    return rule",
-     "    return rule"),
+     "        why = never_allowed(rule) if isinstance(rule, str) else None",
+     "        why = None"),
+    ("allow-never-colon-form",
+     '    if literal.endswith(":"):\n'
+     "        literal = literal[:-1]\n",
+     ""),
+    ("allow-never-shorter-prefix",
+     "        if (literal == name or name.startswith(literal)\n",
+     "        if (literal == name\n"),
+    ("allow-never-global-option",
+     '                or literal.startswith(name + " -")):',
+     "                ):"),
+    ("allow-never-exact-rule-is-anyones",
+     '    if "*" not in pattern:\n'
+     "        return None\n",
+     ""),
     # Measured: with the sandbox on and no `filesystem` stanza, a
     # permitted Write reached `$HOME`. These are the paths that cannot be
     # recovered from.
@@ -1668,8 +1673,8 @@ MUTATIONS = [
      '        "`git grep -n <pattern> HEAD`, which reads the commit rather than "\n'
      '        "the files, so it searches `.claude/` too and no denied path can "\n'
      '        "fail it. `grep -rn --exclude-dir=.claude`, `git ls-files` and `ls` "\n'
-     '        "also work through Bash. `sed`, `awk`, "\n'
-     '        "`find` and every interpreter, `python3` among them, are denied, so "\n'
+     '        "also work through Bash. `sed`, `awk`, `find`, `jq` and every "\n'
+     '        "interpreter, `python3` among them, are refused, so "\n'
      '        "reaching for one costs a turn and returns nothing. Only the allowed "',
      '        "it. Only the allowed "'),
     # With autoAllowBashIfSandboxed false, four shapes reviews had used are

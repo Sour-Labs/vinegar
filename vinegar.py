@@ -221,29 +221,65 @@ PERMISSION_MODE = "default"
 # cannot see `-O<cmd>`, and the script hazard the read-only analysis
 # refuses is open again with nothing saying so. These four are the ones
 # the README argues against by name; the rest of the list is the
-# operator's to shape. `Bash(*)` and `Bash(git *)` are the same rules in
-# the other spelling Claude Code accepts, and allow_canonical() reads them
-# as such.
+# operator's to shape.
+#
+# Matched on what a wildcard rule has to see before its `*`, not on one
+# spelling: `Bash(git:*)`, `Bash(git *)` and `Bash(git*)` all grant every
+# git command, `Bash(g*)` grants git and gh both, `Bash(git -C:*)` grants
+# every subcommand behind a global option, and `Bash(git grep -n:*)` is
+# the fix an operator reaches for and the one that brings `-O` back. A
+# rule with no `*` matches one exact command and is anyone's to add, and
+# so is one that fixes the pattern: git reads its options before the
+# pattern only (measured, `git grep foo -n` fails on `-n` as a revision),
+# so `Bash(git grep foo *)` grants no `-O`.
 ALLOW_NEVER = (
-    ("Bash", "allows every command"),
-    ("Bash(git:*)", "is arbitrary command execution: `git -c alias.x='!cmd' x` "
-     "runs a shell"),
-    ("Bash(gh:*)", "lets a review approve and merge the pull request it is "
-     "reviewing, and read any private repository the token can see"),
-    ("Bash(git grep:*)", "cannot see `-O<cmd>`, which runs a command on each "
-     "match; the plain form needs no rule, since Claude Code's read-only "
-     "set runs it"),
+    ("", "allows every command"),
+    ("git", "is arbitrary command execution: `git -c alias.x='!cmd' x` runs "
+     "a shell"),
+    ("gh", "would allow every gh subcommand, leaving the closed network and "
+     "the stripped token as all that kept a review from approving and "
+     "merging the pull request it reviews"),
+    ("git grep", "cannot see `-O<cmd>`, which runs a command on each match; "
+     "the plain form needs no rule, since Claude Code's read-only set runs "
+     "it"),
 )
 
 
-def allow_canonical(rule):
-    """`Bash(*)` and `Bash(git *)` as ALLOW_NEVER spells them, `Bash` and
-    `Bash(git:*)`. Claude Code reads each pair as one rule."""
-    if rule == "Bash(*)":
-        return "Bash"
-    if rule.startswith("Bash(") and rule.endswith(" *)"):
-        return rule[:-3] + ":*)"
-    return rule
+def allow_literal(rule):
+    """What a Bash allow rule has to match before its wildcard, with the
+    spaces collapsed and the `:` of the `:*` form dropped, so that
+    `Bash(git:*)`, `Bash(git *)` and `Bash(git*)` all read `git` and a bare
+    `Bash` reads empty. None for a rule with no wildcard, which matches one
+    command only, and for a rule that is not a Bash rule at all."""
+    if rule == "Bash":
+        return ""
+    if not (rule.startswith("Bash(") and rule.endswith(")")):
+        return None
+    pattern = rule[5:-1]
+    if "*" not in pattern:
+        return None
+    literal = pattern.split("*", 1)[0].rstrip()
+    if literal.endswith(":"):
+        literal = literal[:-1]
+    return " ".join(literal.split())
+
+
+def never_allowed(rule):
+    """Why this allow entry would hand Bash back, or None if it would not.
+
+    A literal that is one of the names, or shorter than one (`g` grants
+    git and gh), or the name followed by an option (`git -C`, `gh -R`,
+    `git grep -n`: every subcommand, or the `-O`, is still to come), is
+    the name's grant.
+    """
+    literal = allow_literal(rule)
+    if literal is None:
+        return None
+    for name, why in ALLOW_NEVER:
+        if (literal == name or name.startswith(literal)
+                or literal.startswith(name + " -")):
+            return why
+    return None
 
 
 # What the sandbox stanza in review-settings.json must say, and why each
@@ -2124,9 +2160,7 @@ def load_settings():
     # And the entries that would hand Bash back whatever else the file
     # says. ALLOW_NEVER says why each is there.
     for rule in allowed:
-        if not isinstance(rule, str):
-            continue
-        why = dict(ALLOW_NEVER).get(allow_canonical(rule))
+        why = never_allowed(rule) if isinstance(rule, str) else None
         if why:
             sys.exit(
                 "review-settings.json allows %s, which %s. The allow list "
@@ -3246,8 +3280,8 @@ def reviewer_brief(pr, config, since=None, blockers=False):
         "`git grep -n <pattern> HEAD`, which reads the commit rather than "
         "the files, so it searches `.claude/` too and no denied path can "
         "fail it. `grep -rn --exclude-dir=.claude`, `git ls-files` and `ls` "
-        "also work through Bash. `sed`, `awk`, "
-        "`find` and every interpreter, `python3` among them, are denied, so "
+        "also work through Bash. `sed`, `awk`, `find`, `jq` and every "
+        "interpreter, `python3` among them, are refused, so "
         "reaching for one costs a turn and returns nothing. Only the allowed "
         "commands and Claude Code's read-only set run at all: any option "
         "before the git subcommand (`-C <dir>`, `--no-pager`, `-c ...`), "
@@ -6297,9 +6331,10 @@ def review(path, repo, pr, config, env, tokens, resent=False, check=None,
     # attacker-authored branch publishes what it is told to — finding text
     # goes to the pull request verbatim. Measured end to end with a fake
     # token: `env | grep GH_TOKEN` printed the value and the model quoted
-    # it back. SANDBOX_RULES pins that key false now, so `env` is refused
-    # again; the strip stays as the second wall, because an allowed
-    # command with a flag nobody measured could print the environment too.
+    # it back. SANDBOX_RULES pins that key false now, and `printenv PATH`
+    # is refused under it (measured; bare `env` was not re-measured); the
+    # strip stays as the second wall, because an allowed command with a
+    # flag nobody measured could print the environment too.
     #
     # Nothing is lost by removing it. The reviewer has no network, so
     # `gh` cannot reach GitHub whatever credential it holds, and the git
