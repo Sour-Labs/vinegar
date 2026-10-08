@@ -1027,6 +1027,29 @@ MUTATIONS = [
      "        ((name, wanted) for name, wanted, _ in SANDBOX_RULES\n"
      '         if name != "autoAllowBashIfSandboxed"),\n'
      '        filesystem={"denyWrite": denied},'),
+    # The same key filtered out of the triage stanza alone, so that the
+    # severity-pass check is the one that notices; severity-sandboxed above
+    # is killed by the enabled check first.
+    ("severity-sends-auto-allow-pin",
+     '    "sandbox": dict(\n'
+     "        ((name, wanted) for name, wanted, _ in SANDBOX_RULES),",
+     '    "sandbox": dict(\n'
+     "        ((name, wanted) for name, wanted, _ in SANDBOX_RULES\n"
+     '         if name != "autoAllowBashIfSandboxed"),'),
+    # The allow entries that would hand Bash back: the check, and the
+    # reading of the other spelling Claude Code accepts.
+    ("allow-never-checked",
+     "        why = dict(ALLOW_NEVER).get(allow_canonical(rule))\n"
+     "        if why:",
+     "        why = None\n"
+     "        if why:"),
+    ("allow-never-other-spelling",
+     '    if rule == "Bash(*)":\n'
+     '        return "Bash"\n'
+     '    if rule.startswith("Bash(") and rule.endswith(" *)"):\n'
+     '        return rule[:-3] + ":*)"\n'
+     "    return rule",
+     "    return rule"),
     # Measured: with the sandbox on and no `filesystem` stanza, a
     # permitted Write reached `$HOME`. These are the paths that cannot be
     # recovered from.
@@ -1656,7 +1679,8 @@ MUTATIONS = [
     # says so.
     ("brief-says-what-the-allow-list-refuses",
      '        "reaching for one costs a turn and returns nothing. Only the allowed "\n'
-     '        "commands and Claude Code\'s read-only set run at all: `git -C <dir>`, "\n'
+     '        "commands and Claude Code\'s read-only set run at all: any option "\n'
+     '        "before the git subcommand (`-C <dir>`, `--no-pager`, `-c ...`), "\n'
      '        "a `cd` before a git command, an unquoted glob after `git grep` and "\n'
      '        "a context count written `-A12` are each refused, so quote globs as "\n'
      '        "`-- \'*.kt\'`, write `-A 12`, and run git from "\n'

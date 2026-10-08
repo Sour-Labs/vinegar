@@ -58,11 +58,12 @@ DENY_HOME = "Read(//**/.vinegar/**)"
 # branch could then read `~/.ssh/id_ed25519` and quote it into a finding
 # Vinegar publishes on a public pull request.
 #
-# These, and the command denies in DENY_COMMANDS below, and not the rest
-# of the file. The allow list is meant to be tuned, and the write denials
-# are backed by the sandbox now; what cannot be recovered from is a
-# credential read, because the finding carrying it is already public by
-# the time anyone notices.
+# These, the command denies in DENY_COMMANDS below and the four allow
+# entries ALLOW_NEVER refuses, and not the rest of the file. The allow
+# list is otherwise meant to be tuned, and the write denials are backed
+# by the sandbox now; what cannot be recovered from is a credential read,
+# because the finding carrying it is already public by the time anyone
+# notices.
 #
 # Every one of these binds Bash as well as Read. Claude Code merges Read
 # deny rules into the sandbox, so `cat`, `grep -r` and `git` get
@@ -134,8 +135,9 @@ DENY_ALWAYS = (
 # `GIT_EXTERNAL_DIFF=./x.sh git diff` and a `git -c alias` wrapper.
 # Measured again the same day with autoAllowBashIfSandboxed false: every
 # spelling that had run came back "This command requires approval", so
-# the allow list is the boundary and this list is defence in depth behind
-# it. Whether a sandboxed command can unlock a keychain item from a
+# the allow list, with Claude Code's reading of each command, is the
+# boundary and this list is defence in depth behind it. Whether a
+# sandboxed command can unlock a keychain item from a
 # headless launchd session is not measured either way. The denies are
 # right regardless: nothing a review needs talks to any of these.
 DENY_COMMANDS = (
@@ -211,6 +213,38 @@ def denied_by(path, homes):
 # every rule above without touching one of them. Absent is the same as
 # "default"; anything else is refused.
 PERMISSION_MODE = "default"
+
+# The allow entries that would make Bash arbitrary again whatever else the
+# file says, refused by name now that the allow list gates Bash. The list
+# is meant to be tuned, and a reviewer losing turns to `-A12` invites the
+# obvious fix: an operator adds `Bash(git grep:*)`, a prefix rule that
+# cannot see `-O<cmd>`, and the script hazard the read-only analysis
+# refuses is open again with nothing saying so. These four are the ones
+# the README argues against by name; the rest of the list is the
+# operator's to shape. `Bash(*)` and `Bash(git *)` are the same rules in
+# the other spelling Claude Code accepts, and allow_canonical() reads them
+# as such.
+ALLOW_NEVER = (
+    ("Bash", "allows every command"),
+    ("Bash(git:*)", "is arbitrary command execution: `git -c alias.x='!cmd' x` "
+     "runs a shell"),
+    ("Bash(gh:*)", "lets a review approve and merge the pull request it is "
+     "reviewing, and read any private repository the token can see"),
+    ("Bash(git grep:*)", "cannot see `-O<cmd>`, which runs a command on each "
+     "match; the plain form needs no rule, since Claude Code's read-only "
+     "set runs it"),
+)
+
+
+def allow_canonical(rule):
+    """`Bash(*)` and `Bash(git *)` as ALLOW_NEVER spells them, `Bash` and
+    `Bash(git:*)`. Claude Code reads each pair as one rule."""
+    if rule == "Bash(*)":
+        return "Bash"
+    if rule.startswith("Bash(") and rule.endswith(" *)"):
+        return rule[:-3] + ":*)"
+    return rule
+
 
 # What the sandbox stanza in review-settings.json must say, and why each
 # part of it carries weight. The allow list names subcommands and cannot
@@ -2087,6 +2121,17 @@ def load_settings():
             "told to report through a tool it cannot call, and every review "
             "would come back as prose with no findings. Add %s to "
             "permissions.allow." % (REPORT_TOOL, REPORT_TOOL))
+    # And the entries that would hand Bash back whatever else the file
+    # says. ALLOW_NEVER says why each is there.
+    for rule in allowed:
+        if not isinstance(rule, str):
+            continue
+        why = dict(ALLOW_NEVER).get(allow_canonical(rule))
+        if why:
+            sys.exit(
+                "review-settings.json allows %s, which %s. The allow list "
+                "gates Bash now, so this one entry would undo it. Remove it "
+                "from permissions.allow." % (rule, why))
     # And the rule check_paths' two path checks spend thirty lines reasoning
     # about. They confirm HOME sits where the glob covers; nothing
     # confirmed the glob was still there. Dropped or mistyped while
@@ -2106,9 +2151,9 @@ def load_settings():
     for rule in DENY_COMMANDS:
         if rule not in denied:
             sys.exit(
-                "review-settings.json must deny %s. With the sandbox on, "
-                "only the deny list stops a command, and DENY_COMMANDS in "
-                "vinegar.py says why this one is there. Add it to "
+                "review-settings.json must deny %s. The deny list is the "
+                "defence in depth behind the allow list, and DENY_COMMANDS "
+                "in vinegar.py says why this one is there. Add it to "
                 "permissions.deny." % rule)
     # And the word that would make every rule above decorative.
     mode = permissions.get("defaultMode", PERMISSION_MODE)
@@ -3204,7 +3249,8 @@ def reviewer_brief(pr, config, since=None, blockers=False):
         "also work through Bash. `sed`, `awk`, "
         "`find` and every interpreter, `python3` among them, are denied, so "
         "reaching for one costs a turn and returns nothing. Only the allowed "
-        "commands and Claude Code's read-only set run at all: `git -C <dir>`, "
+        "commands and Claude Code's read-only set run at all: any option "
+        "before the git subcommand (`-C <dir>`, `--no-pager`, `-c ...`), "
         "a `cd` before a git command, an unquoted glob after `git grep` and "
         "a context count written `-A12` are each refused, so quote globs as "
         "`-- '*.kt'`, write `-A 12`, and run git from "
@@ -6246,13 +6292,14 @@ def review(path, repo, pr, config, env, tokens, resent=False, check=None,
     # used, so it carries the App installation token, and at the time the
     # sandbox approved every command on sight (autoAllowBashIfSandboxed
     # was unset, so true): measured, `env` was refused without the sandbox
-    # and ran with it, with nothing in `permission_denials`. SANDBOX_RULES
-    # pins that key false now, and the strip stays as the second wall. So
-    # the reviewer could print the token, and a
-    # reviewer reading an attacker-authored branch publishes what it is
-    # told to — finding text goes to the pull request verbatim. Measured
-    # end to end with a fake token: `env | grep GH_TOKEN` printed the
-    # value and the model quoted it back.
+    # and ran with it, with nothing in `permission_denials`. So the
+    # reviewer could print the token, and a reviewer reading an
+    # attacker-authored branch publishes what it is told to — finding text
+    # goes to the pull request verbatim. Measured end to end with a fake
+    # token: `env | grep GH_TOKEN` printed the value and the model quoted
+    # it back. SANDBOX_RULES pins that key false now, so `env` is refused
+    # again; the strip stays as the second wall, because an allowed
+    # command with a flag nobody measured could print the environment too.
     #
     # Nothing is lost by removing it. The reviewer has no network, so
     # `gh` cannot reach GitHub whatever credential it holds, and the git

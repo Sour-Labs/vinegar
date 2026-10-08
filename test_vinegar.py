@@ -2604,9 +2604,9 @@ check("a missing private-key deny rule refuses to start",
 # key's rule used to be checked, out of 47 in the file, so deleting the
 # ssh or gh-config rule while editing left every check passing and a
 # review able to quote `~/.ssh/id_ed25519` into a published finding.
-# And every command deny in DENY_COMMANDS: with the sandbox on the allow
-# list no longer gates Bash, so the deny list is all that stands between a
-# reviewer reading an attacker's branch and `gh auth token`.
+# And every command deny in DENY_COMMANDS: the allow list gates Bash again
+# since autoAllowBashIfSandboxed was pinned false, and these are the defence
+# in depth behind it for the spellings a prefix rule misses.
 # Both tuples spelled out rather than read off the constants, so that
 # dropping a name from a constant is a check that fails and not a check
 # that is skipped. Every rule in each, except DENY_HOME, which the check
@@ -2821,6 +2821,28 @@ for _label, _stanza in (("nulls the filesystem", dict(_good, filesystem=None)),
 _sent = _built_with(_good)["sandbox"]
 check("the settings sent make the allow list gate Bash",
       _sent.get("autoAllowBashIfSandboxed") is False, json.dumps(_sent))
+# With the allow list gating Bash, a few entries would hand it back whatever
+# else the file says, and the obvious fix for a reviewer losing turns to
+# `-A12` is one of them: `Bash(git grep:*)` cannot see `-O<cmd>`. Each is
+# refused by name, in both spellings Claude Code accepts, and the shipped
+# file still starts (the check above this section).
+_never = {"deny": list(vinegar.DENY_ALWAYS + vinegar.DENY_COMMANDS)}
+for _rule, _ in vinegar.ALLOW_NEVER:
+    _said = _sending(_good, permissions=dict(
+        _never, allow=[vinegar.REPORT_TOOL, _rule]))
+    check("allowing %s refuses to start" % _rule,
+          "allows %s" % _rule in _said, _said)
+for _spelt in ("Bash(*)", "Bash(git *)", "Bash(gh *)", "Bash(git grep *)"):
+    _said = _sending(_good, permissions=dict(
+        _never, allow=[vinegar.REPORT_TOOL, _spelt]))
+    check("allowing %s, the other spelling, refuses to start" % _spelt,
+          "allows %s" % _spelt in _said, _said)
+# A neighbour of a refused entry is not refused: the subcommand rules the
+# file ships, and a `git grep` rule narrowed to a file, are the operator's.
+for _ok in ("Bash(git diff:*)", "Bash(gh pr view:*)", "Bash(git grep -n x HEAD)"):
+    _said = _sending(_good, permissions=dict(
+        _never, allow=[vinegar.REPORT_TOOL, _ok]))
+    check("allowing %s still starts" % _ok, _said == "sent", _said)
 # Every key that can turn confinement off is set here, so one left in the
 # file cannot ride along beside four keys that still read true, true,
 # false, false. Checking only the top level accepted a `filesystem.allowWrite`,
@@ -4476,13 +4498,15 @@ check("a first review's brief is left exactly as it was measured working",
       "refs/heads/release-2...HEAD` is the review scope" in brief
       and "re-review" not in brief, brief)
 # With the allow list gating Bash again, four shapes reviews had used are
-# refused, each costing a turn the reviewer cannot see coming: `git -C`, a
-# `cd` before git, an unquoted glob after `git grep`, and a context count
-# written `-A12` (measured 2026-10-07 on 2.1.285: the quoted glob and `-A 12`
-# ran where the bare glob and `-A12` did not; two dry-run reviews lost two
-# commands to the last).
+# refused, each costing a turn the reviewer cannot see coming: any option
+# before the git subcommand (`-C`, `--no-pager`, `-c`), a `cd` before git,
+# an unquoted glob after `git grep`, and a context count written `-A12`
+# (measured 2026-10-07 on 2.1.285: the quoted glob and `-A 12` ran where
+# the bare glob and `-A12` did not; two dry-run reviews lost two commands
+# to the last).
 check("the brief names the shapes the allow list refuses",
-      "`git -C <dir>`" in brief and "`cd` before a git command" in brief
+      "any option before the git subcommand" in brief
+      and "`cd` before a git command" in brief
       and "quote globs as `-- '*.kt'`" in brief and "write `-A 12`" in brief,
       brief)
 # checkout() carries on when the base refresh fails, so a clone can hold
