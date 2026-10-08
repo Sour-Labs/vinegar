@@ -1347,14 +1347,14 @@ MUTATIONS = [
      '        return {"repo": repo, "id": mine[0], "closed": False}',
      "    if False:\n        pass"),
     ("check-ignores-another-apps",
-     '            if str((was.get("app") or {}).get("id"))\n'
-     '            == str(config["github_app"].get("app_id")) and was.get("id")\n'
-     '            and str(was.get("external_id") or DEPLOYMENT) == DEPLOYMENT]',
-     "            if was.get(\"id\")]"),
+     '                if str((was.get("app") or {}).get("id"))\n'
+     '                == str(config["github_app"].get("app_id")) and was.get("id")\n'
+     '                and str(was.get("external_id") or DEPLOYMENT) == DEPLOYMENT]',
+     "                if was.get(\"id\")]"),
     # A handle with no id would PATCH `check-runs/None` on every ending.
     ("check-handle-needs-an-id",
      '    return {"repo": repo, "id": made["id"], "closed": False} \\\n'
-     "        if made and made.get(\"id\") else None",
+     "        if isinstance(made, dict) and made.get(\"id\") else None",
      '    return {"repo": repo, "id": (made or {}).get("id"),\n'
      '            "closed": False}'),
     # A handle holding a token is one log line from publishing it.
@@ -1416,10 +1416,10 @@ MUTATIONS = [
      '    check["closed"] = settled is not None',
      '    check["closed"] = True'),
     ("check-reuse-needs-an-id",
-     '            == str(config["github_app"].get("app_id")) and was.get("id")\n'
-     '            and str(was.get("external_id") or DEPLOYMENT) == DEPLOYMENT]',
-     '            == str(config["github_app"].get("app_id"))\n'
-     '            and str(was.get("external_id") or DEPLOYMENT) == DEPLOYMENT]'),
+     '                == str(config["github_app"].get("app_id")) and was.get("id")\n'
+     '                and str(was.get("external_id") or DEPLOYMENT) == DEPLOYMENT]',
+     '                == str(config["github_app"].get("app_id"))\n'
+     '                and str(was.get("external_id") or DEPLOYMENT) == DEPLOYMENT]'),
     ("check-body-matches-the-flag",
      "    body = json.dumps(payload) if payload is not None else None",
      "    body = json.dumps(payload) if payload else None"),
@@ -1454,12 +1454,12 @@ MUTATIONS = [
     # app_jwt signs with str(app_id), so a quoted one mints and matched
     # nothing here.
     ("check-app-id-compared-as-strings",
-     '            if str((was.get("app") or {}).get("id"))\n'
-     '            == str(config["github_app"].get("app_id")) and was.get("id")\n'
-     '            and str(was.get("external_id") or DEPLOYMENT) == DEPLOYMENT]',
-     '            if (was.get("app") or {}).get("id")\n'
-     '            == config["github_app"].get("app_id") and was.get("id")\n'
-     '            and str(was.get("external_id") or DEPLOYMENT) == DEPLOYMENT]'),
+     '                if str((was.get("app") or {}).get("id"))\n'
+     '                == str(config["github_app"].get("app_id")) and was.get("id")\n'
+     '                and str(was.get("external_id") or DEPLOYMENT) == DEPLOYMENT]',
+     '                if (was.get("app") or {}).get("id")\n'
+     '                == config["github_app"].get("app_id") and was.get("id")\n'
+     '                and str(was.get("external_id") or DEPLOYMENT) == DEPLOYMENT]'),
     # Opening it is the one call here that parses a reply GitHub sent.
     ("check-opened-inside-the-try",
      "        check = open_check(key, repo, pr, config,\n"
@@ -2279,14 +2279,25 @@ MUTATIONS = [
     # A run with no stamp refused rather than adopted, which strands
     # every run open at the moment of the upgrade.
     ("check-run-legacy-stamp-refused",
-     '            and str(was.get("external_id") or DEPLOYMENT) == DEPLOYMENT]',
-     '            and str(was.get("external_id")) == DEPLOYMENT]'),
+     '                and str(was.get("external_id") or DEPLOYMENT) == DEPLOYMENT]',
+     '                and str(was.get("external_id")) == DEPLOYMENT]'),
     # And the answer that makes that distinction possible at all.
     ("running-checks-hides-a-failed-read",
      "    if said is None:\n"
      "        return None\n"
-     '    return [was for was in said.get("check_runs") or []',
-     '    return [was for was in (said or {}).get("check_runs") or []'),
+     "    # A 2xx of the wrong shape counts as unanswered rather than raising.",
+     "    if said is None:\n"
+     "        return []\n"
+     "    # A 2xx of the wrong shape counts as unanswered rather than raising."),
+    # The parse is the one place on this path that could still raise.
+    ("check-listing-shape-is-not-a-raise",
+     "    except Exception as err:\n"
+     '        log("%s: the check runs listing was not the shape expected, so it "',
+     "    except ZeroDivisionError as err:\n"
+     '        log("%s: the check runs listing was not the shape expected, so it "'),
+    ("check-create-shape-is-not-a-raise",
+     '        if isinstance(made, dict) and made.get("id") else None',
+     '        if made and made.get("id") else None'),
     # `failure` makes the stuck merge the outcome rather than the thing
     # being repaired, on a check that read nothing and reported nothing.
     ("sweep-closes-as-a-failure",

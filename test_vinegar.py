@@ -1614,6 +1614,32 @@ check("a create that answers without an id leaves no handle",
       _opened(check_rc=0, check_made={"no": "id"}) is None, checked)
 _opened(check_made={"id": 4242})
 
+
+# A 2xx of the wrong shape. The body is GitHub's to shape, and a listing
+# that is not an object, or holds a run that is not one, raised out of
+# our_checks() and past open_check(): handle_pr had FAILED on disk for a
+# review that never ran, and three polls later the give-up posted on every
+# open pull request in the repository, because the same endpoint answers
+# for all of them. The exception is kept rather than let through, because
+# a check that raises aborts the run and reports nothing.
+def _opened_or_err(**stub):
+    """What open_check answered, or the exception it must not raise."""
+    try:
+        return _opened(**stub)
+    except Exception as err:
+        return err
+
+
+for _shape in ([], "ok", {"check_runs": ["junk"]}, {"check_runs": [7]}):
+    _odd = _opened_or_err(check_open=_shape)
+    check("a listing of the wrong shape adopts nothing and opens one: %r"
+          % (_shape,), isinstance(_odd, dict) and _odd["id"] == 4242, _odd)
+fake_run.check_open = {"check_runs": []}
+_odd = _opened_or_err(check_made=[4242])
+check("a create reply of the wrong shape is no handle, not a raise",
+      _odd is None, _odd)
+fake_run.check_made = {"id": 4242}
+
 # Closing. Only finish() names a conclusion. The sweep and both backstops
 # close with the default, and a failing check is a merge gate wherever it
 # is required, so a close that names none must never fail.
@@ -4720,6 +4746,19 @@ _order = [how for how, _, _ in checked]
 check("the indicator is opened before the review runs",
       "REVIEW" in _order and _order.index("REVIEW") > 0
       and _order[0] in ("GET", "POST"), _order)
+# The ending the audit reproduced: a listing of the wrong shape raised out
+# of open_check before the review, with FAILED already on disk, and three
+# polls of that gave up on a pull request nobody had reviewed. The review
+# must run, and the exception is kept for the same reason as above.
+fake_run.check_open = []
+try:
+    _indicator_after(vinegar.DONE, 0)
+    _odd_ran = "REVIEW" in [how for how, _, _ in checked]
+except Exception as err:
+    _odd_ran = err
+fake_run.check_open = {"check_runs": []}
+check("a listing of the wrong shape does not stop the review",
+      _odd_ran is True, _odd_ran)
 
 # The end of handle_pr is reachable only when nothing goes wrong, which is
 # why the close is in a finally. save_state on a full disk is the failure
