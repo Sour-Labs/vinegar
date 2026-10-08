@@ -5001,10 +5001,23 @@ def our_checks(label, repo, sha, config, env, status):
     # request on every start.
     if said is None:
         return None
-    return [was for was in said.get("check_runs") or []
-            if str((was.get("app") or {}).get("id"))
-            == str(config["github_app"].get("app_id")) and was.get("id")
-            and str(was.get("external_id") or DEPLOYMENT) == DEPLOYMENT]
+    # A 2xx of the wrong shape counts as unanswered rather than raising.
+    # The body is GitHub's to shape, and a listing that is not an object,
+    # or a run in it that is not one, raised out of this comprehension
+    # and past open_check(): handle_pr had FAILED on disk for a review
+    # that never ran, and three polls of that posted the give-up, on
+    # every open pull request in the repository, since this endpoint
+    # answers for all of them. check_api() promises that nothing on this
+    # path is worth a review; this keeps the promise for the parse.
+    try:
+        return [was for was in said.get("check_runs") or []
+                if str((was.get("app") or {}).get("id"))
+                == str(config["github_app"].get("app_id")) and was.get("id")
+                and str(was.get("external_id") or DEPLOYMENT) == DEPLOYMENT]
+    except Exception as err:
+        log("%s: the check runs listing was not the shape expected, so it "
+            "counts as unanswered: %s" % (label, err))
+        return None
 
 
 def open_check(label, repo, pr, config, env, blockers=False):
@@ -5068,9 +5081,11 @@ def open_check(label, repo, pr, config, env, blockers=False):
         asked["details_url"] = pr["url"]
     made = check_api(label, repo, "check-runs", "POST", asked, env)
     # An id or nothing. A handle without one cannot be closed, and
-    # pretending otherwise would send a PATCH to `check-runs/None`.
+    # pretending otherwise would send a PATCH to `check-runs/None`. A
+    # reply that is not an object has no id either, and asked for one it
+    # raised, with the same ending our_checks() describes.
     return {"repo": repo, "id": made["id"], "closed": False} \
-        if made and made.get("id") else None
+        if isinstance(made, dict) and made.get("id") else None
 
 
 def ended_title(outcome, attempts=0):
