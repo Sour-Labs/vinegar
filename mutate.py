@@ -1012,6 +1012,49 @@ MUTATIONS = [
      "        ((name, wanted) for name, wanted, _ in SANDBOX_RULES),",
      '    "sandbox": dict(\n'
      '        (("enabled", False), ("failIfUnavailable", False)),'),
+    # The fourth sandbox key, the one that makes the allow list gate Bash.
+    # Not mutated in the tuple itself: flipping or dropping the entry makes
+    # the shipped file invalid, so the first unguarded settings read exits
+    # the suite and the run comes back ABORTED whatever the checks say.
+    # Instead the guard is made to skip that one key, in the check and in
+    # the stanza sent, which only the auto-allow checks can notice.
+    ("sandbox-auto-allow-pin-checked",
+     "        if sandbox.get(name) is not wanted:",
+     '        if name != "autoAllowBashIfSandboxed" and sandbox.get(name) is not wanted:'),
+    ("sandbox-auto-allow-sent",
+     "        ((name, wanted) for name, wanted, _ in SANDBOX_RULES),\n"
+     '        filesystem={"denyWrite": denied},',
+     "        ((name, wanted) for name, wanted, _ in SANDBOX_RULES\n"
+     '         if name != "autoAllowBashIfSandboxed"),\n'
+     '        filesystem={"denyWrite": denied},'),
+    # The same key filtered out of the triage stanza alone, so that the
+    # severity-pass check is the one that notices; severity-sandboxed above
+    # is killed by the enabled check first.
+    ("severity-sends-auto-allow-pin",
+     '    "sandbox": dict(\n'
+     "        ((name, wanted) for name, wanted, _ in SANDBOX_RULES),",
+     '    "sandbox": dict(\n'
+     "        ((name, wanted) for name, wanted, _ in SANDBOX_RULES\n"
+     '         if name != "autoAllowBashIfSandboxed"),'),
+    # The allow entries that would hand Bash back: the check itself, then
+    # each way of spelling the same grant, one clause at a time.
+    ("allow-never-checked",
+     "        why = never_allowed(rule) if isinstance(rule, str) else None",
+     "        why = None"),
+    ("allow-never-colon-form",
+     '    if literal.endswith(":"):\n'
+     "        literal = literal[:-1]\n",
+     ""),
+    ("allow-never-shorter-prefix",
+     "        if (literal == name or name.startswith(literal)\n",
+     "        if (literal == name\n"),
+    ("allow-never-global-option",
+     '                or literal.startswith(name + " -")):',
+     "                ):"),
+    ("allow-never-exact-rule-is-anyones",
+     '    if "*" not in pattern:\n'
+     "        return None\n",
+     ""),
     # Measured: with the sandbox on and no `filesystem` stanza, a
     # permitted Write reached `$HOME`. These are the paths that cannot be
     # recovered from.
@@ -1630,10 +1673,24 @@ MUTATIONS = [
      '        "`git grep -n <pattern> HEAD`, which reads the commit rather than "\n'
      '        "the files, so it searches `.claude/` too and no denied path can "\n'
      '        "fail it. `grep -rn --exclude-dir=.claude`, `git ls-files` and `ls` "\n'
-     '        "also work through Bash. `sed`, `awk`, "\n'
-     '        "`find` and every interpreter, `python3` among them, are denied, so "\n'
-     '        "reaching for one costs a turn and returns nothing. You cannot run "',
-     '        "it. You cannot run "'),
+     '        "also work through Bash. `sed`, `awk`, `find`, `jq` and every "\n'
+     '        "interpreter, `python3` among them, are refused, so "\n'
+     '        "reaching for one costs a turn and returns nothing. Only the allowed "',
+     '        "it. Only the allowed "'),
+    # With autoAllowBashIfSandboxed false, four shapes reviews had used are
+    # refused (measured 2026-10-07): a global option before the git
+    # subcommand, a cd before git, an unquoted glob after git grep, and a
+    # context count written `-A12`. Each costs a turn unless the brief
+    # says so.
+    ("brief-says-what-the-allow-list-refuses",
+     '        "reaching for one costs a turn and returns nothing. Only the allowed "\n'
+     '        "commands and Claude Code\'s read-only set run at all: any option "\n'
+     '        "before the git subcommand (`-C <dir>`, `--no-pager`, `-c ...`), "\n'
+     '        "a `cd` before a git command, an unquoted glob after `git grep` and "\n'
+     '        "a context count written `-A12` are each refused, so quote globs as "\n'
+     '        "`-- \'*.kt\'`, write `-A 12`, and run git from "\n'
+     '        "the checkout root. You cannot run "',
+     '        "reaching for one costs a turn and returns nothing. You cannot run "'),
     # And only tools it has: 2.1.285 has no Grep or Glob tool, and `rg` is
     # not installed in the reviewer's shell.
     ("brief-names-no-grep-tool",
@@ -1655,9 +1712,9 @@ MUTATIONS = [
     # Separate, because it is a different failure: told only which commands
     # are denied, a reviewer plans a review around running the tests.
     ("brief-says-the-code-cannot-be-run",
-     '        "reaching for one costs a turn and returns nothing. You cannot run "\n'
+     '        "the checkout root. You cannot run "\n'
      '        "this repository\'s tests or any of its code. Files under "',
-     '        "reaching for one costs a turn and returns nothing. Files under "'),
+     '        "the checkout root. Files under "'),
     # Claude Code makes a `.claude/` in the checkout and it is read-denied;
     # git still reads a tracked file there.
     ("brief-reads-dot-claude-through-git",

@@ -693,19 +693,52 @@ request is attacker-controlled.
 denies writing and editing files, fetching the web, the shells and
 interpreters it names, and anything that changes state.
 
-**Denials bind; the allow list does not, once the sandbox is on.** Measured on
-2.1.221: `env` is refused without the sandbox and runs with it, recorded in
-neither case as anything but a denial in the first. Turning the sandbox on
-means Claude Code approves sandboxed Bash rather than gating it on the allow
-list, so a command that is neither allowed nor denied — `date`, `env`,
-`printenv` — now runs. Read that list as what a review is *expected* to need,
-and the deny list plus the sandbox as what actually stops it. Nothing the
-reviewer can run reaches the network or writes outside a temporary directory,
-and it is handed no credential (see below), which is what the confinement now
-rests on.
+**The allow list gates Bash because `autoAllowBashIfSandboxed` is pinned
+false.** Claude Code's default, once the sandbox is on, is to approve every
+sandboxed command on sight and gate nothing on the allow list: measured on
+2.1.221, `env` was refused without the sandbox and ran with it, recorded as a
+denial only in the first case. With the key false a sandboxed command goes
+through the regular permission flow, which in a `-p` run refuses whatever the
+allow list and Claude Code's built-in read-only set (`ls`, `cat`, `echo`, `cd`,
+`grep`, `head`, `tail`, `wc`, `which`, `diff`, `tr` and the read-only forms of
+`git`, among others) do not cover. Measured on 2.1.285 with harmless probes:
+`printenv PATH` ran with the key unset and came back "This command requires
+approval" with it false, while `date`, `git grep -n <pattern> HEAD`,
+`echo ===== && git grep ...` and `cat notes.txt | wc -l` ran either way. Four
+shapes reviews had used are refused too, each costing the reviewer a turn:
+any option before the git subcommand (`git -C <dir>`, `git --no-pager`,
+`git -c ...`), a `cd` before a git command, an unquoted glob after `git grep`
+(`-- *.kt`; the quoted `-- '*.kt'` runs), and a context count written
+attached (`git grep -A12`; `-A 12` runs). Two dry-run reviews of large pull
+requests under this file completed with the usual number of findings and
+lost two commands to the last shape, which the brief now names.
+`SANDBOX_RULES` pins the key like the other three, so Vinegar refuses to start
+when the file drops it.
 
-That is also why the deny list names the macOS tools a review has no use
-for. The `gh` login and the Claude login on a Mac live in the login keychain,
+An allow rule still cannot see flags, so the boundary is the allow list
+together with Claude Code's reading of each command, and the list should
+name only commands whose flags cannot run a program; keeping reads inside
+the checkout is the job of the read denies, which the kernel enforces, not
+of the list. Measured on 2.1.285: with `Bash(sort:*)` in the list,
+`sort --compress-program=./x.sh big.txt` was approved, and with `Bash(jq:*)`,
+`jq -n env` printed the daemon's environment; without those rules both came
+back "requires approval", and plain `sort` still ran through the read-only
+set. So neither is allowed, and nor is `rg`, which is not installed in the
+reviewer's shell. The `gh` entries carry `--web`, which runs a browser, and
+`--jq`, which is a jq; both sit behind a `gh` that has no network and were
+not measured. A few entries would make Bash arbitrary again whatever else
+the file says, and `load_settings()` refuses them: a bare `Bash`, `git`,
+`gh` and `git grep`, in any spelling of the wildcard, as a shorter prefix
+(`Bash(g*)`), or followed by an option (`Bash(git -C:*)`,
+`Bash(git grep -n:*)`), because `git grep -O<cmd>` runs a command while the
+plain form needs no rule. A `git grep` rule that fixes the pattern is fine:
+git reads options before the pattern only, so no `-O` can follow it.
+The deny list and the sandbox stay behind all of it: nothing the reviewer can
+run reaches the network or writes outside a temporary directory, and it is
+handed no credential (see below).
+
+The deny list also names the macOS tools a review has no use for, as defence
+in depth. The `gh` login and the Claude login on a Mac live in the login keychain,
 not in a file, so no read deny covers them: `gh auth token` prints the first,
 `git credential fill` runs whatever helper the host's git names, which on a
 Mac is the osxkeychain one, and `security find-generic-password -w` prints
@@ -732,9 +765,10 @@ sandbox cache write); a script committed to the checkout that calls
 rev-parse` ran, so a global option before the subcommand defeats any `git
 <subcommand>` deny. Claude Code's own analyser refused `env security ...`,
 `source ./x.sh`, `GIT_EXTERNAL_DIFF=./x.sh git diff` and a `git -c alias`
-wrapper. The boundary that closes the whole class is the allow list gating
-Bash again, `autoAllowBashIfSandboxed` set to false, which is issue #51.
-Until then, read this list as defence in depth.
+wrapper. Measured again the same day with `autoAllowBashIfSandboxed` false:
+every spelling that had run came back "This command requires approval". The
+allow list, with Claude Code's reading of each command, is the boundary; read
+this list as defence in depth behind it.
 
 The same file turns on Claude Code's sandbox, which is what actually confines
 writes. The permission rules cannot: they match the start of a command and
@@ -849,7 +883,10 @@ not: the finding carrying a private key is already published by the time
 anyone reads it. `permissions.defaultMode` is pinned for
 the same reason: `bypassPermissions` ignores the allow and deny lists
 entirely, so one word there would undo every rule in the file without touching
-one of them. The allow list itself is meant to be tuned and is not pinned.
+one of them. The allow list itself is meant to be tuned and is not pinned,
+apart from the entries `load_settings()` refuses because each would make Bash
+arbitrary again: a bare `Bash`, and a wildcard on `git`, `gh` or `git grep`,
+on a shorter prefix of one of them, or on one of them followed by an option.
 
 That is why clones live in `~/.vinegar-checkouts/` rather than under
 `~/.vinegar`, `~/src` or `~/Library`. A blanket deny on a directory catches
@@ -891,7 +928,8 @@ operating system level rather than by pattern:
 "sandbox": {
   "enabled": true,
   "failIfUnavailable": true,
-  "allowUnsandboxedCommands": false
+  "allowUnsandboxedCommands": false,
+  "autoAllowBashIfSandboxed": false
 }
 ```
 
@@ -910,7 +948,7 @@ per review rather than per boot.
 The file keeps its own copy of the stanza because it is what you read to learn
 what the reviewer may do, and what a hand-run `claude --settings
 review-settings.json` uses. Vinegar refuses to run when the two disagree: the
-three keys above must match, and the stanza may carry nothing else. A
+four keys above must match, and the stanza may carry nothing else. A
 `filesystem.allowWrite` added to unblock a hand-run would leave that hand-run
 genuinely unconfined, and a `network` rule added to tighten things would be
 dropped from what the daemon sends — either way the file would describe
@@ -944,8 +982,8 @@ future release is free to change.
 
 **And the reviewer is handed no GitHub credential.** The environment the
 review inherits is the one `checkout()` used, so it carried the App
-installation token, and with the allow list no longer gating Bash a review
-could simply print it — measured end to end with a fake token: `env | grep
+installation token, and with the sandbox then approving every command on
+sight a review could simply print it — measured end to end with a fake token: `env | grep
 GH_TOKEN` printed the value and the model quoted it straight back, which is
 the text Vinegar publishes on the pull request. `GH_TOKEN` and `GITHUB_TOKEN`
 are stripped from what the reviewer runs under. Nothing is lost: with no
@@ -1018,11 +1056,12 @@ residual risk to hold on to rather than the memory files.
 
 **The login keychain, past the deny.** `security`, `gh auth` and `git
 credential` are denied by name, and so are the other tools listed above. A
-name deny stops the direct spelling only: a case-folded or absolute-path
-spelling, a wrapper like `arch`, a script committed to the branch, or a git
-global option before the subcommand all run, as measured above, and whether
-a sandboxed command can reach a keychain item from a headless launchd session
-is not measured. Read the deny as defence in depth, and issue #51 as the fix.
+name deny stops the direct spelling only; the case-folded, absolute-path,
+wrapped, scripted and `git -C` spellings measured above are stopped by the
+allow list gating Bash and by Claude Code's reading of each command, not by
+the deny. Whether a sandboxed command can
+reach a keychain item from a headless launchd session is not measured. Read
+the deny as defence in depth behind the allow list.
 
 ### So what is the boundary
 

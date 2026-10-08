@@ -26,17 +26,14 @@
       "Bash(gh issue view:*)",
       "Bash(gh issue list:*)",
       "Bash(gh repo view:*)",
-      "Bash(rg:*)",
       "Bash(grep:*)",
       "Bash(ls:*)",
       "Bash(cat:*)",
       "Bash(head:*)",
       "Bash(tail:*)",
       "Bash(wc:*)",
-      "Bash(sort:*)",
       "Bash(uniq:*)",
-      "Bash(cut:*)",
-      "Bash(jq:*)"
+      "Bash(cut:*)"
     ],
     "deny": [
       "Read(//**/.vinegar/**)",
@@ -119,6 +116,7 @@
     "enabled": true,
     "failIfUnavailable": true,
     "allowUnsandboxedCommands": false,
+    "autoAllowBashIfSandboxed": false,
     "filesystem": {
       "denyWrite": [
         "~/.vinegar-checkouts"
