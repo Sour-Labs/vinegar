@@ -8487,13 +8487,15 @@ check("the entry corrected is the finished one at the reviewed commit",
 FULL_EARN = "e" * 40
 
 
-def _resent_entry(sha, whole=True, refuse=False, marker_lines=None):
+def _resent_entry(sha, whole=True, refuse=False, marker_lines=None,
+                  findings=()):
     """handle_pr's entry after resending a saved review of `sha`."""
     at = dict(PR_LIVE, headRefOid=sha)
     vinegar.run = _run_and_tier
     fake_run.rc, fake_run.post_err = 1, "HTTP 500"
-    vinegar.finish(L, "o/r", at, ROOT, "words", [], CONFIG, None, {},
-                   whole=whole)
+    vinegar.finish(L, "o/r", at, ROOT, "words",
+                   None if findings is None else list(findings), CONFIG,
+                   None, {}, whole=whole)
     vinegar.run = fake_run
     marker = vinegar.unposted_path("o/r", at)
     if marker_lines is not None:
@@ -8521,6 +8523,12 @@ _part = _resent_entry(FULL_EARN, whole=False)
 check("a resent partial review does not move it",
       "reviewed_sha" not in _part and _part.get("outcome") == vinegar.DONE,
       _part)
+# deliver()'s rule for `covered`, findings included: a reviewer that
+# reached the end of the scope in prose alone reported nothing.
+_prose = _resent_entry(FULL_EARN, findings=None)
+check("a resent review that reported nothing does not move it",
+      "reviewed_sha" not in _prose and _prose.get("outcome") == vinegar.DONE,
+      _prose)
 _old = _resent_entry(FULL_EARN, marker_lines="%s\n%s\nNo findings\n" % (
     FULL_EARN, vinegar.CHECK_CLEAN))
 check("a marker from before the whole line reads as partial",

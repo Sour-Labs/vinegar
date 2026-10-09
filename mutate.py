@@ -1508,13 +1508,13 @@ MUTATIONS = [
     ("resend-marker-records-the-conclusion",
      '            write_atomic(marker, "%s\\n%s\\n%s\\n%s\\n" % (\n'
      '                pr["headRefOid"], earned, title,\n'
-     '                "whole" if whole else "partial"))',
+     '                "whole" if whole and findings is not None else "partial"))',
      '            write_atomic(marker, "%s\\n" % (\n'
      '                pr["headRefOid"]))'),
     ("resend-marker-records-the-title",
      '            write_atomic(marker, "%s\\n%s\\n%s\\n%s\\n" % (\n'
      '                pr["headRefOid"], earned, title,\n'
-     '                "whole" if whole else "partial"))',
+     '                "whole" if whole and findings is not None else "partial"))',
      '            write_atomic(marker, "%s\\n%s\\n" % (\n'
      '                pr["headRefOid"], earned))'),
     ("resend-earns-red-on-a-blocker",
@@ -2221,8 +2221,11 @@ MUTATIONS = [
      '            if whole and FULL_SHA.match(at["headRefOid"]):',
      '            if FULL_SHA.match(at["headRefOid"]):'),
     ("marker-records-whether-the-review-was-whole",
-     '                "whole" if whole else "partial"))',
+     '                "whole" if whole and findings is not None else "partial"))',
      '                "whole"))'),
+    ("marker-whole-means-findings-too",
+     '                "whole" if whole and findings is not None else "partial"))',
+     '                "whole" if whole else "partial"))'),
     ("marker-whole-line-is-read-not-assumed",
      '            return len(lines) > 3 and lines[3].strip() == "whole"',
      "            return True"),

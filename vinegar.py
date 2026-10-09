@@ -5818,13 +5818,16 @@ def finish(label, repo, pr, path, text, findings, config, env, tokens,
         # that is what repost() needs to know to move `reviewed_sha` when
         # the send lands: reviewed_through() takes `covered`, and a
         # review killed part-way reached the author without covering the
-        # scope. A marker from before this line reads as partial, which
-        # is the safe way to be wrong: one whole re-read, not a narrowed
-        # pass over ground nobody read.
+        # scope. The same rule as deliver()'s `covered`, findings
+        # included: a reviewer that reached the end of the scope in prose
+        # alone reported nothing, and a narrowed pass after it would never
+        # re-read what it only talked about. A marker from before this
+        # line reads as partial, which is the safe way to be wrong: one
+        # whole re-read, not a narrowed pass over ground nobody read.
         try:
             write_atomic(marker, "%s\n%s\n%s\n%s\n" % (
                 pr["headRefOid"], earned, title,
-                "whole" if whole else "partial"))
+                "whole" if whole and findings is not None else "partial"))
         except OSError as err:
             log("%s: the review is saved but cannot be marked for sending "
                 "again: %s" % (label, err))
