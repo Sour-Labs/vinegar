@@ -1456,6 +1456,46 @@ check("an untiered finding reads as it always did",
       vinegar.describe({"summary": "s", "category": "correctness"})
       == "s\n\n(correctness)",
       vinegar.describe({"summary": "s", "category": "correctness"}))
+
+# --- nothing posted under Vinegar's name renders off the branch ----------
+# Measured 2026-10-09 by posting a comment and reading the HTML back: the
+# zero-width space breaks a mention and `&#64;` does not; `\[` stops an
+# image or a link forming but the URL inside still autolinks; `&#58;` in
+# the scheme renders as plain text; a code span renders nothing.
+_LOUD = ("ping @kevin, see ![p](https://x.y/p.png) and [l](https://x.y/l) "
+         "or https://x.y/bare or <img src=https://x.y/t.png>, keep `[x](y)` "
+         "and `@kevin` and ``https://x.y/c`` as they are")
+_quiet = vinegar.quiet(_LOUD)
+check("a mention is broken with a zero-width space",
+      "@\u200bkevin," in _quiet and "ping @kevin" not in _quiet, _quiet)
+check("an image and a link lose their opening bracket",
+      "!\\[p](" in _quiet and "\\[l](" in _quiet and "![p](" not in _quiet,
+      _quiet)
+check("a url loses the colon of its scheme",
+      "https&#58;//x.y/bare" in _quiet and "https://x.y/bare" not in _quiet
+      and "https&#58;//x.y/p.png" in _quiet, _quiet)
+check("an html tag is escaped",
+      "&lt;img src=https&#58;//x.y/t.png>" in _quiet, _quiet)
+check("code spans are left exactly as written",
+      "`[x](y)`" in _quiet and "`@kevin`" in _quiet
+      and "``https://x.y/c``" in _quiet, _quiet)
+check("plain prose is untouched",
+      vinegar.quiet("a < b, nothing here") == "a &lt; b, nothing here"
+      and vinegar.quiet("plain words") == "plain words")
+# Through _described: a tier outside the table must fail the check, not
+# end the run.
+_loud_finding = _described({
+    "summary": "@kevin", "failure_scenario": "see https://x.y/f",
+    "category": "[c](https://x.y/c)", "verdict": "<b>", "tier": "<i>"})
+check("every model-written field of a finding is quieted",
+      "@\u200bkevin" in _loud_finding and "https&#58;//x.y/f" in _loud_finding
+      and "\\[c](https&#58;//x.y/c)" in _loud_finding
+      and "&lt;b>" in _loud_finding and "&lt;i>" in _loud_finding
+      and "@kevin" not in _loud_finding, _loud_finding)
+check("the reviewer's own prose is quieted",
+      "@\u200bkevin" in vinegar.review_body(L, PR, CONFIG, [], [],
+                                            "ask @kevin"),
+      vinegar.review_body(L, PR, CONFIG, [], [], "ask @kevin"))
 check("the tier reaches an inline comment too",
       "\u26aa **note**" in vinegar.split_findings(
           [{"file": "vinegar.py", "line": 12, "summary": "s",
@@ -10815,6 +10855,12 @@ check("the difficulty a note prints is the one the routing used",
           for n in (12, 250, 700, 4000)))
 check("the note carries the model's sentence unchanged",
       "Reworks session refresh." in _plain, _plain)
+_loud_note = vinegar.note_body(
+    _SHAPE_PR, dict(_clear(), changed=1, files=1, difficulty="trivial",
+                    summary="cc @kevin https://x.y/n"), "low", "why")
+check("the note quiets the model's sentence",
+      "@\u200bkevin https&#58;//x.y/n" in _loud_note
+      and "@kevin" not in _loud_note, _loud_note)
 check("the note names the difficulty and what it measured",
       "Difficulty: moderate, 700 lines across 7 files" in _plain, _plain)
 check("a note reaching no domain says so rather than leaving it blank",

@@ -4275,7 +4275,7 @@ def note_body(pr, shaped, effort, why):
     # Only when the model gave one. An empty summary is a missing sentence,
     # not a blank line to pad the comment with.
     if shaped["summary"]:
-        lines += [shaped["summary"], ""]
+        lines += [quiet(shaped["summary"]), ""]
     lines += ["Difficulty: %s, %d lines across %d file%s · Risk: %s" % (
         shaped["difficulty"], shaped["changed"], shaped["files"],
         "" if shaped["files"] == 1 else "s", risk), "",
@@ -4549,6 +4549,46 @@ def finding_bullet(finding):
     return "- `%s`: %s" % (where, body)
 
 
+# What GitHub would render from text the reviewer or the triage model
+# echoed off the branch, and how each is kept as text. Measured on
+# 2026-10-09 by posting a comment and reading its rendered HTML back:
+# `@name` with a zero-width space after the `@` is plain text, while
+# `&#64;name` is still a mention (entities are decoded before mentions are
+# found); `\[` keeps an image or a link from forming, but the URL inside it
+# still autolinks on its own; `https&#58;//` renders as the URL in plain
+# text (autolinks are found before entities are decoded); and nothing
+# inside a code span is rendered at all.
+QUIET_MENTION = re.compile(r"@(?=[A-Za-z0-9])")
+QUIET_SCHEME = re.compile(r"\b([A-Za-z][A-Za-z0-9+.-]*)://")
+CODE_SPAN = re.compile(r"(`+)[\s\S]*?\1")
+
+
+def quiet(text):
+    """`text` with nothing GitHub would render as a mention, link or image.
+
+    Vinegar posts under its own name, and the summary, the findings and
+    the prose quote a branch it does not trust. Left as written, a pull
+    request could have Vinegar ping a maintainer, render a tracking pixel
+    or put a link under its name, and the audit of 2026-10-06 did each
+    with fake inputs. Code spans are left alone: GitHub renders nothing
+    inside them, and they are where the reviewer quotes code.
+    """
+    out, at = [], 0
+    for span in CODE_SPAN.finditer(text):
+        out.append(quiet_run(text[at:span.start()]))
+        out.append(span.group(0))
+        at = span.end()
+    out.append(quiet_run(text[at:]))
+    return "".join(out)
+
+
+def quiet_run(run):
+    """quiet() for a stretch of text with no code span in it."""
+    run = run.replace("[", "\\[").replace("<", "&lt;")
+    run = QUIET_MENTION.sub("@\u200b", run)
+    return QUIET_SCHEME.sub(r"\1&#58;//", run)
+
+
 def describe(finding):
     """A finding as prose, without the file and line that anchor it.
 
@@ -4560,9 +4600,12 @@ def describe(finding):
     # `or ""` rather than a get default, because these keys arrive present
     # and null often enough, and a default only covers a key that is absent.
     # str(None) is "None", which reads as a finding that says None.
-    summary = str(finding.get("summary") or "").strip() or "(no summary)"
-    scenario = str(finding.get("failure_scenario") or "").strip()
-    category = str(finding.get("category") or "").strip()
+    # Each field quieted on its own, so the Markdown this function adds
+    # around them is the only Markdown in the comment.
+    summary = quiet(str(finding.get("summary") or "").strip()) \
+        or "(no summary)"
+    scenario = quiet(str(finding.get("failure_scenario") or "").strip())
+    category = quiet(str(finding.get("category") or "").strip())
     # The tier opens the comment, because that is the whole of what it
     # buys. Every finding renders through here, inline comments and the
     # general list alike, and a reader facing nine or thirteen of them
@@ -4590,14 +4633,14 @@ def describe(finding):
     # The space travels with the dot rather than sitting in the format,
     # which would leave a comment that lost its dot opening on a stray
     # space instead.
-    tier = str(finding.get("tier") or "").strip()
+    tier = quiet(str(finding.get("tier") or "").strip())
     if tier:
         dot = TIER_DOTS.get(tier)
         summary = "%s**%s** · %s" % (dot + " " if dot else "", tier, summary)
     # The verdict rides with the category when the effort level ran a verify
     # pass. CONFIRMED and PLAUSIBLE read very differently, and posting them
     # identically claims a certainty the reviewer did not.
-    verdict = str(finding.get("verdict") or "").strip()
+    verdict = quiet(str(finding.get("verdict") or "").strip())
     body = "%s\n\nFailure: %s" % (summary, scenario) if scenario else summary
     tags = ", ".join(part for part in (category, verdict) if part)
     return "%s\n\n(%s)" % (body, tags) if tags else body
@@ -4866,7 +4909,7 @@ def review_body(label, pr, config, inline, general, raw=None,
                       "its own words follow unedited." if note else
                       "The reviewer did not return its findings in a form "
                       "Vinegar could read, so its own words follow unedited.",
-                  "", "---", "", raw.strip()]
+                  "", "---", "", quiet(raw).strip()]
     elif not total:
         # Never "No findings." on a run that did not finish: it did not look
         # at everything, so it is not entitled to say the change is clean.
