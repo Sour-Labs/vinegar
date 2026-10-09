@@ -436,14 +436,9 @@ MUTATIONS = [
      "            result = run(step, cwd=path, env=env, timeout=bound)",
      "            result = run(step, env=env, timeout=bound)"),
     # The failure branches, which no check reached until 2026-10-09: the
-    # audit removed each of these and the suite stayed green. Let through,
-    # a failed head fetch reviews the previous pull request's tree under
-    # the new head's commit id.
-    ("checkout-local-step-failure-fatal",
-     '        if result.returncode != 0:\n'
-     '            raise RuntimeError("%s failed: %s" % (" ".join(step),',
-     '        if result.returncode != 0 and step is fetch:\n'
-     '            raise RuntimeError("%s failed: %s" % (" ".join(step),'),
+    # audit removed each of these four and the suite stayed green. Let
+    # through, a failed head fetch reviews the previous pull request's
+    # tree under the new head's commit id.
     ("checkout-step-failed-raise",
      '        if result.returncode != 0:\n'
      '            raise RuntimeError("%s failed: %s" % (" ".join(step),',
@@ -470,6 +465,27 @@ MUTATIONS = [
      '        return path',
      '    except subprocess.TimeoutExpired:\n'
      '        return path'),
+    # The local steps kept fatal, each on its own. The head fetch stays
+    # fatal under both, and what each lets through is a failed detach or
+    # a failed reset: the previous tree, or a killed review's leftovers,
+    # reviewed as the head commit.
+    ("checkout-local-step-failure-fatal",
+     '        if result.returncode != 0:\n'
+     '            raise RuntimeError("%s failed: %s" % (" ".join(step),',
+     '        if result.returncode != 0 and step is fetch:\n'
+     '            raise RuntimeError("%s failed: %s" % (" ".join(step),'),
+    ("checkout-reset-failure-fatal",
+     '        if result.returncode != 0:\n'
+     '            raise RuntimeError("%s failed: %s" % (" ".join(step),',
+     '        if result.returncode != 0 and step[1] not in ("reset", "clean"):\n'
+     '            raise RuntimeError("%s failed: %s" % (" ".join(step),'),
+    # And the conversion of a hung step, left to escape as the clone's
+    # twin entry leaves the clone's: the log then names a subprocess
+    # rather than the step.
+    ("checkout-step-timeout-unconverted",
+     '            raise RuntimeError("%s did not finish within %ds" % (\n'
+     '                " ".join(step), bound))',
+     "            raise"),
     ("checkout-unusable-repo",
      "        if not usable:\n"
      '            log("%s: the checkout is not a usable repository, cloning it "\n'

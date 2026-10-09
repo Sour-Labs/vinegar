@@ -693,13 +693,7 @@ def clone_hangs(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
 # loop already converts its own timeout for that reason.
 vinegar.run = clone_hangs
 shutil.rmtree(_co_path, ignore_errors=True)
-try:
-    vinegar.checkout("o/r", PR, None)
-    _co_hung = "returned normally"
-except subprocess.TimeoutExpired:
-    _co_hung = "TimeoutExpired escaped"
-except RuntimeError as err:
-    _co_hung = str(err)
+_co_hung = _co_checkout()
 check("a clone that hangs is reported as a clone that hung",
       "did not finish within" in _co_hung, _co_hung)
 check("the message names the command, like the steps below it do",
@@ -771,6 +765,18 @@ _co_said = _co_checkout()
 check("a detach that fails stops the checkout and names the step",
       "checkout --quiet --detach" in _co_said
       and "failed: refused" in _co_said, _co_said)
+# And the reset between them, which fails for its own reasons (a
+# permissions error on a file a killed review left). Made non-fatal on
+# its own, the detach succeeds whenever the leftovers do not conflict,
+# and the leftovers ride into the next pull request's tree as if they
+# were the head commit.
+vinegar.run = _co_failing("reset")
+del _co_ran[:]
+_co_said = _co_checkout()
+check("a reset that fails stops the checkout and names the step",
+      "git reset" in _co_said and "failed: refused" in _co_said, _co_said)
+check("nothing after the failed reset runs",
+      _co_after("reset") == [], _co_after("reset"))
 # A local step that hangs is converted the same way the clone is, so
 # the log names the step rather than a subprocess, and nothing after it
 # runs either.
@@ -9960,22 +9966,26 @@ check("and the workers really were racing for it",
 # that reviews nothing and logs nothing.
 
 
-def _one_falls_over(repo, config, state, tokens, turn=False):
-    if repo == "o/bad":
-        raise _one_falls_over.how("the settings file cannot be used")
-    return False
+def _falls_over_with(how):
+    """A poll_repo whose turn on o/bad raises `how`."""
+    def poll_repo(repo, config, state, tokens, turn=False):
+        if repo == "o/bad":
+            raise how("the settings file cannot be used")
+        return False
+    return poll_repo
 
 
 for _how in (ValueError, SystemExit):
-    _one_falls_over.how = _how
     _crash_said, _crash_raised = [], []
-    vinegar.poll_repo = _one_falls_over
+    vinegar.poll_repo = _falls_over_with(_how)
     _schedule_cleared()
     _kept_log, vinegar.log = vinegar.log, lambda m: _crash_said.append(m)
     _runner = _loop(dict(CONFIG, repos=["o/bad", "o/good"],
                          parallel_repos=2, poll_interval=0.02),
                     raised=_crash_raised)
-    _waited_for(lambda: not _runner.is_alive())
+    # join(), not a polling wait: it blocks until the thread ends, and
+    # the margin is for a slow runner. Only a broken guard spends it.
+    _runner.join(15)
     _crash_finished = not _runner.is_alive()
     _crash_stopped = vinegar.STOPPING.is_set()
     # A loop that did not stop by itself is asked to, so a broken guard
