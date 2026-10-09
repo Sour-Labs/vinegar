@@ -1476,6 +1476,12 @@ check("a scheme autolink is broken inside the slashes",
 check("a www autolink is broken before the dot, case kept",
       "www" + Z + ".x.y/w" in _quiet
       and vinegar.quiet("WWW.x") == "WWW" + Z + ".x", _quiet)
+# GitHub takes a `www.` after `_`, `*`, `~` or `(` as an autolink too,
+# and `_` is a word character to Python, so no word boundary.
+check("a www autolink is broken after an underscore too",
+      vinegar.quiet("see _www.x.y/l (www.x.y)")
+      == "see _www" + Z + ".x.y/l (www" + Z + ".x.y)",
+      vinegar.quiet("see _www.x.y/l (www.x.y)"))
 check("a link, an image and a reference are broken at the bracket",
       "![p]" + Z + "(" in _quiet and "[l]" + Z + "(" in _quiet
       and "[t]" + Z + "[r]" in _quiet and "[r]" + Z + ":" in _quiet, _quiet)

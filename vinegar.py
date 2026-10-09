@@ -4574,7 +4574,9 @@ def finding_bullet(finding):
 QUIET = (
     (re.compile(r"@(?=[A-Za-z0-9])"), "@\u200b"),
     (re.compile(r"://"), ":/\u200b/"),
-    (re.compile(r"\bwww\.", re.I), lambda hit: hit.group(0)[:3] + "\u200b."),
+    # No word boundary: GitHub's extended autolink takes a `www.` after
+    # `_`, which Python counts as a word character.
+    (re.compile(r"www\.", re.I), lambda hit: hit.group(0)[:3] + "\u200b."),
     (re.compile(r"\](?=[(\[:])"), "]\u200b"),
     (re.compile(r"<(?=[A-Za-z/!?])"), "<\u200b"),
     (re.compile(r"&(?=[#A-Za-z])"), "&\u200b"),
