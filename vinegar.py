@@ -4527,7 +4527,10 @@ def finding_where(finding):
     model saw two, so the indices it answers against stopped matching the
     findings it was given.
     """
-    where = " ".join(str(finding.get("file") or "").split()) or "(no file)"
+    # No backtick, because finding_bullet() puts the name in a code span
+    # and a backtick in it would close the span and render what follows.
+    where = " ".join(
+        str(finding.get("file") or "").replace("`", "").split()) or "(no file)"
     line = finding_line(finding)
     return "%s:%d" % (where, line) if line is not None else where
 
@@ -4551,16 +4554,28 @@ def finding_bullet(finding):
 
 # What GitHub would render from text the reviewer or the triage model
 # echoed off the branch, and how each is kept as text. Measured on
-# 2026-10-09 by posting a comment and reading its rendered HTML back:
-# `@name` with a zero-width space after the `@` is plain text, while
-# `&#64;name` is still a mention (entities are decoded before mentions are
-# found); `\[` keeps an image or a link from forming, but the URL inside it
-# still autolinks on its own; `https&#58;//` renders as the URL in plain
-# text (autolinks are found before entities are decoded); and nothing
-# inside a code span is rendered at all.
+# 2026-10-09 by posting comments and reading their rendered HTML back:
+# `@name` with a zero-width space after the `@` is plain text, and so is
+# an email address, while `&#64;name` is still a mention (entities are
+# decoded before mentions are found); `\[` keeps an image or a link from
+# forming, but the URL inside it still autolinks on its own, and a `\`
+# the model wrote before the bracket has to be doubled first or the
+# bracket is live again; `https&#58;//` and `www&#46;` render as the URL
+# in plain text (autolinks are found before entities are decoded); and
+# nothing inside a code span or a fenced block is rendered at all.
 QUIET_MENTION = re.compile(r"@(?=[A-Za-z0-9])")
 QUIET_SCHEME = re.compile(r"\b([A-Za-z][A-Za-z0-9+.-]*)://")
-CODE_SPAN = re.compile(r"(`+)[\s\S]*?\1")
+QUIET_WWW = re.compile(r"\bwww\.", re.I)
+# Code as CommonMark reads it, because GitHub does and the reviewer
+# writes it. A fence is a line of `~~~` or ``` closed by a line of the
+# same; a span opens on a backtick run that no backslash or backtick
+# precedes, and closes on the next run of exactly that length, within
+# one paragraph. A run with no such close is text, which is what the
+# first draft got wrong: "`@name``" is not a span, and the name is
+# pinged.
+FENCE_RE = r"^(~~~+|```+)[^\n]*\n[\s\S]*?^\1[ \t]*$"
+SPAN_RE = r"(?<![`\\])(`+)(?!`)(?:(?!\n[ \t]*\n)[\s\S])*?(?<!`)\2(?!`)"
+CODE_SPAN = re.compile("%s|%s" % (FENCE_RE, SPAN_RE), re.M)
 
 
 def quiet(text):
@@ -4584,8 +4599,11 @@ def quiet(text):
 
 def quiet_run(run):
     """quiet() for a stretch of text with no code span in it."""
-    run = run.replace("[", "\\[").replace("<", "&lt;")
+    # The backslash first, or a `\[` the model wrote becomes `\\[`: an
+    # escaped backslash and a live bracket.
+    run = run.replace("\\", "\\\\").replace("[", "\\[").replace("<", "&lt;")
     run = QUIET_MENTION.sub("@\u200b", run)
+    run = QUIET_WWW.sub(lambda hit: hit.group(0)[:3] + "&#46;", run)
     return QUIET_SCHEME.sub(r"\1&#58;//", run)
 
 

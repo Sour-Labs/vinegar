@@ -1482,6 +1482,35 @@ check("code spans are left exactly as written",
 check("plain prose is untouched",
       vinegar.quiet("a < b, nothing here") == "a &lt; b, nothing here"
       and vinegar.quiet("plain words") == "plain words")
+# The second round of measurement, after Vinegar's review of the first
+# draft: a backslash the model wrote re-arms the bracket, `www.` autolinks
+# without a scheme, and a backtick run closes a span only with a run of the
+# same length. All three measured on GitHub the same way.
+check("a backslash the model wrote is doubled before the bracket",
+      vinegar.quiet("\\[click](https://x.y)")
+      == "\\\\\\[click](https&#58;//x.y)", vinegar.quiet("\\[click](https://x.y)"))
+check("a www link loses its dot",
+      vinegar.quiet("see www.x.y/login") == "see www&#46;x.y/login"
+      and vinegar.quiet("WWW.x.y") == "WWW&#46;x.y", vinegar.quiet("see www.x.y/login"))
+check("an email is broken like a mention",
+      vinegar.quiet("nobody@x.y") == "nobody@\u200bx.y")
+check("a backtick run closes a span only with a run of the same length",
+      "@\u200bkevin" in vinegar.quiet("`@kevin``")
+      and "@\u200bkevin" in vinegar.quiet("`` @kevin `")
+      and "@\u200bkevin" in vinegar.quiet("``@kevin` tail"),
+      [vinegar.quiet("`@kevin``"), vinegar.quiet("`` @kevin `")])
+check("an escaped backtick opens no span",
+      "@\u200bkevin" in vinegar.quiet("\\`@kevin`"), vinegar.quiet("\\`@kevin`"))
+check("a span does not cross a blank line",
+      "@\u200bkevin" in vinegar.quiet("`a\n\n@kevin`"), vinegar.quiet("`a\n\n@kevin`"))
+_FENCED = "text\n\n~~~\nif a < b: xs[0] @kevin\n~~~\n\n```py\n[x](y)\n```\n"
+check("a fenced block is left exactly as written",
+      vinegar.quiet(_FENCED) == _FENCED, vinegar.quiet(_FENCED))
+_loud_bullet = vinegar.finding_bullet({
+    "file": "x` @kevin ![p](https://x.y/p.png) `y", "summary": "s"})
+check("a file name cannot close the bullet's code span",
+      _loud_bullet.startswith("- `x @kevin ![p](https://x.y/p.png) y`: ")
+      and _loud_bullet.count("`") == 2, _loud_bullet)
 # Through _described: a tier outside the table must fail the check, not
 # end the run.
 _loud_finding = _described({
