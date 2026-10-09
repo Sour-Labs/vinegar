@@ -2262,6 +2262,13 @@ check("a dated snapshot of the pinned name is not a substitution",
 check("a dated snapshot of another model still is",
       vinegar.substituted("claude-haiku-4-5", ["claude-sonnet-4-5-20250929"])
       == "claude-sonnet-4-5-20250929")
+# Same family, longer name: the date is eight digits and nothing else,
+# or `claude-opus-5` answered by `claude-opus-5-5` would pass as itself.
+check("a model whose name starts with the pinned name still is",
+      vinegar.substituted("claude-opus-5", ["claude-opus-5-5"])
+      == "claude-opus-5-5"
+      and vinegar.substituted("claude-opus-4", ["claude-opus-4-1-20250805"])
+      == "claude-opus-4-1-20250805")
 check("no model asked for means nothing to compare",
       vinegar.substituted(None, ["claude-opus-5"]) is None)
 
