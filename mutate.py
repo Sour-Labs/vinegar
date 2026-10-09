@@ -439,6 +439,11 @@ MUTATIONS = [
     # audit removed each of these and the suite stayed green. Let through,
     # a failed head fetch reviews the previous pull request's tree under
     # the new head's commit id.
+    ("checkout-local-step-failure-fatal",
+     '        if result.returncode != 0:\n'
+     '            raise RuntimeError("%s failed: %s" % (" ".join(step),',
+     '        if result.returncode != 0 and step is fetch:\n'
+     '            raise RuntimeError("%s failed: %s" % (" ".join(step),'),
     ("checkout-step-failed-raise",
      '        if result.returncode != 0:\n'
      '            raise RuntimeError("%s failed: %s" % (" ".join(step),',
@@ -563,11 +568,19 @@ MUTATIONS = [
      "        if False:\n"
      "            return"),
     # --- the continuous loop -------------------------------------------
-    # A worker that falls over. The pass had these three covered and the
-    # continuous loop did not, until 2026-10-09: the audit removed each
-    # and the suite stayed green. Without the first the daemon carries on
-    # one worker short and says nothing; without the second it exits 0
-    # and launchd restarts a daemon that never said why.
+    # A worker that falls over. Nothing here ran under the suite until
+    # 2026-10-09: the audit removed each of these and it stayed green.
+    # Without the first the failing repository is tried again every
+    # poll_interval with nothing logged until shutdown; without the
+    # second the daemon exits 0 and launchd restarts one that never said
+    # why; without the catch of BaseException a SystemExit from
+    # load_settings() ends the worker silently and the daemon lives on
+    # with no worker left.
+    ("worker-crash-catches-exit",
+     "            except BaseException as err:\n"
+     "                # BaseException, not Exception, for the reason the pass\n",
+     "            except Exception as err:\n"
+     "                # BaseException, not Exception, for the reason the pass\n"),
     ("worker-crash-stops-the-loop",
      "                stop_polling()\n"
      "            finally:\n"
