@@ -1458,73 +1458,56 @@ check("an untiered finding reads as it always did",
       vinegar.describe({"summary": "s", "category": "correctness"}))
 
 # --- nothing posted under Vinegar's name renders off the branch ----------
-# Measured 2026-10-09 by posting a comment and reading the HTML back: the
-# zero-width space breaks a mention and `&#64;` does not; `\[` stops an
-# image or a link forming but the URL inside still autolinks; `&#58;` in
-# the scheme renders as plain text; a code span renders nothing.
-_LOUD = ("ping @kevin, see ![p](https://x.y/p.png) and [l](https://x.y/l) "
-         "or https://x.y/bare or <img src=https://x.y/t.png>, keep `[x](y)` "
-         "and `@kevin` and ``https://x.y/c`` as they are")
+# Measured 2026-10-09 by posting comments and reading the HTML back: a
+# zero-width space at the junction keeps each construct as text, and inside
+# a code span it is invisible. No parsing: two drafts that left code spans
+# alone by reading Markdown as CommonMark does were bypassed by every place
+# GitHub reads it differently.
+Z = "\u200b"
+_LOUD = ("ping @kevin or a@b.c, see ![p](https://x.y/p.png) and [l](https://x.y/l) "
+         "or https://x.y/bare or www.x.y/w or <img src=x> or <https://x.y/a> "
+         "or &#64;kevin or [t][r] and [r]: y, and `xs[0](y) @d`")
 _quiet = vinegar.quiet(_LOUD)
-check("a mention is broken with a zero-width space",
-      "@\u200bkevin," in _quiet and "ping @kevin" not in _quiet, _quiet)
-check("an image and a link lose their opening bracket",
-      "!\\[p](" in _quiet and "\\[l](" in _quiet and "![p](" not in _quiet,
-      _quiet)
-check("a url loses the colon of its scheme",
-      "https&#58;//x.y/bare" in _quiet and "https://x.y/bare" not in _quiet
-      and "https&#58;//x.y/p.png" in _quiet, _quiet)
-check("an html tag is escaped",
-      "&lt;img src=https&#58;//x.y/t.png>" in _quiet, _quiet)
-check("code spans are left exactly as written",
-      "`[x](y)`" in _quiet and "`@kevin`" in _quiet
-      and "``https://x.y/c``" in _quiet, _quiet)
+check("a mention and an email are broken after the at sign",
+      "@" + Z + "kevin" in _quiet and "a@" + Z + "b.c" in _quiet
+      and "ping @kevin" not in _quiet, _quiet)
+check("a scheme autolink is broken inside the slashes",
+      "https:/" + Z + "/x.y/bare" in _quiet and "://" not in _quiet, _quiet)
+check("a www autolink is broken before the dot, case kept",
+      "www" + Z + ".x.y/w" in _quiet
+      and vinegar.quiet("WWW.x") == "WWW" + Z + ".x", _quiet)
+check("a link, an image and a reference are broken at the bracket",
+      "![p]" + Z + "(" in _quiet and "[l]" + Z + "(" in _quiet
+      and "[t]" + Z + "[r]" in _quiet and "[r]" + Z + ":" in _quiet, _quiet)
+check("a tag and an angle autolink are broken after the bracket",
+      "<" + Z + "img" in _quiet and "<" + Z + "https:/" in _quiet, _quiet)
+check("an entity is broken after the ampersand",
+      "&" + Z + "#64;kevin" in _quiet, _quiet)
+check("a code span gets the same invisible breaks",
+      "`xs[0]" + Z + "(y) @" + Z + "d`" in _quiet, _quiet)
 check("plain prose is untouched",
-      vinegar.quiet("a < b, nothing here") == "a &lt; b, nothing here"
-      and vinegar.quiet("plain words") == "plain words")
-# The second round of measurement, after Vinegar's review of the first
-# draft: a backslash the model wrote re-arms the bracket, `www.` autolinks
-# without a scheme, and a backtick run closes a span only with a run of the
-# same length. All three measured on GitHub the same way.
-check("a backslash the model wrote is doubled before the bracket",
-      vinegar.quiet("\\[click](https://x.y)")
-      == "\\\\\\[click](https&#58;//x.y)", vinegar.quiet("\\[click](https://x.y)"))
-check("a www link loses its dot",
-      vinegar.quiet("see www.x.y/login") == "see www&#46;x.y/login"
-      and vinegar.quiet("WWW.x.y") == "WWW&#46;x.y", vinegar.quiet("see www.x.y/login"))
-check("an email is broken like a mention",
-      vinegar.quiet("nobody@x.y") == "nobody@\u200bx.y")
-check("a backtick run closes a span only with a run of the same length",
-      "@\u200bkevin" in vinegar.quiet("`@kevin``")
-      and "@\u200bkevin" in vinegar.quiet("`` @kevin `")
-      and "@\u200bkevin" in vinegar.quiet("``@kevin` tail"),
-      [vinegar.quiet("`@kevin``"), vinegar.quiet("`` @kevin `")])
-check("an escaped backtick opens no span",
-      "@\u200bkevin" in vinegar.quiet("\\`@kevin`"), vinegar.quiet("\\`@kevin`"))
-check("a span does not cross a blank line",
-      "@\u200bkevin" in vinegar.quiet("`a\n\n@kevin`"), vinegar.quiet("`a\n\n@kevin`"))
-_FENCED = "text\n\n~~~\nif a < b: xs[0] @kevin\n~~~\n\n```py\n[x](y)\n```\n"
-check("a fenced block is left exactly as written",
-      vinegar.quiet(_FENCED) == _FENCED, vinegar.quiet(_FENCED))
-_loud_bullet = vinegar.finding_bullet({
-    "file": "x` @kevin ![p](https://x.y/p.png) `y", "summary": "s"})
-check("a file name cannot close the bullet's code span",
-      _loud_bullet.startswith("- `x @kevin ![p](https://x.y/p.png) y`: ")
-      and _loud_bullet.count("`") == 2, _loud_bullet)
+      vinegar.quiet("a < b & c, nothing [x] (y) here")
+      == "a < b & c, nothing [x] (y) here")
 # Through _described: a tier outside the table must fail the check, not
 # end the run.
 _loud_finding = _described({
     "summary": "@kevin", "failure_scenario": "see https://x.y/f",
     "category": "[c](https://x.y/c)", "verdict": "<b>", "tier": "<i>"})
 check("every model-written field of a finding is quieted",
-      "@\u200bkevin" in _loud_finding and "https&#58;//x.y/f" in _loud_finding
-      and "\\[c](https&#58;//x.y/c)" in _loud_finding
-      and "&lt;b>" in _loud_finding and "&lt;i>" in _loud_finding
+      "@" + Z + "kevin" in _loud_finding
+      and "https:/" + Z + "/x.y/f" in _loud_finding
+      and "[c]" + Z + "(https:/" + Z + "/x.y/c)" in _loud_finding
+      and "<" + Z + "b>" in _loud_finding and "<" + Z + "i>" in _loud_finding
       and "@kevin" not in _loud_finding, _loud_finding)
 check("the reviewer's own prose is quieted",
-      "@\u200bkevin" in vinegar.review_body(L, PR, CONFIG, [], [],
-                                            "ask @kevin"),
+      "@" + Z + "kevin" in vinegar.review_body(L, PR, CONFIG, [], [],
+                                                "ask @kevin"),
       vinegar.review_body(L, PR, CONFIG, [], [], "ask @kevin"))
+_loud_bullet = vinegar.finding_bullet({
+    "file": "x` @kevin ![p](https://x.y/p.png) `y", "summary": "s"})
+check("a file name cannot end the bullet's code span early",
+      _loud_bullet.startswith("- `x @kevin ![p](https://x.y/p.png) y`: ")
+      and _loud_bullet.count("`") == 2, _loud_bullet)
 check("the tier reaches an inline comment too",
       "\u26aa **note**" in vinegar.split_findings(
           [{"file": "vinegar.py", "line": 12, "summary": "s",
@@ -10888,7 +10871,7 @@ _loud_note = vinegar.note_body(
     _SHAPE_PR, dict(_clear(), changed=1, files=1, difficulty="trivial",
                     summary="cc @kevin https://x.y/n"), "low", "why")
 check("the note quiets the model's sentence",
-      "@\u200bkevin https&#58;//x.y/n" in _loud_note
+      "@\u200bkevin https:/\u200b/x.y/n" in _loud_note
       and "@kevin" not in _loud_note, _loud_note)
 check("the note names the difficulty and what it measured",
       "Difficulty: moderate, 700 lines across 7 files" in _plain, _plain)

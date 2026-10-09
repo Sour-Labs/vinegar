@@ -4528,7 +4528,8 @@ def finding_where(finding):
     findings it was given.
     """
     # No backtick, because finding_bullet() puts the name in a code span
-    # and a backtick in it would close the span and render what follows.
+    # and a backtick in it would end the span early, leaving the rest of
+    # the name as prose.
     where = " ".join(
         str(finding.get("file") or "").replace("`", "").split()) or "(no file)"
     line = finding_line(finding)
@@ -4553,58 +4554,46 @@ def finding_bullet(finding):
 
 
 # What GitHub would render from text the reviewer or the triage model
-# echoed off the branch, and how each is kept as text. Measured on
-# 2026-10-09 by posting comments and reading their rendered HTML back:
-# `@name` with a zero-width space after the `@` is plain text, and so is
-# an email address, while `&#64;name` is still a mention (entities are
-# decoded before mentions are found); `\[` keeps an image or a link from
-# forming, but the URL inside it still autolinks on its own, and a `\`
-# the model wrote before the bracket has to be doubled first or the
-# bracket is live again; `https&#58;//` and `www&#46;` render as the URL
-# in plain text (autolinks are found before entities are decoded); and
-# nothing inside a code span or a fenced block is rendered at all.
-QUIET_MENTION = re.compile(r"@(?=[A-Za-z0-9])")
-QUIET_SCHEME = re.compile(r"\b([A-Za-z][A-Za-z0-9+.-]*)://")
-QUIET_WWW = re.compile(r"\bwww\.", re.I)
-# Code as CommonMark reads it, because GitHub does and the reviewer
-# writes it. A fence is a line of `~~~` or ``` closed by a line of the
-# same; a span opens on a backtick run that no backslash or backtick
-# precedes, and closes on the next run of exactly that length, within
-# one paragraph. A run with no such close is text, which is what the
-# first draft got wrong: "`@name``" is not a span, and the name is
-# pinged.
-FENCE_RE = r"^(~~~+|```+)[^\n]*\n[\s\S]*?^\1[ \t]*$"
-SPAN_RE = r"(?<![`\\])(`+)(?!`)(?:(?!\n[ \t]*\n)[\s\S])*?(?<!`)\2(?!`)"
-CODE_SPAN = re.compile("%s|%s" % (FENCE_RE, SPAN_RE), re.M)
+# echoed off the branch, and the junction each needs. A zero-width space
+# at the junction keeps each as text: measured on 2026-10-09 by posting
+# comments and reading their rendered HTML back, for a mention and an
+# email (`@`), a scheme autolink (`://`), a `www.` autolink, a link, an
+# image and a reference (`](`, `][`, `]:`), a raw tag and an angle
+# autolink (`<` before a letter, `/`, `!` or `?`), and an entity (`&`
+# before `#` or a letter, which is how `&#64;name` still pings a name).
+#
+# No parsing, on purpose. Two drafts left code spans alone by reading
+# Markdown the way CommonMark does, and each review round found another
+# place where GitHub read it differently: unequal backtick runs, escaped
+# backticks, tilde fences, longer closes, block starts, fields joined into
+# one paragraph. Every difference was a bypass. A zero-width space is
+# context-free: inside a code span nothing renders and it is invisible,
+# outside one it breaks the junction, so the same text is safe wherever
+# describe() or finding_bullet() places it. What it costs is an invisible
+# character, at those junctions, in text copied out of a comment.
+QUIET = (
+    (re.compile(r"@(?=[A-Za-z0-9])"), "@\u200b"),
+    (re.compile(r"://"), ":/\u200b/"),
+    (re.compile(r"\bwww\.", re.I), lambda hit: hit.group(0)[:3] + "\u200b."),
+    (re.compile(r"\](?=[(\[:])"), "]\u200b"),
+    (re.compile(r"<(?=[A-Za-z/!?])"), "<\u200b"),
+    (re.compile(r"&(?=[#A-Za-z])"), "&\u200b"),
+)
 
 
 def quiet(text):
-    """`text` with nothing GitHub would render as a mention, link or image.
+    """`text` with nothing GitHub would render as a mention, a link, an
+    image, a tag or an entity, wherever it lands in a comment.
 
     Vinegar posts under its own name, and the summary, the findings and
     the prose quote a branch it does not trust. Left as written, a pull
     request could have Vinegar ping a maintainer, render a tracking pixel
-    or put a link under its name, and the audit of 2026-10-06 did each
-    with fake inputs. Code spans are left alone: GitHub renders nothing
-    inside them, and they are where the reviewer quotes code.
+    or put a link under its name; the audit of 2026-10-06 did each with
+    fake inputs.
     """
-    out, at = [], 0
-    for span in CODE_SPAN.finditer(text):
-        out.append(quiet_run(text[at:span.start()]))
-        out.append(span.group(0))
-        at = span.end()
-    out.append(quiet_run(text[at:]))
-    return "".join(out)
-
-
-def quiet_run(run):
-    """quiet() for a stretch of text with no code span in it."""
-    # The backslash first, or a `\[` the model wrote becomes `\\[`: an
-    # escaped backslash and a live bracket.
-    run = run.replace("\\", "\\\\").replace("[", "\\[").replace("<", "&lt;")
-    run = QUIET_MENTION.sub("@\u200b", run)
-    run = QUIET_WWW.sub(lambda hit: hit.group(0)[:3] + "&#46;", run)
-    return QUIET_SCHEME.sub(r"\1&#58;//", run)
+    for junction, broken in QUIET:
+        text = junction.sub(broken, text)
+    return text
 
 
 def describe(finding):
