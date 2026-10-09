@@ -679,8 +679,11 @@ starts without the `ReportFindings` tool, which is how a Claude Code release
 that stopped honouring `CLAUDE_CODE_REPORT_FINDINGS` would show: the findings
 then arrive as prose with no inline comments. The file names the release, the
 watchdog pushes about it once per outage, and Vinegar removes it after the next
-review whose session has the tool. A review that answers as a model other than
-the pinned one is logged, and the review comment says which model answered.
+review whose session has the tool. `~/.vinegar/tool-missing` is the same for
+`Read` and `Bash`, which `--tools` names and a release could rename out from
+under it, since the flag ignores a name the binary lacks; the file says which
+tool. A review that answers as a model other than the pinned one is logged,
+and the review comment says which model answered.
 
 ## What the reviewer is allowed to do
 
@@ -704,10 +707,16 @@ tool (`Task` on 2.1.285, `Agent` later) is left out on purpose: measured
 headless on 2.1.285, it launched a subagent with `isolation: "remote"`,
 a cloud environment outside the sandbox and the closed network, and the
 flag cannot keep a tool and refuse one of its arguments. The price is the
-finder subagents the default review prompt spawns at high effort.
-`REVIEWER_TOOLS` in `vinegar.py` pins the list. The two triage passes run
-with `--tools ''`, which starts their sessions with no tool at all; their
-deny list stays behind it.
+finder subagents the default review prompt spawns at the effort levels
+that delegate; at `high` it runs the angles in its own context and says
+so. `REVIEWER_TOOLS` in `vinegar.py` pins the list, and every session's
+init event is read back against it, because the flag ignores a name the
+binary lacks: a release that renamed `Read` would otherwise start a
+reviewer that posts what the diff alone tells it. `DENY_TOOLS` names the
+subagent tool, `Monitor` and `PowerShell` in the file's deny list as the
+backstop behind the flag, and Vinegar refuses to start when the file has
+dropped one. The two triage passes run with `--tools ''`, which starts
+their sessions with no tool at all; their deny list stays behind it.
 
 `review-settings.json` allows reading and searching, a fixed list of read-only
 `git` and `gh` subcommands, and the text utilities a review pipes through. It

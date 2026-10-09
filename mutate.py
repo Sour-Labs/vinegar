@@ -296,6 +296,16 @@ MUTATIONS = [
     ("deny-commands-checked",
      "    for rule in DENY_COMMANDS:",
      "    for rule in ():"),
+    # The backstop behind --tools, added 2026-10-09 and pinned in
+    # DENY_TOOLS the same way: the subagent tool under both names, and
+    # the two that run a command without going through Bash.
+    ("deny-tools-task", '    "Task",\n', ""),
+    ("deny-tools-agent", '    "Agent",\n', ""),
+    ("deny-tools-monitor", '    "Monitor",\n', ""),
+    ("deny-tools-powershell", '    "PowerShell",\n', ""),
+    ("deny-tools-checked",
+     "    for rule in DENY_TOOLS:",
+     "    for rule in ():"),
     # And every other checkout, built per review.
     ("other-checkouts-read-denied",
      "                reads.append(rule)",
@@ -2360,6 +2370,21 @@ MUTATIONS = [
     ("report-tool-marker-written-once",
      "    if not os.path.exists(NO_REPORT_TOOL_PATH):",
      "    if True:"),
+    # The other names REVIEWER_TOOLS asks for: --tools ignores a name the
+    # binary lacks, so only the init event can say one is gone.
+    ("tools-missing-is-marked",
+     "        if missing:\n            tools_missing(label, init, missing)",
+     "        if False:\n            tools_missing(label, init, missing)"),
+    ("tools-back-forgets-the-marker",
+     "            forget(TOOL_MISSING_PATH)",
+     "            pass"),
+    ("tools-missing-marker-written-once",
+     "    if not os.path.exists(TOOL_MISSING_PATH):",
+     "    if True:"),
+    ("tools-missing-skips-the-report-tool",
+     "                   if name != REPORT_TOOL\n"
+     "                   and name not in (init.get(\"tools\") or [])]",
+     "                   if name not in (init.get(\"tools\") or [])]"),
     ("who-reviewed-skips-subagents",
      "        if event.get(\"parent_tool_use_id\"):\n"
      "            continue\n"

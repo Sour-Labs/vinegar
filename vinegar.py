@@ -58,12 +58,12 @@ DENY_HOME = "Read(//**/.vinegar/**)"
 # branch could then read `~/.ssh/id_ed25519` and quote it into a finding
 # Vinegar publishes on a public pull request.
 #
-# These, the command denies in DENY_COMMANDS below and the four allow
-# entries ALLOW_NEVER refuses, and not the rest of the file. The allow
-# list is otherwise meant to be tuned, and the write denials are backed
-# by the sandbox now; what cannot be recovered from is a credential read,
-# because the finding carrying it is already public by the time anyone
-# notices.
+# These, the command and tool denies in DENY_COMMANDS and DENY_TOOLS
+# below and the four allow entries ALLOW_NEVER refuses, and not the rest
+# of the file. The allow list is otherwise meant to be tuned, and the
+# write denials are backed by the sandbox now; what cannot be recovered
+# from is a credential read, because the finding carrying it is already
+# public by the time anyone notices.
 #
 # Every one of these binds Bash as well as Read. Claude Code merges Read
 # deny rules into the sandbox, so `cat`, `grep -r` and `git` get
@@ -163,6 +163,21 @@ DENY_COMMANDS = (
     "Bash(swift:*)",
     "Bash(expect:*)",
     "Bash(tclsh:*)",
+)
+
+# The tools the reviewer's session must not hold even if `--tools` were
+# to stop keeping them out, pinned the same way. REVIEWER_TOOLS is the
+# boundary and says what was measured; this is the backstop behind it,
+# as the deny list in TRIAGE_SETTINGS is behind the two passes'
+# `--tools ""`. The subagent tool under both its names, because headless
+# 2.1.285 launched a subagent with `isolation: "remote"` on request, and
+# the two tools that run a command without going through Bash, which no
+# `Bash(...)` rule above can see.
+DENY_TOOLS = (
+    "Task",
+    "Agent",
+    "Monitor",
+    "PowerShell",
 )
 
 
@@ -382,6 +397,13 @@ LOGGED_OUT_PATH = os.path.join(HOME, "logged-out")
 # session's own init event, so it names the release that dropped the tool,
 # and removed by the next review whose session has it again.
 NO_REPORT_TOOL_PATH = os.path.join(HOME, "no-report-tool")
+
+# And while they start without one of the other tools REVIEWER_TOOLS
+# names. `--tools` ignores a name the binary lacks, measured, so a release
+# that renamed Read or Bash would start the reviewer without it, and the
+# review would post what it could tell from the diff's own words. Its own
+# marker, so the watchdog's push says which outage this is.
+TOOL_MISSING_PATH = os.path.join(HOME, "tool-missing")
 
 # What `reviewed_sha` has to look like before anything diffs from it.
 #
@@ -884,14 +906,19 @@ REPORT_TOOL = "ReportFindings"
 #
 # The subagent tool (`Task` on 2.1.285, `Agent` later) is left out on
 # purpose, and it costs the finder subagents the default review prompt
-# spawns at high effort. Measured on 2.1.285, headless: asked for a
+# spawns at the effort levels that delegate (at `high` it runs the
+# angles in its own context and says so). Measured on 2.1.285, headless:
+# asked for a
 # subagent with `isolation: "remote"`, the tool answered "launched
 # successfully in remote mode", and with `isolation: "worktree"` the
 # same, neither refused. A subagent in a cloud environment is outside
 # the sandbox and its closed network, carrying whatever the reviewer
 # read, and the flag cannot keep the tool and refuse one argument of
 # it. The allow and deny lists keep their job behind this flag: what a
-# named tool may do with its arguments.
+# named tool may do with its arguments, and DENY_TOOLS names what the
+# file must still refuse if the flag ever stops keeping it out. Each
+# session's init event is read back against this tuple, because a name
+# the binary lacks is ignored rather than refused.
 REVIEWER_TOOLS = ("Read", "Bash", REPORT_TOOL)
 
 # The severity tiers, most severe first. One tuple decides three things
@@ -2253,6 +2280,15 @@ def load_settings():
                 "defence in depth behind the allow list, and DENY_COMMANDS "
                 "in vinegar.py says why this one is there. Add it to "
                 "permissions.deny." % rule)
+    # And the tools `--tools` keeps out of the session, denied by name as
+    # well. DENY_TOOLS says why each is there.
+    for rule in DENY_TOOLS:
+        if rule not in denied:
+            sys.exit(
+                "review-settings.json must deny %s. The --tools flag keeps "
+                "it out of the session, and this deny is the backstop behind "
+                "the flag; DENY_TOOLS in vinegar.py says why. Add it to "
+                "permissions.deny." % rule)
     # And the word that would make every rule above decorative.
     mode = permissions.get("defaultMode", PERMISSION_MODE)
     if mode != PERMISSION_MODE:
@@ -3595,11 +3631,11 @@ def read_stream(stdout, label="review"):
             # result event may still be further down it.
             continue
         # A subagent's event is not the review's, whatever its type. Finder
-        # subagents are what the default `high` prompt spawns, and with
-        # --verbose their events arrive here as ordinary events tagged with
-        # the tool call that started them. REVIEWER_TOOLS no longer hands
-        # the reviewer the tool; the filter stays for a release that spawns
-        # one regardless.
+        # subagents are what the default prompt spawns at the effort levels
+        # that delegate, and with --verbose their events arrive here as
+        # ordinary events tagged with the tool call that started them.
+        # REVIEWER_TOOLS no longer hands the reviewer the tool; the filter
+        # stays for a release that spawns one regardless.
         # Unfiltered, an assistant event of theirs replaces the review's
         # findings with two candidates from one angle, because the last call
         # wins, and a terminal event of theirs stands in as the ending of a
@@ -6438,6 +6474,21 @@ def report_tool_missing(label, init):
                      "claude %s\n" % (utc_stamp(), label, release))
 
 
+def tools_missing(label, init, missing):
+    """Say which of REVIEWER_TOOLS the session started without, and mark it.
+
+    The same shape as report_tool_missing(): once per outage, the text
+    keeps when it began, and the watchdog pushes on it.
+    """
+    release = init.get("claude_code_version") or "?"
+    log("%s: the reviewer's session has no %s tool, so it reviewed with "
+        "less than it needs: claude %s" % (label, ", ".join(missing), release))
+    if not os.path.exists(TOOL_MISSING_PATH):
+        write_atomic(TOOL_MISSING_PATH, "since %s, first seen on %s, "
+                     "claude %s, without %s\n"
+                     % (utc_stamp(), label, release, ", ".join(missing)))
+
+
 def logged_out(stdout):
     """Did that attempt stop because Claude could not log in?
 
@@ -6852,6 +6903,16 @@ def review(path, repo, pr, config, env, tokens, resent=False, check=None,
             forget(NO_REPORT_TOOL_PATH)
         else:
             report_tool_missing(label, init)
+        # The other names the same way. `--tools` ignores a name the
+        # binary lacks, so a renamed Read or Bash is a session that reviews
+        # from the diff's own words and reports as if it had read.
+        missing = [name for name in REVIEWER_TOOLS
+                   if name != REPORT_TOOL
+                   and name not in (init.get("tools") or [])]
+        if missing:
+            tools_missing(label, init, missing)
+        else:
+            forget(TOOL_MISSING_PATH)
     other = substituted(model, answered)
     if other:
         log("%s: the review ran on %s, not %s, the model it asked for"

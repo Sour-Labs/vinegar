@@ -2385,6 +2385,50 @@ check("a stream with no init event leaves the marker alone",
       os.path.exists(_marker))
 vinegar.forget(_marker)
 
+# The other names REVIEWER_TOOLS asks for, the same way. `--tools` ignores
+# a name the binary lacks, measured, so a release that renamed Read would
+# start a session that reviews from the diff's own words and posts as if
+# it had read, with nothing on the machine saying so.
+_missing = vinegar.TOOL_MISSING_PATH
+
+
+def _text_of(path):
+    try:
+        with open(path) as handle:
+            return handle.read()
+    except OSError:
+        return None
+
+
+vinegar.forget(_missing)
+claude_run.stream = stream(init_event(tools=["Bash", "ReportFindings"]),
+                           call(FINDINGS[:4]), result_event())
+_ran(ROOT, "o/r", PR, PINNED, None, {})
+_without = _text_of(_missing)
+check("a session without a tool the reviewer needs leaves its own marker",
+      _without is not None and _without.startswith("since ")
+      and "without Read" in _without and "claude 2.1.285" in _without,
+      _without)
+check("the report-tool marker is not the one written for it",
+      not os.path.exists(_marker))
+_ran(ROOT, "o/r", dict(PR, number=13), PINNED, None, {})
+check("that marker is written once per outage",
+      _without is not None and _text_of(_missing) == _without,
+      _text_of(_missing))
+claude_run.stream = stream(init_event(), call(FINDINGS[:4]), result_event())
+_ran(ROOT, "o/r", PR, PINNED, None, {})
+check("a session with every tool again removes it",
+      not os.path.exists(_missing))
+# One outage, one marker. A session without the report tool alone is the
+# report-tool marker's, and writing this one as well would have the
+# watchdog push twice about it.
+claude_run.stream = stream(init_event(tools=["Bash", "Read"]),
+                           call(FINDINGS[:4]), result_event())
+_ran(ROOT, "o/r", PR, PINNED, None, {})
+check("a session without only the report tool does not write this marker",
+      not os.path.exists(_missing), _text_of(_missing))
+vinegar.forget(_marker)
+
 # And the substitution, said on the pull request.
 claude_run.stream = stream(init_event(), said_as("claude-sonnet-4-5"),
                            call(FINDINGS[:4]), result_event())
@@ -2840,7 +2884,8 @@ check("a missing private-key deny rule refuses to start",
 # And every command deny in DENY_COMMANDS: the allow list gates Bash again
 # since autoAllowBashIfSandboxed was pinned false, and these are the defence
 # in depth behind it for the spellings a prefix rule misses.
-# Both tuples spelled out rather than read off the constants, so that
+# And the four tools in DENY_TOOLS, the backstop behind `--tools`.
+# All three tuples spelled out rather than read off the constants, so that
 # dropping a name from a constant is a check that fails and not a check
 # that is skipped. Every rule in each, except DENY_HOME, which the check
 # above covers.
@@ -2859,7 +2904,8 @@ for _rule in (("Read(//**/.claude/**)", "Read(//**/.ssh/**)",
                  "Bash(automator:*)", "Bash(sqlite3:*)", "Bash(pbcopy:*)",
                  "Bash(pbpaste:*)", "Bash(dash:*)", "Bash(ksh:*)",
                  "Bash(csh:*)", "Bash(tcsh:*)", "Bash(ruby:*)",
-                 "Bash(swift:*)", "Bash(expect:*)", "Bash(tclsh:*)")):
+                 "Bash(swift:*)", "Bash(expect:*)", "Bash(tclsh:*)")
+              + ("Task", "Agent", "Monitor", "PowerShell")):
     with open(_settings_real) as h:
         _short = json.load(h)
     _short["permissions"]["deny"] = [r for r in
@@ -2987,7 +3033,8 @@ def _settings_file(sandbox, permissions=None, raw=None):
             doc = {"permissions": permissions if permissions is not None
                    else {"allow": [vinegar.REPORT_TOOL],
                          "deny": list(vinegar.DENY_ALWAYS
-                                      + vinegar.DENY_COMMANDS)},
+                                      + vinegar.DENY_COMMANDS
+                                      + vinegar.DENY_TOOLS)},
                    "bashOutputMaxChars": vinegar.BASH_OUTPUT_MAX}
             if sandbox is not _absent:
                 doc["sandbox"] = sandbox
@@ -3062,7 +3109,8 @@ check("the settings sent make the allow list gate Bash",
 # prefix that grants git and gh at once, and an option after the name,
 # which for `git grep` is where `-O` would sit. Spelled out rather than
 # derived from ALLOW_NEVER, so a name dropped from it fails here.
-_never = {"deny": list(vinegar.DENY_ALWAYS + vinegar.DENY_COMMANDS)}
+_never = {"deny": list(vinegar.DENY_ALWAYS + vinegar.DENY_COMMANDS
+                       + vinegar.DENY_TOOLS)}
 for _rule in ("Bash", "Bash(*)", "Bash(:*)",
               "Bash(git:*)", "Bash(git *)", "Bash(git*)", "Bash(g*)",
               "Bash(git -C:*)", "Bash(git --no-pager *)",
@@ -3116,7 +3164,8 @@ check("the settings sent keep a large diff inline",
       _sent.get("bashOutputMaxChars"))
 _minimal = {"permissions": {"allow": [vinegar.REPORT_TOOL],
                             "deny": list(vinegar.DENY_ALWAYS
-                                         + vinegar.DENY_COMMANDS)},
+                                         + vinegar.DENY_COMMANDS
+                                         + vinegar.DENY_TOOLS)},
             "sandbox": _good}
 _said = _sending(None, raw=json.dumps(_minimal))
 check("a file that leaves out the output limit is refused",
@@ -3259,9 +3308,10 @@ check("the other checkouts are still denied from a symlinked workspace",
 # Added to the file's rules, not put in place of them.
 check("the file's own read and command denies go with the checkout denies",
       all(rule in _deny
-          for rule in vinegar.DENY_ALWAYS + vinegar.DENY_COMMANDS),
+          for rule in vinegar.DENY_ALWAYS + vinegar.DENY_COMMANDS
+          + vinegar.DENY_TOOLS),
       [rule for rule in vinegar.DENY_ALWAYS + vinegar.DENY_COMMANDS
-       if rule not in _deny])
+       + vinegar.DENY_TOOLS if rule not in _deny])
 # Every repository Vinegar polls, cloned or not. Built from the disk alone,
 # a clone made by another worker during this review was readable for the
 # whole of it, which with `parallel_repos` above 1 is a first review of any
