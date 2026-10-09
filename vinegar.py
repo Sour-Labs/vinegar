@@ -58,12 +58,12 @@ DENY_HOME = "Read(//**/.vinegar/**)"
 # branch could then read `~/.ssh/id_ed25519` and quote it into a finding
 # Vinegar publishes on a public pull request.
 #
-# These, the command denies in DENY_COMMANDS below and the four allow
-# entries ALLOW_NEVER refuses, and not the rest of the file. The allow
-# list is otherwise meant to be tuned, and the write denials are backed
-# by the sandbox now; what cannot be recovered from is a credential read,
-# because the finding carrying it is already public by the time anyone
-# notices.
+# These, the command and tool denies in DENY_COMMANDS and DENY_TOOLS
+# below and the four allow entries ALLOW_NEVER refuses, and not the rest
+# of the file. The allow list is otherwise meant to be tuned, and the
+# write denials are backed by the sandbox now; what cannot be recovered
+# from is a credential read, because the finding carrying it is already
+# public by the time anyone notices.
 #
 # Every one of these binds Bash as well as Read. Claude Code merges Read
 # deny rules into the sandbox, so `cat`, `grep -r` and `git` get
@@ -163,6 +163,19 @@ DENY_COMMANDS = (
     "Bash(swift:*)",
     "Bash(expect:*)",
     "Bash(tclsh:*)",
+)
+
+# The two tools that run a command without going through Bash, pinned the
+# same way. A `Bash(...)` rule matches a Bash call and nothing else:
+# PowerShell runs a command in another shell, and Monitor runs one and
+# watches its output, so not one command deny above applies to either.
+# Denied by bare name, which denies every use; a review has no use for
+# them. The reviewer keeps Task, the finder subagents the default prompt
+# spawns, so Agent, the name Task became, is not here; TRIAGE_SETTINGS
+# denies both for the two passes that need no tool at all.
+DENY_TOOLS = (
+    "Monitor",
+    "PowerShell",
 )
 
 
@@ -1005,7 +1018,8 @@ TRIAGE_SETTINGS = {
         # file needs argument patterns because it allows some git and
         # refuses the rest. Nothing here needs any tool at all.
         "deny": ["Bash", "Read", "Write", "Edit", "NotebookEdit", "Glob",
-                 "Grep", "Task", "WebFetch", "WebSearch", "Workflow"],
+                 "Grep", "Task", "Agent", "Monitor", "PowerShell",
+                 "WebFetch", "WebSearch", "Workflow"],
         "ask": [],
     },
     "sandbox": dict(
@@ -2220,6 +2234,15 @@ def load_settings():
                 "defence in depth behind the allow list, and DENY_COMMANDS "
                 "in vinegar.py says why this one is there. Add it to "
                 "permissions.deny." % rule)
+    # And the tools that run a command around Bash, which no rule above
+    # and no gate on Bash can see. DENY_TOOLS says why each is there.
+    for rule in DENY_TOOLS:
+        if rule not in denied:
+            sys.exit(
+                "review-settings.json must deny %s. It runs a command "
+                "without going through Bash, so no Bash rule in the file "
+                "applies to it, and DENY_TOOLS in vinegar.py says why. Add "
+                "it to permissions.deny." % rule)
     # And the word that would make every rule above decorative.
     mode = permissions.get("defaultMode", PERMISSION_MODE)
     if mode != PERMISSION_MODE:

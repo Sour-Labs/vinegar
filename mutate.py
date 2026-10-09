@@ -276,6 +276,13 @@ MUTATIONS = [
     ("deny-commands-checked",
      "    for rule in DENY_COMMANDS:",
      "    for rule in ():"),
+    # The two tools that run a command around Bash, added 2026-10-09 and
+    # pinned in DENY_TOOLS the same way. No `Bash(...)` rule sees either.
+    ("deny-tools-monitor", '    "Monitor",\n', ""),
+    ("deny-tools-powershell", '    "PowerShell",\n', ""),
+    ("deny-tools-checked",
+     "    for rule in DENY_TOOLS:",
+     "    for rule in ():"),
     # And every other checkout, built per review.
     ("other-checkouts-read-denied",
      "                reads.append(rule)",
@@ -1005,8 +1012,16 @@ MUTATIONS = [
      "    env = dict(os.environ)"),
     ("severity-tools-denied",
      '        "deny": ["Bash", "Read", "Write", "Edit", "NotebookEdit", "Glob",\n'
-     '                 "Grep", "Task", "WebFetch", "WebSearch", "Workflow"],',
+     '                 "Grep", "Task", "Agent", "Monitor", "PowerShell",\n'
+     '                 "WebFetch", "WebSearch", "Workflow"],',
      '        "deny": [],'),
+    # Each of the three names a 2026-10-09 release could hand the two
+    # passes a tool through: Agent is what Task became, and the other two
+    # run a command around Bash. Dropping any one of them passed before.
+    ("severity-denies-agent", '"Task", "Agent", ', '"Task", '),
+    ("severity-denies-monitor", '"Agent", "Monitor", ', '"Agent", '),
+    ("severity-denies-powershell",
+     '"Monitor", "PowerShell",\n', '"Monitor",\n'),
     ("severity-sandboxed",
      '    "sandbox": dict(\n'
      "        ((name, wanted) for name, wanted, _ in SANDBOX_RULES),",

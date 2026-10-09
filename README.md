@@ -762,6 +762,10 @@ each runs the others by proxy. That is not every one (`perl5.34`, `irb`,
 `erb`, `lldb`, `vim` and `ex` are on the same host and not denied), and no
 list of names can be. `DENY_COMMANDS` in `vinegar.py` says which for each,
 and Vinegar refuses to start when the file has dropped one.
+Two of Claude Code's own tools are denied by name as well, `Monitor` and
+`PowerShell`: each runs a command without going through Bash, so no
+`Bash(...)` rule in the file applies to it.
+`DENY_TOOLS` pins those two the same way.
 
 A name deny stops the direct spelling and no more. Measured on 2.1.285 under
 this file, with harmless probes: `SECURITY list-keychains`,

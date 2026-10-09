@@ -1231,8 +1231,8 @@ _perm = _sent.get("permissions") or {}
 _box = _sent.get("sandbox") or {}
 check("the severity pass is handed no tool it could act with",
       _perm.get("allow") == []
-      and {"Bash", "Read", "Write", "Edit", "WebFetch"}
-      <= set(_perm.get("deny") or []), _perm)
+      and {"Bash", "Read", "Write", "Edit", "WebFetch", "Agent", "Monitor",
+           "PowerShell"} <= set(_perm.get("deny") or []), _perm)
 check("the severity pass runs sandboxed with no network",
       _box.get("enabled") is True and _box.get("failIfUnavailable") is True
       and (_box.get("network") or {}).get("allowedDomains") == [], _box)
@@ -2817,7 +2817,8 @@ check("a missing private-key deny rule refuses to start",
 # And every command deny in DENY_COMMANDS: the allow list gates Bash again
 # since autoAllowBashIfSandboxed was pinned false, and these are the defence
 # in depth behind it for the spellings a prefix rule misses.
-# Both tuples spelled out rather than read off the constants, so that
+# And the two tools in DENY_TOOLS, which run a command around Bash.
+# All three tuples spelled out rather than read off the constants, so that
 # dropping a name from a constant is a check that fails and not a check
 # that is skipped. Every rule in each, except DENY_HOME, which the check
 # above covers.
@@ -2836,7 +2837,8 @@ for _rule in (("Read(//**/.claude/**)", "Read(//**/.ssh/**)",
                  "Bash(automator:*)", "Bash(sqlite3:*)", "Bash(pbcopy:*)",
                  "Bash(pbpaste:*)", "Bash(dash:*)", "Bash(ksh:*)",
                  "Bash(csh:*)", "Bash(tcsh:*)", "Bash(ruby:*)",
-                 "Bash(swift:*)", "Bash(expect:*)", "Bash(tclsh:*)")):
+                 "Bash(swift:*)", "Bash(expect:*)", "Bash(tclsh:*)")
+              + ("Monitor", "PowerShell")):
     with open(_settings_real) as h:
         _short = json.load(h)
     _short["permissions"]["deny"] = [r for r in
@@ -2964,7 +2966,8 @@ def _settings_file(sandbox, permissions=None, raw=None):
             doc = {"permissions": permissions if permissions is not None
                    else {"allow": [vinegar.REPORT_TOOL],
                          "deny": list(vinegar.DENY_ALWAYS
-                                      + vinegar.DENY_COMMANDS)},
+                                      + vinegar.DENY_COMMANDS
+                                      + vinegar.DENY_TOOLS)},
                    "bashOutputMaxChars": vinegar.BASH_OUTPUT_MAX}
             if sandbox is not _absent:
                 doc["sandbox"] = sandbox
@@ -3039,7 +3042,8 @@ check("the settings sent make the allow list gate Bash",
 # prefix that grants git and gh at once, and an option after the name,
 # which for `git grep` is where `-O` would sit. Spelled out rather than
 # derived from ALLOW_NEVER, so a name dropped from it fails here.
-_never = {"deny": list(vinegar.DENY_ALWAYS + vinegar.DENY_COMMANDS)}
+_never = {"deny": list(vinegar.DENY_ALWAYS + vinegar.DENY_COMMANDS
+                       + vinegar.DENY_TOOLS)}
 for _rule in ("Bash", "Bash(*)", "Bash(:*)",
               "Bash(git:*)", "Bash(git *)", "Bash(git*)", "Bash(g*)",
               "Bash(git -C:*)", "Bash(git --no-pager *)",
@@ -3093,7 +3097,8 @@ check("the settings sent keep a large diff inline",
       _sent.get("bashOutputMaxChars"))
 _minimal = {"permissions": {"allow": [vinegar.REPORT_TOOL],
                             "deny": list(vinegar.DENY_ALWAYS
-                                         + vinegar.DENY_COMMANDS)},
+                                         + vinegar.DENY_COMMANDS
+                                         + vinegar.DENY_TOOLS)},
             "sandbox": _good}
 _said = _sending(None, raw=json.dumps(_minimal))
 check("a file that leaves out the output limit is refused",
@@ -3236,9 +3241,10 @@ check("the other checkouts are still denied from a symlinked workspace",
 # Added to the file's rules, not put in place of them.
 check("the file's own read and command denies go with the checkout denies",
       all(rule in _deny
-          for rule in vinegar.DENY_ALWAYS + vinegar.DENY_COMMANDS),
+          for rule in vinegar.DENY_ALWAYS + vinegar.DENY_COMMANDS
+          + vinegar.DENY_TOOLS),
       [rule for rule in vinegar.DENY_ALWAYS + vinegar.DENY_COMMANDS
-       if rule not in _deny])
+       + vinegar.DENY_TOOLS if rule not in _deny])
 # Every repository Vinegar polls, cloned or not. Built from the disk alone,
 # a clone made by another worker during this review was readable for the
 # whole of it, which with `parallel_repos` above 1 is a first review of any
