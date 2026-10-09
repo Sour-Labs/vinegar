@@ -5818,16 +5818,14 @@ def finish(label, repo, pr, path, text, findings, config, env, tokens,
         # that is what repost() needs to know to move `reviewed_sha` when
         # the send lands: reviewed_through() takes `covered`, and a
         # review killed part-way reached the author without covering the
-        # scope. The same rule as deliver()'s `covered`, findings
-        # included: a reviewer that reached the end of the scope in prose
-        # alone reported nothing, and a narrowed pass after it would never
-        # re-read what it only talked about. A marker from before this
-        # line reads as partial, which is the safe way to be wrong: one
-        # whole re-read, not a narrowed pass over ground nobody read.
+        # scope. covers() is the one rule, shared with deliver(). A marker
+        # from before this line reads as partial, which is the safe way to
+        # be wrong: one whole re-read, not a narrowed pass over ground
+        # nobody read.
         try:
             write_atomic(marker, "%s\n%s\n%s\n%s\n" % (
                 pr["headRefOid"], earned, title,
-                "whole" if whole and findings is not None else "partial"))
+                "whole" if covers(whole, findings) else "partial"))
         except OSError as err:
             log("%s: the review is saved but cannot be marked for sending "
                 "again: %s" % (label, err))
@@ -6209,6 +6207,19 @@ def repost(key, repo, pr, config, state, tokens, done, marker, sha):
     remember(state, key, entry)
 
 
+def covers(whole, findings):
+    """Whether a review that ended this way read the scope for the author.
+
+    One rule for the two places that record it: deliver() answers
+    `covered` with it, and finish() writes it into the marker for the
+    resend to read. The marker kept its own copy once and left out the
+    findings clause, so a reviewer that reached the end of the scope in
+    prose alone would have narrowed the next pass over ground it only
+    talked about.
+    """
+    return bool(whole and findings is not None)
+
+
 def partial_note(cause):
     """The note every partial ending shares, phrased the one way.
 
@@ -6578,7 +6589,7 @@ def review(path, repo, pr, config, env, tokens, resent=False, check=None,
             # request is not its findings reaching it. `comment` says there
             # was a pull request to carry any of it, because a dry run
             # answers POSTED for having correctly posted nothing.
-            if whole and findings is not None and config["comment"]:
+            if covers(whole, findings) and config["comment"]:
                 covered.append(True)
             # The weaker half of the same answer, and the one the round
             # count needs: the author was shown a review, whether or not

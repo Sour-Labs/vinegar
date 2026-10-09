@@ -8525,6 +8525,9 @@ check("a resent partial review does not move it",
       _part)
 # deliver()'s rule for `covered`, findings included: a reviewer that
 # reached the end of the scope in prose alone reported nothing.
+check("covers() wants a whole reading and findings",
+      vinegar.covers(True, []) and not vinegar.covers(False, [])
+      and not vinegar.covers(True, None))
 _prose = _resent_entry(FULL_EARN, findings=None)
 check("a resent review that reported nothing does not move it",
       "reviewed_sha" not in _prose and _prose.get("outcome") == vinegar.DONE,

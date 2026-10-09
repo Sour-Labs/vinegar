@@ -1508,13 +1508,13 @@ MUTATIONS = [
     ("resend-marker-records-the-conclusion",
      '            write_atomic(marker, "%s\\n%s\\n%s\\n%s\\n" % (\n'
      '                pr["headRefOid"], earned, title,\n'
-     '                "whole" if whole and findings is not None else "partial"))',
+     '                "whole" if covers(whole, findings) else "partial"))',
      '            write_atomic(marker, "%s\\n" % (\n'
      '                pr["headRefOid"]))'),
     ("resend-marker-records-the-title",
      '            write_atomic(marker, "%s\\n%s\\n%s\\n%s\\n" % (\n'
      '                pr["headRefOid"], earned, title,\n'
-     '                "whole" if whole and findings is not None else "partial"))',
+     '                "whole" if covers(whole, findings) else "partial"))',
      '            write_atomic(marker, "%s\\n%s\\n" % (\n'
      '                pr["headRefOid"], earned))'),
     ("resend-earns-red-on-a-blocker",
@@ -1757,13 +1757,13 @@ MUTATIONS = [
     # along with the reading scope loses every finding to one bad anchor.
     # --- what review() answers about its own coverage ------------------
     ("covered-needs-a-whole-reading",
-     '            if whole and findings is not None and config["comment"]:',
+     '            if covers(whole, findings) and config["comment"]:',
      '            if findings is not None and config["comment"]:'),
     ("covered-needs-findings",
-     '            if whole and findings is not None and config["comment"]:',
+     '            if covers(whole, findings) and config["comment"]:',
      '            if whole and config["comment"]:'),
     ("covered-needs-a-pull-request",
-     '            if whole and findings is not None and config["comment"]:',
+     '            if covers(whole, findings) and config["comment"]:',
      "            if whole and findings is not None:"),
     ("whole-is-not-the-note",
      "        notes.append(partial_note(\"failed before it finished\"))\n"
@@ -1788,7 +1788,7 @@ MUTATIONS = [
      '                    del done["reviewed_sha"]',
      "                    done.clear()"),
     ("covered-is-not-the-note-either",
-     '            if whole and findings is not None and config["comment"]:',
+     '            if covers(whole, findings) and config["comment"]:',
      "            if (whole and not note and findings is not None\n"
      '                    and config["comment"]):'),
     ("reviewed-through-rule",
@@ -2221,10 +2221,17 @@ MUTATIONS = [
      '            if whole and FULL_SHA.match(at["headRefOid"]):',
      '            if FULL_SHA.match(at["headRefOid"]):'),
     ("marker-records-whether-the-review-was-whole",
-     '                "whole" if whole and findings is not None else "partial"))',
+     '                "whole" if covers(whole, findings) else "partial"))',
      '                "whole"))'),
+    # The rule itself, now one place.
+    ("covers-wants-findings",
+     "    return bool(whole and findings is not None)",
+     "    return bool(whole)"),
+    ("covers-wants-a-whole-reading",
+     "    return bool(whole and findings is not None)",
+     "    return findings is not None"),
     ("marker-whole-means-findings-too",
-     '                "whole" if whole and findings is not None else "partial"))',
+     '                "whole" if covers(whole, findings) else "partial"))',
      '                "whole" if whole else "partial"))'),
     ("marker-whole-line-is-read-not-assumed",
      '            return len(lines) > 3 and lines[3].strip() == "whole"',
