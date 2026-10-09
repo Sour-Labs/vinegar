@@ -6274,14 +6274,18 @@ def substituted(asked, answered):
     Only a pinned name can be substituted. An alias such as `opus` asks
     for whatever it resolves to, so an answer differing from it is the
     alias working; a name with a digit in it asked for one model. The
-    `[1m]` suffix asks for the context window, not a different model.
+    `[1m]` suffix asks for the context window, not a different model, and
+    an undated name is answered as its dated snapshot, which is the model
+    asked for: measured, `claude-haiku-4-5` answers as
+    `claude-haiku-4-5-20251001`.
     """
     if not asked or not any(ch.isdigit() for ch in asked):
         return None
     wanted = re.sub(r"\[[^\]]*\]$", "", asked)
     for model in answered:
-        if model != wanted:
-            return model
+        if model == wanted or re.match(re.escape(wanted) + r"-\d{8}$", model):
+            continue
+        return model
     return None
 
 

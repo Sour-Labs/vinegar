@@ -2255,6 +2255,13 @@ check("the context suffix is not a substitution",
       vinegar.substituted("claude-opus-5[1m]", ["claude-opus-5"]) is None)
 check("an alias resolving is not a substitution",
       vinegar.substituted("opus", ["claude-opus-5"]) is None)
+# Measured: an undated name is answered as its dated snapshot.
+check("a dated snapshot of the pinned name is not a substitution",
+      vinegar.substituted("claude-haiku-4-5", ["claude-haiku-4-5-20251001"])
+      is None)
+check("a dated snapshot of another model still is",
+      vinegar.substituted("claude-haiku-4-5", ["claude-sonnet-4-5-20250929"])
+      == "claude-sonnet-4-5-20250929")
 check("no model asked for means nothing to compare",
       vinegar.substituted(None, ["claude-opus-5"]) is None)
 
