@@ -1229,10 +1229,22 @@ check("the severity pass loads no settings but the ones it is handed",
 _sent = json.loads(_flag("--settings") or "{}")
 _perm = _sent.get("permissions") or {}
 _box = _sent.get("sandbox") or {}
+# Every name, spelled out rather than read off the constant: six of the
+# fourteen could be dropped with the suite green, and the one mutation
+# that covered them emptied the whole list.
 check("the severity pass is handed no tool it could act with",
       _perm.get("allow") == []
-      and {"Bash", "Read", "Write", "Edit", "WebFetch", "Agent", "Monitor",
-           "PowerShell"} <= set(_perm.get("deny") or []), _perm)
+      and {"Bash", "Read", "Write", "Edit", "NotebookEdit", "Glob", "Grep",
+           "Task", "Agent", "Monitor", "PowerShell", "WebFetch", "WebSearch",
+           "Workflow"} <= set(_perm.get("deny") or []), _perm)
+# The deny list names tools; it cannot name the ones a release adds.
+# Measured on 2.1.285, a session under it alone still held nineteen,
+# SendMessage and RemoteTrigger among them. The empty `--tools` is what
+# starts the session with none, so it is checked for being there and
+# empty, not only for the value: _flag() answers "" for a missing flag.
+check("the severity pass is handed no tool at all",
+      "--tools" in (_severity_asked.get("cmd") or [])[:-1]
+      and _flag("--tools") == "", _severity_asked.get("cmd"))
 check("the severity pass runs sandboxed with no network",
       _box.get("enabled") is True and _box.get("failIfUnavailable") is True
       and (_box.get("network") or {}).get("allowedDomains") == [], _box)
@@ -2736,6 +2748,17 @@ check("the reviewer loads no settings but the ones it is handed",
       claude_run.saw)
 check("the reviewer loads no MCP servers but the ones it is handed",
       "--strict-mcp-config" in claude_run.saw, claude_run.saw)
+# And which built-in tools the session holds. Measured on 2.1.285: without
+# the flag the reviewer started with nineteen tools beside the three it
+# uses, SendMessage and RemoteTrigger among them, none of them reached
+# by a `Bash(...)` rule, and the subagent tool, which launched a subagent
+# with `isolation: "remote"` from a headless session. Spelled out rather
+# than read off REVIEWER_TOOLS, so a name dropped from it, the subagent
+# tool put back, or the flag widened to "default", fails here.
+check("the reviewer holds the tools it uses and no other",
+      "--tools" in claude_run.saw[:-1]
+      and claude_run.saw[claude_run.saw.index("--tools") + 1]
+      == "Read,Bash,ReportFindings", claude_run.saw)
 # The checkout, not wherever the daemon happens to be. Vinegar polls several
 # repositories from one process, so a lost cwd does not fail: it reviews the
 # wrong tree, and says nothing about having done so.
@@ -2817,8 +2840,7 @@ check("a missing private-key deny rule refuses to start",
 # And every command deny in DENY_COMMANDS: the allow list gates Bash again
 # since autoAllowBashIfSandboxed was pinned false, and these are the defence
 # in depth behind it for the spellings a prefix rule misses.
-# And the two tools in DENY_TOOLS, which run a command around Bash.
-# All three tuples spelled out rather than read off the constants, so that
+# Both tuples spelled out rather than read off the constants, so that
 # dropping a name from a constant is a check that fails and not a check
 # that is skipped. Every rule in each, except DENY_HOME, which the check
 # above covers.
@@ -2837,8 +2859,7 @@ for _rule in (("Read(//**/.claude/**)", "Read(//**/.ssh/**)",
                  "Bash(automator:*)", "Bash(sqlite3:*)", "Bash(pbcopy:*)",
                  "Bash(pbpaste:*)", "Bash(dash:*)", "Bash(ksh:*)",
                  "Bash(csh:*)", "Bash(tcsh:*)", "Bash(ruby:*)",
-                 "Bash(swift:*)", "Bash(expect:*)", "Bash(tclsh:*)")
-              + ("Monitor", "PowerShell")):
+                 "Bash(swift:*)", "Bash(expect:*)", "Bash(tclsh:*)")):
     with open(_settings_real) as h:
         _short = json.load(h)
     _short["permissions"]["deny"] = [r for r in
@@ -2966,8 +2987,7 @@ def _settings_file(sandbox, permissions=None, raw=None):
             doc = {"permissions": permissions if permissions is not None
                    else {"allow": [vinegar.REPORT_TOOL],
                          "deny": list(vinegar.DENY_ALWAYS
-                                      + vinegar.DENY_COMMANDS
-                                      + vinegar.DENY_TOOLS)},
+                                      + vinegar.DENY_COMMANDS)},
                    "bashOutputMaxChars": vinegar.BASH_OUTPUT_MAX}
             if sandbox is not _absent:
                 doc["sandbox"] = sandbox
@@ -3042,8 +3062,7 @@ check("the settings sent make the allow list gate Bash",
 # prefix that grants git and gh at once, and an option after the name,
 # which for `git grep` is where `-O` would sit. Spelled out rather than
 # derived from ALLOW_NEVER, so a name dropped from it fails here.
-_never = {"deny": list(vinegar.DENY_ALWAYS + vinegar.DENY_COMMANDS
-                       + vinegar.DENY_TOOLS)}
+_never = {"deny": list(vinegar.DENY_ALWAYS + vinegar.DENY_COMMANDS)}
 for _rule in ("Bash", "Bash(*)", "Bash(:*)",
               "Bash(git:*)", "Bash(git *)", "Bash(git*)", "Bash(g*)",
               "Bash(git -C:*)", "Bash(git --no-pager *)",
@@ -3097,8 +3116,7 @@ check("the settings sent keep a large diff inline",
       _sent.get("bashOutputMaxChars"))
 _minimal = {"permissions": {"allow": [vinegar.REPORT_TOOL],
                             "deny": list(vinegar.DENY_ALWAYS
-                                         + vinegar.DENY_COMMANDS
-                                         + vinegar.DENY_TOOLS)},
+                                         + vinegar.DENY_COMMANDS)},
             "sandbox": _good}
 _said = _sending(None, raw=json.dumps(_minimal))
 check("a file that leaves out the output limit is refused",
@@ -3241,10 +3259,9 @@ check("the other checkouts are still denied from a symlinked workspace",
 # Added to the file's rules, not put in place of them.
 check("the file's own read and command denies go with the checkout denies",
       all(rule in _deny
-          for rule in vinegar.DENY_ALWAYS + vinegar.DENY_COMMANDS
-          + vinegar.DENY_TOOLS),
+          for rule in vinegar.DENY_ALWAYS + vinegar.DENY_COMMANDS),
       [rule for rule in vinegar.DENY_ALWAYS + vinegar.DENY_COMMANDS
-       + vinegar.DENY_TOOLS if rule not in _deny])
+       if rule not in _deny])
 # Every repository Vinegar polls, cloned or not. Built from the disk alone,
 # a clone made by another worker during this review was readable for the
 # whole of it, which with `parallel_repos` above 1 is a first review of any
@@ -10472,6 +10489,22 @@ _ok, _ = _shaped()
 check("a readable answer comes back with the diff's own measurements",
       _ok and _ok["changed"] == 9 and _ok["files"] == 6
       and _ok["difficulty"] == "trivial" and _ok["truncated"] is False, _ok)
+
+# This pass reads the attacker's diff verbatim and runs under the same
+# rules as the severity pass. Only the severity call was checked, so a
+# refactor handing this one its own settings, or dropping either flag,
+# kept the suite green. The command is taken from the stub without
+# indexing, so a call that never reached the model fails these rather
+# than aborting the run.
+_, _shape_seen = _shaped()
+_shape_cmd = ([c for c, _, _ in _shape_seen if c[0] == "claude"] or [[]])[0]
+check("the shape pass runs under the triage settings",
+      "--settings" in _shape_cmd[:-1]
+      and _shape_cmd[_shape_cmd.index("--settings") + 1]
+      == json.dumps(vinegar.TRIAGE_SETTINGS), _shape_cmd)
+check("the shape pass is handed no tool at all",
+      "--tools" in _shape_cmd[:-1]
+      and _shape_cmd[_shape_cmd.index("--tools") + 1] == "", _shape_cmd)
 
 
 _listings = {}

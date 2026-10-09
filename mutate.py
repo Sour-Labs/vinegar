@@ -217,6 +217,26 @@ MUTATIONS = [
      '           "--setting-sources", "",\n'
      '           "--strict-mcp-config"]',
      '           "--setting-sources", ""]'),
+    # Which built-in tools the reviewer's session holds. Without the flag
+    # it held nineteen the deny list never named, measured on 2.1.285;
+    # widened to "default" it would again, and the subagent tool put back
+    # launches a subagent outside the sandbox. Each name on its own,
+    # because the check spells the list out.
+    ("reviewer-tools-flag",
+     '           "--tools", ",".join(REVIEWER_TOOLS),\n', ""),
+    ("reviewer-tools-default", '",".join(REVIEWER_TOOLS)', '"default"'),
+    ("reviewer-tools-read",
+     'REVIEWER_TOOLS = ("Read", "Bash", REPORT_TOOL)',
+     'REVIEWER_TOOLS = ("Bash", REPORT_TOOL)'),
+    ("reviewer-tools-bash",
+     'REVIEWER_TOOLS = ("Read", "Bash", REPORT_TOOL)',
+     'REVIEWER_TOOLS = ("Read", REPORT_TOOL)'),
+    ("reviewer-tools-report",
+     'REVIEWER_TOOLS = ("Read", "Bash", REPORT_TOOL)',
+     'REVIEWER_TOOLS = ("Read", "Bash")'),
+    ("reviewer-tools-subagent",
+     'REVIEWER_TOOLS = ("Read", "Bash", REPORT_TOOL)',
+     'REVIEWER_TOOLS = ("Read", "Bash", "Task", "Agent", REPORT_TOOL)'),
     ("review-timeout",
      "                         cwd=path, timeout=left, env=reviewing)",
      "                         cwd=path, env=reviewing)"),
@@ -275,13 +295,6 @@ MUTATIONS = [
     ("deny-commands-tclsh", '    "Bash(tclsh:*)",\n', ""),
     ("deny-commands-checked",
      "    for rule in DENY_COMMANDS:",
-     "    for rule in ():"),
-    # The two tools that run a command around Bash, added 2026-10-09 and
-    # pinned in DENY_TOOLS the same way. No `Bash(...)` rule sees either.
-    ("deny-tools-monitor", '    "Monitor",\n', ""),
-    ("deny-tools-powershell", '    "PowerShell",\n', ""),
-    ("deny-tools-checked",
-     "    for rule in DENY_TOOLS:",
      "    for rule in ():"),
     # And every other checkout, built per review.
     ("other-checkouts-read-denied",
@@ -1015,13 +1028,45 @@ MUTATIONS = [
      '                 "Grep", "Task", "Agent", "Monitor", "PowerShell",\n'
      '                 "WebFetch", "WebSearch", "Workflow"],',
      '        "deny": [],'),
-    # Each of the three names a 2026-10-09 release could hand the two
-    # passes a tool through: Agent is what Task became, and the other two
-    # run a command around Bash. Dropping any one of them passed before.
-    ("severity-denies-agent", '"Task", "Agent", ', '"Task", '),
-    ("severity-denies-monitor", '"Agent", "Monitor", ', '"Agent", '),
-    ("severity-denies-powershell",
-     '"Monitor", "PowerShell",\n', '"Monitor",\n'),
+    # Each name on its own. Six of the fourteen could be dropped with the
+    # suite green until 2026-10-09, because the check above was the only
+    # one and it emptied the whole list.
+    ("severity-denies-bash", '["Bash", "Read",', '["Read",'),
+    ("severity-denies-read", '"Bash", "Read", "Write"', '"Bash", "Write"'),
+    ("severity-denies-write", '"Read", "Write", "Edit"', '"Read", "Edit"'),
+    ("severity-denies-edit", '"Write", "Edit", "NotebookEdit"',
+     '"Write", "NotebookEdit"'),
+    ("severity-denies-notebookedit", '"Edit", "NotebookEdit", "Glob"',
+     '"Edit", "Glob"'),
+    ("severity-denies-glob", '"NotebookEdit", "Glob",\n', '"NotebookEdit",\n'),
+    ("severity-denies-grep", '                 "Grep", "Task",',
+     '                 "Task",'),
+    ("severity-denies-task", '"Grep", "Task", "Agent"', '"Grep", "Agent"'),
+    ("severity-denies-agent", '"Task", "Agent", "Monitor"', '"Task", "Monitor"'),
+    ("severity-denies-monitor", '"Agent", "Monitor", "PowerShell"',
+     '"Agent", "PowerShell"'),
+    ("severity-denies-powershell", '"Monitor", "PowerShell",\n',
+     '"Monitor",\n'),
+    ("severity-denies-webfetch", '                 "WebFetch", "WebSearch"',
+     '                 "WebSearch"'),
+    ("severity-denies-websearch", '"WebFetch", "WebSearch", "Workflow"',
+     '"WebFetch", "Workflow"'),
+    ("severity-denies-workflow", '"WebSearch", "Workflow"],', '"WebSearch"],'),
+    # The flag that empties the session, on each of the two passes, and the
+    # shape pass handed settings of its own. Measured on 2.1.285: the deny
+    # list alone left nineteen tools in the session.
+    ("severity-no-tools",
+     '                      "--strict-mcp-config", "--tools", ""],',
+     '                      "--strict-mcp-config"],'),
+    ("shape-no-tools",
+     '                      "--setting-sources", "", "--strict-mcp-config",\n'
+     '                      "--tools", ""],',
+     '                      "--setting-sources", "", "--strict-mcp-config"],'),
+    ("shape-own-settings",
+     '                      "--settings", json.dumps(TRIAGE_SETTINGS),\n'
+     '                      "--setting-sources", "", "--strict-mcp-config",',
+     '                      "--settings", "{}",\n'
+     '                      "--setting-sources", "", "--strict-mcp-config",'),
     ("severity-sandboxed",
      '    "sandbox": dict(\n'
      "        ((name, wanted) for name, wanted, _ in SANDBOX_RULES),",

@@ -58,12 +58,12 @@ DENY_HOME = "Read(//**/.vinegar/**)"
 # branch could then read `~/.ssh/id_ed25519` and quote it into a finding
 # Vinegar publishes on a public pull request.
 #
-# These, the command and tool denies in DENY_COMMANDS and DENY_TOOLS
-# below and the four allow entries ALLOW_NEVER refuses, and not the rest
-# of the file. The allow list is otherwise meant to be tuned, and the
-# write denials are backed by the sandbox now; what cannot be recovered
-# from is a credential read, because the finding carrying it is already
-# public by the time anyone notices.
+# These, the command denies in DENY_COMMANDS below and the four allow
+# entries ALLOW_NEVER refuses, and not the rest of the file. The allow
+# list is otherwise meant to be tuned, and the write denials are backed
+# by the sandbox now; what cannot be recovered from is a credential read,
+# because the finding carrying it is already public by the time anyone
+# notices.
 #
 # Every one of these binds Bash as well as Read. Claude Code merges Read
 # deny rules into the sandbox, so `cat`, `grep -r` and `git` get
@@ -163,19 +163,6 @@ DENY_COMMANDS = (
     "Bash(swift:*)",
     "Bash(expect:*)",
     "Bash(tclsh:*)",
-)
-
-# The two tools that run a command without going through Bash, pinned the
-# same way. A `Bash(...)` rule matches a Bash call and nothing else:
-# PowerShell runs a command in another shell, and Monitor runs one and
-# watches its output, so not one command deny above applies to either.
-# Denied by bare name, which denies every use; a review has no use for
-# them. The reviewer keeps Task, the finder subagents the default prompt
-# spawns, so Agent, the name Task became, is not here; TRIAGE_SETTINGS
-# denies both for the two passes that need no tool at all.
-DENY_TOOLS = (
-    "Monitor",
-    "PowerShell",
 )
 
 
@@ -885,6 +872,28 @@ MAX_SPOKEN = 4000
 # and the two must agree or findings arrive nowhere.
 REPORT_TOOL = "ReportFindings"
 
+# The built-in tools the reviewer's session holds, and no other. `--tools`
+# names them, and a tool it does not name is not in the session: absent,
+# not denied. Measured on 2.1.285: under review-settings.json alone the
+# session started with 22 tools, these three, the subagent tool, and
+# eighteen the deny list never named (SendMessage, RemoteTrigger,
+# PushNotification, CronCreate, Skill, EnterWorktree and the rest), each
+# able to act outside the sandbox without a Bash call for a `Bash(...)`
+# rule to match. With this flag it starts with exactly what is named,
+# and a name the binary lacks is ignored, measured the same day.
+#
+# The subagent tool (`Task` on 2.1.285, `Agent` later) is left out on
+# purpose, and it costs the finder subagents the default review prompt
+# spawns at high effort. Measured on 2.1.285, headless: asked for a
+# subagent with `isolation: "remote"`, the tool answered "launched
+# successfully in remote mode", and with `isolation: "worktree"` the
+# same, neither refused. A subagent in a cloud environment is outside
+# the sandbox and its closed network, carrying whatever the reviewer
+# read, and the flag cannot keep the tool and refuse one argument of
+# it. The allow and deny lists keep their job behind this flag: what a
+# named tool may do with its arguments.
+REVIEWER_TOOLS = ("Read", "Bash", REPORT_TOOL)
+
 # The severity tiers, most severe first. One tuple decides three things
 # that have to agree: what the severity pass may answer, what order the
 # findings are posted in, and what the top-level comment counts. Spelled
@@ -996,7 +1005,14 @@ Use the index numbers given below. Output exactly {count}.
 # simplifies it to that. Measured: with that flag and nothing else, the
 # model read a file it was asked for and printed the contents, and
 # `permission_denials` came back empty. With the deny list below the tools
-# are not in the session at all and the same request writes nothing.
+# it names are not in the session at all and the same request writes
+# nothing. But the list is not the whole of the session either: measured
+# on 2.1.285, a session under these rules alone still started with
+# nineteen tools the list never named, SendMessage, RemoteTrigger,
+# PushNotification, CronCreate and Skill among them, each able to act
+# without a Bash call for a rule to match. `--tools ""` on the command is
+# what empties the session: measured the same day, the init event listed
+# no tool, and the same request to read a file came back as "cannot".
 #
 # The sandbox as well, but not as a general write boundary, because
 # measurement says it is not one. With these rules and `Write` permitted
@@ -1006,10 +1022,13 @@ Use the index numbers given below. Output exactly {count}.
 # sandbox was the backstop that survives a stale tool list, which would
 # have been a false assurance for the next person to widen the list.
 #
-# So the two rules divide the job. The deny list is what stops a tool
-# running, and it has to be kept in step with Claude Code's tool set. The
-# network rule and the denied paths below are what a write cannot reach
-# even if one ever does get through.
+# So the three rules divide the job. `--tools ""` is what keeps a tool out
+# of the session. The deny list is the backstop behind it, for a release
+# that reads the flag differently, and a deny by name has to be kept in
+# step with Claude Code's tool set, a chase this list lost once (Task
+# became Agent, and Monitor and PowerShell arrived). The network rule and
+# the denied paths below are what a write cannot reach even if one ever
+# does get through.
 TRIAGE_SETTINGS = {
     "permissions": {
         "defaultMode": PERMISSION_MODE,
@@ -2234,15 +2253,6 @@ def load_settings():
                 "defence in depth behind the allow list, and DENY_COMMANDS "
                 "in vinegar.py says why this one is there. Add it to "
                 "permissions.deny." % rule)
-    # And the tools that run a command around Bash, which no rule above
-    # and no gate on Bash can see. DENY_TOOLS says why each is there.
-    for rule in DENY_TOOLS:
-        if rule not in denied:
-            sys.exit(
-                "review-settings.json must deny %s. It runs a command "
-                "without going through Bash, so no Bash rule in the file "
-                "applies to it, and DENY_TOOLS in vinegar.py says why. Add "
-                "it to permissions.deny." % rule)
     # And the word that would make every rule above decorative.
     mode = permissions.get("defaultMode", PERMISSION_MODE)
     if mode != PERMISSION_MODE:
@@ -3585,9 +3595,11 @@ def read_stream(stdout, label="review"):
             # result event may still be further down it.
             continue
         # A subagent's event is not the review's, whatever its type. Finder
-        # subagents are what the default `high` prompt spawns, `Task` is in
-        # the allow list, and with --verbose their events arrive here as
-        # ordinary events tagged with the tool call that started them.
+        # subagents are what the default `high` prompt spawns, and with
+        # --verbose their events arrive here as ordinary events tagged with
+        # the tool call that started them. REVIEWER_TOOLS no longer hands
+        # the reviewer the tool; the filter stays for a release that spawns
+        # one regardless.
         # Unfiltered, an assistant event of theirs replaces the review's
         # findings with two candidates from one angle, because the last call
         # wins, and a terminal event of theirs stands in as the ending of a
@@ -3858,7 +3870,7 @@ def triage(label, findings, config):
                       "--model", chooser,
                       "--settings", json.dumps(TRIAGE_SETTINGS),
                       "--setting-sources", "",
-                      "--strict-mcp-config"],
+                      "--strict-mcp-config", "--tools", ""],
                      timeout=SEVERITY_TIMEOUT, env=env)
         event = json.loads(result.stdout)
         said = str(event.get("result") or "")
@@ -4238,7 +4250,8 @@ def shape(label, repo, path, pr, config, env, since=None):
                       "--output-format", "json",
                       "--model", chooser,
                       "--settings", json.dumps(TRIAGE_SETTINGS),
-                      "--setting-sources", "", "--strict-mcp-config"],
+                      "--setting-sources", "", "--strict-mcp-config",
+                      "--tools", ""],
                      timeout=SHAPE_TIMEOUT, env=call_env)
         event = json.loads(result.stdout)
         said = str(event.get("result") or "")
@@ -6551,7 +6564,11 @@ def review(path, repo, pr, config, env, tokens, resent=False, check=None,
     # `--verbose` because the tool call is an event in the stream rather than
     # part of the final result, and this is the combination that was measured
     # working rather than the one that reads most likely.
+    #
+    # `--tools` because the settings file governs what a tool may do and
+    # nothing about which tools exist: REVIEWER_TOOLS has the measurement.
     cmd = ["claude", "-p", prompt,
+           "--tools", ",".join(REVIEWER_TOOLS),
            "--append-system-prompt", reviewer_brief(pr, config, since,
                                                     blockers),
            "--output-format", "stream-json", "--verbose",
