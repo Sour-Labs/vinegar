@@ -2214,6 +2214,132 @@ check("a review that never fell back says nothing about a fallback",
       posted and "could not be reached" not in posted[0][1]["body"],
       posted[0][1]["body"][:300] if posted else "nothing posted")
 
+
+# --- what the session says about itself -----------------------------------
+# The init event lists the tools the session started with, and each answer
+# carries the model the API answered as. Measured on Claude Code 2.1.285:
+# the init event and the result's modelUsage both echo the name that was
+# asked for, a retired `claude-opus-5[999m]` included, so only the answers
+# can show a substitution.
+def init_event(tools=None, **over):
+    return dict({"type": "system", "subtype": "init",
+                 "model": "claude-opus-5[1m]", "claude_code_version": "2.1.285",
+                 "tools": ["Bash", "Read", "ReportFindings"]
+                 if tools is None else tools}, **over)
+
+
+def said_as(model):
+    return {"type": "assistant", "message": {
+        "model": model, "content": [{"type": "text", "text": "reading"}]}}
+
+
+_init, _as = vinegar.who_reviewed(stream(
+    init_event(), said_as("claude-opus-5"),
+    dict(said_as("claude-haiku-4-5"), parent_tool_use_id="t_1"),
+    said_as("<synthetic>"), call(REAL), result_event()))
+check("the init event is read off the stream",
+      _init and _init["tools"] == ["Bash", "Read", "ReportFindings"], _init)
+check("the answering model is read off the stream, once",
+      _as == ["claude-opus-5"], _as)
+check("a subagent's model is not the review's",
+      "claude-haiku-4-5" not in _as, _as)
+check("a message Claude Code wrote itself names no model",
+      "<synthetic>" not in _as, _as)
+check("a stream with no init event has none",
+      vinegar.who_reviewed(stream(call(REAL), result_event())) == (None, []),
+      vinegar.who_reviewed(stream(call(REAL), result_event())))
+check("a pinned model answered by another is a substitution",
+      vinegar.substituted("claude-opus-5[1m]", ["claude-sonnet-4-5"])
+      == "claude-sonnet-4-5")
+check("the context suffix is not a substitution",
+      vinegar.substituted("claude-opus-5[1m]", ["claude-opus-5"]) is None)
+check("an alias resolving is not a substitution",
+      vinegar.substituted("opus", ["claude-opus-5"]) is None)
+# Measured: an undated name is answered as its dated snapshot.
+check("a dated snapshot of the pinned name is not a substitution",
+      vinegar.substituted("claude-haiku-4-5", ["claude-haiku-4-5-20251001"])
+      is None)
+check("a dated snapshot of another model still is",
+      vinegar.substituted("claude-haiku-4-5", ["claude-sonnet-4-5-20250929"])
+      == "claude-sonnet-4-5-20250929")
+# Same family, longer name: the date is eight digits and nothing else,
+# or `claude-opus-5` answered by `claude-opus-5-5` would pass as itself.
+check("a model whose name starts with the pinned name still is",
+      vinegar.substituted("claude-opus-5", ["claude-opus-5-5"])
+      == "claude-opus-5-5"
+      and vinegar.substituted("claude-opus-4", ["claude-opus-4-1-20250805"])
+      == "claude-opus-4-1-20250805")
+check("no model asked for means nothing to compare",
+      vinegar.substituted(None, ["claude-opus-5"]) is None)
+
+# Through review(): the marker the watchdog pushes about.
+_marker = vinegar.NO_REPORT_TOOL_PATH
+# The home exists before any review runs: acquire_lock() makes it at start.
+os.makedirs(vinegar.HOME, exist_ok=True)
+vinegar.forget(_marker)
+claude_run.stream = stream(init_event(tools=["Bash", "Read"]),
+                           call(FINDINGS[:4]), result_event())
+del posted[:]
+
+
+def _marked():
+    """The marker's text, or None: a check that opens a missing file
+    raises, which aborts the run instead of failing the check."""
+    try:
+        with open(_marker) as handle:
+            return handle.read()
+    except OSError:
+        return None
+
+
+_ran(ROOT, "o/r", PR, PINNED, None, {})
+_first = _marked()
+check("a session without the report tool leaves the watchdog its marker",
+      _first is not None and _first.startswith("since ")
+      and "claude 2.1.285" in _first, _first)
+# A second review in the same outage, on another pull request, must not
+# restart the clock: the watchdog pushes once per text.
+_ran(ROOT, "o/r", dict(PR, number=13), PINNED, None, {})
+check("the marker is written once per outage",
+      _first is not None and _marked() == _first, _marked())
+claude_run.stream = stream(init_event(), call(FINDINGS[:4]), result_event())
+_ran(ROOT, "o/r", PR, PINNED, None, {})
+check("a session with the tool again removes the marker",
+      not os.path.exists(_marker))
+# A stream with no init event, such as one that stopped early, says
+# nothing either way.
+vinegar.write_atomic(_marker, "since earlier\n")
+claude_run.stream = stream(call(FINDINGS[:4]), result_event())
+_ran(ROOT, "o/r", PR, PINNED, None, {})
+check("a stream with no init event leaves the marker alone",
+      os.path.exists(_marker))
+vinegar.forget(_marker)
+
+# And the substitution, said on the pull request.
+claude_run.stream = stream(init_event(), said_as("claude-sonnet-4-5"),
+                           call(FINDINGS[:4]), result_event())
+del posted[:]
+_ran(ROOT, "o/r", PR, PINNED, None, {})
+check("the pull request is told which model answered instead",
+      posted and "ran on `claude-sonnet-4-5`, not `claude-opus-5[1m]`"
+      in posted[0][1]["body"],
+      posted[0][1]["body"][:300] if posted else "nothing posted")
+claude_run.stream = stream(init_event(), said_as("claude-opus-5"),
+                           call(FINDINGS[:4]), result_event())
+del posted[:]
+_ran(ROOT, "o/r", PR, PINNED, None, {})
+check("the pinned model answering as itself gets no warning",
+      posted and "ran on `" not in posted[0][1]["body"],
+      posted[0][1]["body"][:300] if posted else "nothing posted")
+claude_run.stream = stream(init_event(), said_as("claude-sonnet-4-5"),
+                           call(FINDINGS[:4]), result_event())
+del posted[:]
+_ran(ROOT, "o/r", PR, dict(CONFIG, model="opus"), None, {})
+check("an alias answering as anything gets no warning",
+      posted and "ran on `" not in posted[0][1]["body"],
+      posted[0][1]["body"][:300] if posted else "nothing posted")
+claude_run.stream = stream(call(FINDINGS[:4]), result_event())
+
 # Only a routing failure. Every other failure has already spent the
 # review's budget by the time it is known. A live 529 arrived eight and a
 # half minutes into an xhigh run, and a second model does not repair it.
