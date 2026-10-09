@@ -1068,8 +1068,10 @@ MUTATIONS = [
     # than trims: a newline in `file` forged an extra numbered block in
     # the severity prompt.
     ("severity-where-is-collapsed",
-     '    where = " ".join(str(finding.get("file") or "").split()) or "(no file)"',
-     '    where = str(finding.get("file") or "").strip() or "(no file)"'),
+     '    where = " ".join(\n'
+     '        str(finding.get("file") or "").replace("`", "").split()) or "(no file)"',
+     '    where = str(finding.get("file") or "").replace("`", "").strip() \\\n'
+     '        or "(no file)"'),
     ("severity-every-field-collapsed",
      "    def flat(finding, name):\n"
      '        return " ".join(str(finding.get(name) or "").split())',
@@ -2211,6 +2213,57 @@ MUTATIONS = [
     ("github-app-must-be-an-object",
      "    if app is not None and not isinstance(app, dict):",
      "    if False:"),
+
+    # --- nothing posted under Vinegar's name renders off the branch -------
+    # --- nothing posted under Vinegar's name renders off the branch -------
+    # One entry per junction, each a zero-width space not inserted.
+    ('quiet-breaks-mentions',
+     '    (re.compile(r"@(?=[A-Za-z0-9])"), "@\\u200b"),',
+     '    (re.compile(r"@(?=[A-Za-z0-9])"), "@"),'),
+    ('quiet-breaks-scheme-autolinks',
+     '    (re.compile(r"://"), ":/\\u200b/"),',
+     '    (re.compile(r"://"), "://"),'),
+    ('www-is-broken-after-any-character',
+     '    (re.compile(r"www\\.", re.I), lambda hit: hit.group(0)[:3] + "\\u200b."),',
+     '    (re.compile(r"\\bwww\\.", re.I), lambda hit: hit.group(0)[:3] + "\\u200b."),'),
+    ('quiet-breaks-www-autolinks',
+     '    (re.compile(r"www\\.", re.I), lambda hit: hit.group(0)[:3] + "\\u200b."),',
+     '    (re.compile(r"\\bwww\\.", re.I), lambda hit: hit.group(0)),'),
+    ('quiet-breaks-links-and-images',
+     '    (re.compile(r"\\](?=[(\\[:])"), "]\\u200b"),',
+     '    (re.compile(r"\\](?=[(\\[:])"), "]"),'),
+    ('quiet-breaks-tags',
+     '    (re.compile(r"<(?=[A-Za-z/!?])"), "<\\u200b"),',
+     '    (re.compile(r"<(?=[A-Za-z/!?])"), "<"),'),
+    ('quiet-breaks-entities',
+     '    (re.compile(r"&(?=[#A-Za-z])"), "&\\u200b"),',
+     '    (re.compile(r"&(?=[#A-Za-z])"), "&"),'),
+    ("where-has-no-backtick",
+     '        str(finding.get("file") or "").replace("`", "").split()) or "(no file)"',
+     '        str(finding.get("file") or "").split()) or "(no file)"'),
+    ("describe-quiets-the-summary",
+     '    summary = quiet(str(finding.get("summary") or "").strip()) \\\n'
+     '        or "(no summary)"',
+     '    summary = str(finding.get("summary") or "").strip() \\\n'
+     '        or "(no summary)"'),
+    ("describe-quiets-the-scenario",
+     '    scenario = quiet(str(finding.get("failure_scenario") or "").strip())',
+     '    scenario = str(finding.get("failure_scenario") or "").strip()'),
+    ("describe-quiets-the-category",
+     '    category = quiet(str(finding.get("category") or "").strip())',
+     '    category = str(finding.get("category") or "").strip()'),
+    ("describe-quiets-the-verdict",
+     '    verdict = quiet(str(finding.get("verdict") or "").strip())',
+     '    verdict = str(finding.get("verdict") or "").strip()'),
+    ("describe-quiets-the-tier",
+     '    tier = quiet(str(finding.get("tier") or "").strip())',
+     '    tier = str(finding.get("tier") or "").strip()'),
+    ("note-quiets-the-summary",
+     '        lines += [quiet(shaped["summary"]), ""]',
+     '        lines += [shaped["summary"], ""]'),
+    ("prose-is-quieted",
+     '                  "", "---", "", quiet(raw).strip()]',
+     '                  "", "---", "", raw.strip()]'),
 
     # --- a resent review moves where the next pass starts ----------------
     ("resend-moves-where-the-next-pass-starts",

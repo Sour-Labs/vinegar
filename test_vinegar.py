@@ -1456,6 +1456,64 @@ check("an untiered finding reads as it always did",
       vinegar.describe({"summary": "s", "category": "correctness"})
       == "s\n\n(correctness)",
       vinegar.describe({"summary": "s", "category": "correctness"}))
+
+# --- nothing posted under Vinegar's name renders off the branch ----------
+# Measured 2026-10-09 by posting comments and reading the HTML back: a
+# zero-width space at the junction keeps each construct as text, and inside
+# a code span it is invisible. No parsing: two drafts that left code spans
+# alone by reading Markdown as CommonMark does were bypassed by every place
+# GitHub reads it differently.
+Z = "\u200b"
+_LOUD = ("ping @kevin or a@b.c, see ![p](https://x.y/p.png) and [l](https://x.y/l) "
+         "or https://x.y/bare or www.x.y/w or <img src=x> or <https://x.y/a> "
+         "or &#64;kevin or [t][r] and [r]: y, and `xs[0](y) @d`")
+_quiet = vinegar.quiet(_LOUD)
+check("a mention and an email are broken after the at sign",
+      "@" + Z + "kevin" in _quiet and "a@" + Z + "b.c" in _quiet
+      and "ping @kevin" not in _quiet, _quiet)
+check("a scheme autolink is broken inside the slashes",
+      "https:/" + Z + "/x.y/bare" in _quiet and "://" not in _quiet, _quiet)
+check("a www autolink is broken before the dot, case kept",
+      "www" + Z + ".x.y/w" in _quiet
+      and vinegar.quiet("WWW.x") == "WWW" + Z + ".x", _quiet)
+# GitHub takes a `www.` after `_`, `*`, `~` or `(` as an autolink too,
+# and `_` is a word character to Python, so no word boundary.
+check("a www autolink is broken after an underscore too",
+      vinegar.quiet("see _www.x.y/l (www.x.y)")
+      == "see _www" + Z + ".x.y/l (www" + Z + ".x.y)",
+      vinegar.quiet("see _www.x.y/l (www.x.y)"))
+check("a link, an image and a reference are broken at the bracket",
+      "![p]" + Z + "(" in _quiet and "[l]" + Z + "(" in _quiet
+      and "[t]" + Z + "[r]" in _quiet and "[r]" + Z + ":" in _quiet, _quiet)
+check("a tag and an angle autolink are broken after the bracket",
+      "<" + Z + "img" in _quiet and "<" + Z + "https:/" in _quiet, _quiet)
+check("an entity is broken after the ampersand",
+      "&" + Z + "#64;kevin" in _quiet, _quiet)
+check("a code span gets the same invisible breaks",
+      "`xs[0]" + Z + "(y) @" + Z + "d`" in _quiet, _quiet)
+check("plain prose is untouched",
+      vinegar.quiet("a < b & c, nothing [x] (y) here")
+      == "a < b & c, nothing [x] (y) here")
+# Through _described: a tier outside the table must fail the check, not
+# end the run.
+_loud_finding = _described({
+    "summary": "@kevin", "failure_scenario": "see https://x.y/f",
+    "category": "[c](https://x.y/c)", "verdict": "<b>", "tier": "<i>"})
+check("every model-written field of a finding is quieted",
+      "@" + Z + "kevin" in _loud_finding
+      and "https:/" + Z + "/x.y/f" in _loud_finding
+      and "[c]" + Z + "(https:/" + Z + "/x.y/c)" in _loud_finding
+      and "<" + Z + "b>" in _loud_finding and "<" + Z + "i>" in _loud_finding
+      and "@kevin" not in _loud_finding, _loud_finding)
+check("the reviewer's own prose is quieted",
+      "@" + Z + "kevin" in vinegar.review_body(L, PR, CONFIG, [], [],
+                                                "ask @kevin"),
+      vinegar.review_body(L, PR, CONFIG, [], [], "ask @kevin"))
+_loud_bullet = vinegar.finding_bullet({
+    "file": "x` @kevin ![p](https://x.y/p.png) `y", "summary": "s"})
+check("a file name cannot end the bullet's code span early",
+      _loud_bullet.startswith("- `x @kevin ![p](https://x.y/p.png) y`: ")
+      and _loud_bullet.count("`") == 2, _loud_bullet)
 check("the tier reaches an inline comment too",
       "\u26aa **note**" in vinegar.split_findings(
           [{"file": "vinegar.py", "line": 12, "summary": "s",
@@ -10815,6 +10873,12 @@ check("the difficulty a note prints is the one the routing used",
           for n in (12, 250, 700, 4000)))
 check("the note carries the model's sentence unchanged",
       "Reworks session refresh." in _plain, _plain)
+_loud_note = vinegar.note_body(
+    _SHAPE_PR, dict(_clear(), changed=1, files=1, difficulty="trivial",
+                    summary="cc @kevin https://x.y/n"), "low", "why")
+check("the note quiets the model's sentence",
+      "@\u200bkevin https:/\u200b/x.y/n" in _loud_note
+      and "@kevin" not in _loud_note, _loud_note)
 check("the note names the difficulty and what it measured",
       "Difficulty: moderate, 700 lines across 7 files" in _plain, _plain)
 check("a note reaching no domain says so rather than leaving it blank",

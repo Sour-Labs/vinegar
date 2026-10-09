@@ -4275,7 +4275,7 @@ def note_body(pr, shaped, effort, why):
     # Only when the model gave one. An empty summary is a missing sentence,
     # not a blank line to pad the comment with.
     if shaped["summary"]:
-        lines += [shaped["summary"], ""]
+        lines += [quiet(shaped["summary"]), ""]
     lines += ["Difficulty: %s, %d lines across %d file%s · Risk: %s" % (
         shaped["difficulty"], shaped["changed"], shaped["files"],
         "" if shaped["files"] == 1 else "s", risk), "",
@@ -4527,7 +4527,11 @@ def finding_where(finding):
     model saw two, so the indices it answers against stopped matching the
     findings it was given.
     """
-    where = " ".join(str(finding.get("file") or "").split()) or "(no file)"
+    # No backtick, because finding_bullet() puts the name in a code span
+    # and a backtick in it would end the span early, leaving the rest of
+    # the name as prose.
+    where = " ".join(
+        str(finding.get("file") or "").replace("`", "").split()) or "(no file)"
     line = finding_line(finding)
     return "%s:%d" % (where, line) if line is not None else where
 
@@ -4549,6 +4553,51 @@ def finding_bullet(finding):
     return "- `%s`: %s" % (where, body)
 
 
+# What GitHub would render from text the reviewer or the triage model
+# echoed off the branch, and the junction each needs. A zero-width space
+# at the junction keeps each as text: measured on 2026-10-09 by posting
+# comments and reading their rendered HTML back, for a mention and an
+# email (`@`), a scheme autolink (`://`), a `www.` autolink, a link, an
+# image and a reference (`](`, `][`, `]:`), a raw tag and an angle
+# autolink (`<` before a letter, `/`, `!` or `?`), and an entity (`&`
+# before `#` or a letter, which is how `&#64;name` still pings a name).
+#
+# No parsing, on purpose. Two drafts left code spans alone by reading
+# Markdown the way CommonMark does, and each review round found another
+# place where GitHub read it differently: unequal backtick runs, escaped
+# backticks, tilde fences, longer closes, block starts, fields joined into
+# one paragraph. Every difference was a bypass. A zero-width space is
+# context-free: inside a code span nothing renders and it is invisible,
+# outside one it breaks the junction, so the same text is safe wherever
+# describe() or finding_bullet() places it. What it costs is an invisible
+# character, at those junctions, in text copied out of a comment.
+QUIET = (
+    (re.compile(r"@(?=[A-Za-z0-9])"), "@\u200b"),
+    (re.compile(r"://"), ":/\u200b/"),
+    # No word boundary: GitHub's extended autolink takes a `www.` after
+    # `_`, which Python counts as a word character.
+    (re.compile(r"www\.", re.I), lambda hit: hit.group(0)[:3] + "\u200b."),
+    (re.compile(r"\](?=[(\[:])"), "]\u200b"),
+    (re.compile(r"<(?=[A-Za-z/!?])"), "<\u200b"),
+    (re.compile(r"&(?=[#A-Za-z])"), "&\u200b"),
+)
+
+
+def quiet(text):
+    """`text` with nothing GitHub would render as a mention, a link, an
+    image, a tag or an entity, wherever it lands in a comment.
+
+    Vinegar posts under its own name, and the summary, the findings and
+    the prose quote a branch it does not trust. Left as written, a pull
+    request could have Vinegar ping a maintainer, render a tracking pixel
+    or put a link under its name; the audit of 2026-10-06 did each with
+    fake inputs.
+    """
+    for junction, broken in QUIET:
+        text = junction.sub(broken, text)
+    return text
+
+
 def describe(finding):
     """A finding as prose, without the file and line that anchor it.
 
@@ -4560,9 +4609,12 @@ def describe(finding):
     # `or ""` rather than a get default, because these keys arrive present
     # and null often enough, and a default only covers a key that is absent.
     # str(None) is "None", which reads as a finding that says None.
-    summary = str(finding.get("summary") or "").strip() or "(no summary)"
-    scenario = str(finding.get("failure_scenario") or "").strip()
-    category = str(finding.get("category") or "").strip()
+    # Each field quieted on its own, so the Markdown this function adds
+    # around them is the only Markdown in the comment.
+    summary = quiet(str(finding.get("summary") or "").strip()) \
+        or "(no summary)"
+    scenario = quiet(str(finding.get("failure_scenario") or "").strip())
+    category = quiet(str(finding.get("category") or "").strip())
     # The tier opens the comment, because that is the whole of what it
     # buys. Every finding renders through here, inline comments and the
     # general list alike, and a reader facing nine or thirteen of them
@@ -4590,14 +4642,14 @@ def describe(finding):
     # The space travels with the dot rather than sitting in the format,
     # which would leave a comment that lost its dot opening on a stray
     # space instead.
-    tier = str(finding.get("tier") or "").strip()
+    tier = quiet(str(finding.get("tier") or "").strip())
     if tier:
         dot = TIER_DOTS.get(tier)
         summary = "%s**%s** · %s" % (dot + " " if dot else "", tier, summary)
     # The verdict rides with the category when the effort level ran a verify
     # pass. CONFIRMED and PLAUSIBLE read very differently, and posting them
     # identically claims a certainty the reviewer did not.
-    verdict = str(finding.get("verdict") or "").strip()
+    verdict = quiet(str(finding.get("verdict") or "").strip())
     body = "%s\n\nFailure: %s" % (summary, scenario) if scenario else summary
     tags = ", ".join(part for part in (category, verdict) if part)
     return "%s\n\n(%s)" % (body, tags) if tags else body
@@ -4866,7 +4918,7 @@ def review_body(label, pr, config, inline, general, raw=None,
                       "its own words follow unedited." if note else
                       "The reviewer did not return its findings in a form "
                       "Vinegar could read, so its own words follow unedited.",
-                  "", "---", "", raw.strip()]
+                  "", "---", "", quiet(raw).strip()]
     elif not total:
         # Never "No findings." on a run that did not finish: it did not look
         # at everything, so it is not entitled to say the change is clean.
