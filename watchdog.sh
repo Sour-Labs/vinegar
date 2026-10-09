@@ -130,10 +130,12 @@ if [ "$alive" = "1" ]; then
     # untouched, because the daemon is alive and healthchecks.io is the
     # channel for a daemon that is not.
     #
-    # The same shape serves a second marker, `no-report-tool`: Vinegar writes
-    # it when a review's session starts without the ReportFindings tool, so
-    # every review posts as prose with no inline comments, and removes it
-    # after the next session that has the tool.
+    # The same shape serves two more markers. `no-report-tool`: Vinegar
+    # writes it when a review's session starts without the ReportFindings
+    # tool, so every review posts as prose with no inline comments, and
+    # removes it after the next session that has the tool. `tool-missing`:
+    # the same for Read or Bash, which a release could rename out from
+    # under the --tools flag that names them.
     push_marker() {
         marker="$HOME_DIR/$1"
         sent="$HOME_DIR/$1.sent"
@@ -158,6 +160,9 @@ if [ "$alive" = "1" ]; then
     push_marker no-report-tool "Vinegar's reviewer cannot report findings" warning \
         "Claude Code on $(hostname -s) starts reviews without the ReportFindings tool," \
         "Reviews post as prose with no inline comments until it is back. Check the claude under ~/.vinegar/bin and CLAUDE_CODE_REPORT_FINDINGS. No second push until a session has the tool again."
+    push_marker tool-missing "Vinegar's reviewer is missing a tool it needs" warning \
+        "Claude Code on $(hostname -s) starts reviews without a tool REVIEWER_TOOLS names," \
+        "Reviews post what the diff alone tells them until it is back. Check the claude under ~/.vinegar/bin against REVIEWER_TOOLS in vinegar.py. No second push until a session has them all again."
     exit 0
 fi
 
