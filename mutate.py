@@ -2210,6 +2210,36 @@ MUTATIONS = [
      "    if app is not None and not isinstance(app, dict):",
      "    if False:"),
 
+    # --- what the session says about itself ------------------------------
+    ("report-tool-missing-is-marked",
+     "        if REPORT_TOOL in (init.get(\"tools\") or []):",
+     "        if True:"),
+    ("report-tool-back-forgets-the-marker",
+     "            forget(NO_REPORT_TOOL_PATH)",
+     "            pass"),
+    ("report-tool-marker-written-once",
+     "    if not os.path.exists(NO_REPORT_TOOL_PATH):",
+     "    if True:"),
+    ("who-reviewed-skips-subagents",
+     "        if event.get(\"parent_tool_use_id\"):\n"
+     "            continue\n"
+     "        if event.get(\"type\") == \"system\" and event.get(\"subtype\") == \"init\":",
+     "        if event.get(\"type\") == \"system\" and event.get(\"subtype\") == \"init\":"),
+    ("who-reviewed-skips-synthetic-answers",
+     "            if (isinstance(model, str) and model and not model.startswith(\"<\")",
+     "            if (isinstance(model, str) and model"),
+    ("substituted-ignores-aliases",
+     "    if not asked or not any(ch.isdigit() for ch in asked):",
+     "    if not asked:"),
+    ("substituted-strips-the-context-suffix",
+     "    wanted = re.sub(r\"\\[[^\\]]*\\]$\", \"\", asked)",
+     "    wanted = asked"),
+    ("substituted-model-is-noted",
+     "    if other:\n"
+     "        notes.append(",
+     "    if False:\n"
+     "        notes.append("),
+
     # --- closing the checks a stopped Vinegar left spinning -------------
     # The wire, which every check on sweep_checks() itself is blind to:
     # they call it directly, so this shipped uncovered would leave all of

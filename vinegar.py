@@ -377,6 +377,11 @@ REVIEW_DIR = os.path.join(HOME, "reviews")
 # stays true across a restart and across a pull request closed while it
 # waited.
 LOGGED_OUT_PATH = os.path.join(HOME, "logged-out")
+# There while the reviewer's sessions start without the tool its findings
+# arrive on, for watchdog.sh to push about the same way. Written from the
+# session's own init event, so it names the release that dropped the tool,
+# and removed by the next review whose session has it again.
+NO_REPORT_TOOL_PATH = os.path.join(HOME, "no-report-tool")
 
 # What `reviewed_sha` has to look like before anything diffs from it.
 #
@@ -6224,6 +6229,76 @@ def unroutable(output, findings):
             and output.get("total_cost_usd") == 0)
 
 
+def who_reviewed(stdout):
+    """The session's init event, and the models its answers came back as.
+
+    Two facts the result event does not hold. The init event lists the
+    tools the session started with, which is where a release that stops
+    honouring the flag ReportFindings is enabled by would show: the
+    reviewer then has nothing to report with, every review posts as prose
+    with no anchors, and nothing else in the stream says why. The
+    assistant events carry the model the API answered as, which is the one
+    name that reflects a substitution. Measured on 2.1.285: the init event
+    and the result's `modelUsage` both echo the name that was asked for, a
+    retired one included, and only the answers name what ran. `[1m]` is
+    asked for and answered without, and `<synthetic>` is the shape of a
+    message Claude Code wrote itself, such as a failed login.
+
+    Subagents' events are skipped for the reason read_stream() gives.
+    """
+    init, answered = None, []
+    for line in stream_lines(stdout):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("parent_tool_use_id"):
+            continue
+        if event.get("type") == "system" and event.get("subtype") == "init":
+            init = event
+        elif event.get("type") == "assistant":
+            message = event.get("message")
+            model = message.get("model") if isinstance(message, dict) else None
+            if (isinstance(model, str) and model and not model.startswith("<")
+                    and model not in answered):
+                answered.append(model)
+    return init, answered
+
+
+def substituted(asked, answered):
+    """The model that answered in place of `asked`, or None.
+
+    Only a pinned name can be substituted. An alias such as `opus` asks
+    for whatever it resolves to, so an answer differing from it is the
+    alias working; a name with a digit in it asked for one model. The
+    `[1m]` suffix asks for the context window, not a different model.
+    """
+    if not asked or not any(ch.isdigit() for ch in asked):
+        return None
+    wanted = re.sub(r"\[[^\]]*\]$", "", asked)
+    for model in answered:
+        if model != wanted:
+            return model
+    return None
+
+
+def report_tool_missing(label, init):
+    """Say the session cannot report findings, and mark it for the watchdog.
+
+    Written once per outage and left alone, like the login marker: the
+    watchdog pushes on the text, and the text keeps when this began.
+    """
+    release = init.get("claude_code_version") or "?"
+    log("%s: the reviewer's session has no %s tool, so it can only answer "
+        "in prose: claude %s" % (label, REPORT_TOOL, release))
+    if not os.path.exists(NO_REPORT_TOOL_PATH):
+        write_atomic(NO_REPORT_TOOL_PATH, "since %s, first seen on %s, "
+                     "claude %s\n" % (utc_stamp(), label, release))
+
+
 def logged_out(stdout):
     """Did that attempt stop because Claude could not log in?
 
@@ -6625,6 +6700,20 @@ def review(path, repo, pr, config, env, tokens, resent=False, check=None,
         # fallback a zero and have it killed before it started.
         left = max(1, left - took)
 
+    # Off the stream itself, which is the only place either fact is. The
+    # marker goes both ways here, so a release that brings the tool back
+    # ends the outage on its first review.
+    init, answered = who_reviewed(result.stdout)
+    if init is not None:
+        if REPORT_TOOL in (init.get("tools") or []):
+            forget(NO_REPORT_TOOL_PATH)
+        else:
+            report_tool_missing(label, init)
+    other = substituted(model, answered)
+    if other:
+        log("%s: the review ran on %s, not %s, the model it asked for"
+            % (label, other, model))
+
     if output is None:
         # No terminal event, so the process died rather than finished: killed
         # for memory, a segfault, a truncated pipe. If it had already reported
@@ -6730,6 +6819,14 @@ def review(path, repo, pr, config, env, tokens, resent=False, check=None,
             "use. `%s` could not be reached, so `%s` reviewed instead. The "
             "findings stand; the configuration needs looking at."
             % (abandoned, config["fallback_model"]))
+    # Said where an operator will see it, for the reason the fallback note
+    # gives: the daemon log alone leaves every pull request looking as it
+    # did before.
+    if other:
+        notes.append(
+            "This review ran on `%s`, not `%s`, the model Vinegar asked for. "
+            "The findings stand; the configuration needs looking at."
+            % (other, model))
 
     if output.get("is_error"):
         log("%s: review failed after %ds%s: %s" % (

@@ -129,22 +129,35 @@ if [ "$alive" = "1" ]; then
     # rather than a message with no time in it. The heartbeat above is
     # untouched, because the daemon is alive and healthchecks.io is the
     # channel for a daemon that is not.
-    LOGGED_OUT="$HOME_DIR/logged-out"
-    SENT="$HOME_DIR/logged-out.sent"
-    outage="$(head -c 200 "$LOGGED_OUT" 2>/dev/null)"
-    if [ -n "$outage" ] && [ -n "$NTFY_TOPIC" ] \
-        && [ "$outage" != "$(cat "$SENT" 2>/dev/null)" ]; then
-        if curl -fsS -m 10 --retry 3 -o /dev/null \
-            -H "Title: Vinegar cannot log in to Claude" \
-            -H "Priority: high" \
-            -H "Tags: key" \
-            -d "Claude Code on $(hostname -s) cannot log in, $outage. Reviews wait and retry by themselves. If it does not clear, log in again with claude on that machine. No second push until a review works again." \
-            "https://ntfy.sh/$NTFY_TOPIC"; then
-            printf '%s\n' "$outage" > "$SENT"
-        else
-            log "ntfy push about the Claude login did not send"
+    #
+    # The same shape serves a second marker, `no-report-tool`: Vinegar writes
+    # it when a review's session starts without the ReportFindings tool, so
+    # every review posts as prose with no inline comments, and removes it
+    # after the next session that has the tool.
+    push_marker() {
+        marker="$HOME_DIR/$1"
+        sent="$HOME_DIR/$1.sent"
+        outage="$(head -c 200 "$marker" 2>/dev/null)"
+        if [ -n "$outage" ] && [ -n "$NTFY_TOPIC" ] \
+            && [ "$outage" != "$(cat "$sent" 2>/dev/null)" ]; then
+            if curl -fsS -m 10 --retry 3 -o /dev/null \
+                -H "Title: $2" \
+                -H "Priority: high" \
+                -H "Tags: $3" \
+                -d "$4 $outage. $5" \
+                "https://ntfy.sh/$NTFY_TOPIC"; then
+                printf '%s\n' "$outage" > "$sent"
+            else
+                log "ntfy push about $1 did not send"
+            fi
         fi
-    fi
+    }
+    push_marker logged-out "Vinegar cannot log in to Claude" key \
+        "Claude Code on $(hostname -s) cannot log in," \
+        "Reviews wait and retry by themselves. If it does not clear, log in again with claude on that machine. No second push until a review works again."
+    push_marker no-report-tool "Vinegar's reviewer cannot report findings" warning \
+        "Claude Code on $(hostname -s) starts reviews without the ReportFindings tool," \
+        "Reviews post as prose with no inline comments until it is back. Check the claude under ~/.vinegar/bin and CLAUDE_CODE_REPORT_FINDINGS. No second push until a session has the tool again."
     exit 0
 fi
 

@@ -674,6 +674,14 @@ restart and after the waiting pull request is closed, because neither proves
 the login works. Nothing about it goes to healthchecks.io, which is the channel
 for a daemon that is not running.
 
+It writes `~/.vinegar/no-report-tool` the same way when a review's session
+starts without the `ReportFindings` tool, which is how a Claude Code release
+that stopped honouring `CLAUDE_CODE_REPORT_FINDINGS` would show: the findings
+then arrive as prose with no inline comments. The file names the release, the
+watchdog pushes about it once per outage, and Vinegar removes it after the next
+review whose session has the tool. A review that answers as a model other than
+the pinned one is logged, and the review comment says which model answered.
+
 ## What the reviewer is allowed to do
 
 A pull request diff is input written by someone else, and the reviewer reads it
