@@ -8480,6 +8480,80 @@ check("the entry corrected is the finished one at the reviewed commit",
 # A review found already up may be an earlier attempt's, so the resend
 # closes the entry as finish() closes a post that found it up: the tally,
 # the summary, and no tick.
+# The next pass starts where a resent review finished. Without this the
+# next push was read as a first round: the whole pull request again at full
+# price, repeating findings already posted. Only a whole reading moves it,
+# and only a full commit id, which is what state_entry() keeps.
+FULL_EARN = "e" * 40
+
+
+def _resent_entry(sha, whole=True, refuse=False, marker_lines=None,
+                  findings=()):
+    """handle_pr's entry after resending a saved review of `sha`."""
+    at = dict(PR_LIVE, headRefOid=sha)
+    vinegar.run = _run_and_tier
+    fake_run.rc, fake_run.post_err = 1, "HTTP 500"
+    vinegar.finish(L, "o/r", at, ROOT, "words",
+                   None if findings is None else list(findings), CONFIG,
+                   None, {}, whole=whole)
+    vinegar.run = fake_run
+    marker = vinegar.unposted_path("o/r", at)
+    if marker_lines is not None:
+        vinegar.write_atomic(marker, marker_lines)
+    fake_run.rc, fake_run.post_err = (1, "HTTP 500") if refuse else (0, "")
+    fake_run.check_open = {"check_runs": []}
+    del posted[:]
+    vinegar._post_failed_at.clear()
+    env_was = vinegar.github_env
+    vinegar.github_env = lambda *a, **k: CHK_ENV
+    key = vinegar.pr_key("o/r", at)
+    state = {key: {"outcome": vinegar.DONE, "sha": sha, "attempts": 1}}
+    vinegar.handle_pr("o/r", at, CHK_CONFIG, state, {})
+    vinegar.github_env = env_was
+    fake_run.rc, fake_run.post_err = 0, ""
+    vinegar.forget(marker)
+    return state.get(key, {})
+
+
+_moved = _resent_entry(FULL_EARN)
+check("a resent whole review moves where the next pass starts",
+      _moved.get("reviewed_sha") == FULL_EARN
+      and _moved.get("outcome") == vinegar.DONE, _moved)
+_part = _resent_entry(FULL_EARN, whole=False)
+check("a resent partial review does not move it",
+      "reviewed_sha" not in _part and _part.get("outcome") == vinegar.DONE,
+      _part)
+# deliver()'s rule for `covered`, findings included: a reviewer that
+# reached the end of the scope in prose alone reported nothing.
+check("covers() wants a whole reading and findings",
+      vinegar.covers(True, []) and not vinegar.covers(False, [])
+      and not vinegar.covers(True, None))
+_prose = _resent_entry(FULL_EARN, findings=None)
+check("a resent review that reported nothing does not move it",
+      "reviewed_sha" not in _prose and _prose.get("outcome") == vinegar.DONE,
+      _prose)
+_old = _resent_entry(FULL_EARN, marker_lines="%s\n%s\nNo findings\n" % (
+    FULL_EARN, vinegar.CHECK_CLEAN))
+check("a marker from before the whole line reads as partial",
+      "reviewed_sha" not in _old and _old.get("outcome") == vinegar.DONE,
+      _old)
+_held = _resent_entry(FULL_EARN, refuse=True)
+check("a resend refused again moves nothing",
+      "reviewed_sha" not in _held and _held.get("sha") == FULL_EARN, _held)
+_short = _resent_entry("ea4dea4dea4d")
+check("a resend at a short commit id moves nothing",
+      "reviewed_sha" not in _short and _short.get("outcome") == vinegar.DONE,
+      _short)
+_probe = os.path.join(vinegar.REVIEW_DIR, "whole-probe")
+vinegar.write_atomic(_probe, "sha\nclean\nNo findings\nwhole\n")
+_said_whole = vinegar.read_whole(_probe)
+vinegar.write_atomic(_probe, "sha\nclean\nNo findings\npartial\n")
+_said_partial = vinegar.read_whole(_probe)
+vinegar.forget(_probe)
+check("the marker's fourth line says whether the review was whole",
+      _said_whole and not _said_partial and not vinegar.read_whole(_probe),
+      (_said_whole, _said_partial))
+
 PR_UP, _up_marker = _refused("ea3cea3cea3c")
 _up_patch = _resent(PR_UP, _ours("neutral"),
                     look=vinegar.BODY_MARK + " reviewed `ea3cea3` ...\n")

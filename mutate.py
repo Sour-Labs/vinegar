@@ -1506,13 +1506,15 @@ MUTATIONS = [
     # The marker records the conclusion a landed post gets, a term at a
     # time, and its title, beneath the commit it names.
     ("resend-marker-records-the-conclusion",
-     '            write_atomic(marker, "%s\\n%s\\n%s\\n" % (\n'
-     '                pr["headRefOid"], earned, title))',
+     '            write_atomic(marker, "%s\\n%s\\n%s\\n%s\\n" % (\n'
+     '                pr["headRefOid"], earned, title,\n'
+     '                "whole" if covers(whole, findings) else "partial"))',
      '            write_atomic(marker, "%s\\n" % (\n'
      '                pr["headRefOid"]))'),
     ("resend-marker-records-the-title",
-     '            write_atomic(marker, "%s\\n%s\\n%s\\n" % (\n'
-     '                pr["headRefOid"], earned, title))',
+     '            write_atomic(marker, "%s\\n%s\\n%s\\n%s\\n" % (\n'
+     '                pr["headRefOid"], earned, title,\n'
+     '                "whole" if covers(whole, findings) else "partial"))',
      '            write_atomic(marker, "%s\\n%s\\n" % (\n'
      '                pr["headRefOid"], earned))'),
     ("resend-earns-red-on-a-blocker",
@@ -1755,13 +1757,13 @@ MUTATIONS = [
     # along with the reading scope loses every finding to one bad anchor.
     # --- what review() answers about its own coverage ------------------
     ("covered-needs-a-whole-reading",
-     '            if whole and findings is not None and config["comment"]:',
+     '            if covers(whole, findings) and config["comment"]:',
      '            if findings is not None and config["comment"]:'),
     ("covered-needs-findings",
-     '            if whole and findings is not None and config["comment"]:',
+     '            if covers(whole, findings) and config["comment"]:',
      '            if whole and config["comment"]:'),
     ("covered-needs-a-pull-request",
-     '            if whole and findings is not None and config["comment"]:',
+     '            if covers(whole, findings) and config["comment"]:',
      "            if whole and findings is not None:"),
     ("whole-is-not-the-note",
      "        notes.append(partial_note(\"failed before it finished\"))\n"
@@ -1786,7 +1788,7 @@ MUTATIONS = [
      '                    del done["reviewed_sha"]',
      "                    done.clear()"),
     ("covered-is-not-the-note-either",
-     '            if whole and findings is not None and config["comment"]:',
+     '            if covers(whole, findings) and config["comment"]:',
      "            if (whole and not note and findings is not None\n"
      '                    and config["comment"]):'),
     ("reviewed-through-rule",
@@ -2209,6 +2211,31 @@ MUTATIONS = [
     ("github-app-must-be-an-object",
      "    if app is not None and not isinstance(app, dict):",
      "    if False:"),
+
+    # --- a resent review moves where the next pass starts ----------------
+    ("resend-moves-where-the-next-pass-starts",
+     '            if whole and FULL_SHA.match(at["headRefOid"]):\n'
+     '                entry.update(reviewed_through(True, at["headRefOid"], done))',
+     "            pass"),
+    ("resend-moves-it-only-for-a-whole-review",
+     '            if whole and FULL_SHA.match(at["headRefOid"]):',
+     '            if FULL_SHA.match(at["headRefOid"]):'),
+    ("marker-records-whether-the-review-was-whole",
+     '                "whole" if covers(whole, findings) else "partial"))',
+     '                "whole"))'),
+    # The rule itself, now one place.
+    ("covers-wants-findings",
+     "    return bool(whole and findings is not None)",
+     "    return bool(whole)"),
+    ("covers-wants-a-whole-reading",
+     "    return bool(whole and findings is not None)",
+     "    return findings is not None"),
+    ("marker-whole-means-findings-too",
+     '                "whole" if covers(whole, findings) else "partial"))',
+     '                "whole" if whole else "partial"))'),
+    ("marker-whole-line-is-read-not-assumed",
+     '            return len(lines) > 3 and lines[3].strip() == "whole"',
+     "            return True"),
 
     # --- what the session says about itself ------------------------------
     ("report-tool-missing-is-marked",
