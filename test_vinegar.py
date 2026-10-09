@@ -716,6 +716,105 @@ _co_checkout()
 check("the poll after a hung clone clones again rather than limping on",
       any(c[:3] == ["gh", "repo", "clone"] for c, _w, _t in _co_ran),
       [c[:3] for c, _w, _t in _co_ran])
+
+# The failure branches. None of them had ever run under the suite: the
+# audit of 2026-10-06 removed each raise below in turn and every check
+# stayed green. What that leaves is the quietest wrong review there is.
+# One clone serves every pull request of a repository; the head fetch
+# fails (a token expired mid-pass, a branch deleted between the listing
+# and the fetch), the detach fails after it, checkout() answers the path
+# anyway, /code-review reads the previous pull request's tree, and the
+# findings are pinned to the new head.
+
+
+def _co_failing(marker, code=1, hangs=False):
+    """co_run with the git step whose text carries `marker` answering
+    `code`, or raising TimeoutExpired. The head fetch names `pull/`, the
+    base fetch `<base>:<base>`, so the two are told apart."""
+    def run(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
+        if cmd[0] == "git" and marker in " ".join(cmd):
+            _co_ran.append((cmd, cwd, timeout))
+            if hangs:
+                raise subprocess.TimeoutExpired(cmd, timeout or 0)
+            return subprocess.CompletedProcess(cmd, code, "", "refused")
+        return co_run(cmd, cwd, timeout, env, stdin_text)
+    return run
+
+
+def _co_after(word):
+    """The git steps recorded after the first one carrying `word`."""
+    cmds = [c for c, _w, _t in _co_ran if c[0] == "git"]
+    hit = next((i for i, c in enumerate(cmds) if word in c), None)
+    return cmds[hit + 1:] if hit is not None else cmds
+
+
+vinegar.run = _co_failing("pull/")
+del _co_ran[:]
+_co_said = _co_checkout()
+check("a head fetch that fails stops the checkout and names the step",
+      isinstance(_co_said, str) and "fetch" in _co_said
+      and "failed: refused" in _co_said, _co_said)
+check("nothing after the failed fetch runs on the old tree",
+      _co_after("fetch") == [], _co_after("fetch"))
+# A local step that hangs is converted the same way the clone is, so
+# the log names the step rather than a subprocess, and nothing after it
+# runs either.
+vinegar.run = _co_failing("reset", hangs=True)
+del _co_ran[:]
+_co_said = _co_checkout()
+check("a step that hangs stops the checkout and names the step",
+      isinstance(_co_said, str) and "reset" in _co_said
+      and "did not finish within" in _co_said, _co_said)
+check("nothing after the hung step runs",
+      _co_after("reset") == [], _co_after("reset"))
+# A clone that exits non-zero leaves no repository to fetch into. Let
+# through, the steps loop runs in a directory with no .git and every one
+# of them fails for the wrong reason.
+
+
+def _clone_refused(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
+    if cmd[:3] == ["gh", "repo", "clone"]:
+        _co_ran.append((cmd, cwd, timeout))
+        return subprocess.CompletedProcess(cmd, 1, "", "repository not found")
+    return co_run(cmd, cwd, timeout, env, stdin_text)
+
+
+vinegar.run = _clone_refused
+shutil.rmtree(_co_path, ignore_errors=True)
+del _co_ran[:]
+_co_said = _co_checkout()
+check("a clone that fails stops the checkout and says why",
+      isinstance(_co_said, str)
+      and _co_said == "clone failed: repository not found", _co_said)
+check("no git step runs in a checkout that was never cloned",
+      not any(c[0] == "git" for c, _w, _t in _co_ran),
+      [c[:2] for c, _w, _t in _co_ran])
+# The base fetch after the loop is the one failure that must not fail
+# the checkout: the tree is already on the right commit, and a stale
+# base only widens the diff. But it has to say so, because a diff that
+# includes merged work is otherwise a review that looks wrong for no
+# reason anyone can find.
+vinegar.run = co_run
+shutil.rmtree(_co_path, ignore_errors=True)
+_co_checkout()
+_co_base = "%s:%s" % (PR["baseRefName"], PR["baseRefName"])
+_co_log = []
+vinegar.log = lambda m: _co_log.append(m)
+vinegar.run = _co_failing(_co_base)
+_co_said = _co_checkout()
+check("a base fetch that fails does not fail the checkout",
+      _co_said == _co_path, _co_said)
+check("but it is said, with git's reason",
+      any("not refreshed" in m and "refused" in m for m in _co_log), _co_log)
+del _co_log[:]
+vinegar.run = _co_failing(_co_base, hangs=True)
+_co_said = _co_checkout()
+check("a base fetch that hangs does not fail the checkout either",
+      _co_said == _co_path, _co_said)
+check("and the hang is said, with its bound",
+      any("not refreshed after %ds" % vinegar.FETCH_TIMEOUT in m
+          for m in _co_log), _co_log)
+vinegar.log = lambda message: None
 vinegar.CHECKOUT_DIR = _co_dir
 vinegar.run = fake_run
 
@@ -9825,6 +9924,62 @@ check("one repository is never in two workers at once",
 # Without this the check above passes on a loop that never ran at all.
 check("and the workers really were racing for it",
       len(_entered) >= 5, len(_entered))
+
+# A worker that falls over. The pass-based loop had this covered and the
+# continuous one did not: the audit of 2026-10-06 removed stop_polling()
+# from the worker's except, then the re-raise, then the naming loop, and
+# every check stayed green. With the first gone the worker's `while True`
+# takes the next repository and the daemon carries on one worker short
+# with nothing in the log; with the second gone poll_forever() returns
+# normally, main() releases the lock and exits 0, and launchd restarts a
+# daemon that never said why it stopped. The raise is reachable:
+# review() builds the reviewer's settings through load_settings(), which
+# sys.exits on a settings file it cannot use.
+_crash_said, _crash_raised = [], []
+
+
+def _one_falls_over(repo, config, state, tokens, turn=False):
+    if repo == "o/bad":
+        raise ValueError("the settings file cannot be used")
+    return False
+
+
+def _loop_recording(config):
+    """poll_forever() on a thread, keeping what it raised."""
+    def target():
+        try:
+            vinegar.poll_forever(config, {}, {}, False, None)
+        except BaseException as err:
+            _crash_raised.append(err)
+    runner = threading.Thread(target=target)
+    runner.daemon = True
+    runner.start()
+    return runner
+
+
+vinegar.poll_repo = _one_falls_over
+_schedule_cleared()
+_kept_log, vinegar.log = vinegar.log, lambda m: _crash_said.append(m)
+_runner = _loop_recording(dict(CONFIG, repos=["o/bad", "o/good"],
+                               parallel_repos=2, poll_interval=0.02))
+_runner.join(15)
+_crash_finished = not _runner.is_alive()
+_crash_stopped = vinegar.STOPPING.is_set()
+# A loop that did not stop by itself is asked to, so a broken guard
+# fails these checks rather than leaving a worker running under the
+# rest of the file.
+_stop(_runner, "crash")
+vinegar.log = _kept_log
+check("a worker that falls over stops the loop by itself",
+      _crash_finished and _crash_stopped,
+      (_crash_finished, _crash_stopped))
+check("and the loop raises what the worker raised, so the daemon exits "
+      "non-zero",
+      _crash_raised and isinstance(_crash_raised[0], ValueError)
+      and "cannot be used" in str(_crash_raised[0]), _crash_raised)
+check("and the repository whose turn fell over is named",
+      any("o/bad: its turn fell over: the settings file cannot be used"
+          in m for m in _crash_said), _crash_said)
 
 # A turn reviews at most one pull request, so a repository with five of
 # them holds a worker for one review rather than for five.

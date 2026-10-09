@@ -435,6 +435,36 @@ MUTATIONS = [
     ("checkout-cwd",
      "            result = run(step, cwd=path, env=env, timeout=bound)",
      "            result = run(step, env=env, timeout=bound)"),
+    # The failure branches, which no check reached until 2026-10-09: the
+    # audit removed each of these and the suite stayed green. Let through,
+    # a failed head fetch reviews the previous pull request's tree under
+    # the new head's commit id.
+    ("checkout-step-failed-raise",
+     '        if result.returncode != 0:\n'
+     '            raise RuntimeError("%s failed: %s" % (" ".join(step),',
+     '        if False:\n'
+     '            raise RuntimeError("%s failed: %s" % (" ".join(step),'),
+    ("checkout-step-timeout-raise",
+     '            raise RuntimeError("%s did not finish within %ds" % (\n'
+     '                " ".join(step), bound))',
+     "            continue"),
+    ("clone-failed-raise",
+     '        if result.returncode != 0:\n'
+     '            raise RuntimeError("clone failed: %s" % result.stderr.strip())',
+     '        if False:\n'
+     '            raise RuntimeError("clone failed: %s" % result.stderr.strip())'),
+    ("base-fetch-failure-logged",
+     '    if result.returncode != 0:\n'
+     '        log("%s#%d: base %s not refreshed, the diff may include merged work: %s"',
+     '    if False:\n'
+     '        log("%s#%d: base %s not refreshed, the diff may include merged work: %s"'),
+    ("base-fetch-timeout-logged",
+     '    except subprocess.TimeoutExpired:\n'
+     '        log("%s#%d: base %s not refreshed after %ds, the diff may include "\n'
+     '            "merged work" % (repo, pr["number"], base, FETCH_TIMEOUT))\n'
+     '        return path',
+     '    except subprocess.TimeoutExpired:\n'
+     '        return path'),
     ("checkout-unusable-repo",
      "        if not usable:\n"
      '            log("%s: the checkout is not a usable repository, cloning it "\n'
@@ -533,6 +563,30 @@ MUTATIONS = [
      "        if False:\n"
      "            return"),
     # --- the continuous loop -------------------------------------------
+    # A worker that falls over. The pass had these three covered and the
+    # continuous loop did not, until 2026-10-09: the audit removed each
+    # and the suite stayed green. Without the first the daemon carries on
+    # one worker short and says nothing; without the second it exits 0
+    # and launchd restarts a daemon that never said why.
+    ("worker-crash-stops-the-loop",
+     "                stop_polling()\n"
+     "            finally:\n"
+     "                release_repo(repo, reviewed, config)",
+     "                pass\n"
+     "            finally:\n"
+     "                release_repo(repo, reviewed, config)"),
+    ("worker-crash-is-raised",
+     '        log("%s: its turn fell over: %s" % (repo, said))\n'
+     "    if first:\n"
+     "        raise first[0]",
+     '        log("%s: its turn fell over: %s" % (repo, said))\n'
+     "    if False:\n"
+     "        raise first[0]"),
+    ("worker-crash-is-named",
+     "    for repo, said in fell_over:\n"
+     '        log("%s: its turn fell over: %s" % (repo, said))',
+     "    for repo, said in ():\n"
+     '        log("%s: its turn fell over: %s" % (repo, said))'),
     # What replaced the barrier. poll_once() joined every worker before it
     # returned, so the gap between passes was the slowest repository's
     # whole pass plus `poll_interval`; at seventeen repositories a push
