@@ -3317,6 +3317,36 @@ check("a zero parallel_repos refuses to start",
 check("a boolean parallel_repos is not a number either",
       "whole number of repositories" in _config_with(parallel_repos=True),
       _config_with(parallel_repos=True))
+# The five switches. A string is read by truthiness, so `"comment":
+# "false"` is true and a rehearsal posts to a real pull request.
+for _switch in ("comment", "review_on_push", "skip_drafts", "skip_bots",
+                "skip_forks"):
+    check("a %s given as a string refuses to start" % _switch,
+          "true or false" in _config_with(**{_switch: "false"}),
+          _config_with(**{_switch: "false"}))
+check("a switch given as 0 refuses to start",
+      "true or false" in _config_with(comment=0), _config_with(comment=0))
+check("the switches as booleans still start",
+      _config_with(comment=False, review_on_push=True, skip_drafts=False,
+                   skip_bots=False, skip_forks=False) == "started",
+      _config_with(comment=False, review_on_push=True, skip_drafts=False,
+                   skip_bots=False, skip_forks=False))
+# One login as a string is searched by `in`, so "kev" passes the test.
+check("authors given as one login refuses to start",
+      "list of GitHub logins" in _config_with(authors="kevin"),
+      _config_with(authors="kevin"))
+check("an author that is not a login refuses to start",
+      "list of GitHub logins" in _config_with(authors=["kevin", 7]),
+      _config_with(authors=["kevin", 7]))
+check("authors as a list of logins still start",
+      _config_with(authors=["kevin"]) == "started",
+      _config_with(authors=["kevin"]))
+# A boolean github_app tracebacked on `set(app)`, which under launchd is
+# a restart loop; `false` read as no App at all.
+for _app in (True, False, "x", 7):
+    check("a github_app given as %r refuses to start" % (_app,),
+          "null or an object" in _config_with(github_app=_app),
+          _config_with(github_app=_app))
 # A repository named twice used to cost one wasted listing per pass. Polled
 # at once it puts two passes on the one checkout that repository has, and
 # the second pass's `git reset --hard` moves the tree under the first.
