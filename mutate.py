@@ -1506,13 +1506,15 @@ MUTATIONS = [
     # The marker records the conclusion a landed post gets, a term at a
     # time, and its title, beneath the commit it names.
     ("resend-marker-records-the-conclusion",
-     '            write_atomic(marker, "%s\\n%s\\n%s\\n" % (\n'
-     '                pr["headRefOid"], earned, title))',
+     '            write_atomic(marker, "%s\\n%s\\n%s\\n%s\\n" % (\n'
+     '                pr["headRefOid"], earned, title,\n'
+     '                "whole" if whole else "partial"))',
      '            write_atomic(marker, "%s\\n" % (\n'
      '                pr["headRefOid"]))'),
     ("resend-marker-records-the-title",
-     '            write_atomic(marker, "%s\\n%s\\n%s\\n" % (\n'
-     '                pr["headRefOid"], earned, title))',
+     '            write_atomic(marker, "%s\\n%s\\n%s\\n%s\\n" % (\n'
+     '                pr["headRefOid"], earned, title,\n'
+     '                "whole" if whole else "partial"))',
      '            write_atomic(marker, "%s\\n%s\\n" % (\n'
      '                pr["headRefOid"], earned))'),
     ("resend-earns-red-on-a-blocker",
@@ -2209,6 +2211,21 @@ MUTATIONS = [
     ("github-app-must-be-an-object",
      "    if app is not None and not isinstance(app, dict):",
      "    if False:"),
+
+    # --- a resent review moves where the next pass starts ----------------
+    ("resend-moves-where-the-next-pass-starts",
+     '            if whole and FULL_SHA.match(at["headRefOid"]):\n'
+     '                entry.update(reviewed_through(True, at["headRefOid"], done))',
+     "            pass"),
+    ("resend-moves-it-only-for-a-whole-review",
+     '            if whole and FULL_SHA.match(at["headRefOid"]):',
+     '            if FULL_SHA.match(at["headRefOid"]):'),
+    ("marker-records-whether-the-review-was-whole",
+     '                "whole" if whole else "partial"))',
+     '                "whole"))'),
+    ("marker-whole-line-is-read-not-assumed",
+     '            return len(lines) > 3 and lines[3].strip() == "whole"',
+     "            return True"),
 
     # --- what the session says about itself ------------------------------
     ("report-tool-missing-is-marked",

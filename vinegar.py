@@ -5814,9 +5814,17 @@ def finish(label, repo, pr, path, text, findings, config, env, tokens,
         # transcript was not saved, which here is false and misleading:
         # the transcript is safely on disk and what failed is the note
         # saying it still needs sending.
+        # A fourth line says whether this was a whole reading, because
+        # that is what repost() needs to know to move `reviewed_sha` when
+        # the send lands: reviewed_through() takes `covered`, and a
+        # review killed part-way reached the author without covering the
+        # scope. A marker from before this line reads as partial, which
+        # is the safe way to be wrong: one whole re-read, not a narrowed
+        # pass over ground nobody read.
         try:
-            write_atomic(marker, "%s\n%s\n%s\n" % (
-                pr["headRefOid"], earned, title))
+            write_atomic(marker, "%s\n%s\n%s\n%s\n" % (
+                pr["headRefOid"], earned, title,
+                "whole" if whole else "partial"))
         except OSError as err:
             log("%s: the review is saved but cannot be marked for sending "
                 "again: %s" % (label, err))
@@ -5982,6 +5990,20 @@ def read_earned(path):
         return None, None
 
 
+def read_whole(path):
+    """Whether the marker says the saved review was a whole reading.
+
+    False for a marker written before the line existed, or that cannot
+    be read: finish() says why partial is the safe answer.
+    """
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            lines = handle.read().splitlines()
+            return len(lines) > 3 and lines[3].strip() == "whole"
+    except OSError:
+        return False
+
+
 def repost(key, repo, pr, config, state, tokens, done, marker, sha):
     """Send a review that GitHub refused, again, from the transcript.
 
@@ -6011,6 +6033,8 @@ def repost(key, repo, pr, config, state, tokens, done, marker, sha):
 
     at = dict(pr, headRefOid=sha or pr["headRefOid"])
     saved = transcript_path(repo, at)
+    # Read before the marker can be forgotten below.
+    whole = read_whole(marker)
     landed, give_up_on_it = False, tries >= MAX_ATTEMPTS
 
     # The read is guarded on its own, and narrowly. Wrapping the sending
@@ -6165,6 +6189,15 @@ def repost(key, repo, pr, config, state, tokens, done, marker, sha):
             # on the next line. Counted through the same helper as every
             # other site so the rule stays in one place.
             entry.update(rounds_done(True, done))
+            # The findings reached the author here, so the next pass may
+            # start where this review finished, as it would have had the
+            # post landed the first time. Without this the next push was
+            # read as a first round: the whole pull request again at full
+            # price, repeating findings already posted. Only a whole
+            # reading, for reviewed_through()'s reason, and only a full
+            # commit id, which is what state_entry() keeps.
+            if whole and FULL_SHA.match(at["headRefOid"]):
+                entry.update(reviewed_through(True, at["headRefOid"], done))
     else:
         entry = dict(done, post_tries=tries)
         if waived:
