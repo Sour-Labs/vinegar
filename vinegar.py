@@ -1918,6 +1918,32 @@ def load_config(path):
     # told anything smaller, once, and nothing on it says so. An operator
     # who wants that is describing a different tool, and one who typed it
     # meaning "off" wanted null.
+    # The switches must be booleans, because JSON has them and anything
+    # else is read by truthiness: `"comment": "false"` is a non-empty
+    # string, so a rehearsal posts to a real pull request.
+    for name in ("comment", "review_on_push", "skip_drafts", "skip_bots",
+                 "skip_forks"):
+        if not isinstance(config[name], bool):
+            sys.exit("%s: %s must be true or false, not %r" % (
+                path, name, config[name]))
+
+    # A list, not one login: `"authors": "kevin"` is a string that `in`
+    # searches by substring, so "kev" and "evin" pass the author test.
+    authors = config["authors"]
+    if not isinstance(authors, list) or not all(
+            isinstance(login, str) and login.strip() for login in authors):
+        sys.exit("%s: authors must be a list of GitHub logins, not %r" % (
+            path, authors))
+
+    # Null or an object. `true` tracebacks on `set(app)` below, which
+    # under launchd is a restart every thirty seconds into the same
+    # traceback; `false` and `""` read as "no App", which is not what
+    # was written.
+    app = config["github_app"]
+    if app is not None and not isinstance(app, dict):
+        sys.exit("%s: github_app must be null or an object with app_id and "
+                 "private_key, not %r" % (path, app))
+
     rounds = config["blockers_only_after"]
     if rounds is not None and (not isinstance(rounds, int)
                                or isinstance(rounds, bool) or rounds <= 0):

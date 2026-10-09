@@ -2192,6 +2192,23 @@ MUTATIONS = [
      "    if rounds is not None and (not isinstance(rounds, int)\n"
      "                               or isinstance(rounds, bool) or rounds <= 0):",
      "    if rounds is not None and not isinstance(rounds, int):"),
+    # The switches read by truthiness: `"comment": "false"` posts.
+    ("switches-must-be-booleans",
+     "        if not isinstance(config[name], bool):\n"
+     '            sys.exit("%s: %s must be true or false, not %r" % (',
+     "        if False:\n"
+     '            sys.exit("%s: %s must be true or false, not %r" % ('),
+    # One login as a string is searched by substring.
+    ("authors-must-be-a-list",
+     "    if not isinstance(authors, list) or not all(",
+     "    if not all("),
+    ("authors-must-be-logins",
+     "            isinstance(login, str) and login.strip() for login in authors):",
+     "            True for login in authors):"),
+    # A boolean App tracebacks into a launchd restart loop.
+    ("github-app-must-be-an-object",
+     "    if app is not None and not isinstance(app, dict):",
+     "    if False:"),
 
     # --- closing the checks a stopped Vinegar left spinning -------------
     # The wire, which every check on sweep_checks() itself is blind to:
