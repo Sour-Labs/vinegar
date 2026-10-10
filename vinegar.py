@@ -2601,7 +2601,10 @@ def rebuild_entry(head, outcome, attempts, kept, was, covered=False,
     empty once the head has moved; `was` is the one the two fields that
     outlive the head are read from; `fields` lands on top of what
     carry_forward() gives, which is how a site resets a budget or says a
-    saved review is waiting.
+    saved review is waiting. The two fields read from `was` are not a
+    site's to set: one that tries gets Python's repeated-keyword TypeError
+    on its first run rather than a round count quietly handed back, which
+    is the drift rounds_done() describes.
     """
     return state_entry(head, outcome, attempts,
                        **dict(carry_forward(kept), **fields,
@@ -5282,7 +5285,8 @@ def open_check(label, repo, pr, config, env, blockers=False):
 def ended_title(outcome, attempts=0):
     """What the checks list says about a review that reached no ending.
 
-    One definition, called from both finallys. Written out twice, only
+    One definition, called from attempt_review()'s finally. When the
+    daemon and the hand run each closed their own, written out twice, only
     handle_pr's copy was anchored by a mutation, so reworded or inverted
     text in the `--pr` path was caught by nothing.
 
@@ -5310,8 +5314,8 @@ def ended_title(outcome, attempts=0):
 def ended_conclusion(outcome):
     """The conclusion that goes with ended_title()'s title.
 
-    Beside it and called from the same two finallys, for the reason its
-    docstring gives: written out twice, the hand run's copy is the one
+    Beside it and called from the same finally, for the reason its
+    docstring gives: when there were two, the hand run's copy was the one
     nothing checks.
     """
     return CHECK_LOGGED_OUT if outcome == LOGGED_OUT else CHECK_CONCLUSION
@@ -7982,41 +7986,53 @@ def login_failed(key):
 
 
 def attempt_review(label, repo, pr, config, tokens, env, path, since,
-                   blockers, resent=False, attempts=0):
-    """One review with its indicator: opened before, closed whatever happens.
+                   blockers, record, resent=False, attempts=0):
+    """One review with its indicator: opened before, recorded and closed
+    whatever happens.
 
     What the daemon and a `--pr` run do between deciding to review and
-    recording how it went, written once. It was written twice, and the
-    last three fixes to it each landed in both copies. What differs stays
-    with the caller: the daemon marks the attempt on disk first, passes
-    `resent` for a second attempt at a head and schedules on the answer;
-    a hand run records in its own finally so that Ctrl-C still leaves an
-    entry.
+    going on with the answer, written once. It was written twice, and the
+    last three fixes to it each landed in both copies. What differs is
+    `record`, called with review()'s triple once the review has ended,
+    however it ended: the daemon rebuilds the entry it marked before the
+    review and hands a login failure its attempt back; a hand run re-reads
+    the state file so that a review lasting twenty minutes records against
+    whatever the file says then.
 
     Opened here rather than inside review(), so that the one place that
-    sees every ending is also the place that finishes it. review()
-    returns FAILED on two paths and can raise out of a third, and none of
-    those knows whether MAX_ATTEMPTS has just run out, which is the
-    difference between "it will be tried again" and "it was given up on";
-    `attempts` is how ended_title() tells the two apart.
+    sees every ending is also the place that finishes it. review() returns
+    FAILED on two paths and can raise out of a third, and none of those
+    knows whether MAX_ATTEMPTS has just run out, which is the difference
+    between "it will be tried again" and "it was given up on"; `attempts`
+    is how ended_title() tells the two apart.
 
-    The opening sits inside the try, because it is the one call here that
-    parses a reply GitHub sent. check_api swallows every way the
-    subprocess can fail, but a 2xx of the wrong shape once raised out of
-    the comprehension above it, and from above the try that escaped
-    handle_pr entirely: with FAILED already on disk, the review never
-    ran, the outcome was never recorded, the give-up never fired, and the
-    next poll did it again until MAX_ATTEMPTS was spent on a pull request
-    nobody had reviewed. check_api's docstring promises nothing here is
-    worth a review; this is what makes that structural.
+    The opening sits inside the except with the review, which was the hand
+    run's shape and not the daemon's. check_api swallows every way the
+    subprocess can fail, and open_check() answers None rather than raising
+    on a reply of the wrong shape, so nothing here is expected to raise;
+    the daemon's copy let one through regardless, and the comment beside
+    it recorded what that cost once: FAILED already on disk for a review
+    that never ran, the outcome never recorded, the give-up never fired.
+    Caught, it is recorded like any other failed attempt and MAX_ATTEMPTS
+    stays in charge.
 
-    The review's own raise is kept rather than let through. The
-    subscription is spent by the time most of these can happen, and an
-    unrecorded pull request is reviewed again on the very next poll, at
-    full cost, for ever. announce() covers the posting; this covers
-    everything else review() touches, including the two read_stream calls
-    and `claude` missing from PATH entirely. The caller records FAILED,
-    which keeps MAX_ATTEMPTS in charge of how many times that may repeat.
+    The review's own raise is kept rather than let through for the same
+    reason. The subscription is spent by the time most of these can
+    happen, and an unrecorded pull request is reviewed again on the very
+    next poll, at full cost, for ever. announce() covers the posting; this
+    covers everything else review() touches, including the two
+    read_stream calls and `claude` missing from PATH entirely.
+
+    Recorded before the indicator is closed, not after. The close is a
+    token mint and a PATCH, and a SIGTERM inside those seconds with the
+    entry not yet written would leave the daemon's pre-review marker as
+    the outcome: a finished review bought again on the next poll, and a
+    login failure's attempt never handed back. Recorded in the finally
+    rather than beside the review, so that Ctrl-C, which is not an
+    Exception and walks past the handler above, still leaves an entry;
+    without one the daemon reviewed the same head a minute later at full
+    cost and posted a second complete review, because a first attempt
+    does not ask.
 
     The close mints its own credentials. The ones the caller holds were
     asked to cover the checkout alone, and by here a review has run on
@@ -8024,25 +8040,24 @@ def attempt_review(label, repo, pr, config, tokens, env, path, since,
     indicator most needs finishing. Not "finished" for a DONE outcome:
     finish() closes the indicator itself on every ending that posted, so
     an open one here means the posting is what did not happen, and
-    ended_title() says so. KeyboardInterrupt is not an Exception, so it
-    walks past the handler here and out through the finally, which is
-    what keeps a Ctrl-C from leaving a Vinegar check spinning for ever
-    on a pull request where it is required. Under launchd there is no
-    interrupt at all: `bootout` is a SIGTERM that Python installs no
-    handler for, so the process dies without running this finally or any
-    other, which is the case the daemon's marker on disk exists for.
+    ended_title() says so. It runs even when the recording raises, which
+    save_state does on a full disk, because a stuck run blocks a merge
+    wherever the check is required. Under launchd there is no interrupt
+    at all: `bootout` is a SIGTERM that Python installs no handler for,
+    so the process dies without running this finally or any other, which
+    is the case the daemon's marker on disk exists for.
 
     Answers review()'s triple, and FAILED with nothing covered or reached
-    when review() raised.
+    when it raised.
     """
     outcome = FAILED
     covered = reached = False
     check = None
     try:
-        check = open_check(label, repo, pr, config,
-                           posting_env(label, config, repo, tokens, env) or env,
-                           blockers)
         try:
+            check = open_check(
+                label, repo, pr, config,
+                posting_env(label, config, repo, tokens, env) or env, blockers)
             outcome, covered, reached = review(
                 path, repo, pr, config, env, tokens, resent=resent,
                 check=check, since=since, blockers=blockers)
@@ -8050,9 +8065,12 @@ def attempt_review(label, repo, pr, config, tokens, env, path, since,
             log("%s: the review did not complete: %s" % (label, err))
             outcome, covered, reached = FAILED, False, False
     finally:
-        close_check(label, check, ended_title(outcome, attempts),
-                    posting_env(label, config, repo, tokens, env) or env,
-                    conclusion=ended_conclusion(outcome))
+        try:
+            record(outcome, covered, reached)
+        finally:
+            close_check(label, check, ended_title(outcome, attempts),
+                        posting_env(label, config, repo, tokens, env) or env,
+                        conclusion=ended_conclusion(outcome))
     return outcome, covered, reached
 
 
@@ -8320,6 +8338,26 @@ def handle_pr(repo, pr, config, state, tokens):
     # it greppable before the bill arrives.
     blockers = this_round(done, config, key)
 
+    def record(outcome, covered, reached):
+        # Handed back, because the marker above charged it before anything
+        # ran. Kept, a login broken for the length of three polls spends
+        # every budget it meets, which is the give-up LOGGED_OUT exists to
+        # prevent.
+        nonlocal attempts
+        if outcome == LOGGED_OUT:
+            attempts -= 1
+        # Recorded with whether a saved review is waiting behind it, so the
+        # next poll can find that out without listing a directory. The
+        # marker says a review is waiting to be sent. It does not say the
+        # author saw nothing, which is what the round count needs and what
+        # review() answers: finish() writes the marker only when the
+        # transcript write succeeded, so a run that could neither save nor
+        # post leaves none and was counted as a round nobody saw.
+        remember(state, key, rebuild_entry(
+            head, outcome, attempts, kept, done, covered, reached,
+            unposted=os.path.exists(unposted_path(repo, pr)),
+            **repost_budget(outcome)))
+
     # A second attempt at a head asks before posting. The marker above is
     # written before review() runs and the real outcome only after, so a
     # process killed in between — launchd booting the job out, a
@@ -8329,27 +8367,8 @@ def handle_pr(repo, pr, config, state, tokens):
     # The give-up rediscovery already says `resent` for the same crash
     # window.
     outcome, covered, reached = attempt_review(
-        key, repo, pr, config, tokens, env, path, since, blockers,
+        key, repo, pr, config, tokens, env, path, since, blockers, record,
         resent=attempts > 1, attempts=attempts)
-
-    # Handed back, because the marker above charged it before anything
-    # ran. Kept, a login broken for the length of three polls spends
-    # every budget it meets, which is the give-up LOGGED_OUT exists to
-    # prevent.
-    if outcome == LOGGED_OUT:
-        attempts -= 1
-
-    # Recorded with whether a saved review is waiting behind it, so the
-    # next poll can find that out without listing a directory. The
-    # marker says a review is waiting to be sent. It does not say the
-    # author saw nothing, which is what the round count needs and what
-    # review() answers: finish() writes the marker only when the
-    # transcript write succeeded, so a run that could neither save nor
-    # post leaves none and was counted as a round nobody saw.
-    remember(state, key, rebuild_entry(
-        head, outcome, attempts, kept, done, covered, reached,
-        unposted=os.path.exists(unposted_path(repo, pr)),
-        **repost_budget(outcome)))
 
     if outcome == LOGGED_OUT:
         login_failed(key)
@@ -8685,43 +8704,25 @@ def main():
             # The same indicator as the daemon's. A hand-run review is
             # still minutes of silence on a real pull request, which is
             # the whole thing this shows.
-            # Bound before the attempt, because the recording below runs
-            # in a finally: Ctrl-C between here and the review would
-            # otherwise leave all three unbound, and the whole protection
-            # that finally exists to give — an entry on disk, so the
-            # daemon does not buy the same head again — would be lost to
-            # a NameError on the way out.
-            outcome = FAILED
-            covered = reached = False
-            # One finally over the recording, because the recording is
-            # what matters. Without an entry the daemon reviews the same
-            # head a minute later at full cost and posts a second complete
-            # review, because a first attempt does not ask. `except
-            # Exception` never covered Ctrl-C, which is how the README
-            # says to stop a run and which as a BaseException walks
-            # straight out to main's own handler. The indicator is
-            # attempt_review's own finally; this one protects the
-            # expensive artifact, which was the half nothing protected.
-            try:
-                outcome, covered, reached = attempt_review(
-                    args.pr, repo, pr, config, tokens, env, where, since,
-                    blockers)
-            finally:
-                # Recorded, always. A manual run is still a review of that
-                # commit, and leaving no trace meant two reviews and two
-                # subscriptions for one commit.
+            def record(outcome, covered, reached):
+                # Read here as well as before the review, rather than
+                # hoisting that copy: a review lasting twenty minutes
+                # records against whatever the file says then, and holding
+                # a copy across the review would write back a snapshot
+                # from before it and undo anything the operator changed
+                # meanwhile.
                 #
                 # This run's own head only for the marker: the scan would
-                # find one the daemon left at some other head, claim a review
-                # was saved when none was, and move the entry's sha away from
-                # the marker that needed it.
+                # find one the daemon left at some other head, claim a
+                # review was saved when none was, and move the entry's sha
+                # away from the marker that needed it.
                 state = load_state()
                 was = state.get(pr_key(repo, pr), {})
                 kept = was if was.get("sha") == pr["headRefOid"] else {}
                 # The outcome the review actually reached, not DONE. Writing
-                # DONE for a run that never got that far, a rate-limit window
-                # or a logged-out CLI, closed the pull request off for good:
-                # the daemon returns at the DONE check and, with
+                # DONE for a run that never got that far, a rate-limit
+                # window or a logged-out CLI, closed the pull request off
+                # for good: the daemon returns at the DONE check and, with
                 # review_on_push false, never looks again. FAILED is what
                 # MAX_ATTEMPTS is for, and LOGGED_OUT is outside it.
                 #
@@ -8736,6 +8737,15 @@ def main():
                 if state[pr_key(repo, pr)].get("unposted"):
                     log("%s: the review is saved to be posted on a later "
                         "poll" % args.pr)
+
+            # Recorded by attempt_review whatever happens, Ctrl-C included,
+            # which is how the README says to stop a run. A manual run is
+            # still a review of that commit, and leaving no trace meant the
+            # daemon reviewed the same head a minute later at full cost and
+            # posted a second complete review, because a first attempt does
+            # not ask.
+            attempt_review(args.pr, repo, pr, config, tokens, env, where,
+                           since, blockers, record)
             return
 
         state = load_state()
