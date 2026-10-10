@@ -7840,7 +7840,7 @@ def spend_announce(key, config, state, head, attempts, tries, said):
         log("%s: the give-up could not be posted in %d attempts, so it "
             "stays in this log only" % (key, tries))
     elif not said:
-        # Spaced like the resend of a saved review, for the same reason.
+        # Spaced like the resend of a saved review, for the same reasons.
         hold_posts(key)
     was = state.get(key, {})
     # ALREADY is a give-up a retry found up, which is the give-up said.
