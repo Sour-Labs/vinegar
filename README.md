@@ -155,15 +155,20 @@ second script that breaks each guard in `vinegar.py` and confirms the suite
 notices:
 
 ```sh
-python3 mutate.py                        # every mutation, about four minutes
+python3 mutate.py                        # every mutation, half an hour to an hour
 python3 mutate.py post-timeout           # one, by name
+python3 mutate.py --check                # every anchor still matches, no suite run
 ```
 
-It edits `vinegar.py` in place and puts it back, verifying the restore. Add
-an entry when you add a check. This is not ceremony: four checks shipped once
-that passed against the very regression they were named for, and each was
-found only by running the mutation. One entry is expected to survive and one
-to abort, both explained in the file.
+It edits `vinegar.py` in place and puts it back, verifying the restore. A
+full run is one suite run per entry, so it grows with the list: about half
+an hour on an idle Mac and about an hour with the machine busy. `--check`
+takes a second and runs nothing; GitHub Actions runs it on every pull
+request, so an anchor that drifts is reported on the change that moved it.
+Add an entry when you add a check. This is not ceremony: four checks shipped
+once that passed against the very regression they were named for, and each
+was found only by running the mutation. Three entries are expected to survive
+and one to abort, all explained in the file.
 
 **Run it in a scratch worktree if a daemon executes the checkout**, because a
 broken `vinegar.py` is on disk for a few seconds per entry and a `KeepAlive`

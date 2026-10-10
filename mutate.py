@@ -16,8 +16,9 @@
 
 """Break a line the suite defends, and check that the suite turns red.
 
-    python3 mutate.py                 # every mutation, about four minutes
+    python3 mutate.py                 # every mutation, half an hour to an hour
     python3 mutate.py post-timeout    # one, by name
+    python3 mutate.py --check         # every anchor still matches, no suite run
     python3 mutate.py --list
 
 A check that has never been seen to fail is a claim rather than a test, and
@@ -43,6 +44,14 @@ Add an entry whenever you add a check. Four checks shipped once that passed
 against the very regression they were named for, and each was found only by
 running the mutation.
 
+A full run is one suite run per entry, so it grows with the list below:
+about half an hour on an idle Mac and about an hour with the machine busy,
+at six hundred entries. `--check` takes a second: it verifies that every
+anchor still matches exactly once and runs nothing, and CI runs it on every
+pull request (.github/workflows/tests.yml), so an anchor that drifts is
+reported on the change that moved it rather than an hour into the next
+full run.
+
 Anchors are unique substrings, not line numbers. An anchored line number
 stops meaning anything the moment an edit lands above it, which is why the
 first set of these was thrown away rather than re-anchored. An anchor that
@@ -51,6 +60,8 @@ no longer matches exactly once is reported, not silently skipped.
 Outcomes:
     KILLED   the suite failed and named a check. What every entry wants.
     SURVIVED the suite passed with the guard broken. The check is a claim.
+             A suite that hangs past TIMEOUT is reported here too, as timed
+             out, and the run goes on to the entries below it.
     ABORTED  the suite raised instead of failing, so the checks below the
              raise never ran. Coverage was voided rather than exercised,
              and the exit code alone cannot tell the two apart.
@@ -71,10 +82,17 @@ TIMEOUT = 300
 CACHE = tempfile.mkdtemp(prefix="vinegar-mutate-pycache-")
 atexit.register(shutil.rmtree, CACHE, True)
 
-# Every entry is expected to be KILLED except the two named here.
+# Every entry is expected to be KILLED except those named here.
 EXPECT = {
     # Not a guard: the suite's own reporting, checked like anything else.
     "SELFTEST-abort": "ABORTED",
+    # Hangs the suite on purpose, so every full run spends TIMEOUT on it.
+    # That is the price of knowing a hung suite comes back as a survivor
+    # and the run goes on, rather than as a traceback that voids every
+    # entry below it. Twice a real mutation hung the suite and the run
+    # died with it (the suite's notes on `once-never-goes-continuous` and
+    # `the-pool-is-parallel-repos-wide`).
+    "SELFTEST-timeout": "SURVIVED",
     # Unreachable, and listed to record that it was measured rather than
     # missed. A deletion's hunk is always `+0,0`, so the empty-hunk gate
     # blocks the write whatever `name` holds. No diff git can produce
@@ -109,6 +127,11 @@ MUTATIONS = [
     # KILLED is the day the suite stopped being able to say it was cut off.
     ("SELFTEST-abort",
      "def clamp(label, body):", "def clamp(label, body, required):"),
+    # This one never returns, so it must come back SURVIVED with "timed
+    # out" as the reason and the entries after it must still run.
+    ("SELFTEST-timeout",
+     "def clamp(label, body):",
+     "def clamp(label, body):\n    while True:\n        time.sleep(60)"),
 
     # --- reading the reviewer's stream ---------------------------------
     ("unreadable-line",
@@ -3261,10 +3284,20 @@ def run_suite():
     """
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1",
                PYTHONPYCACHEPREFIX=CACHE)
-    done = subprocess.run([sys.executable, SUITE], cwd=REPO, env=env,
-                          capture_output=True, text=True, timeout=TIMEOUT)
+    try:
+        # Unbuffered so that a suite killed at the timeout has already
+        # written every check it finished; block-buffered on a pipe, the
+        # eleven that ran before the hang were still in its buffer.
+        done = subprocess.run([sys.executable, "-u", SUITE], cwd=REPO,
+                              env=env, capture_output=True, text=True,
+                              timeout=TIMEOUT)
+    except subprocess.TimeoutExpired as err:
+        # A hung suite is this entry's survivor, not the end of the run.
+        # The partial output is bytes whatever `text` says.
+        out = (err.stdout or b"").decode("utf-8", "replace")
+        return "SURVIVED", checks_in(out), "timed out after %ds" % TIMEOUT
     out = done.stdout
-    ran = out.count(" ok\n") + out.count("FAIL ")
+    ran = checks_in(out)
     if "ABORTED after" in out:
         # The suite says so itself. Exit 1 alone cannot tell a run that was
         # cut off from one that caught the regression, which is the mistake
@@ -3276,6 +3309,22 @@ def run_suite():
         return "KILLED", ran, out.rsplit("FAILED: ", 1)[1].strip()
     tail = (done.stderr or out).strip().splitlines()
     return "ABORTED", ran, tail[-1] if tail else "no output"
+
+
+def checks_in(out):
+    return out.count(" ok\n") + out.count("FAIL ")
+
+
+def check_anchors():
+    """Say which entries no longer match exactly once, running nothing."""
+    source = read()
+    loose = [(name, source.count(old)) for name, old, _new in MUTATIONS
+             if source.count(old) != 1]
+    for name, seen in loose:
+        print("%-22s ANCHOR    matched %d times, expected 1" % (name, seen))
+    print("ANCHORS ADRIFT: %d of %d" % (len(loose), len(MUTATIONS)) if loose
+          else "every anchor matches exactly once")
+    return 1 if loose else 0
 
 
 def apply_one(name, old, new):
@@ -3299,6 +3348,8 @@ def main():
         for name, _old, _new in MUTATIONS:
             print(name)
         return 0
+    if "--check" in sys.argv:
+        return check_anchors()
 
     wanted = [a for a in sys.argv[1:] if not a.startswith("-")]
     chosen = [m for m in MUTATIONS if not wanted or m[0] in wanted]
