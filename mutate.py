@@ -1586,8 +1586,43 @@ MUTATIONS = [
     # Left open, the pull request lists a Vinegar check that spins for
     # ever and the next attempt reuses it rather than clearing it.
     ("check-closed-when-the-review-fails",
-     "        close_check(key, check, ended_title(outcome, attempts),",
-     "        (lambda *a, **k: None)(key, check, ended_title(outcome, attempts),"),
+     '            close_check(label, check, ended_title(outcome, attempts),',
+     '            (lambda *a, **k: None)(label, check, ended_title(outcome, attempts),'),
+    ("check-closed-even-if-recording-raises",
+     '        finally:\n'
+     '            close_check(label, check, ended_title(outcome, attempts),\n',
+     '        except BaseException:\n'
+     '            raise\n'
+     '        else:\n'
+     '            close_check(label, check, ended_title(outcome, attempts),\n'),
+    ("open-check-failure-does-not-stop-the-review",
+     '        except Exception as err:\n'
+     '            log("%s: the indicator could not be opened: %s" % (label, err))\n'
+     '        try:\n'
+     '            outcome, covered, reached = review(',
+     '            outcome, covered, reached = review('),
+    ("record-before-close",
+     '        try:\n'
+     '            record(outcome, covered, reached)\n'
+     '        except Exception as err:\n'
+     '            if not stopping:\n'
+     '                raise\n'
+     '            log("%s: the attempt could not be recorded while stopping: %s"\n'
+     '                % (label, err))\n'
+     '        finally:\n'
+     '            close_check(label, check, ended_title(outcome, attempts),\n'
+     '                        posting_env(label, config, repo, tokens, env) or env,\n'
+     '                        conclusion=ended_conclusion(outcome))',
+     '        try:\n'
+     '            close_check(label, check, ended_title(outcome, attempts),\n'
+     '                        posting_env(label, config, repo, tokens, env) or env,\n'
+     '                        conclusion=ended_conclusion(outcome))\n'
+     '        finally:\n'
+     '            record(outcome, covered, reached)'),
+    ("interrupt-outlives-a-failed-recording",
+     '            if not stopping:\n'
+     '                raise\n',
+     '            raise\n'),
 
     # --- what the first review pass found ------------------------------
     ("check-close-retryable-after-a-refusal",
@@ -1601,21 +1636,14 @@ MUTATIONS = [
     ("check-body-matches-the-flag",
      "    body = json.dumps(payload) if payload is not None else None",
      "    body = json.dumps(payload) if payload else None"),
-    ("check-closed-even-if-recording-raises",
-     "    finally:\n"
-     "        # Its own credentials, minted now. The ones above were asked to",
-     "    except BaseException:\n"
-     "        raise\n"
-     "    else:\n"
-     "        # Its own credentials, minted now. The ones above were asked to"),
     ("check-done-that-posted-nothing-is-not-finished",
      '    return "The review ran but nothing reached the pull request"',
      '    return "The review finished"'),
     ("check-closed-on-fresh-credentials",
-     "        close_check(key, check, ended_title(outcome, attempts),\n"
-     "                    posting_env(key, config, repo, tokens, env) or env,\n",
-     "        close_check(key, check, ended_title(outcome, attempts),\n"
-     "                    env,\n"),
+     '            close_check(label, check, ended_title(outcome, attempts),\n'
+     '                        posting_env(label, config, repo, tokens, env) or env,\n',
+     '            close_check(label, check, ended_title(outcome, attempts),\n'
+     '                        env,\n'),
     # Not the extraction, which changes no behaviour and so nothing can
     # catch: the format itself, which GitHub rejects the update over.
     ("utc-stamp-format",
@@ -1640,40 +1668,30 @@ MUTATIONS = [
      '                and str(was.get("external_id") or DEPLOYMENT) == DEPLOYMENT]'),
     # Opening it is the one call here that parses a reply GitHub sent.
     ("check-opened-inside-the-try",
-     "        check = open_check(key, repo, pr, config,\n"
-     "                           posting_env(key, config, repo, tokens, env) or env,\n"
-     "                           blockers)\n"
-     "        try:",
-     "        try:"),
+     '            check = open_check(\n'
+     '                label, repo, pr, config,\n'
+     '                posting_env(label, config, repo, tokens, env) or env, blockers)\n',
+     '            pass\n'),
     # Opened on a token minted where it runs, not on the checkout's (#17).
     ("check-opened-on-a-fresh-token",
-     "                           posting_env(key, config, repo, tokens, env) or env,\n"
-     "                           blockers)",
-     "                           env,\n"
-     "                           blockers)"),
+     '                posting_env(label, config, repo, tokens, env) or env, blockers)',
+     '                env, blockers)'),
     # The hand-run path: reachable by no check and anchored by no
     # mutation until the second pass said so.
     ("check-hand-run-opens-one",
-     "                hand = open_check(\n"
-     "                    args.pr, repo, pr, config,\n"
-     "                    posting_env(args.pr, config, repo, tokens, env) or env,\n"
-     "                    blockers)",
-     "                hand = None"),
-    ("check-hand-run-opens-on-a-fresh-token",
-     "                    posting_env(args.pr, config, repo, tokens, env) or env,\n"
-     "                    blockers)",
-     "                    env,\n"
-     "                    blockers)"),
-    ("check-hand-run-closes-it",
-     "                close_check(args.pr, hand, ended_title(outcome),",
-     "                (lambda *a, **k: None)(args.pr, hand, ended_title(outcome),"),
-    ("check-hand-run-records-through-ctrl-c",
-     "            finally:\n"
-     "                # Not \"finished\" for a review that answered DONE. finish()",
-     "            except BaseException:\n"
-     "                raise\n"
-     "            else:\n"
-     "                # Not \"finished\" for a review that answered DONE. finish()"),
+     '            attempt_review(args.pr, repo, pr, config, tokens, env, where,\n'
+     '                           since, blockers, record)',
+     '            record(*review(where, repo, pr, config, env, tokens,\n'
+     '                           since=since, blockers=blockers))'),
+    ("records-through-ctrl-c",
+     '        try:\n'
+     '            record(outcome, covered, reached)\n'
+     '        except Exception as err:',
+     '        try:\n'
+     '            if stopping:\n'
+     '                raise KeyboardInterrupt()\n'
+     '            record(outcome, covered, reached)\n'
+     '        except Exception as err:'),
     # The reuse lookup's query. Dropping the status filter adopts a
     # completed run, and a completed run cannot be reopened.
     ("check-reuse-asks-for-running-only",
@@ -2012,18 +2030,16 @@ MUTATIONS = [
 
     # --- the manual half, which no check reached before ----------------
     ("hand-run-since",
-     "                    where, repo, pr, config, env, tokens, check=hand,\n"
-     "                    since=since, blockers=blockers)",
-     "                    where, repo, pr, config, env, tokens, check=hand,\n"
-     "                    blockers=blockers)"),
+     'tokens, env, where,\n'
+     '                           since, blockers, record)',
+     'tokens, env, where,\n'
+     '                           None, blockers, record)'),
     ("hand-run-whole-flag",
      "            since = None if args.whole else review_scope(",
      "            since = None or review_scope("),
     ("hand-run-records-the-start",
-     "                           **reviewed_through(covered, pr[\"headRefOid\"],\n"
-     "                                              was),\n"
-     "                           **rounds_done(reached, was)))",
-     "                           **rounds_done(reached, was)))"),
+     '                    kept, was, covered, reached,\n',
+     '                    kept, was, False, reached,\n'),
 
     ("anchors-from-the-base",
      '            findings, diff_lines(path, pr["baseRefName"], env, label), '
@@ -2100,19 +2116,16 @@ MUTATIONS = [
     # moved — and the head moving is the normal way a round ends, so the
     # count never reaches two and nothing is ever narrowed.
     ("rounds-survive-the-head-moving",
-     "                   **reviewed_through(covered, head, done),\n"
-     "                   **rounds_done(reached, done)))",
-     "                   **reviewed_through(covered, head, done),\n"
-     "                   **rounds_done(reached, kept)))"),
+     '            head, outcome, attempts, kept, done, covered, reached,\n',
+     '            head, outcome, attempts, kept,\n'
+     '            dict(done, rounds=kept.get("rounds", 0)), covered, reached,\n'),
     # The rebuilds that are not reviews handing the count back. One draft
     # toggle or one failed clone and the pull request reports everything
     # again.
     ("rounds-survive-a-skip",
-     "                        **dict(carry_forward(kept),\n"
-     "                               **reviewed_through(False, head, done),\n"
-     "                               **rounds_done(False, done)))",
-     "                        **dict(carry_forward(kept),\n"
-     "                               **reviewed_through(False, head, done)))"),
+     '    entry = rebuild_entry(head, outcome, kept.get("attempts", 0), kept, done,\n',
+     '    entry = rebuild_entry(head, outcome, kept.get("attempts", 0), kept,\n'
+     '                          dict(done, rounds=0),\n'),
     # The reviewer told nothing, so the narrowing is a sentence on the pull
     # request about a review that was never asked to hold anything back.
     ("blockers-reach-the-reviewer",
@@ -2294,19 +2307,19 @@ MUTATIONS = [
     # findings are on the pull request already", on a pull request that
     # carries nothing at all.
     ("rounds-need-the-post-to-land",
-     "                   **rounds_done(reached, done)))",
-     "                   **rounds_done(outcome == DONE, done)))"),
+     '            head, outcome, attempts, kept, done, covered, reached,\n',
+     '            head, outcome, attempts, kept, done, covered, outcome == DONE,\n'),
     ("hand-run-rounds-need-the-post-to-land",
-     "                           **rounds_done(reached, was)))",
-     "                           **rounds_done(outcome == DONE, was)))"),
+     '                    kept, was, covered, reached,\n',
+     '                    kept, was, covered, outcome == DONE,\n'),
     # Read off the filesystem rather than off review()'s answer. The
     # marker is written only when the transcript write succeeded, so a run
     # that could neither save nor post leaves none and reads as a round
     # the author never saw.
     ("rounds-not-inferred-from-the-marker",
-     "                   **rounds_done(reached, done)))",
-     "                   **rounds_done(outcome == DONE and not os.path.exists(\n"
-     "                       unposted_path(repo, pr)), done)))"),
+     '            head, outcome, attempts, kept, done, covered, reached,\n',
+     '            head, outcome, attempts, kept, done, covered,\n'
+     '            outcome == DONE and not os.path.exists(unposted_path(repo, pr)),\n'),
     # The `comment` guard, which is what keeps a dry run from counting.
     # post_review answers POSTED for correctly posting nothing.
     ("rounds-need-a-pull-request-to-reach",
@@ -2324,17 +2337,14 @@ MUTATIONS = [
     # killed mid-review leaves behind. Dropping the carry there hands back
     # every round already spent.
     ("rounds-survive-the-pre-review-marker",
-     "        **dict(carry_forward(kept), post_tries=0, waivers=0,\n"
-     "               **reviewed_through(False, head, done),\n"
-     "               **rounds_done(False, done))))",
-     "        **dict(carry_forward(kept), post_tries=0, waivers=0,\n"
-     "               **reviewed_through(False, head, done))))"),
+     '        head, FAILED, attempts, kept, done, post_tries=0, waivers=0))',
+     '        head, FAILED, attempts, kept, dict(done, rounds=0), post_tries=0,\n'
+     '        waivers=0))'),
     # The give-up rebuild, which rounds_done()'s own docstring names as a
     # case it exists for and which nothing was holding.
     ("rounds-survive-a-give-up",
-     "                               **reviewed_through(False, head, was),\n"
-     "                               **rounds_done(False, was)))",
-     "                               **reviewed_through(False, head, was)))"),
+     '    entry = rebuild_entry(head, FAILED, attempts, was, was,\n',
+     '    entry = rebuild_entry(head, FAILED, attempts, was, dict(was, rounds=0),\n'),
     # The narrowing reaching the checks list only while the review runs.
     # close_check overwrites the in_progress title on the way out, and the
     # one it leaves behind stands for the rest of the pull request's life.
@@ -3075,10 +3085,10 @@ MUTATIONS = [
      "                    and logged_out(result.stdout)):",
      "            if logged_out(result.stdout):"),
     ("login-hands-back-attempt",
-     "        if outcome == LOGGED_OUT:\n"
-     "            attempts -= 1",
-     "        if outcome == LOGGED_OUT:\n"
-     "            pass"),
+     '        if outcome == LOGGED_OUT:\n'
+     '            attempts -= 1',
+     '        if outcome == LOGGED_OUT:\n'
+     '            pass'),
     ("login-answers-no-review",
      "    return outcome != LOGGED_OUT",
      "    return True"),
@@ -3095,10 +3105,10 @@ MUTATIONS = [
      "    _login_failed_at = time.monotonic()",
      "    _login_failed_at = None"),
     ("login-failed-called",
-     "        if outcome == LOGGED_OUT:\n"
-     "            login_failed(key)",
-     "        if False:\n"
-     "            login_failed(key)"),
+     '    if outcome == LOGGED_OUT:\n'
+     '        login_failed(key)',
+     '    if False:\n'
+     '        login_failed(key)'),
     # The watchdog's half: written, written once, and cleared only by a
     # review that ran.
     ("login-marker-written",
@@ -3115,11 +3125,11 @@ MUTATIONS = [
      '"since %s, first seen on %s\\n" % (utc_stamp(), key)',
      '"\\n"'),
     ("login-marker-cleared",
-     "            forget(LOGGED_OUT_PATH)",
-     "            pass"),
+     '        forget(LOGGED_OUT_PATH)',
+     '        pass'),
     ("login-marker-kept-on-failed",
-     "        elif outcome == DONE and os.path.exists(LOGGED_OUT_PATH):",
-     "        elif os.path.exists(LOGGED_OUT_PATH):"),
+     '    elif outcome == DONE and os.path.exists(LOGGED_OUT_PATH):',
+     '    elif os.path.exists(LOGGED_OUT_PATH):'),
     ("login-title",
      "    if outcome == LOGGED_OUT:\n"
      '        return "Claude could not log in',
@@ -3131,20 +3141,25 @@ MUTATIONS = [
     # A login failure wrote no transcript, so a saved review keeps its
     # spent budget; every other ending still starts it over.
     ("login-keeps-the-repost-budget",
-     "        budget = ({} if outcome == LOGGED_OUT\n"
-     '                  else {"post_tries": 0, "waivers": 0})',
-     '        budget = {"post_tries": 0, "waivers": 0}'),
+     '    return {} if outcome == LOGGED_OUT else {"post_tries": 0, "waivers": 0}',
+     '    return {"post_tries": 0, "waivers": 0}'),
     ("login-budget-reset-otherwise",
-     "        budget = ({} if outcome == LOGGED_OUT\n"
-     '                  else {"post_tries": 0, "waivers": 0})',
-     "        budget = ({} if outcome == LOGGED_OUT\n"
-     "                  else {})"),
+     '    return {} if outcome == LOGGED_OUT else {"post_tries": 0, "waivers": 0}',
+     '    return {} if outcome == LOGGED_OUT else {}'),
     ("login-hand-run-keeps-the-budget",
-     "                budget = ({} if outcome == LOGGED_OUT\n"
-     '                          else {"post_tries": 0, "waivers": 0})',
-     '                budget = {"post_tries": 0, "waivers": 0}'),
+     '                    unposted=os.path.exists(unposted_path(repo, pr)),\n'
+     '                    **repost_budget(outcome)))',
+     '                    unposted=os.path.exists(unposted_path(repo, pr)),\n'
+     '                    post_tries=0, waivers=0))'),
+    ("login-daemon-keeps-the-budget",
+     '            head, outcome, attempts, kept, done, covered, reached,\n'
+     '            unposted=os.path.exists(unposted_path(repo, pr)),\n'
+     '            **repost_budget(outcome)))',
+     '            head, outcome, attempts, kept, done, covered, reached,\n'
+     '            unposted=os.path.exists(unposted_path(repo, pr)),\n'
+     '            post_tries=0, waivers=0))'),
     # Closed as one a required check refuses, because neutral passes it.
-    # The value, the one place that picks it, and both finallys.
+    # The value, the one place that picks it, and the one finally.
     ("login-conclusion-value",
      'CHECK_LOGGED_OUT = "action_required"',
      'CHECK_LOGGED_OUT = "neutral"'),
@@ -3152,13 +3167,10 @@ MUTATIONS = [
      "    return CHECK_LOGGED_OUT if outcome == LOGGED_OUT else "
      "CHECK_CONCLUSION",
      "    return CHECK_CONCLUSION"),
-    ("login-conclusion-daemon",
-     "or env,\n"
-     "                    conclusion=ended_conclusion(outcome))",
-     "or env)"),
-    ("login-conclusion-hand-run",
-     "                            or env, conclusion=ended_conclusion(outcome))",
-     "                            or env)"),
+    ("login-conclusion",
+     'or env,\n'
+     '                        conclusion=ended_conclusion(outcome))',
+     'or env)'),
 
     # --- a failed review waits before its next attempt ------------------
     # Retried at once, the three attempts were spent in under a minute,
@@ -3175,8 +3187,8 @@ MUTATIONS = [
      "            and FAILED_RETRY):"),
     ("failed-retry-value", "FAILED_RETRY = 600", "FAILED_RETRY = 0"),
     ("failed-retry-recorded",
-     "            _failed_at[key] = time.monotonic()",
-     "            pass"),
+     '        _failed_at[key] = time.monotonic()',
+     '        pass'),
     # A push is new work and is reviewed at once.
     ("failed-retry-same-head-only",
      '    if (done.get("outcome") == FAILED and done.get("sha") == head\n'
@@ -3184,10 +3196,8 @@ MUTATIONS = [
      '    if (done.get("outcome") == FAILED\n'
      "            and key in _failed_at"),
     ("failed-retry-logged",
-     '            log("%s: attempt %d of %d failed, and the next waits at '
-     'least "',
-     '            (lambda *a: None)("%s: attempt %d of %d failed, and the '
-     'next waits at least "'),
+     '        log("%s: attempt %d of %d failed, and the next waits at least "',
+     '        (lambda *a: None)("%s: attempt %d of %d failed, and the next waits at least "'),
     # The wait is what spaces the attempts, so the turn still ends on a
     # failed review rather than going on to review the next pull request.
     ("failed-review-ends-the-turn",

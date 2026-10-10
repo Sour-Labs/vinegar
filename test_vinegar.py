@@ -5185,6 +5185,114 @@ _disk = [asked["output"]["title"] for how, _, asked in checked
 check("recording that fails still finishes the indicator",
       _disk == ["The review failed and will be tried again"], _disk)
 
+
+# The indicator is decoration. check_api's docstring promises nothing
+# about it is worth a review, and nothing today raises out of opening one;
+# were something to, the review must still run. Charged as a failed
+# attempt instead, three polls of it gave up on a pull request Claude
+# never saw.
+def _opening_breaks(*a, **k):
+    raise RuntimeError("the indicator is broken")
+
+
+_open_kept = vinegar.open_check
+vinegar.open_check = _opening_breaks
+_decorated = _indicator_after(vinegar.DONE, 0)
+vinegar.open_check = _open_kept
+check("an indicator that cannot be opened does not stop the review",
+      "REVIEW" in [how for how, _, _ in checked] and _decorated == [],
+      ([how for how, _, _ in checked], _decorated))
+
+
+# Recorded before the indicator is closed. The close is a token mint and
+# a PATCH, and a SIGTERM inside those with the entry not yet written
+# leaves the pre-review marker as the outcome: a finished review is bought
+# again on the next poll, and a login failure's attempt is never handed
+# back.
+def _closing_sees(what):
+    """The outcome handle_pr's state holds at the moment the indicator is
+    closed, for one ending."""
+    seen = []
+    state = {}
+    kept = vinegar.close_check
+
+    def closing(label, check, title, env, *a, **k):
+        seen.append(state.get(L, {}).get("outcome"))
+        return kept(label, check, title, env, *a, **k)
+
+    def review_stub(path, repo, pr, config, env, tokens, resent=False,
+                    check=None, since=None, blockers=False):
+        return what, what == vinegar.DONE, what == vinegar.DONE
+
+    vinegar.review = review_stub
+    vinegar.close_check = closing
+    vinegar._failed_at.clear()
+    try:
+        vinegar.handle_pr("o/r", PR_LIVE, CHK_CONFIG, state, {})
+    finally:
+        vinegar.close_check = kept
+    return seen
+
+
+_closing = _closing_sees(vinegar.DONE)
+check("the entry holds the real outcome by the time the indicator closes",
+      _closing == [vinegar.DONE], _closing)
+
+
+# Ctrl-C is not an Exception. It walks past attempt_review's handler and
+# out through its finally, which records on the way where the daemon used
+# to leave the pre-review marker; and a recording that raises on that
+# path must not replace the interrupt, or the daemon the operator just
+# stopped logs "unhandled error" and goes on to the next pull request.
+def _review_interrupted(path, repo, pr, config, env, tokens, resent=False,
+                        check=None, since=None, blockers=False):
+    checked.append(("REVIEW", "", None))
+    raise KeyboardInterrupt()
+
+
+def _daemon_interrupted(saving):
+    """How handle_pr ends under Ctrl-C, the entry it left, and the calls."""
+    state = {}
+    kept = vinegar.save_state
+    vinegar.review = _review_interrupted
+    vinegar.save_state = saving
+    vinegar._failed_at.clear()
+    del checked[:]
+    try:
+        vinegar.handle_pr("o/r", PR_LIVE, CHK_CONFIG, state, {})
+        ended = "returned"
+    except KeyboardInterrupt:
+        ended = "interrupted"
+    except Exception as err:
+        ended = err
+    finally:
+        vinegar.save_state = kept
+    return ended, state.get(L, {}), [how for how, _, _ in checked]
+
+
+_ci_ended, _ci_entry, _ci_calls = _daemon_interrupted(lambda st: None)
+check("Ctrl-C during a daemon review still stops the daemon",
+      _ci_ended == "interrupted", _ci_ended)
+check("Ctrl-C during a daemon review records the attempt",
+      _ci_entry.get("outcome") == vinegar.FAILED
+      and _ci_entry.get("attempts") == 1 and "PATCH" in _ci_calls,
+      (_ci_entry, _ci_calls))
+# The marker before the review saves once and must; it is the recording
+# on the way out that meets the full disk.
+_cf_saves = [0]
+
+
+def _disk_fills(state):
+    _cf_saves[0] += 1
+    if _cf_saves[0] > 1:
+        raise OSError("no space left on device")
+
+
+_cf_ended, _cf_entry, _cf_calls = _daemon_interrupted(_disk_fills)
+check("a recording that fails while stopping does not swallow the Ctrl-C",
+      _cf_ended == "interrupted" and _cf_saves[0] == 2
+      and "PATCH" in _cf_calls, (_cf_ended, _cf_saves, _cf_calls))
+
 # The credentials above were asked to cover the checkout alone, so after a
 # review they can be spent by the time this runs. Closing on them was a 401
 # exactly when the indicator most needs closing.
@@ -7473,6 +7581,10 @@ def _hand_interrupted(*a, **k):
 # It used to walk past the handler with the indicator still spinning and,
 # worse, with no state entry, so the daemon re-reviewed the same head at
 # full cost and posted a second complete review.
+# From no state, or the three runs above have already left the entry this
+# asserts on: the recording check held with the recording deleted, and
+# was only ever killed through the close that shared its finally.
+vinegar.save_state({})
 try:
     _hand_ctrl_c = _hand_run(_hand_interrupted)
 except KeyboardInterrupt:
