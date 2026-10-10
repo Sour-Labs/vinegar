@@ -333,10 +333,12 @@ startup and launchd relaunched it every ten seconds, polling nothing at all.
 Turning a working install into an outage is the worse of the two answers, and
 the log line is what keeps the collapse from being silent.
 
-**`parallel_repos` is capped at 8**, whatever the file asks for. Each unit of it
-is a whole reviewer with its own clone beside it, so the number is what one
-machine can run at once rather than how many repositories are watched: the ones
-over the width wait for a worker. It is the one setting that multiplies every
+**`parallel_repos` is refused above 8**, at startup, with the reason: it is
+not capped, so a file asking for 9 stops the process, and under launchd that
+is a restart loop until the file is fixed. Each unit of it is a whole reviewer
+with its own clone beside it, so the number is what one machine can run at
+once rather than how many repositories are watched: the ones over the width
+wait for a worker. It is the one setting that multiplies every
 other runaway this program bounds, and a cap that followed the repository count
 would make the same file mean something different as repositories were added.
 
@@ -408,8 +410,12 @@ settings → GitHub Apps → New GitHub App**:
   project ended up at `vinegar-bot`.
 - **Homepage URL** anything; it is required and unused.
 - **Webhooks**: untick **Active**. Vinegar polls and needs no callback.
-- **Repository permissions**: `Pull requests` read and write, `Contents` read,
-  `Metadata` read. Nothing else.
+- **Repository permissions**: `Pull requests` read and write, `Checks` read
+  and write, `Contents` read, `Metadata` read. Nothing else. `Checks` is for
+  the entry in the pull request's checks list; without it every review still
+  runs and posts, and logs once that the check run needs the permission. A
+  permission added to an existing App is held until the installation accepts
+  it, on the installation's settings page.
 - Upload a logo on the App's page. That image is the avatar on every comment.
   `brand/vinegar-avatar-1024.png` in this repo is ready to use.
 
@@ -499,7 +505,7 @@ The cause of a change is a checkbox in a browser on some other machine, so the
 log is the only place the two facts ever meet.
 
 Watching many repositories at once is what `parallel_repos` is for; it is
-capped at 8 and defaults to 1, so discovering seventeen repositories still
+refused above 8 and defaults to 1, so discovering seventeen repositories still
 polls them one at a time until you raise it.
 
 ### Running it under launchd
