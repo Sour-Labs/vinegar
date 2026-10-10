@@ -1595,6 +1595,34 @@ MUTATIONS = [
      '            raise\n'
      '        else:\n'
      '            close_check(label, check, ended_title(outcome, attempts),\n'),
+    ("open-check-failure-does-not-stop-the-review",
+     '        except Exception as err:\n'
+     '            log("%s: the indicator could not be opened: %s" % (label, err))\n'
+     '        try:\n'
+     '            outcome, covered, reached = review(',
+     '            outcome, covered, reached = review('),
+    ("record-before-close",
+     '        try:\n'
+     '            record(outcome, covered, reached)\n'
+     '        except Exception as err:\n'
+     '            if not stopping:\n'
+     '                raise\n'
+     '            log("%s: the attempt could not be recorded while stopping: %s"\n'
+     '                % (label, err))\n'
+     '        finally:\n'
+     '            close_check(label, check, ended_title(outcome, attempts),\n'
+     '                        posting_env(label, config, repo, tokens, env) or env,\n'
+     '                        conclusion=ended_conclusion(outcome))',
+     '        try:\n'
+     '            close_check(label, check, ended_title(outcome, attempts),\n'
+     '                        posting_env(label, config, repo, tokens, env) or env,\n'
+     '                        conclusion=ended_conclusion(outcome))\n'
+     '        finally:\n'
+     '            record(outcome, covered, reached)'),
+    ("interrupt-outlives-a-failed-recording",
+     '            if not stopping:\n'
+     '                raise\n',
+     '            raise\n'),
 
     # --- what the first review pass found ------------------------------
     ("check-close-retryable-after-a-refusal",
@@ -1643,7 +1671,7 @@ MUTATIONS = [
      '            check = open_check(\n'
      '                label, repo, pr, config,\n'
      '                posting_env(label, config, repo, tokens, env) or env, blockers)\n',
-     ''),
+     '            pass\n'),
     # Opened on a token minted where it runs, not on the checkout's (#17).
     ("check-opened-on-a-fresh-token",
      '                posting_env(label, config, repo, tokens, env) or env, blockers)',
@@ -1656,19 +1684,14 @@ MUTATIONS = [
      '            record(*review(where, repo, pr, config, env, tokens,\n'
      '                           since=since, blockers=blockers))'),
     ("records-through-ctrl-c",
-     '    finally:\n'
      '        try:\n'
      '            record(outcome, covered, reached)\n'
-     '        finally:\n',
-     '    except BaseException:\n'
-     '        close_check(label, check, ended_title(outcome, attempts),\n'
-     '                    posting_env(label, config, repo, tokens, env) or env,\n'
-     '                    conclusion=ended_conclusion(outcome))\n'
-     '        raise\n'
-     '    else:\n'
+     '        except Exception as err:',
      '        try:\n'
+     '            if stopping:\n'
+     '                raise KeyboardInterrupt()\n'
      '            record(outcome, covered, reached)\n'
-     '        finally:\n'),
+     '        except Exception as err:'),
     # The reuse lookup's query. Dropping the status filter adopts a
     # completed run, and a completed run cannot be reopened.
     ("check-reuse-asks-for-running-only",

@@ -8006,15 +8006,14 @@ def attempt_review(label, repo, pr, config, tokens, env, path, since,
     between "it will be tried again" and "it was given up on"; `attempts`
     is how ended_title() tells the two apart.
 
-    The opening sits inside the except with the review, which was the hand
-    run's shape and not the daemon's. check_api swallows every way the
-    subprocess can fail, and open_check() answers None rather than raising
-    on a reply of the wrong shape, so nothing here is expected to raise;
-    the daemon's copy let one through regardless, and the comment beside
-    it recorded what that cost once: FAILED already on disk for a review
-    that never ran, the outcome never recorded, the give-up never fired.
-    Caught, it is recorded like any other failed attempt and MAX_ATTEMPTS
-    stays in charge.
+    The opening has an except of its own, and the review runs whether it
+    succeeded or not. check_api's docstring promises nothing about the
+    indicator is worth a review, and open_check() answers None rather than
+    raising on a reply of the wrong shape, so nothing here is expected to
+    raise; the two copies disagreed about what to do if one did, the
+    daemon's letting it escape with FAILED already on disk for a review
+    that never ran, the hand run's charging an attempt for one. Neither is
+    right for a decoration: logged, and the review runs without it.
 
     The review's own raise is kept rather than let through for the same
     reason. The subscription is spent by the time most of these can
@@ -8032,7 +8031,10 @@ def attempt_review(label, repo, pr, config, tokens, env, path, since,
     Exception and walks past the handler above, still leaves an entry;
     without one the daemon reviewed the same head a minute later at full
     cost and posted a second complete review, because a first attempt
-    does not ask.
+    does not ask. A recording that raises while Ctrl-C is already
+    unwinding is logged rather than raised, so that what the operator
+    asked for is what happens; on the normal path the raise is the
+    caller's, as it always was.
 
     The close mints its own credentials. The ones the caller holds were
     asked to cover the checkout alone, and by here a review has run on
@@ -8058,6 +8060,9 @@ def attempt_review(label, repo, pr, config, tokens, env, path, since,
             check = open_check(
                 label, repo, pr, config,
                 posting_env(label, config, repo, tokens, env) or env, blockers)
+        except Exception as err:
+            log("%s: the indicator could not be opened: %s" % (label, err))
+        try:
             outcome, covered, reached = review(
                 path, repo, pr, config, env, tokens, resent=resent,
                 check=check, since=since, blockers=blockers)
@@ -8065,8 +8070,21 @@ def attempt_review(label, repo, pr, config, tokens, env, path, since,
             log("%s: the review did not complete: %s" % (label, err))
             outcome, covered, reached = FAILED, False, False
     finally:
+        # What is already unwinding wins. A recording that raises inside
+        # this finally replaces it: with Ctrl-C in flight and the disk
+        # full, save_state's OSError reached poll_repo's `except
+        # Exception`, which logged it and carried on, and the daemon the
+        # operator had just stopped went on to the next pull request.
+        unwinding = sys.exc_info()[1]
+        stopping = (unwinding is not None
+                    and not isinstance(unwinding, Exception))
         try:
             record(outcome, covered, reached)
+        except Exception as err:
+            if not stopping:
+                raise
+            log("%s: the attempt could not be recorded while stopping: %s"
+                % (label, err))
         finally:
             close_check(label, check, ended_title(outcome, attempts),
                         posting_env(label, config, repo, tokens, env) or env,
@@ -8695,15 +8713,6 @@ def main():
             # exists for.
             narrows = this_round(entry, config, args.pr)
             blockers = narrows and not args.whole
-            # Wrapped, so the recording below always happens. The
-            # subscription is spent by the time most of these can fire,
-            # and dying here left no entry at all: the daemon reviewed
-            # the same head a minute later at full cost and posted a
-            # second complete review, because its first attempt does not
-            # ask. handle_pr wraps its own call for the same reason.
-            # The same indicator as the daemon's. A hand-run review is
-            # still minutes of silence on a real pull request, which is
-            # the whole thing this shows.
             def record(outcome, covered, reached):
                 # Read here as well as before the review, rather than
                 # hoisting that copy: a review lasting twenty minutes
