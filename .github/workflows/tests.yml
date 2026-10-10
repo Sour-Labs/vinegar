@@ -1,7 +1,8 @@
 # The offline suite, on every pull request and every push to main. It needs
 # nothing installed and touches no network, so the job holds no secret, and
-# a fork's pull request runs it with a read-only token. mutate.py is not
-# here: a full run takes about 45 minutes.
+# a fork's pull request runs it with a read-only token. mutate.py --check
+# only verifies its anchors; a full run takes half an hour to an hour and
+# stays out of CI.
 name: Tests
 
 on:
@@ -23,3 +24,4 @@ jobs:
           persist-credentials: false
       - run: /usr/bin/python3 --version
       - run: /usr/bin/python3 test_vinegar.py
+      - run: /usr/bin/python3 mutate.py --check
