@@ -7473,6 +7473,10 @@ def _hand_interrupted(*a, **k):
 # It used to walk past the handler with the indicator still spinning and,
 # worse, with no state entry, so the daemon re-reviewed the same head at
 # full cost and posted a second complete review.
+# From no state, or the three runs above have already left the entry this
+# asserts on: the recording check held with the recording deleted, and
+# was only ever killed through the close that shared its finally.
+vinegar.save_state({})
 try:
     _hand_ctrl_c = _hand_run(_hand_interrupted)
 except KeyboardInterrupt:
