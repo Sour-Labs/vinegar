@@ -761,7 +761,7 @@ MUTATIONS = [
     ("turn-answers-reviewed",
      "    # repository has been waiting through them. A login failure spent a\n"
      "    # few seconds, and True would put the repository back due at once.\n"
-     "    return outcome != LOGGED_OUT\n",
+     "    return outcome not in OUTAGE_ENDINGS\n",
      "    return False\n"),
     ("handle-skip-is-not-work",
      "        # is what let a draft toggle launder the retry budget.\n"
@@ -3102,27 +3102,40 @@ MUTATIONS = [
     # requests given up on that way were merged at the commit nobody
     # reviewed.
     ("login-detected",
-     "                return LOGGED_OUT, False, False",
+     "                return held, False, False",
      "                return FAILED, False, False"),
     ("login-reads-the-field",
-     '                and event.get("error") == "authentication_failed"):',
+     '                and event.get("error") in OUTAGES):',
      '                and event.get("error")):'),
+    ("limit-is-an-outage",
+     'OUTAGES = {"authentication_failed": LOGGED_OUT, "rate_limit": LIMITED}',
+     'OUTAGES = {"authentication_failed": LOGGED_OUT}'),
+    ("limit-held-like-login",
+     "OUTAGE_ENDINGS = (LOGGED_OUT, LIMITED)",
+     "OUTAGE_ENDINGS = (LOGGED_OUT,)"),
+    ("limit-has-its-own-marker",
+     "OUTAGE_PATHS = {LOGGED_OUT: LOGGED_OUT_PATH, LIMITED: LIMITED_PATH}",
+     "OUTAGE_PATHS = {LOGGED_OUT: LOGGED_OUT_PATH, LIMITED: LOGGED_OUT_PATH}"),
+    ("limit-says-so",
+     "    if outcome == LIMITED:\n"
+     "        return (\"Claude's usage limit is reached, so the review will run once \"\n"
+     "                \"it resets\")\n",
+     ""),
     ("login-not-a-subagent",
      '                and not event.get("parent_tool_use_id")\n'
      '                and event.get("error")',
      '                and event.get("error")'),
     # Free, like unroutable(), or it counts.
     ("login-is-free-only",
-     '            if (output.get("total_cost_usd") == 0\n'
-     "                    and logged_out(result.stdout)):",
-     "            if logged_out(result.stdout):"),
+     '            held = output.get("total_cost_usd") == 0 and outage(result.stdout)\n',
+     '            held = outage(result.stdout)\n'),
     ("login-hands-back-attempt",
-     '        if outcome == LOGGED_OUT:\n'
+     '        if outcome in OUTAGE_ENDINGS:\n'
      '            attempts -= 1',
-     '        if outcome == LOGGED_OUT:\n'
+     '        if outcome in OUTAGE_ENDINGS:\n'
      '            pass'),
     ("login-answers-no-review",
-     "    return outcome != LOGGED_OUT",
+     "    return outcome not in OUTAGE_ENDINGS",
      "    return True"),
     ("login-holds-every-review",
      "    if (_login_failed_at is not None\n"
@@ -3137,47 +3150,53 @@ MUTATIONS = [
      "    _login_failed_at = time.monotonic()",
      "    _login_failed_at = None"),
     ("login-failed-called",
-     '    if outcome == LOGGED_OUT:\n'
-     '        login_failed(key)',
+     '    if outcome in OUTAGE_ENDINGS:\n'
+     '        held_up(key, outcome)',
      '    if False:\n'
-     '        login_failed(key)'),
+     '        held_up(key, outcome)'),
     # The watchdog's half: written, written once, and cleared only by a
     # review that ran.
     ("login-marker-written",
-     "    if not os.path.exists(LOGGED_OUT_PATH):\n"
-     "        write_atomic(LOGGED_OUT_PATH,",
+     "    if not os.path.exists(OUTAGE_PATHS[outcome]):\n"
+     "        write_atomic(OUTAGE_PATHS[outcome],",
      "    if False:\n"
-     "        write_atomic(LOGGED_OUT_PATH,"),
+     "        write_atomic(OUTAGE_PATHS[outcome],"),
     ("login-marker-once",
-     "    if not os.path.exists(LOGGED_OUT_PATH):\n"
-     "        write_atomic(LOGGED_OUT_PATH,",
+     "    if not os.path.exists(OUTAGE_PATHS[outcome]):\n"
+     "        write_atomic(OUTAGE_PATHS[outcome],",
      "    if True:\n"
-     "        write_atomic(LOGGED_OUT_PATH,"),
+     "        write_atomic(OUTAGE_PATHS[outcome],"),
     ("login-marker-text",
      '"since %s, first seen on %s\\n" % (utc_stamp(), key)',
      '"\\n"'),
     ("login-marker-cleared",
-     '        forget(LOGGED_OUT_PATH)',
-     '        pass'),
+     '                log("%s: %s" % (key, OUTAGE_OVER[ended]))\n'
+     '                forget(path)',
+     '                log("%s: %s" % (key, OUTAGE_OVER[ended]))\n'
+     '                pass'),
     ("login-marker-kept-on-failed",
-     '    elif outcome == DONE and os.path.exists(LOGGED_OUT_PATH):',
-     '    elif os.path.exists(LOGGED_OUT_PATH):'),
+     '    elif outcome == DONE:\n'
+     '        # A review that ran proves both',
+     '    else:\n'
+     '        # A review that ran proves both'),
     ("login-title",
      "    if outcome == LOGGED_OUT:\n"
      '        return "Claude could not log in',
      "    if False:\n"
      '        return "Claude could not log in'),
     ("login-hand-run-no-attempt",
-     '                    kept.get("attempts", 0) + (outcome != LOGGED_OUT),',
+     '                    kept.get("attempts", 0) + (outcome not in OUTAGE_ENDINGS),',
      '                    kept.get("attempts", 0) + 1,'),
     # A login failure wrote no transcript, so a saved review keeps its
     # spent budget; every other ending still starts it over.
     ("login-keeps-the-repost-budget",
-     '    return {} if outcome == LOGGED_OUT else {"post_tries": 0, "waivers": 0}',
+     '    return ({} if outcome in OUTAGE_ENDINGS\n'
+     '            else {"post_tries": 0, "waivers": 0})',
      '    return {"post_tries": 0, "waivers": 0}'),
     ("login-budget-reset-otherwise",
-     '    return {} if outcome == LOGGED_OUT else {"post_tries": 0, "waivers": 0}',
-     '    return {} if outcome == LOGGED_OUT else {}'),
+     '    return ({} if outcome in OUTAGE_ENDINGS\n'
+     '            else {"post_tries": 0, "waivers": 0})',
+     '    return {} if outcome in OUTAGE_ENDINGS else {}'),
     ("login-hand-run-keeps-the-budget",
      '                    unposted=os.path.exists(unposted_path(repo, pr)),\n'
      '                    **repost_budget(outcome)))',
@@ -3196,8 +3215,8 @@ MUTATIONS = [
      'CHECK_LOGGED_OUT = "action_required"',
      'CHECK_LOGGED_OUT = "neutral"'),
     ("login-conclusion-chosen",
-     "    return CHECK_LOGGED_OUT if outcome == LOGGED_OUT else "
-     "CHECK_CONCLUSION",
+     "    return (CHECK_LOGGED_OUT if outcome in OUTAGE_ENDINGS\n"
+     "            else CHECK_CONCLUSION)",
      "    return CHECK_CONCLUSION"),
     ("login-conclusion",
      'or env,\n'
@@ -3233,7 +3252,7 @@ MUTATIONS = [
     # The wait is what spaces the attempts, so the turn still ends on a
     # failed review rather than going on to review the next pull request.
     ("failed-review-ends-the-turn",
-     "    return outcome != LOGGED_OUT",
+     "    return outcome not in OUTAGE_ENDINGS",
      "    return outcome == DONE"),
 
     # --- which claude runs the reviews is said, and a change is said -----

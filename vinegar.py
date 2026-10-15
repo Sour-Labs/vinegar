@@ -392,6 +392,7 @@ REVIEW_DIR = os.path.join(HOME, "reviews")
 # stays true across a restart and across a pull request closed while it
 # waited.
 LOGGED_OUT_PATH = os.path.join(HOME, "logged-out")
+LIMITED_PATH = os.path.join(HOME, "usage-limited")
 # There while the reviewer's sessions start without the tool its findings
 # arrive on, for watchdog.sh to push about the same way. Written from the
 # session's own init event, so it names the release that dropped the tool,
@@ -551,6 +552,30 @@ DONE, FAILED = "reviewed", "failed"
 # seconds before the next one tries.
 LOGGED_OUT = "logged out"
 LOGIN_RETRY = 600
+
+# The fourth ending, held the same way: Claude's usage limit is reached.
+# Claude Code reports it as an assistant event marked `error: "rate_limit"`
+# in about two seconds at no cost, and it lasts until the window resets or
+# the limit is raised, hours either way. Kept FAILED it looked exactly like
+# the login outage: on 2026-10-15 agent-hub#37 spent its three attempts in
+# twenty minutes against a limit that reset an hour later, was given up
+# on, and had to be reviewed by hand. The two share LOGIN_RETRY and the
+# gate in handle_pr; each has its own marker and its own words.
+LIMITED = "usage limit"
+OUTAGE_ENDINGS = (LOGGED_OUT, LIMITED)
+
+# Which `error` on the event Claude Code writes in place of an answer is
+# one of these, as against a failure that is the attempt's own. A 529
+# (`overloaded`) and a `server_error` clear in seconds, and FAILED_RETRY
+# already spaces three attempts over twenty minutes for them. Claude Code
+# retries a 429 itself before writing `rate_limit`, so one that reaches
+# here has outlasted that, and with a subscription it is the usage limit.
+OUTAGES = {"authentication_failed": LOGGED_OUT, "rate_limit": LIMITED}
+OUTAGE_PATHS = {LOGGED_OUT: LOGGED_OUT_PATH, LIMITED: LIMITED_PATH}
+OUTAGE_WHY = {LOGGED_OUT: "Claude could not log in",
+              LIMITED: "Claude's usage limit is reached"}
+OUTAGE_OVER = {LOGGED_OUT: "Claude can log in again",
+               LIMITED: "Claude's usage limit has reset"}
 
 # What one posting attempt settled. Named rather than True/False/None,
 # because the caller has four distinct moves to make and three of these
@@ -2626,7 +2651,8 @@ def repost_budget(outcome):
     run both ask here, because the two writing the rule out separately is
     how a fix to one of them reached the other a release later.
     """
-    return {} if outcome == LOGGED_OUT else {"post_tries": 0, "waivers": 0}
+    return ({} if outcome in OUTAGE_ENDINGS
+            else {"post_tries": 0, "waivers": 0})
 
 
 def state_entry(head, outcome, attempts=0, reason=None, announced=False,
@@ -5360,6 +5386,9 @@ def ended_title(outcome, attempts=0):
     """
     if outcome == LOGGED_OUT:
         return "Claude could not log in, so the review will run once it can"
+    if outcome == LIMITED:
+        return ("Claude's usage limit is reached, so the review will run once "
+                "it resets")
     if outcome == FAILED and attempts >= MAX_ATTEMPTS:
         return "The review failed %d times and was given up on" % attempts
     if outcome == FAILED:
@@ -5375,7 +5404,8 @@ def ended_conclusion(outcome):
     docstring gives: when there were two, the hand run's copy was the one
     nothing checks.
     """
-    return CHECK_LOGGED_OUT if outcome == LOGGED_OUT else CHECK_CONCLUSION
+    return (CHECK_LOGGED_OUT if outcome in OUTAGE_ENDINGS
+            else CHECK_CONCLUSION)
 
 
 def close_check(label, check, title, env, summary="",
@@ -6586,8 +6616,8 @@ def tools_missing(label, init, missing):
                      % (utc_stamp(), label, release, ", ".join(missing)))
 
 
-def logged_out(stdout):
-    """Did that attempt stop because Claude could not log in?
+def outage(stdout):
+    """Which free, machine-wide ending stopped that attempt, or None.
 
     Read off the field and not the words. When the login fails, Claude Code
     writes an assistant event in place of an answer and marks it `error:
@@ -6596,7 +6626,10 @@ def logged_out(stdout):
     refreshed", and a token that is simply wrong says "API Error: 401
     OAuth access token is invalid". The field was read in a stream from
     Claude Code 2.1.284, and in the session record a failed review of the
-    daemon's left on 2.1.283.
+    daemon's left on 2.1.283. The usage limit is the same event marked
+    `error: "rate_limit"`, read in the session records of agent-hub#37's
+    three attempts on 2.1.285, beside "You've hit your monthly spend limit
+    · raise it at claude.ai/settings/usage".
 
     A subagent's event is not the review's, for the reason read_stream()
     gives, and a subagent that fails to log in part way through a review
@@ -6612,9 +6645,9 @@ def logged_out(stdout):
             continue
         if (event.get("type") == "assistant"
                 and not event.get("parent_tool_use_id")
-                and event.get("error") == "authentication_failed"):
-            return True
-    return False
+                and event.get("error") in OUTAGES):
+            return OUTAGES[event["error"]]
+    return None
 
 
 def review(path, repo, pr, config, env, tokens, resent=False, check=None,
@@ -7136,9 +7169,9 @@ def review(path, repo, pr, config, env, tokens, resent=False, check=None,
             # Free, like unroutable(), or it is FAILED. A login lost part
             # way through a review has spent the review, and nothing here
             # re-buys one without MAX_ATTEMPTS counting it.
-            if (output.get("total_cost_usd") == 0
-                    and logged_out(result.stdout)):
-                return LOGGED_OUT, False, False
+            held = output.get("total_cost_usd") == 0 and outage(result.stdout)
+            if held:
+                return held, False, False
             keep(label, repo, pr, spoken, "the review failed")
             return FAILED, False, False
         log("%s: it failed with %d finding(s) already reported, so those are "
@@ -8022,23 +8055,25 @@ def posts_held(key):
             and time.monotonic() - _post_failed_at[key] < FAILED_RETRY)
 
 
-def login_failed(key):
-    """Hold every review back for LOGIN_RETRY, and leave the watchdog its
-    marker.
+def held_up(key, outcome):
+    """Hold every review back for LOGIN_RETRY, and leave the watchdog the
+    marker for this outage.
 
     The marker is written once and then left alone, so the watchdog can
     tell an outage it has already pushed about from a new one by whether
-    the file is there, and its first line keeps when this one began.
+    the file is there, and its first line keeps when this one began. One
+    file per outage, because the watchdog's push names what is wrong and
+    what to do about it, and those differ.
     """
     global _login_failed_at
     _login_failed_at = time.monotonic()
-    log("%s: Claude could not log in. That is not counted as an attempt, "
-        "and no review starts for %ds" % (key, LOGIN_RETRY))
+    log("%s: %s. That is not counted as an attempt, and no review starts "
+        "for %ds" % (key, OUTAGE_WHY[outcome], LOGIN_RETRY))
     # Whole or not at all, because the watchdog tells one outage from the
     # next by this text, and a half-written line read mid-write would push
     # once for the fragment and again for the whole.
-    if not os.path.exists(LOGGED_OUT_PATH):
-        write_atomic(LOGGED_OUT_PATH,
+    if not os.path.exists(OUTAGE_PATHS[outcome]):
+        write_atomic(OUTAGE_PATHS[outcome],
                      "since %s, first seen on %s\n" % (utc_stamp(), key))
 
 
@@ -8341,10 +8376,11 @@ def handle_pr(repo, pr, config, state, tokens):
                         "skipped, %s" % reason, counted=counted)
             return False
 
-    # The login is this machine's, not this pull request's, so one failure
-    # holds every review back rather than each one finding out for itself
-    # a minute apart. Nothing is said or recorded here: login_failed() has
-    # said it once for all of them, and the entry keeps what it had.
+    # The login and the usage limit are this machine's, not this pull
+    # request's, so one failure holds every review back rather than each
+    # one finding out for itself a minute apart. Nothing is said or
+    # recorded here: held_up() has said it once for all of them, and the
+    # entry keeps what it had.
     if (_login_failed_at is not None
             and time.monotonic() - _login_failed_at < LOGIN_RETRY):
         return False
@@ -8457,7 +8493,7 @@ def handle_pr(repo, pr, config, state, tokens):
         # every budget it meets, which is the give-up LOGGED_OUT exists to
         # prevent.
         nonlocal attempts
-        if outcome == LOGGED_OUT:
+        if outcome in OUTAGE_ENDINGS:
             attempts -= 1
         # Recorded with whether a saved review is waiting behind it, so the
         # next poll can find that out without listing a directory. The
@@ -8483,11 +8519,14 @@ def handle_pr(repo, pr, config, state, tokens):
         key, repo, pr, config, tokens, env, path, since, blockers, record,
         resent=attempts > 1, attempts=attempts)
 
-    if outcome == LOGGED_OUT:
-        login_failed(key)
-    elif outcome == DONE and os.path.exists(LOGGED_OUT_PATH):
-        log("%s: Claude can log in again" % key)
-        forget(LOGGED_OUT_PATH)
+    if outcome in OUTAGE_ENDINGS:
+        held_up(key, outcome)
+    elif outcome == DONE:
+        # A review that ran proves both: it logged in and it was served.
+        for ended, path in OUTAGE_PATHS.items():
+            if os.path.exists(path):
+                log("%s: %s" % (key, OUTAGE_OVER[ended]))
+                forget(path)
 
     if outcome == FAILED and attempts < MAX_ATTEMPTS:
         _failed_at[key] = time.monotonic()
@@ -8507,7 +8546,7 @@ def handle_pr(repo, pr, config, state, tokens):
     # this answer is really about, and anything else open on this
     # repository has been waiting through them. A login failure spent a
     # few seconds, and True would put the repository back due at once.
-    return outcome != LOGGED_OUT
+    return outcome not in OUTAGE_ENDINGS
 
 
 def find_pr(repo, number, env):
@@ -8834,7 +8873,7 @@ def main():
                 # run cannot spend the budget the daemon was told to keep.
                 remember(state, pr_key(repo, pr), rebuild_entry(
                     pr["headRefOid"], outcome,
-                    kept.get("attempts", 0) + (outcome != LOGGED_OUT),
+                    kept.get("attempts", 0) + (outcome not in OUTAGE_ENDINGS),
                     kept, was, covered, reached,
                     unposted=os.path.exists(unposted_path(repo, pr)),
                     **repost_budget(outcome)))
