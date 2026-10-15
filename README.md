@@ -225,7 +225,7 @@ Every key in `config.example.json`:
 | `fallback_model` | `null` | Model to run the review again on when `model` cannot be routed. Null means no fallback. See below. |
 | `review_on_push` | `false` | Review again when the head commit changes. A second review reads only what was added since the last one that posted. See "The review". |
 | `blockers_only_after` | `2` | After this many reviews of one pull request, later reviews of it report only blockers. Nothing stops them running. Reached on every push with `review_on_push` on, and through repeated `--pr` runs without it. Null reports everything, every time. See below. |
-| `max_changed_lines` | `3000` | Skip pull requests larger than this. |
+| `max_changed_lines` | `3000` | Skip pull requests larger than this. A pass that reads only what was added since the last review is judged on those lines, not on the whole branch. See "The review". |
 | `parallel_repos` | `1` | How many repositories to poll and review at the same time. Reviews of one repository stay one at a time whatever this says. Read at startup, so changing it needs a restart. See below. |
 | `skip_drafts` | `true` | Skip drafts. |
 | `skip_bots` | `true` | Skip pull requests opened by bots. |
@@ -1388,13 +1388,18 @@ the pull request: GitHub keeps a comment live where the code around it did not
 change, and where it did change, that code is in the next pass's diff and gets
 read again.
 
-Two things this does **not** change. Inline comments are still anchored against
+One thing this does **not** change. Inline comments are still anchored against
 the pull request's full diff, because that is the only thing GitHub will accept
-an anchor in, and one bad anchor loses the whole review. And `max_changed_lines`
-still counts the whole pull request, so one that grows past the cap is skipped
-even when each new push is small. That is the existing behaviour rather than a
-decision this made, and it is worth revisiting alongside whatever turns
-`review_on_push` on.
+an anchor in, and one bad anchor loses the whole review.
+
+`max_changed_lines` follows the scope. A pass that reads only what was added
+since the last review is judged on those lines, so a branch that has grown past
+the cap is still reviewed while each push stays under it, which is the shape of
+every push that answers a review. The whole pull request is judged on its first
+review, on a pass that falls back to reading it whole, and when git cannot
+count the increment. The cap used to count the whole pull request on every
+pass, and a 17,000-line pull request was skipped for a push that added 618
+lines; the log said so, and nothing was reviewed.
 
 The narrowing statement goes in the saved transcript as well as in the comment,
 because a refused review is delivered later from the transcript and would

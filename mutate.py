@@ -413,6 +413,18 @@ MUTATIONS = [
     ("skip-size-cap",
      '    if changed > config["max_changed_lines"]:',
      "    if False:"),
+    ("cap-waits-for-the-increment",
+     "    if increment_pending(pr, done or {}):\n        return None\n",
+     ""),
+    ("cap-on-the-increment",
+     "    changed = increment_lines(path, since, env, key) if since else None\n",
+     "    changed = None\n"),
+    ("cap-on-the-increment-skips",
+     "    if reason:\n"
+     '        record_once(state, key, done, head, "skipped", "skipped, %s" % reason)\n'
+     "        return False\n",
+     "    if reason:\n"
+     "        pass\n"),
     ("skip-bots",
      '    if config["skip_bots"] and author.get("is_bot"):',
      "    if False:"),
@@ -734,9 +746,11 @@ MUTATIONS = [
      "    return outcome != LOGGED_OUT\n",
      "    return False\n"),
     ("handle-skip-is-not-work",
+     "        # is what let a draft toggle launder the retry budget.\n"
      '        record_once(state, key, done, head, "skipped", '
      '"skipped, %s" % reason)\n'
      "        return False",
+     "        # is what let a draft toggle launder the retry budget.\n"
      '        record_once(state, key, done, head, "skipped", '
      '"skipped, %s" % reason)\n'
      "        return True"),
