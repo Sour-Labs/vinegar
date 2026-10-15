@@ -2631,7 +2631,8 @@ def repost_budget(outcome):
 
 def state_entry(head, outcome, attempts=0, reason=None, announced=False,
                 tries=0, post_tries=0, unposted=False, waivers=0,
-                announce_waivers=0, reviewed_sha=None, rounds=0):
+                announce_waivers=0, reviewed_sha=None, rounds=0,
+                counted=None):
     """One pull request's record, built the one way.
 
     Four sites used to spell this out as a fresh literal, each deciding for
@@ -2699,6 +2700,8 @@ def state_entry(head, outcome, attempts=0, reason=None, announced=False,
         # reviews this pull request has had over its whole life.
         # rounds_done() is where that difference is argued.
         entry["rounds"] = rounds
+    if counted is not None:
+        entry["counted"] = counted
     return entry
 
 
@@ -2812,7 +2815,8 @@ def load_state():
                           or isinstance(done[field], bool)
                           for field in ("attempts", "announce_tries",
                                         "post_tries", "post_waivers",
-                                        "announce_waivers", "seen", "rounds")
+                                        "announce_waivers", "seen", "rounds",
+                                        "counted")
                           if field in done)
                    # The flags too, and for the same reason: this file is
                    # hand-edited on the log's own advice, and a bare
@@ -2940,8 +2944,14 @@ def open_prs(repo, env):
     return prs
 
 
-def skip_reason(pr, config):
-    """Say why this pull request needs no review, or return None to review it."""
+def skip_reason(pr, config, done=None):
+    """Say why this pull request needs no review, or return None to review it.
+
+    `done` is what the state remembers about it. The size cap is not
+    judged here once an earlier review posted at another head: that pass
+    reads only what was added since, and handle_pr judges the cap on
+    that, after the checkout, because the count needs the clone.
+    """
     if config["skip_drafts"] and pr["isDraft"]:
         return "draft"
     if config["skip_forks"] and pr["isCrossRepository"]:
@@ -2953,11 +2963,58 @@ def skip_reason(pr, config):
         return "opened by the bot %s" % login
     if config["authors"] and login not in config["authors"]:
         return "author %s is not in the authors list" % (login or "unknown")
-    changed = pr["additions"] + pr["deletions"]
+    if increment_pending(pr, done or {}):
+        return None
+    return size_reason(pr["additions"] + pr["deletions"], config)
+
+
+def increment_pending(pr, done):
+    """Whether the next pass of this pull request reads only what was added.
+
+    True once a review posted at a head that is not the current one.
+    review_scope() can still answer the whole branch, when that review's
+    commit is gone or the range holds a merge, and handle_pr judges the
+    cap on whichever it answers.
+    """
+    since = done.get("reviewed_sha")
+    return bool(since) and since != pr["headRefOid"]
+
+
+def size_reason(changed, config, since=None):
+    """The skip reason for a change of this many lines, or None under the cap."""
     if changed > config["max_changed_lines"]:
-        return "%d changed lines, over the %d cap" % (
-            changed, config["max_changed_lines"])
+        return "%d changed lines%s, over the %d cap" % (
+            changed, " since %s" % since[:7] if since else "",
+            config["max_changed_lines"])
     return None
+
+
+def increment_lines(path, since, env, label):
+    """How many lines `since...HEAD` changes, or None when git cannot say.
+
+    What the cap is judged against on a pass that reads only what was
+    added since the last review. Judged on the whole branch, that cap
+    skipped wonky-flow#175 at 17254 lines for a push that added 618, and
+    every push answering a review is that shape. Additions plus deletions,
+    like the whole-branch count GitHub reports; a binary file counts as
+    none, which is what `--numstat` prints for it.
+    """
+    try:
+        result = run(["git", "diff", "--numstat", "--no-textconv",
+                      "--no-ext-diff", "%s...HEAD" % since], cwd=path,
+                     env=env, timeout=DIFF_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        result = None
+    if result is None or result.returncode != 0:
+        log("%s: cannot count what was added since %s, so the whole pull "
+            "request is judged against the cap" % (label, since[:7]))
+        return None
+    changed = 0
+    for line in result.stdout.splitlines():
+        counts = line.split("\t")[:2]
+        if len(counts) == 2:
+            changed += sum(int(n) for n in counts if n.isdigit())
+    return changed
 
 
 def checkout_path(repo):
@@ -7890,7 +7947,7 @@ def spend_announce(key, config, state, head, attempts, tries, said):
     remember(state, key, entry)
 
 
-def record_once(state, key, done, head, outcome, reason):
+def record_once(state, key, done, head, outcome, reason, **fields):
     """Record a decision that repeats, and say it only when it changes.
 
     A skip and a failed checkout are both decided again on every poll and
@@ -7926,7 +7983,7 @@ def record_once(state, key, done, head, outcome, reason):
     # request would then be read whole on the next pass that does run,
     # silently, with only the bill to show for it.
     entry = rebuild_entry(head, outcome, kept.get("attempts", 0), kept, done,
-                          reason=reason)
+                          reason=reason, **fields)
     entry["seen"] = seen
     remember(state, key, entry)
 
@@ -8180,7 +8237,9 @@ def handle_pr(repo, pr, config, state, tokens):
     # Only a finished review closes a pull request off. A skip is decided
     # again on every poll, because the filter that caused it can stop
     # applying: a draft is marked ready, an oversized pull request is split
-    # down, a login is added to `authors`.
+    # down, a login is added to `authors`. What is kept is a count, not a
+    # decision: the lines a push added since the last review, which only a
+    # push can change, and which the cap is judged on again every poll.
     if done.get("outcome") == DONE:
         if done.get("sha") == head or not config["review_on_push"]:
             return False
@@ -8257,13 +8316,30 @@ def handle_pr(repo, pr, config, state, tokens):
                                tries, said)
             return False
 
-    reason = skip_reason(pr, config)
+    reason = skip_reason(pr, config, done)
     if reason:
         # Deciding again is free. Saying so every minute is noise, and the
         # attempts burned at this head have to ride along: dropping them
         # is what let a draft toggle launder the retry budget.
         record_once(state, key, done, head, "skipped", "skipped, %s" % reason)
         return False
+
+    # The lines a push added since the last review are counted once per
+    # head. Counting them costs a token mint, a fetch and the scope probes,
+    # and nothing the count depends on moves without a push: the head, and
+    # where the last review finished, which only a posted review moves and
+    # that rebuilds the entry. The cap is judged on the count every poll,
+    # so raising it takes effect at the next one, and the skips above
+    # answer first, so a draft toggle is still recorded as the reason.
+    # The whole-branch count is GitHub's and is not kept: a retarget
+    # changes it with no push.
+    counted = done.get("counted") if done.get("sha") == head else None
+    if counted is not None:
+        reason = size_reason(counted, config, done.get("reviewed_sha"))
+        if reason:
+            record_once(state, key, done, head, "skipped",
+                        "skipped, %s" % reason, counted=counted)
+            return False
 
     # The login is this machine's, not this pull request's, so one failure
     # holds every review back rather than each one finding out for itself
@@ -8323,6 +8399,31 @@ def handle_pr(repo, pr, config, state, tokens):
                     "checkout failed: %s" % err)
         return False
 
+    # Worked out before the review, because it is what the review is told,
+    # and after the checkout, because both probes read this clone. Before
+    # the marker below, because the cap is judged on what this pass reads
+    # and a skip is not an attempt.
+    since = review_scope(path, pr, done, env, key)
+
+    # skip_reason() left the cap for here once an earlier review posted:
+    # a branch that grew past it is still reviewed while each push stays
+    # under it. The whole branch is judged when the pass reads it whole,
+    # and when git cannot count the increment.
+    changed = increment_lines(path, since, env, key) if since else None
+    if changed is not None:
+        reason, kept = size_reason(changed, config, since), {"counted": changed}
+    else:
+        reason, kept = size_reason(pr["additions"] + pr["deletions"], config), {}
+    if reason:
+        record_once(state, key, done, head, "skipped", "skipped, %s" % reason,
+                    **kept)
+        return False
+    # Said once the cap has let it through, because it says a review is
+    # happening, and on a skipped pass that was the last line before the
+    # skip said otherwise.
+    if since:
+        log("%s: reviewing what was added since %s" % (key, since[:7]))
+
     attempts = done.get("attempts", 0) + 1 if done.get("sha") == head else 1
 
     # Recorded before the review runs, not after. Nothing inside review() can
@@ -8341,12 +8442,6 @@ def handle_pr(repo, pr, config, state, tokens):
     kept = done if done.get("sha") == head else {}
     remember(state, key, rebuild_entry(
         head, FAILED, attempts, kept, done, post_tries=0, waivers=0))
-
-    # Worked out before the review, because it is what the review is told,
-    # and after the checkout, because both probes read this clone.
-    since = review_scope(path, pr, done, env, key)
-    if since:
-        log("%s: reviewing what was added since %s" % (key, since[:7]))
 
     # Worked out from the entry rather than from a counter of this run,
     # because the round this review is has to survive the process dying

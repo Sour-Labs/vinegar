@@ -164,6 +164,9 @@ def fake_run(cmd, cwd=None, timeout=None, env=None, stdin_text=None):
     # it deliberately.
     if cmd[0] == "claude" and not cmd[2].startswith("/code-review"):
         return subprocess.CompletedProcess(cmd, 0, all_advisory(cmd[2]), "")
+    if cmd[:3] == ["git", "diff", "--numstat"]:
+        return subprocess.CompletedProcess(cmd, fake_run.numstat_rc,
+                                           fake_run.numstat, "")
     if cmd[0] == "git" and "diff" in cmd:
         last_git_diff[0], last_git_diff[1] = cmd, timeout
         return subprocess.CompletedProcess(
@@ -221,6 +224,8 @@ fake_run.check_open = {"check_runs": []}
 fake_run.check_made = {"id": 4242}
 fake_run.diff_rc = 0
 fake_run.diff_out = ""
+fake_run.numstat_rc = 0
+fake_run.numstat = ""
 fake_run.look_rc = 0
 fake_run.look_out = ""
 fake_run.scope_rc = 0
@@ -267,6 +272,8 @@ def reset_stubs():
     fake_run.rc = 0
     fake_run.diff_rc = 0
     fake_run.diff_out = ""
+    fake_run.numstat_rc = 0
+    fake_run.numstat = ""
     fake_run.look_rc = 0
     fake_run.look_out = ""
     fake_run.scope_rc = 0
@@ -5006,6 +5013,27 @@ check("a branch over the changed-lines cap is skipped",
 check("a branch under the changed-lines cap is reviewed",
       _skipped({"additions": 2000, "deletions": 999}) is None,
       _skipped({"additions": 2000, "deletions": 999}))
+# Once a review posted at another head, the next pass reads only what was
+# added since, and handle_pr judges the cap on that: judged whole, the cap
+# skipped wonky-flow#175 at 17254 lines for a push of 618, and every push
+# answering a review is that shape. The other gates still answer first,
+# because none of them is about size.
+_GROWN = {"additions": 20000, "headRefOid": NEW_SHA}
+check("the cap waits for the increment once a review posted at another head",
+      vinegar.skip_reason(dict(PR_LIVE, **_GROWN), CONFIG, REVIEWED) is None,
+      vinegar.skip_reason(dict(PR_LIVE, **_GROWN), CONFIG, REVIEWED))
+check("the cap is judged whole while the last review is at this head",
+      "over the" in (vinegar.skip_reason(
+          dict(PR_LIVE, **dict(_GROWN, headRefOid=OLD_SHA)), CONFIG,
+          REVIEWED) or ""),
+      vinegar.skip_reason(dict(PR_LIVE, **dict(_GROWN, headRefOid=OLD_SHA)),
+                          CONFIG, REVIEWED))
+check("the other gates do not wait for the increment",
+      "authors list" in (vinegar.skip_reason(
+          dict(PR_LIVE, **_GROWN), dict(CONFIG, authors=["someone"]),
+          REVIEWED) or ""),
+      vinegar.skip_reason(dict(PR_LIVE, **_GROWN),
+                          dict(CONFIG, authors=["someone"]), REVIEWED))
 # A deleted account leaves no author object at all, and reading .get on it
 # is what turns "skip this one" into a traceback on every poll.
 #
@@ -5906,6 +5934,13 @@ with open(vinegar.STATE_PATH, "w") as h:
             '"post_tries": "1"}}')
 check("a post_tries that is not a number is dropped too",
       vinegar.load_state() == {}, vinegar.load_state())
+# `counted` is compared with > against the cap on the poll path, and a
+# string there is a TypeError on every poll until someone edits the file.
+with open(vinegar.STATE_PATH, "w") as h:
+    h.write('{"o/r#12": {"outcome": "skipped", "sha": "a", '
+            '"counted": "5"}}')
+check("a counted that is not a number is dropped too",
+      vinegar.load_state() == {}, vinegar.load_state())
 
 # The flags are hand-edited too, and a bare truthiness test reads
 # `"announced": "no"` as yes — the opposite of what someone writing that
@@ -6118,9 +6153,18 @@ AGAIN_CFG = dict(CONFIG, review_on_push=True)
 _ag_saves = []
 
 
-def _second_pass(entry, config=None, review=None, checkout=None):
-    """One handle_pr over a pull request that was reviewed at OLD_SHA."""
+def _second_pass(entry, config=None, review=None, checkout=None, log=None,
+                 pr=None, **stubs):
+    """One handle_pr over a pull request that was reviewed at OLD_SHA.
+
+    `stubs` are fake_run attributes, set after the reset so they hold,
+    and `log` replaces the silenced one for the same reason.
+    """
     reset_stubs()
+    for name, value in stubs.items():
+        setattr(fake_run, name, value)
+    if log:
+        vinegar.log = log
     del _ag_saves[:]
     # After reset_stubs, not before it: reset_stubs puts the genuine
     # functions back, so a caller that stubbed the checkout on its own
@@ -6140,7 +6184,7 @@ def _second_pass(entry, config=None, review=None, checkout=None):
     if review:
         vinegar.review = review
     state = {L: dict(entry)}
-    vinegar.handle_pr("o/r", PR_AGAIN, config or AGAIN_CFG, state, {})
+    vinegar.handle_pr("o/r", pr or PR_AGAIN, config or AGAIN_CFG, state, {})
     return state.get(L, {})
 
 
@@ -6211,6 +6255,91 @@ _ag_skipped = _second_pass(REVIEWED, config=dict(AGAIN_CFG, authors=["nobody"]))
 check("a skip does not forget where the last review finished",
       _ag_skipped.get("reviewed_sha") == OLD_SHA
       and _ag_skipped.get("outcome") == "skipped", _ag_skipped)
+
+# The cap on a pass that reads only what was added. PR_AGAIN is one changed
+# line whole, so a cap of 0 is the branch that grew past it; what decides
+# is the increment, which the stubbed `--numstat` answers.
+_CAPPED = dict(AGAIN_CFG, max_changed_lines=0)
+_ag_small_push = _second_pass(REVIEWED, config=_CAPPED)
+check("a branch over the cap is still reviewed while the push is under it",
+      _ag_small_push.get("outcome") == vinegar.DONE
+      and _ag_small_push.get("reviewed_sha") == NEW_SHA, _ag_small_push)
+# A binary file is `-\t-`, and counts as nothing rather than raising.
+_ag_big_push = _second_pass(REVIEWED, config=_CAPPED,
+                            numstat="3\t2\tvinegar.py\n-\t-\tbrand/logo.png\n")
+check("a push over the cap is skipped, and the reason says what was counted",
+      _ag_big_push.get("outcome") == "skipped"
+      and "5 changed lines since %s, over the 0 cap" % OLD_SHA[:7]
+      in _ag_big_push.get("reason", ""), _ag_big_push)
+# Judged before the marker, so the skip is not an attempt: nothing was spent.
+check("a push skipped on the cap is not an attempt",
+      not _ag_big_push.get("attempts")
+      and _ag_big_push.get("reviewed_sha") == OLD_SHA
+      and not any(saved[L].get("outcome") == vinegar.FAILED
+                  for saved in _ag_saves), (_ag_big_push, _ag_saves))
+# The count cost a token, a fetch and the probes, and only a push changes
+# it, so it is kept at this head rather than paid for again every poll;
+# the polls it holds through are still counted.
+check("the lines a push added are recorded with the skip",
+      _ag_big_push.get("counted") == 5, _ag_big_push)
+_ag_calls = []
+_ag_kept = _second_pass(_ag_big_push, config=_CAPPED,
+                        checkout=lambda *a: _ag_calls.append(a) or ROOT,
+                        numstat="3\t2\tvinegar.py\n")
+check("a kept count is not counted again at its head",
+      not _ag_calls and _ag_kept.get("outcome") == "skipped"
+      and _ag_kept.get("seen") == 2 and _ag_kept.get("counted") == 5
+      and not scoped, (_ag_kept, _ag_calls))
+# What is kept is the count, not the decision: the cap is judged on it
+# again every poll, so raising it takes effect at the next one.
+_ag_raised = _second_pass(_ag_big_push, config=dict(AGAIN_CFG,
+                                                   max_changed_lines=10),
+                          numstat="3\t2\tvinegar.py\n")
+check("a raised cap judges a kept count again",
+      _ag_raised.get("outcome") == vinegar.DONE, _ag_raised)
+# The other skips answer first, so an operator reading the entry after a
+# draft toggle is pointed at the draft, not at a cap that no longer decides.
+_ag_calls = []
+_ag_drafted = _second_pass(_ag_big_push, config=_CAPPED,
+                           checkout=lambda *a: _ag_calls.append(a) or ROOT,
+                           pr=dict(PR_AGAIN, isDraft=True))
+check("a draft toggle is recorded over a kept count",
+      _ag_drafted.get("reason") == "skipped, draft" and not _ag_calls,
+      (_ag_drafted, _ag_calls))
+# The whole-branch count is GitHub's, and a retarget onto another base
+# changes it with no push, so a skip on it is judged again every poll.
+_ag_first = _second_pass({}, config=_CAPPED)
+_ag_shrunk = _second_pass(_ag_first, config=_CAPPED,
+                          pr=dict(PR_AGAIN, additions=0))
+check("a whole-branch skip is judged again when the pull request shrinks",
+      _ag_first.get("outcome") == "skipped" and "counted" not in _ag_first
+      and _ag_shrunk.get("outcome") == vinegar.DONE, (_ag_first, _ag_shrunk))
+# "reviewing what was added since" says a review is happening, so it is
+# not said on a pass the cap then skips.
+_ag_said = []
+_second_pass(REVIEWED, config=_CAPPED, log=_ag_said.append,
+             numstat="3\t2\tvinegar.py\n")
+check("a skipped pass does not say it is reviewing",
+      not any("reviewing what was added" in line for line in _ag_said)
+      and any("skipped, 5 changed lines since" in line for line in _ag_said),
+      _ag_said)
+_ag_said = []
+_second_pass(REVIEWED, config=_CAPPED, log=_ag_said.append)
+check("a pass the cap lets through still says what it reads",
+      any("reviewing what was added since %s" % OLD_SHA[:7] in line
+          for line in _ag_said), _ag_said)
+_ag_uncounted = _second_pass(REVIEWED, config=_CAPPED, numstat_rc=1)
+check("when git cannot count the push, the whole branch is judged",
+      _ag_uncounted.get("outcome") == "skipped"
+      and "1 changed lines, over the 0 cap" in _ag_uncounted.get("reason", ""),
+      _ag_uncounted)
+# The earlier review's commit is gone, so the pass reads the whole branch,
+# and the whole branch is what the cap judges.
+_ag_whole_again = _second_pass(REVIEWED, config=_CAPPED, scope_rc=1)
+check("a pass that falls back to the whole branch is judged whole",
+      _ag_whole_again.get("outcome") == "skipped"
+      and "1 changed lines, over the 0 cap" in _ag_whole_again.get("reason", ""),
+      _ag_whole_again)
 
 # And a pull request nothing has reviewed yet is still read whole.
 _ag_first = _second_pass({})

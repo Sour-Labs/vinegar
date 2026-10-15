@@ -413,6 +413,36 @@ MUTATIONS = [
     ("skip-size-cap",
      '    if changed > config["max_changed_lines"]:',
      "    if False:"),
+    ("cap-waits-for-the-increment",
+     "    if increment_pending(pr, done or {}):\n        return None\n",
+     ""),
+    ("cap-on-the-increment",
+     "    changed = increment_lines(path, since, env, key) if since else None\n",
+     "    changed = None\n"),
+    ("cap-count-is-kept",
+     '    counted = done.get("counted") if done.get("sha") == head else None\n'
+     "    if counted is not None:\n",
+     "    counted = None\n"
+     "    if counted is not None:\n"),
+    ("cap-count-is-recorded",
+     '        reason, kept = size_reason(changed, config, since), {"counted": changed}\n',
+     "        reason, kept = size_reason(changed, config, since), {}\n"),
+    ("counted-is-a-number",
+     '                                        "announce_waivers", "seen", "rounds",\n'
+     '                                        "counted")\n',
+     '                                        "announce_waivers", "seen", "rounds")\n'),
+    ("scope-said-after-the-cap",
+     "    since = review_scope(path, pr, done, env, key)\n\n",
+     "    since = review_scope(path, pr, done, env, key)\n"
+     "    if since:\n"
+     '        log("%s: reviewing what was added since %s" % (key, since[:7]))\n\n'),
+    ("cap-on-the-increment-skips",
+     "    if reason:\n"
+     '        record_once(state, key, done, head, "skipped", "skipped, %s" % reason,\n'
+     "                    **kept)\n"
+     "        return False\n",
+     "    if reason:\n"
+     "        pass\n"),
     ("skip-bots",
      '    if config["skip_bots"] and author.get("is_bot"):',
      "    if False:"),
@@ -734,9 +764,11 @@ MUTATIONS = [
      "    return outcome != LOGGED_OUT\n",
      "    return False\n"),
     ("handle-skip-is-not-work",
+     "        # is what let a draft toggle launder the retry budget.\n"
      '        record_once(state, key, done, head, "skipped", '
      '"skipped, %s" % reason)\n'
      "        return False",
+     "        # is what let a draft toggle launder the retry budget.\n"
      '        record_once(state, key, done, head, "skipped", '
      '"skipped, %s" % reason)\n'
      "        return True"),
