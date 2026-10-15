@@ -1397,7 +1397,9 @@ since the last review is judged on those lines, so a branch that has grown past
 the cap is still reviewed while each push stays under it, which is the shape of
 every push that answers a review. The whole pull request is judged on its first
 review, on a pass that falls back to reading it whole, and when git cannot
-count the increment. The cap used to count the whole pull request on every
+count the increment. Counting the increment needs the checkout, so that
+decision stands at its head until the next push or a change to the cap, where
+the other skips are decided again on every poll. The cap used to count the whole pull request on every
 pass, and a 17,000-line pull request was skipped for a push that added 618
 lines; the log said so, and nothing was reviewed.
 

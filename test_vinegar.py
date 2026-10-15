@@ -6146,14 +6146,18 @@ AGAIN_CFG = dict(CONFIG, review_on_push=True)
 _ag_saves = []
 
 
-def _second_pass(entry, config=None, review=None, checkout=None, **stubs):
+def _second_pass(entry, config=None, review=None, checkout=None, log=None,
+                 **stubs):
     """One handle_pr over a pull request that was reviewed at OLD_SHA.
 
-    `stubs` are fake_run attributes, set after the reset so they hold.
+    `stubs` are fake_run attributes, set after the reset so they hold,
+    and `log` replaces the silenced one for the same reason.
     """
     reset_stubs()
     for name, value in stubs.items():
         setattr(fake_run, name, value)
+    if log:
+        vinegar.log = log
     del _ag_saves[:]
     # After reset_stubs, not before it: reset_stubs puts the genuine
     # functions back, so a caller that stubbed the checkout on its own
@@ -6266,6 +6270,37 @@ check("a push skipped on the cap is not an attempt",
       and _ag_big_push.get("reviewed_sha") == OLD_SHA
       and not any(saved[L].get("outcome") == vinegar.FAILED
                   for saved in _ag_saves), (_ag_big_push, _ag_saves))
+# Judged on the increment, the decision cost a token, a fetch and the
+# probes, so it stands at this head rather than being paid for again every
+# poll, and the polls it stands through are still counted.
+_ag_calls = []
+_ag_stood = _second_pass(_ag_big_push, config=_CAPPED,
+                         checkout=lambda *a: _ag_calls.append(a) or ROOT,
+                         numstat="3\t2\tvinegar.py\n")
+check("a cap decision stands at its head without another checkout",
+      not _ag_calls and _ag_stood.get("outcome") == "skipped"
+      and _ag_stood.get("seen") == 2 and not scoped, (_ag_stood, _ag_calls))
+# The cap is the one input that moves without a push: raised, the standing
+# decision was judged against another cap and is judged again.
+_ag_raised = _second_pass(_ag_big_push, config=dict(AGAIN_CFG,
+                                                   max_changed_lines=10),
+                          numstat="3\t2\tvinegar.py\n")
+check("a raised cap judges a standing decision again",
+      _ag_raised.get("outcome") == vinegar.DONE, _ag_raised)
+# "reviewing what was added since" says a review is happening, so it is
+# not said on a pass the cap then skips.
+_ag_said = []
+_second_pass(REVIEWED, config=_CAPPED, log=_ag_said.append,
+             numstat="3\t2\tvinegar.py\n")
+check("a skipped pass does not say it is reviewing",
+      not any("reviewing what was added" in line for line in _ag_said)
+      and any("skipped, 5 changed lines since" in line for line in _ag_said),
+      _ag_said)
+_ag_said = []
+_second_pass(REVIEWED, config=_CAPPED, log=_ag_said.append)
+check("a pass the cap lets through still says what it reads",
+      any("reviewing what was added since %s" % OLD_SHA[:7] in line
+          for line in _ag_said), _ag_said)
 _ag_uncounted = _second_pass(REVIEWED, config=_CAPPED, numstat_rc=1)
 check("when git cannot count the push, the whole branch is judged",
       _ag_uncounted.get("outcome") == "skipped"

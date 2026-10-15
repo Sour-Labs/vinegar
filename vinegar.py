@@ -2979,10 +2979,19 @@ def increment_pending(pr, done):
 def size_reason(changed, config, since=None):
     """The skip reason for a change of this many lines, or None under the cap."""
     if changed > config["max_changed_lines"]:
-        return "%d changed lines%s, over the %d cap" % (
-            changed, " since %s" % since[:7] if since else "",
-            config["max_changed_lines"])
+        return "%d changed lines%s, %s" % (
+            changed, " since %s" % since[:7] if since else "", cap_text(config))
     return None
+
+
+def cap_text(config):
+    """How a skip reason names the cap, so a standing one can be recognised.
+
+    handle_pr reads it back off the recorded reason: a cap decision stands
+    while the head and the cap it was judged against are the same, and the
+    cap is the one input that changes without a push.
+    """
+    return "over the %d cap" % config["max_changed_lines"]
 
 
 def increment_lines(path, since, env, label):
@@ -8310,6 +8319,16 @@ def handle_pr(repo, pr, config, state, tokens):
                                tries, said)
             return False
 
+    # A cap decision stands while nothing it was decided on has moved: the
+    # head, and the cap itself. Judged on the increment, below, it costs a
+    # token mint, a fetch and the scope probes, so deciding it again on
+    # every poll is not free the way the other skips are; counted here
+    # instead, so "still true after N polls" is still said.
+    if (done.get("outcome") == "skipped" and done.get("sha") == head
+            and done.get("reason", "").endswith(cap_text(config))):
+        record_once(state, key, done, head, "skipped", done["reason"])
+        return False
+
     reason = skip_reason(pr, config, done)
     if reason:
         # Deciding again is free. Saying so every minute is noise, and the
@@ -8381,8 +8400,6 @@ def handle_pr(repo, pr, config, state, tokens):
     # the marker below, because the cap is judged on what this pass reads
     # and a skip is not an attempt.
     since = review_scope(path, pr, done, env, key)
-    if since:
-        log("%s: reviewing what was added since %s" % (key, since[:7]))
 
     # skip_reason() left the cap for here once an earlier review posted:
     # a branch that grew past it is still reviewed while each push stays
@@ -8394,6 +8411,11 @@ def handle_pr(repo, pr, config, state, tokens):
     if reason:
         record_once(state, key, done, head, "skipped", "skipped, %s" % reason)
         return False
+    # Said once the cap has let it through, because it says a review is
+    # happening, and on a skipped pass that was the last line before the
+    # skip said otherwise.
+    if since:
+        log("%s: reviewing what was added since %s" % (key, since[:7]))
 
     attempts = done.get("attempts", 0) + 1 if done.get("sha") == head else 1
 

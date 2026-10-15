@@ -419,6 +419,15 @@ MUTATIONS = [
     ("cap-on-the-increment",
      "    changed = increment_lines(path, since, env, key) if since else None\n",
      "    changed = None\n"),
+    ("cap-decision-stands",
+     '    if (done.get("outcome") == "skipped" and done.get("sha") == head\n'
+     '            and done.get("reason", "").endswith(cap_text(config))):\n',
+     "    if False:\n"),
+    ("scope-said-after-the-cap",
+     "    since = review_scope(path, pr, done, env, key)\n\n",
+     "    since = review_scope(path, pr, done, env, key)\n"
+     "    if since:\n"
+     '        log("%s: reviewing what was added since %s" % (key, since[:7]))\n\n'),
     ("cap-on-the-increment-skips",
      "    if reason:\n"
      '        record_once(state, key, done, head, "skipped", "skipped, %s" % reason)\n'
