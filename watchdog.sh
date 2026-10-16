@@ -157,6 +157,9 @@ if [ "$alive" = "1" ]; then
     push_marker logged-out "Vinegar cannot log in to Claude" key \
         "Claude Code on $(hostname -s) cannot log in," \
         "Reviews wait and retry by themselves. If it does not clear, log in again with claude on that machine. No second push until a review works again."
+    push_marker usage-limited "Vinegar has hit Claude's usage limit" hourglass \
+        "Claude Code on $(hostname -s) has hit its usage limit," \
+        "Reviews wait and retry by themselves until it resets. To review sooner, raise the limit at claude.ai/settings/usage. No second push until a review works again."
     push_marker no-report-tool "Vinegar's reviewer cannot report findings" warning \
         "Claude Code on $(hostname -s) starts reviews without the ReportFindings tool," \
         "Reviews post as prose with no inline comments until it is back. Check the claude under ~/.vinegar/bin and CLAUDE_CODE_REPORT_FINDINGS. No second push until a session has the tool again."

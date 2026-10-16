@@ -676,9 +676,20 @@ three times between 28 August and 29 September 2026, the login worked again
 within forty minutes on two of them, and three pull requests were merged at the
 commit Vinegar had given up on.
 
-Vinegar also writes `~/.vinegar/logged-out` with the time the outage began, and
-the watchdog's next pass sends one ntfy push about it. Vinegar removes the file
-after the next review that runs. The watchdog keeps the text it pushed and
+**A usage limit is held the same way.** Claude Code reports it as
+`rate_limit`, also in about two seconds at no cost, and it lasts until the
+window resets or the limit is raised. Counted as attempts, it looked exactly
+like the login outage: on 15 October 2026 one pull request spent its three
+attempts in twenty minutes against a limit that reset an hour later, was given
+up on, and had to be reviewed by hand. The check is titled `Claude's usage
+limit is reached, so the review will run once it resets`. A 529 or a server
+error is not held: those clear in seconds, and the three spaced attempts are
+the right answer for them.
+
+Vinegar also writes `~/.vinegar/logged-out`, or `~/.vinegar/usage-limited` for
+the limit, with the time the outage began, and the watchdog's next pass sends
+one ntfy push about it, naming which. Vinegar removes the file after the next
+review that runs. The watchdog keeps the text it pushed and
 pushes again whenever the file names a different start, so a new outage gets
 its own push even when it begins before the next pass. The file stays after a
 restart and after the waiting pull request is closed, because neither proves

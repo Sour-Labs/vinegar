@@ -2732,12 +2732,29 @@ check("a review that cannot log in says so rather than failing",
       _login == vinegar.LOGGED_OUT and not posted, (_login, posted))
 # Everything else that fails for free stays FAILED, which is what keeps
 # MAX_ATTEMPTS in charge of it. A rate limit is the common one.
-claude_run.stream = stream(
-    {"type": "assistant", "error": "rate_limit",
-     "message": {"content": [{"type": "text", "text": "Usage limit"}]}},
-    dict(_AUTH_END, result="Claude AI usage limit reached"))
+# A usage limit is the other free, machine-wide ending, and was FAILED
+# until agent-hub#37 spent its three attempts in twenty minutes against one
+# that reset an hour later, on 2026-10-15. The shape is what Claude Code
+# 2.1.285 left in the session records of those three attempts.
+_LIMIT = dict(_AUTH, error="rate_limit",
+              message={"model": "<synthetic>", "role": "assistant",
+                       "content": [{"type": "text", "text": (
+                           "You've hit your monthly spend limit · raise it "
+                           "at claude.ai/settings/usage?from="
+                           "cc_cli_limit_message · your session limit "
+                           "resets 4pm (America/Los_Angeles)")}]})
+claude_run.stream = stream(_LIMIT, dict(
+    _AUTH_END, result="You've hit your monthly spend limit"))
 _login = _reviewed(CONFIG)
-check("an error that is not the login is still a failed attempt",
+check("a review that hits the usage limit is held, not failed",
+      _login == vinegar.LIMITED, _login)
+# A 529 clears in seconds, and the three spaced attempts are right for it:
+# the one the daemon met, 2026-09, was reviewed on the next attempt.
+claude_run.stream = stream(
+    dict(_AUTH, error="overloaded"),
+    dict(_AUTH_END, result="API Error: 529 Overloaded"))
+_login = _reviewed(CONFIG)
+check("an error that is not an outage is still a failed attempt",
       _login == vinegar.FAILED, _login)
 # Like unroutable(): only a run that bought nothing is free to throw away.
 # A login lost part way through a review has spent it, and treating that
@@ -2749,8 +2766,11 @@ check("a login lost after the review spent something is an attempt",
       _login == vinegar.FAILED, _login)
 # A subagent's event is not the review's, the rule read_stream() keeps.
 check("a subagent that cannot log in is not the review logged out",
-      not vinegar.logged_out(stream(dict(_AUTH, parent_tool_use_id="t_1"),
-                                    _AUTH_END)))
+      vinegar.outage(stream(dict(_AUTH, parent_tool_use_id="t_1"),
+                            _AUTH_END)) is None)
+check("a subagent that hits the limit is not the review held",
+      vinegar.outage(stream(dict(_LIMIT, parent_tool_use_id="t_1"),
+                            _AUTH_END)) is None)
 claude_run.stream = stream(call(FINDINGS[:4]), result_event())
 
 # The two attempts share one bound. Given a fresh review_timeout each, one
@@ -5559,6 +5579,47 @@ check("a login failure closes the check as one a required check refuses",
       _lo_ends == ["action_required"], _lo_ends)
 vinegar._login_failed_at = None
 vinegar.forget(vinegar.LOGGED_OUT_PATH)
+del checked[:]
+del posted[:]
+
+# The usage limit is held the same way, with its own marker and its own
+# words: the watchdog's push says what is wrong and what to do, and those
+# differ between a login and a limit.
+vinegar.forget(vinegar.LIMITED_PATH)
+vinegar.review = lambda *a, **k: _lo_ran.append(1) or (_lo_answer[0], False,
+                                                        False)
+_lo_answer[0] = vinegar.LIMITED
+_ul_state = {L: {"outcome": vinegar.FAILED, "sha": PR["headRefOid"],
+                 "attempts": vinegar.MAX_ATTEMPTS - 1}}
+vinegar._failed_at.clear()
+del _lo_ran[:]
+del posted[:]
+_ul_said = vinegar.handle_pr("o/r", PR_LIVE, CONFIG, _ul_state, {})
+check("a usage limit hands back the attempt and is recorded as itself",
+      _ul_state[L].get("attempts") == vinegar.MAX_ATTEMPTS - 1
+      and _ul_state[L]["outcome"] == vinegar.LIMITED
+      and not posted and _ul_said is False, (_ul_state, posted, _ul_said))
+check("a usage limit leaves the watchdog its own marker",
+      os.path.exists(vinegar.LIMITED_PATH)
+      and not os.path.exists(vinegar.LOGGED_OUT_PATH), vinegar.LIMITED_PATH)
+vinegar.handle_pr("o/r", _lo_other, CONFIG, {}, {})
+check("a usage limit holds every review back",
+      len(_lo_ran) == 1, len(_lo_ran))
+vinegar._login_failed_at = None
+_lo_answer[0] = vinegar.DONE
+vinegar.handle_pr("o/r", _lo_other, CONFIG, {}, {})
+check("a review that ran removes the limit marker",
+      not os.path.exists(vinegar.LIMITED_PATH), vinegar.LIMITED_PATH)
+_ul_title = _indicator_after(vinegar.LIMITED, 0)
+_ul_ends = [asked.get("conclusion") for how, _, asked in checked
+            if how == "PATCH"]
+check("a usage limit says so in the checks list",
+      _ul_title == ["Claude's usage limit is reached, so the review will "
+                    "run once it resets"], _ul_title)
+check("a usage limit closes the check as one a required check refuses",
+      _ul_ends == ["action_required"], _ul_ends)
+vinegar._login_failed_at = None
+vinegar.forget(vinegar.LIMITED_PATH)
 del checked[:]
 del posted[:]
 
